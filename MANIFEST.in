@@ -1,0 +1,4 @@
+include schema/*.json
+include templates/*.md
+include README.md
+include LICENSE

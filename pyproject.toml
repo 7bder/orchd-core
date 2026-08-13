@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orchd"
+dynamic = ["version"]
+description = "Cross-agent-platform task distribution CLI: event sourcing, file locking, DAG ready-pool, two-phase review"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+    "jsonschema>=4.20",
+]
+
+[project.scripts]
+orchd = "orchd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["orchd*"]
+
+[tool.setuptools.package-data]
+orchd = [
+    "../schema/*.json",
+    "../templates/*.md",
+]
+
+[tool.setuptools_scm]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "setuptools-scm>=8.0",
+    "build>=1.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# 规则集：E4/E7/E9（语法+风格核心）+ F（pyflakes 正确性）。
+# 既有代码基线（task-release-pipeline 记录，2026-08-08）：
+# - E402：__init__.py/ledger.py 模块级 import 不在文件顶部（有意的惰性加载）→ 忽略
+# - F401：ledger/pool/report/spec/onboard 遗留未使用 import（基线）→ 忽略
+# - F541：onboard 遗留无占位 f-string（基线）→ 忽略
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+]
+ignore = [
+    "E402",
+    "F401",
+    "F541",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

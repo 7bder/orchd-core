@@ -1,0 +1,424 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://orchd.dev/schema/_master.schema.json",
+  "title": "Orchd Master Project Specification",
+  "description": "Orchd 项目完整规格，由 BOOTSTRAP agent 生成，orchd validate 校验。",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project",
+    "modules",
+    "tasks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ],
+      "description": "Schema 版本号。演进时递增，orchd validate 据此判断兼容性。当前仅 v1；新增版本须同步落地 schema/v{N}/ 目录。"
+    },
+    "project": {
+      "type": "object",
+      "required": [
+        "name",
+        "brief"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "项目名称。"
+        },
+        "brief": {
+          "type": "string",
+          "minLength": 1,
+          "description": "一句话项目描述。"
+        }
+      }
+    },
+    "modules": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "role"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^mod-[a-z0-9-]+$",
+            "description": "模块 ID，格式 mod-{name}。"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "模块显示名称。"
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "description": "模块在整个项目中的定位。"
+          },
+          "estimated_hours": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0,
+            "description": "模块预估总工时。"
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "brief",
+          "module",
+          "acceptance_criteria",
+          "files_to_edit",
+          "reviewers"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^task-[a-z0-9-]+$",
+            "description": "任务 ID，格式 task-{name}。"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "任务名称。"
+          },
+          "brief": {
+            "type": "string",
+            "minLength": 1,
+            "description": "任务一句话描述。"
+          },
+          "module": {
+            "type": "string",
+            "description": "所属模块 ID，引用 modules[].id。"
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "上游任务 ID 列表，引用 tasks[].id。"
+          },
+          "estimated_hours": {
+            "type": "number",
+            "minimum": 0,
+            "default": 1,
+            "description": "预估工时。"
+          },
+          "importance": {
+            "enum": [
+              "critical",
+              "high",
+              "normal",
+              "low"
+            ],
+            "description": "显式重要性。缺省时由 orchd 基于下游阻塞数自动推导。"
+          },
+          "difficulty": {
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "description": "任务难度。"
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "执行该任务所需的能力标签。"
+          },
+          "acceptance_criteria": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "验收标准列表，spec review 逐条对照。"
+          },
+          "files_to_read": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "object",
+              "required": [
+                "path",
+                "priority"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "相对 workspace 根目录的文件路径。"
+                },
+                "priority": {
+                  "enum": [
+                    "must_read",
+                    "reference"
+                  ],
+                  "description": "must_read：必须读；reference：按需参考。"
+                },
+                "hint": {
+                  "type": "string",
+                  "description": "一行摘要，帮助 agent 决定读取深度。"
+                }
+              }
+            }
+          },
+          "files_to_edit": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "本任务将修改的文件列表，用于文件冲突检测。"
+          },
+          "reviewers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "审查者 agent ID 列表，至少 1 人。Agent ID 为自声明字符串，不预注册。"
+          },
+          "verify_command": {
+            "type": "string",
+            "description": "可选。done 时由 CLI 执行的客观验证命令，exit 0 才允许写 DONE。"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 3,
+            "description": "审查打回最大次数，超过后 request 返回警告。"
+          },
+          "deliverables": {
+            "type": "object",
+            "description": "交付契约（可选）。定义任务的对外形状，供 spec review 逐项核对与 verify_command 测试锚点。",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "code_api",
+                  "data_format"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "code_api"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "api"
+                  ],
+                  "properties": {
+                    "api": {
+                      "type": "object",
+                      "required": [
+                        "language",
+                        "signatures"
+                      ],
+                      "properties": {
+                        "language": {
+                          "type": "string"
+                        },
+                        "signatures": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "name",
+                              "params"
+                            ],
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "params": {
+                                "type": "array",
+                                "items": {
+                                  "type": "object",
+                                  "required": [
+                                    "name",
+                                    "type"
+                                  ],
+                                  "properties": {
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              },
+                              "returns": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "data_format"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "schema"
+                  ],
+                  "properties": {
+                    "schema": {
+                      "type": "object",
+                      "required": [
+                        "file",
+                        "format",
+                        "fields"
+                      ],
+                      "properties": {
+                        "file": {
+                          "type": "string"
+                        },
+                        "format": {
+                          "type": "string",
+                          "description": "文件格式。常见值：json / csv / parquet / binary。不做枚举限制，因格式种类不可穷举。"
+                        },
+                        "fields": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "name",
+                              "type"
+                            ],
+                            "properties": {
+                              "name": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string"
+                              },
+                              "unit": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "exempt_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "uniqueItems": true,
+            "description": "必要连带豁免文件列表（可选）。声明任务实现必需但不在 files_to_edit 内的文件（如新增错误码连带更新的测试断言文件），E020 hook 校验豁免，引擎 ensure_committed 不兜底提交（须实现者自行 commit）。"
+          },
+          "source": {
+            "type": "string",
+            "pattern": "^(idea|roadmap):[a-z0-9-]+$",
+            "description": "任务来源（可选）。格式 ^(idea|roadmap):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id。缺省无 source 时校验通过（向后兼容存量任务）。"
+          },
+          "verify_timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "verify_command 执行超时（秒，可选）。缺省回退引擎默认 _VERIFY_TIMEOUT=120。全量 pytest 慢机器/沙箱拦截场景可调大（如 300）。"
+          }
+        }
+      }
+    },
+    "shared": {
+      "type": "object",
+      "description": "共享上下文文件路径。可选：缺省时 CLI claim 跳过共享上下文自动附加（不报错），适用于无架构/规范文档的简单项目。",
+      "additionalProperties": true,
+      "properties": {
+        "architecture": {
+          "type": "string",
+          "description": "架构文档相对路径（BOOTSTRAP 写入 .orchd/shared/architecture.md）。"
+        },
+        "conventions": {
+          "type": "string",
+          "description": "编码规范相对路径（BOOTSTRAP 写入 .orchd/shared/conventions.md）。"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "description": "引擎行为配置（1.1）：importance 阈值覆盖等",
+      "properties": {
+        "importance": {
+          "type": "object",
+          "description": "derive_importance 阈值下界覆盖",
+          "properties": {
+            "critical": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "high": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "normal": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "doc_single_stage_blocked": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "文档单阶段审查 blocked 文件集合（可选）。含这些文件的任务保持双阶段审查。缺省回退硬编码 {SKILL.md, .orchd/shared/conventions.md, .orchd/_master.json}。"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$comment": "JSON Schema 职责边界：本文件只校验结构层（字段类型、必选/可选、枚举值、数组长度）。以下跨引用约束由 orchd validate 的代码实现（spec.py），不属于 JSON Schema 表达范围：\n  1. DAG 无环（拓扑排序检测）\n  2. depends_on 引用的 task_id 存在\n  3. reviewers 非空且格式合法（agent ID 为自声明，不校验预注册）\n  4. task_id 全局唯一\n  5. task.module 指向已定义的 module_id\n  6. files_to_edit 路径格式合法\n实现时对照 docs/system-design.md §3.4 逐条编写 pytest。"
+}
