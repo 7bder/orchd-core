@@ -50,3 +50,6 @@ orchd-dashboard/
 
 # 2026-08-08 仓库事故现场备份（对象/refs 丢失，保留供追溯）
 .git.damaged-20260808/
+
+# orchd-core 自动同步运行日志（scripts/sync_orchd_core.sh 生成）
+.orchd-core-sync.log
