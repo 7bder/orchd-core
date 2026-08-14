@@ -68,6 +68,10 @@ def status(
                 detail["review_phase"] = ts.review_phase
             if ts.review_claimed_by:
                 detail["review_claimed_by"] = ts.review_claimed_by
+            # B1（2026-08-13 full-audit-v2）：completed 但 merge 未落地时展示
+            # merge_warning，供 audit-merge 告警后的「人工确认 main 是否含实现」直接查看
+            if ts.merge_warning:
+                detail["merge_warning"] = ts.merge_warning
             detail["attempt_count"] = ts.attempt_count
         return {"task": detail}
 
@@ -205,6 +209,24 @@ def merge_audit(
                 "task_id": tid,
                 "branch": branch,
                 "reason": "merged_but_not_cleaned",
+            })
+
+    # B1（2026-08-13 full-audit-v2）：merge 降级盲区——completed 任务含
+    # merge_warning 但 task 分支已删（merge 未落地 + audit 失明）→ 单独告警。
+    # 分支仍存在时由上循环的 branch_not_merged / merged_but_not_cleaned 覆盖。
+    branch_ids = {b[len("task/"):] for b in branch_names if b.startswith("task/")}
+    for tid in registered_ids:
+        ts = state.get(tid)
+        if not ts or ts.status != "completed" or not ts.merge_warning:
+            continue
+        if tid not in branch_ids:
+            warnings.append({
+                "task_id": tid,
+                "reason": "merge_warning_unresolved",
+                "message": ts.merge_warning,
+                "hint": "该任务标记完成但 git merge 未执行（best-effort 降级），"
+                        "且 task 分支已删除，无法从分支差异核对；"
+                        "请人工确认 main 是否含实现",
             })
     return {"skipped": False, "warnings": warnings}
 

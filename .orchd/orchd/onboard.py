@@ -1722,6 +1722,14 @@ def review_submit(
                         f"请人工核对状态与 main 分支后处理"
                     )
                 else:
+                    if merge_result is None:
+                        # B1（2026-08-13 full-audit-v2）：merge 降级（环境异常/best-effort）
+                        # 记录到完成事件，供 audit-merge 对"completed 但 merge 未落地"告警，
+                        # 即使 task 分支随后被删，审计也不失明
+                        pending_code_event["merge_warning"] = (
+                            "git merge 未执行（非 git 仓库或 git 不可用），"
+                            "按 best-effort 语义标记完成"
+                        )
                     store.append_event(pending_code_event)
                     new_state = store.replay()
                     store.update_checkpoint(new_state)
@@ -1731,10 +1739,7 @@ def review_submit(
             if result.get("reason") != "state_changed_during_merge":
                 if merge_result is None:
                     result["merged"] = None
-                    result["merge_warning"] = (
-                        "git merge 未执行（非 git 仓库或 git 不可用），"
-                        "按 best-effort 语义标记完成"
-                    )
+                    result["merge_warning"] = pending_code_event.get("merge_warning", "")
                 else:
                     result["merged"] = True
                     if auto_resolved:

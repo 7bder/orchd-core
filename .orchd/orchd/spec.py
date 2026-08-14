@@ -623,10 +623,34 @@ def validate_source(
     return errors
 
 
+def _exact_ref_match(ref_id: str, title: str) -> bool:
+    """ref_id 是否为 title 中的一个完整词（子串/前缀误命中防护，P3 2026-08-13）。
+
+    匹配规则：ref_id 在标题中出现，且前后边界均为「非字母数字/连字符/下划线」
+    （开头/结尾视为合法边界），避免 ``2026-08-1`` 误命中 ``2026-08-10``。
+    支持 ref_id 出现在标题任意位置（roadmap id 形如 ``id: snapshotstore-m-p0``）。
+    """
+    start = 0
+    while True:
+        pos = title.find(ref_id, start)
+        if pos == -1:
+            return False
+        before_ok = pos == 0 or (
+            not title[pos - 1].isalnum() and title[pos - 1] not in ("-", "_")
+        )
+        after = pos + len(ref_id)
+        after_ok = after == len(title) or (
+            not title[after].isalnum() and title[after] not in ("-", "_")
+        )
+        if before_ok and after_ok:
+            return True
+        start = pos + 1
+
+
 def _check_idea_reference(
     tid: str, task_idx: int, ref_id: str, ideas_path: Path
 ) -> list[ValidationError]:
-    """核对 IDEAS.md：存在 ``## YYYY-MM-DD <标题>`` 且引用 id 匹配、status 为 pending。"""
+    """核对 IDEAS.md：存在 ``## YYYY-MM-DD <标题>`` 且引用 id 匹配（精确词）、status 为 pending。"""
     errors: list[ValidationError] = []
     text = ideas_path.read_text(encoding="utf-8")
     # 解析条目：## 标题行 + 后续行中的 status 字段（支持 "- status: pending" 列表格式）
@@ -649,7 +673,10 @@ def _check_idea_reference(
 
     matched = None
     for e in entries:
-        if ref_id in e["title"]:
+        # P3（2026-08-13 full-audit-v2）：子串匹配改精确匹配——ref_id 须为
+        # 标题的一个完整词（以空格/冒号/括号/结尾为边界），避免前缀误命中
+        # （如 idea:2026-08-1 命中多个 2026-08-1x 条目）
+        if _exact_ref_match(ref_id, e["title"]):
             matched = e
             break
     if matched is None:
@@ -686,7 +713,8 @@ def _check_roadmap_reference(
         for line in text.splitlines()
         if line.strip().startswith("## ")
     ]
-    matched = any(ref_id in header for header in section_headers)
+    # P3（2026-08-13 full-audit-v2）：精确匹配（完整词），避免前缀误命中
+    matched = any(_exact_ref_match(ref_id, header) for header in section_headers)
     if not matched:
         errors.append(
             ValidationError(

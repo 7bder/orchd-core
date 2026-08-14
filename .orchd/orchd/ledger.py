@@ -67,6 +67,8 @@ class TaskState:
         attempt_count:      累计尝试次数，每次 DONE 事件递增；FORCE_STATUS(pending) 时重置为 0。
         review_phase:       当前审核阶段类型（如 ``"spec"`` 或 ``"code"``），无审核时为 None。
         review_claimed_by:  认领该审核的 reviewer agent ID，未认领时为 None。
+        merge_warning:      代码审查通过后 git merge 未执行（环境异常/best-effort 降级），
+                            标记完成但 merge 未落地，audit-merge 需告警。仅 completed 有值。
     """
 
     status: str = "pending"
@@ -74,12 +76,13 @@ class TaskState:
     attempt_count: int = 0
     review_phase: str | None = None
     review_claimed_by: str | None = None
+    merge_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """将任务状态序列化为字典，用于写入 checkpoint JSON。
 
         为保持 checkpoint 紧凑，值为 ``None`` 的可选字段（``claimed_by``、
-        ``review_phase``、``review_claimed_by``）会被省略。
+        ``review_phase``、``review_claimed_by``、``merge_warning``）会被省略。
         始终包含 ``status`` 和 ``attempt_count``。
         """
         d: dict[str, Any] = {"status": self.status, "attempt_count": self.attempt_count}
@@ -89,6 +92,8 @@ class TaskState:
             d["review_phase"] = self.review_phase
         if self.review_claimed_by:
             d["review_claimed_by"] = self.review_claimed_by
+        if self.merge_warning:
+            d["merge_warning"] = self.merge_warning
         return d
 
     @classmethod
@@ -104,6 +109,7 @@ class TaskState:
             attempt_count=d.get("attempt_count", 0),
             review_phase=d.get("review_phase"),
             review_claimed_by=d.get("review_claimed_by"),
+            merge_warning=d.get("merge_warning"),
         )
 
 
@@ -691,6 +697,9 @@ class Store:
                         ts.status = "completed"
                         ts.review_phase = None
                         ts.review_claimed_by = None
+                        # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
+                        # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
+                        ts.merge_warning = event.get("merge_warning")
                     else:
                         # spec review 通过但 code review 尚未开始，
                         # CLI 层会自动生成 REVIEW_READY(code) 事件，此处无需处理
@@ -828,6 +837,12 @@ class Store:
                     ts.status = "completed"
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    # B1（2026-08-13 full-audit-v2）：与 _apply_events 保持一致——
+                    # merge 降级标记随事件持久化。全量重建（RETRACT / check_integrity
+                    # 前缀重放）若不设置，merge_warning 将丢失：既让 audit-merge
+                    # 对漏 merge 失明，又会与含 merge_warning 的 checkpoint 快照
+                    # 不一致而误报 E030 篡改告警。
+                    ts.merge_warning = event.get("merge_warning")
                 elif verdict == "CHANGES_REQUESTED":
                     # 不重置 attempt_count（与 _apply_events 一致）：打回次数累计，
                     # 供 request 的 max_attempts 上限警告；仅 force-status pending 重置。

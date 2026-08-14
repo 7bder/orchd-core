@@ -1,6 +1,6 @@
 # orchd-core
 
-跨 AI agent 平台的任务编排 CLI 核心套件。本仓库是 **orchd 引擎的最小可移植核心**，可复制到任意新项目中，为该项目托管「多 agent 协作的任务领取 / 提交 / 审查」基础设施。
+跨 AI agent 平台的任务编排 CLI 核心套件。本仓库是 **orchd 引擎的最小可移植核心**，交付为**单一 `.orchd/` 自包含工作空间**——引擎、资源、协议层、打包配置全部在 `.orchd/` 内，宿主项目根**零额外文件**。
 
 orchd 不做需求推理、不内置 LLM 调用。它只为一个项目里的多个 AI agent 提供**可靠**的协作基础设施：
 
@@ -44,49 +44,35 @@ cancelled（强制取消）
 
 ---
 
-## 安装
+## 安装（零安装，零根文件模型）
 
 要求 Python >= 3.10，依赖仅 `jsonschema`。
 
 ```bash
-# 开发安装（套件根目录）
-pip install -e .
-orchd --version
+# 把 orchd-core 的 .orchd/ 复制到你的项目根即可
+cp -R orchd-core/.orchd ./你的项目/.orchd
+cd 你的项目
+python .orchd/__main__.py --version
 ```
+
+`python .orchd/__main__.py <子命令> ...` 与 `orchd <子命令> ...` 完全等价——无需安装、不依赖 PATH、宿主项目根零额外文件。
 
 ---
 
 ## 快速开始：为你的新项目启动 orchd 托管
 
-1. 把本套件复制到你的项目根目录（或作为子模块引入），确保目录结构：
-
-```
-你的项目/
-├── orchd/                 # 引擎（本套件）
-├── schema/_master.schema.json
-├── templates/             # architect / implementer / reviewer prompt
-├── pyproject.toml
-├── SKILL.md               # agent 协议适配层
-└── docs/decomposition-guide.md
-```
-
-2. 安装并让 agent 生成任务分解：
+1. 把 orchd-core 的 `.orchd/` 复制到项目根（见上 §安装），在项目根放 `requirements.md`（任意来源需求文档）。
+2. 首个 agent 读 `.orchd/SKILL.md` 进入 **BOOTSTRAP 模式**：
 
 ```bash
-pip install -e .
-orchd bootstrap            # 输出 schema + architect prompt + 分解指南
+python .orchd/__main__.py bootstrap            # 输出 schema + architect prompt + 分解指南
+# 按 schema 与拆解指南写 .orchd/_master.json
+python .orchd/__main__.py validate .orchd/_master.json   # 结构 + 引用 + 质量校验
+python .orchd/__main__.py init                 # 生成 mod-*/spec.json 快照 + 空 ledger + checkpoint
 ```
 
-3. 编写（或由 LLM 生成）任务清单 `.orchd/_master.json`，然后校验并初始化：
-
-```bash
-orchd validate .orchd/_master.json   # 结构 + 引用 + 质量校验
-orchd init                           # 生成 mod-*/spec.json 快照 + 空 ledger + checkpoint
-```
-
-4. 写项目共享上下文 `.orchd/shared/architecture.md` 与 `.orchd/shared/conventions.md`。
-
-5. agent 进入工作流：`orchd request → claim → 实现 → done → review`（见下方命令）。
+3. 写项目共享上下文 `.orchd/shared/architecture.md` 与 `.orchd/shared/conventions.md`。
+4. agent 进入工作流：`python .orchd/__main__.py request → claim → 实现 → done → review`（见下方命令）。
 
 ---
 
@@ -94,45 +80,44 @@ orchd init                           # 生成 mod-*/spec.json 快照 + 空 ledge
 
 | 命令 | 作用 |
 |------|------|
-| `orchd bootstrap` | 输出分解套件（schema + architect prompt + guide） |
-| `orchd validate <master>` | 校验任务清单（结构/引用/质量/source） |
-| `orchd init` | 初始化快照 + 空 ledger + checkpoint |
-| `orchd amend` | 增量更新快照（按状态约束矩阵过滤） |
-| `orchd request` | 获取下一个候选任务（`--role reviewer` 领审查） |
-| `orchd pool` | 列出就绪池（`--all` 含非就绪） |
-| `orchd claim` | 认领任务（自动建 `task/{id}` 分支） |
-| `orchd done` | 报告完成（跑 verify_command → 自动进入审查） |
-| `orchd review` | 提交审查结论（APPROVED / CHANGES_REQUESTED） |
-| `orchd retract` | 撤回事件（级联） |
-| `orchd force-status` | 强制设置状态（受"允许从"矩阵约束） |
-| `orchd status` | 全局状态快照 / 单任务详情 |
-| `orchd watchdog` | 僵死任务巡检 |
-| `orchd doctor` | git 仓库完整性只读检测 |
+| `bootstrap` | 输出分解套件（schema + architect prompt + guide） |
+| `validate <master>` | 校验任务清单（结构/引用/质量/source） |
+| `init` | 初始化快照 + 空 ledger + checkpoint |
+| `amend` | 增量更新快照（按状态约束矩阵过滤） |
+| `request` | 获取下一个候选任务（`--role reviewer` 领审查） |
+| `pool` | 列出就绪池（`--all` 含非就绪） |
+| `claim` | 认领任务（自动建 `task/{id}` 分支，`--confirm` 两段式确认） |
+| `done` | 报告完成（跑 verify_command → 自动进入审查） |
+| `review` | 提交审查结论（APPROVED / CHANGES_REQUESTED） |
+| `retract` | 撤回事件（级联） |
+| `force-status` | 强制设置状态（受"允许从"矩阵约束） |
+| `status` | 全局状态快照 / 单任务详情 |
+| `watchdog` | 僵死任务巡检 |
+| `ideas-archive` | 自动归档已完结的 IDEAS 条目 |
+| `doctor` | git 仓库完整性只读检测 |
 
-所有命令统一输出 JSON（UTF-8），便于脚本/管道消费。
+所有命令统一输出 JSON（UTF-8），便于脚本/管道消费。统一用 `python .orchd/__main__.py <命令>` 调用。
 
 ---
 
-## 目录结构
+## 目录结构（单一 `.orchd/`）
 
 ```
-orchd/                     # 引擎包（13 个模块）
-  cli.py                   # CLI 路由 + 统一 JSON 输出
-  ledger.py                # 事件溯源存储 + 文件锁
-  onboard.py               # 状态机生命周期（claim/done/review/retract/force）
-  pool.py                  # 就绪池 / DAG / 冲突检测
-  split.py                 # init/amend 快照
-  spec.py                  # master 校验（结构/引用/质量/source）
-  gitops.py                # git 分支/hook/session 锁
-  report.py                # status/watchdog
-  ideas.py                 # IDEAS.md 自动归档
-  doctor.py                # git 完整性检测
-  errors.py                # 错误码 E001–E028
-schema/_master.schema.json # 任务清单 JSON Schema
-templates/                 # architect / implementer / spec-reviewer / code-reviewer prompt
-SKILL.md                   # agent 协议适配层（双模式）
-docs/decomposition-guide.md# 任务拆解方法论
+你的项目/
+└── .orchd/
+    ├── orchd/                  # vendored 只读引擎（cli / spec / split / ledger / pool / onboard / report / errors / gitops / ideas / doctor）
+    ├── schema/_master.schema.json
+    ├── templates/              # architect / implementer / spec-reviewer / code-reviewer prompt
+    ├── docs/decomposition-guide.md
+    ├── SKILL.md                # agent 协议适配层（三模式 + 规则目录索引）
+    ├── __main__.py             # 零根文件启动入口
+    ├── pyproject.toml / MANIFEST.in / LICENSE / .gitignore
+    ├── shared/                 # 工作区骨架（宿主项目共享上下文）
+    ├── proposals/              # 工作区骨架（提案目录）
+    └── README.md               # 本说明
 ```
+
+宿主项目根**零额外文件**——像 `.claude/` / `.cursor/` 一样无感。
 
 ---
 

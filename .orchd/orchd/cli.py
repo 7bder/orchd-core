@@ -374,13 +374,43 @@ def _cmd_validate(args) -> dict:
     """校验 _master.json 的结构与引用完整性。
 
     CLI 参数: args.path — master 文件路径（默认 .orchd/_master.json）。
-    返回: {"valid": True/False, "errors": [...]}。
+    返回: {"valid": True/False, "errors": [...], "warnings": [...]}。
+
+    注（2026-08-14 发版清理批次）：对终态（completed/cancelled）任务豁免
+    E029（粒度拆分建议）与 E023（模糊词）历史残留——拆分/改写验收标准对
+    已完成任务无意义，且其核心字段（files_to_edit / acceptance_criteria）
+    受 E007 终态保护无法改写。豁免按当前状态动态生效：任务被 force-status
+    重置回 pending 后豁免自动失效，不掩盖新任务的质量问题。
     """
+    import re
+
+    from orchd.ledger import Store
     from orchd.spec import load_master, validate_quality, validate_references, validate_structure
 
     master = load_master(args.path)
     structure_errors = validate_structure(master) + validate_references(master)
     quality_warnings = validate_quality(master)  # E022/E023/E024 为质量告警，不判 invalid
+
+    # 终态任务集合；无可用 ledger（新项目 / replay 失败）时跳过过滤，validate 保持可运行。
+    terminal_ids: set[str] | None = None
+    try:
+        state = Store(Path(args.path).parent).replay()
+        terminal_ids = {tid for tid, ts in state.items() if ts.status in ("completed", "cancelled")}
+    except Exception:
+        terminal_ids = None
+
+    def _keep_quality_warning(e) -> bool:
+        if terminal_ids is None or e.code.name not in ("E029", "E023"):
+            return True
+        m = re.match(r"\$\.tasks\[(\d+)\]", e.path or "")
+        if not m:
+            return True
+        idx = int(m.group(1))
+        tid = master.tasks[idx].get("id") if idx < len(master.tasks) else None
+        return tid not in terminal_ids
+
+    quality_warnings = [e for e in quality_warnings if _keep_quality_warning(e)]
+
     if structure_errors:
         return {
             "valid": False,
