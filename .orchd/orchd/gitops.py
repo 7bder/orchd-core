@@ -246,8 +246,9 @@ def hook_install(
     - 任务活跃 → **任何分支**都校验 staged 文件 ⊆ files_to_edit
       （堵住任务活跃期间在 main / 幽灵分支越界提交实现内容的事故：
       b3c2e84 直接在 main 提交、task/task-1 幽灵分支）
-    - 固定资产豁免：.orchd/_master.json、IDEAS.md（amend 自动提交的路径，
-      cli.py ensure_committed 在 main 执行，若不豁免会被自身 hook 拦截）
+    - 固定资产豁免：.orchd/_master.json、IDEAS.md 与 .orchd/IDEAS.md
+      （amend 自动提交的路径，cli.py ensure_committed 在 main 执行，
+      若不豁免会被自身 hook 拦截）
     - R1-b 审查期实现者冻结：任务分支上 REVIEW_CLAIMED 且无后续结论 → 拒绝
     - 越界 → 拒绝提交（exit 1），打印越界文件清单
     - --no-verify 可绕过（git 原生行为，hook 无需特殊处理）
@@ -345,10 +346,11 @@ OUT_OF_SCOPE=""
 for FILE in $STAGED; do
     IN_SCOPE=no
     # 固定资产豁免（引擎自动提交路径，不在任务 files_to_edit 内）：
-    # .orchd/_master.json、IDEAS.md —— amend 在 main 分支提交它们，
-    # 若不豁免会被本 hook 拦截（引擎自动提交零改动）
+    # .orchd/_master.json、IDEAS.md（根布局）与 .orchd/IDEAS.md（发布态自包含
+    # .orchd 布局）——amend 在 main 分支提交它们，若不豁免会被本 hook 拦截
+    # （引擎自动提交零改动）。
     case "$FILE" in
-        .orchd/_master.json|IDEAS.md)
+        .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md)
             IN_SCOPE=yes
             ;;
     esac

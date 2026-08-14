@@ -64,6 +64,9 @@ _FORCE_ESCAPE_HATCHES = frozenset({
 # verify_command 超时（秒）：120s 是在"给测试套件足够执行时间"与
 # "避免无限期阻塞 done 流程"之间的折中值；大部分单测 / lint 命令在 2 分钟内可完成。
 _VERIFY_TIMEOUT = 120
+# 方案 C（task-full-regression-gate）：全量 pytest 冒烟超时上限（秒）。
+# 全量套件不含慢用例时约 35s，预留足够余量；失败仅告警不阻断 done。
+_FULL_REGRESSION_TIMEOUT = 300
 
 
 def _guard_write_command(
@@ -161,6 +164,25 @@ _FALLBACK_GUIDE = (
 )
 
 
+def _resolve_resource_root(project_root: Path) -> Path:
+    """解析引擎资源根（schema / templates / docs 所在目录，task-12-engine-path-abstraction）。
+
+    双态兼容：
+    - 根布局（开发态）：资源在项目根（``project_root/schema``）→ 返回 ``project_root``。
+    - 发布态布局（自包含 ``.orchd/``）：资源归置 ``.orchd/``（``.orchd/schema``）→
+      返回 ``project_root / ".orchd"``。
+    判定以 ``schema/`` 是否存在为准；两者都无 → 回退 ``project_root``
+    （保持既有 E001「缺失报错」语义，缺失时由调用方抛错）。
+    """
+    project_root = Path(project_root)
+    if (project_root / "schema").is_dir():
+        return project_root
+    orchd_dir = project_root / ".orchd"
+    if (orchd_dir / "schema").is_dir():
+        return orchd_dir
+    return project_root
+
+
 def bootstrap(project_root: Path | None = None) -> dict[str, Any]:
     """输出分解套件 JSON：schema + prompt + guide + next_step。
 
@@ -168,15 +190,19 @@ def bootstrap(project_root: Path | None = None) -> dict[str, Any]:
     注意：此函数仅读取项目静态文件（schema / templates / docs），
     不要求 .orchd/ 目录已存在——它可在项目初始化（orchd init）之前安全调用。
 
+    资源根双态兼容（task-12-engine-path-abstraction，AC1）：
+    开发态在项目根（``schema/`` 等），发布态在 ``.orchd/``（引擎资源归置）。
+
     Raises:
         OrchdError E001: schema 或 architect.md 缺失。
     """
     if project_root is None:
         project_root = _find_project_root()
+    resource_root = _resolve_resource_root(project_root)
 
-    schema_path = project_root / "schema" / "_master.schema.json"
-    prompt_path = project_root / "templates" / "architect.md"
-    guide_path = project_root / "docs" / "decomposition-guide.md"
+    schema_path = resource_root / "schema" / "_master.schema.json"
+    prompt_path = resource_root / "templates" / "architect.md"
+    guide_path = resource_root / "docs" / "decomposition-guide.md"
 
     if not schema_path.exists():
         raise OrchdError(
@@ -208,15 +234,17 @@ def bootstrap(project_root: Path | None = None) -> dict[str, Any]:
 
 
 def _find_project_root() -> Path:
-    """从 cwd 向上逐层搜索包含 schema/ 子目录的项目根目录。
+    """从 cwd 向上逐层搜索项目根目录。
 
     搜索策略：依次检查 cwd → cwd.parent → cwd.parent.parent → …，
-    返回第一个含有 schema/ 目录的祖先路径；若所有祖先均不匹配则回退到 cwd 本身。
+    返回第一个含有 ``.orchd/`` 目录的祖先路径（task-12-engine-path-abstraction，
+    AC2：按 .orchd/ 定位项目根，不再依赖根含 schema/——发布态自包含 .orchd/
+    工作空间同样命中）；若所有祖先均不匹配则回退到 cwd 本身。
     这使得在子目录中运行 CLI 也能正确定位到项目根。
     """
     cwd = Path.cwd()
     for parent in [cwd] + list(cwd.parents):
-        if (parent / "schema").is_dir():
+        if (parent / ".orchd").is_dir():
             return parent
     return cwd
 
@@ -751,12 +779,20 @@ def _is_high_risk(task_def: dict[str, Any]) -> bool:
     用于「共享上下文按需」：这类任务的实现默认自动附 conventions.md
     （编码规范 + 自检约定），降低越界/违规概率；architecture.md 不自动附，
     仅任务自身 files_to_read 显式引用或 --with-context 显式开启时提供。
+
+    双态兼容（task-12-engine-path-abstraction，AC4）：files_to_edit 命中
+    ``orchd/``（开发态根布局）或 ``.orchd/orchd/``（发布态自包含 .orchd 布局）
+    均判高风险；``.orchd/_master.json`` 固定资产同样高风险。
     """
     module = task_def.get("module", "")
     if module == "mod-core":
         return True
     for f in task_def.get("files_to_edit", []):
-        if f.startswith("orchd/") or f == ".orchd/_master.json":
+        if (
+            f.startswith("orchd/")
+            or f.startswith(".orchd/orchd/")
+            or f == ".orchd/_master.json"
+        ):
             return True
     return False
 
@@ -829,6 +865,8 @@ def claim(
 
     store.acquire_lock()
     try:
+        # 红线 8（R3）：写命令前置校验运行时文件完整性（只读告警，不阻断）
+        integrity_warnings = store.check_integrity()
         state = store.replay()
         # H2（2026-08-13）：单次扫描派生缓存，供 E016 校验与返回段
         # review_comments / done_event / previous_changes 复用（锁外同样
@@ -1062,7 +1100,7 @@ def claim(
         if c.claimed_by == "pending"
     ]
 
-    return {
+    result = {
         "claimed": True,
         "task": task_def,
         "files_to_read": files_to_read,
@@ -1073,6 +1111,9 @@ def claim(
         "pending_conflicts": pending_conflicts,
         "event_id": event["event_id"],
     }
+    if integrity_warnings:
+        result["integrity_warnings"] = integrity_warnings
+    return result
 
 
 # ------------------------------------------------------------------
@@ -1116,8 +1157,9 @@ def _is_doc_single_stage(
     满足以下条件返回 True（文档类单阶段 code 终审）：
     - files_to_edit 全部为「真文档」（白名单后缀 .md/.mdx/.markdown/.rst/.txt，
       含 docs/、doc/ 目录下的文档文件——目录不再无条件放行，见下）
-    - 不包含约定/状态文件：SKILL.md、.orchd/shared/conventions.md、.orchd/_master.json
-      （这些属于"约定改变"，须保持双阶段审查）
+    - 不包含约定/状态文件：SKILL.md、.orchd/SKILL.md、
+      .orchd/shared/conventions.md、.orchd/_master.json
+      （这些属于"约定改变"，须保持双阶段审查；.orchd/SKILL.md 为发布态布局）
 
     白名单语义（2026-08-13 全面审核 §4.1 收紧）：schema JSON、pyproject.toml、
     CI yml、任何代码文件（含非 Python）都是高风险变更，一律双阶段终审。
@@ -1141,7 +1183,12 @@ def _is_doc_single_stage(
     if not files_to_edit:
         return False
     if blocked is None:
-        blocked = {"SKILL.md", ".orchd/shared/conventions.md", ".orchd/_master.json"}
+        blocked = {
+            "SKILL.md",
+            ".orchd/SKILL.md",
+            ".orchd/shared/conventions.md",
+            ".orchd/_master.json",
+        }
     for f in files_to_edit:
         if f in blocked:
             return False
@@ -1338,9 +1385,72 @@ def done(
             agent_id=agent_id,
         )
 
+    # 方案 C（task-full-regression-gate）：引擎改动 merge 前全量回归闸门。
+    # files_to_edit 含 orchd/*.py（核心引擎）时，done verify 通过、自动提交后，
+    # 锁外附加一次全量 pytest 冒烟，防止契约漂移在合并时静默通过。失败仅生成本
+    # 次 DONE 的 full_regression 警告，不阻断 done、不改任务状态（对齐验收标准 2）。
+    # 锁外执行（约 35s），避免长时间持锁；锁内二次校验仍兜底 TOCTOU。
+    full_regression: dict[str, Any] | None = None
+    files_to_edit = task_def.get("files_to_edit", [])
+    if project_root and any(
+        (f.startswith("orchd/") or f.startswith(".orchd/orchd/")) and f.endswith(".py")
+        for f in files_to_edit
+    ):
+        reg_started = time.monotonic()
+        try:
+            reg_result = subprocess.run(
+                "python -m pytest tests/ -q --basetemp=\"${TMPDIR:-/tmp}/orchd-vf-$$\"",
+                shell=True, cwd=str(project_root),
+                capture_output=True, timeout=_FULL_REGRESSION_TIMEOUT,
+            )
+            reg_elapsed = round(time.monotonic() - reg_started, 1)
+            if reg_result.returncode == 0:
+                full_regression = {
+                    "ok": True,
+                    "elapsed_seconds": reg_elapsed,
+                    "output_summary": _verify_output_summary(reg_result.stdout, reg_result.stderr),
+                }
+            else:
+                full_regression = {
+                    "ok": False,
+                    "code": "full_regression",
+                    "severity": "warning",
+                    "message": (
+                        f"full_regression_failed: exit code {reg_result.returncode} "
+                        f"after {reg_elapsed}s"
+                    ),
+                    "details": {
+                        "command": "python -m pytest tests/ -q",
+                        "returncode": reg_result.returncode,
+                        "elapsed_seconds": reg_elapsed,
+                        "output_summary": _verify_output_summary(reg_result.stdout, reg_result.stderr),
+                    },
+                }
+        except subprocess.TimeoutExpired as exc:
+            reg_elapsed = round(time.monotonic() - reg_started, 1)
+            partial_out = _decode_subprocess_output(
+                (exc.stdout or b"")[:300] if hasattr(exc, "stdout") else b""
+            )
+            full_regression = {
+                "ok": False,
+                "code": "full_regression",
+                "severity": "warning",
+                "message": (
+                    f"full_regression_timeout: after {reg_elapsed}s "
+                    f"(timeout={_FULL_REGRESSION_TIMEOUT}s)"
+                ),
+                "details": {
+                    "command": "python -m pytest tests/ -q",
+                    "timeout": _FULL_REGRESSION_TIMEOUT,
+                    "elapsed_seconds": reg_elapsed,
+                    "partial_stdout": partial_out,
+                },
+            }
+
     # 锁内二次校验 + 写事件
     store.acquire_lock()
     try:
+        integrity_warnings = store.check_integrity()
         state = store.replay()
         ts = state.get(task_id)
         if not ts or ts.status != "claimed" or ts.claimed_by != agent_id:
@@ -1385,6 +1495,10 @@ def done(
         "review_created": {"type": review_type},
         "event_id": done_event["event_id"],
     }
+    if integrity_warnings:
+        result["integrity_warnings"] = integrity_warnings
+    if full_regression is not None:
+        result["full_regression"] = full_regression
     if commit_result is not None:
         result["commit"] = commit_result
 
@@ -1476,6 +1590,7 @@ def review_submit(
 
     store.acquire_lock()
     try:
+        integrity_warnings = store.check_integrity()
         state = store.replay()
         # H2（2026-08-13）：单次扫描派生缓存，供漂移检测 baseline 查询复用
         derived = store.scan_task_derived()
@@ -1522,6 +1637,8 @@ def review_submit(
             "review_type": review_type,
             "verdict": verdict,
         }
+        if integrity_warnings:
+            result["integrity_warnings"] = integrity_warnings
 
         if baseline_drift:
             result["baseline_warning"] = (
@@ -1741,6 +1858,7 @@ def retract(
     """
     store.acquire_lock()
     try:
+        integrity_warnings = store.check_integrity()
         # 读取全部事件找 target
         all_events = store._read_ledger_lines(from_line=1)
         target_event = None
@@ -1791,12 +1909,15 @@ def retract(
     if project_root:
         hook_uninstall(project_root)
 
-    return {
+    result = {
         "retracted": True,
         "retracted_events": retracted_events,
         "task_id": task_id,
         "new_status": new_state.get(task_id, TaskState()).status,
     }
+    if integrity_warnings:
+        result["integrity_warnings"] = integrity_warnings
+    return result
 
 
 # ------------------------------------------------------------------
@@ -1842,6 +1963,7 @@ def force_status(
 
     store.acquire_lock()
     try:
+        integrity_warnings = store.check_integrity()
         state = store.replay()
         ts = state.get(task_id)
         current = ts.status if ts else "pending"
@@ -1886,13 +2008,16 @@ def force_status(
     finally:
         store.release_lock()
 
-    return {
+    result = {
         "forced": True,
         "task_id": task_id,
         "previous_status": current,
         "new_status": target_status,
         "reason": reason,
     }
+    if integrity_warnings:
+        result["integrity_warnings"] = integrity_warnings
+    return result
 
 
 # ------------------------------------------------------------------

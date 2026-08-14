@@ -27,6 +27,7 @@ import sys
 import time
 import uuid
 import warnings
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from itertools import count as _count
 from pathlib import Path
@@ -148,40 +149,190 @@ def generate_session_fingerprint() -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
-class Store:
-    """事件存储引擎，封装 ledger / checkpoint / lock 的全部 I/O。"""
+def resolve_store_dir(orchd_dir: Path) -> Path:
+    """解析账本根目录（task-orchd-home-redirect，roadmap:snapshotstore-m-p0）。
+
+    账本（ledger / checkpoint / lock / mod-*）由环境变量 ``ORCHD_HOME`` 重定向到
+    外部目录；未设置时回退到传入的 ``orchd_dir``（默认 ``<cwd 向上找的 .orchd/>``）。
+
+    注意：``orchd_dir`` 语义是「master 目录」（含 ``_master.json`` + ``shared/``，
+    走 git，不入 backend）；返回的账本根仅用于 FilesystemBackend 派生账本文件路径。
+    """
+    home = os.environ.get("ORCHD_HOME")
+    if home:
+        return Path(home)
+    return orchd_dir
+
+
+_WORKSPACE_DOCS = ("IDEAS.md", "ROADMAP.md", "SKILL.md")
+
+
+def resolve_workspace_root(project_root: Path) -> Path:
+    """解析工作区文档根目录（IDEAS.md / ROADMAP.md / SKILL.md 所在目录）。
+
+    task-12-engine-path-abstraction 双态兼容：
+    - 根布局（开发态）：工作区文档在项目根 → 返回 ``project_root``。
+    - 发布态布局（自包含 ``.orchd/``）：工作区文档归置 ``.orchd/`` → 返回
+      ``project_root / ".orchd"``。
+
+    判定：``.orchd/`` 下已存在任一工作区文档 → 发布态；否则若项目根存在 → 开发态；
+    两者都无 → 默认返回 ``.orchd/``（发布态默认，AC3）。
+
+    调用方：``validate_source``（spec.py）、``archive_resolved_ideas``（ideas.py）、
+    ``amend``/``ideas_archive``（cli.py）——统一经本 helper 解析 IDEAS/ROADMAP/SKILL 路径。
+    """
+    project_root = Path(project_root)
+    orchd_dir = project_root / ".orchd"
+    if any((orchd_dir / name).exists() for name in _WORKSPACE_DOCS):
+        return orchd_dir
+    if any((project_root / name).exists() for name in _WORKSPACE_DOCS):
+        return project_root
+    return orchd_dir
+
+
+class StorageBackend(ABC):
+    """存储后端抽象：Store 通过本接口访问 ledger / checkpoint / lock 的全部 I/O。
+
+    引入目的（task-storage-backend-interface，roadmap:snapshotstore-m-p0）：
+    将 Store 与底层存储位置解耦，为 ORCHD_HOME 账本根重定向、并行化 / 远程化
+    打地基。默认实现 :class:`FilesystemBackend` 保持当前行为与路径不变。
+
+    接口暴露七个方法：append_event / read_events / event_count /
+    load_checkpoint / save_checkpoint / acquire_lock / release_lock。
+    """
+
+    @abstractmethod
+    def append_event(self, event: dict[str, Any]) -> None:
+        """以 append 模式写一条事件到 ledger（追加 + fsync）。"""
+
+    @abstractmethod
+    def read_events(self, from_line: int = 1) -> list[dict[str, Any]]:
+        """读取 ledger 事件（从 ``from_line`` 起，1-based 行号）。
+
+        容错语义与既有实现一致：末行损坏跳过 + warning，中间行损坏抛 E002。
+        ``from_line`` 必须在文件层先跳过前 ``from_line-1`` 行再解析——保证
+        checkpoint 之前（已被快照覆盖）的损坏行不会被解析（B-1 修复，
+        恢复增量 replay 的容错语义）。
+        """
+
+    @abstractmethod
+    def event_count(self) -> int:
+        """返回 ledger 事件总数（行数）。"""
+
+    @abstractmethod
+    def load_checkpoint(self) -> dict[str, Any] | None:
+        """读取 checkpoint。文件不存在或解析失败返回 None。"""
+
+    @abstractmethod
+    def save_checkpoint(self, data: dict[str, Any]) -> None:
+        """原子写入 checkpoint（write-tmp + os.replace）。"""
+
+    @abstractmethod
+    def acquire_lock(self) -> None:
+        """获取排他文件锁，重试 50/100/200ms，全部失败抛 E012。"""
+
+    @abstractmethod
+    def release_lock(self) -> None:
+        """释放文件锁。"""
+
+
+class FilesystemBackend(StorageBackend):
+    """默认文件系统存储后端：行为与路径与改造前完全一致。
+
+    持有三个文件路径（ledger / checkpoint / lock）与锁文件描述符；Store 的
+    ``ledger_path`` / ``checkpoint_path`` / ``lock_path`` / ``_lock_fd``
+    属性转发到本后端，保证既有测试与调用方兼容。
+    """
 
     def __init__(self, orchd_dir: Path) -> None:
-        """初始化 Store，根据给定的 ``orchd_dir`` 目录派生出三个文件路径。
-
-        Args:
-            orchd_dir: ``.orchd`` 根目录（通常由 ``orchd init`` 创建）。
-
-        派生路径：
-            - ``ledger_path``:     ``<orchd_dir>/_ledger.jsonl``，事件追加日志。
-            - ``checkpoint_path``: ``<orchd_dir>/_checkpoint.json``，状态快照。
-            - ``lock_path``:       ``<orchd_dir>/.lock``，排他文件锁。
-
-        ``_lock_fd`` 记录当前持有的锁文件描述符，未持锁时为 ``None``。
-        """
         self.orchd_dir = orchd_dir
         self.ledger_path = orchd_dir / "_ledger.jsonl"
         self.checkpoint_path = orchd_dir / "_checkpoint.json"
         self.lock_path = orchd_dir / ".lock"
         self._lock_fd: int | None = None
-        # H4（2026-08-13）：ledger 行数内存计数器。None = 未校准（惰性，
-        # 首次 _current_line_count() 时以实际文件行数为准）；append 成功后
-        # 已校准则 +1。避免每次写 checkpoint 全文件数行（O(L) → O(1)）。
-        # 注：orchd 命令均为短进程，写路径（append → update_checkpoint）
-        # 在文件锁内完成，校准必发生在 append 之后，故内存计数准确。
-        self._line_count: int | None = None
 
-    # ------------------------------------------------------------------
-    # 文件锁
-    # ------------------------------------------------------------------
+    def append_event(self, event: dict[str, Any]) -> None:
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        fd = os.open(str(self.ledger_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        try:
+            os.write(fd, line.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def read_events(self, from_line: int = 1) -> list[dict[str, Any]]:
+        """读取 ledger 事件（从 ``from_line`` 起，1-based 行号）。
+
+        ``from_line`` 语义：在文件层先跳过前 ``from_line-1`` 行，再解析剩余行。
+        这样 checkpoint 之前（已被快照覆盖）的损坏行不会被解析——B-1 修复，
+        恢复增量 replay 的容错语义（重构前 ``_read_ledger_lines`` 直接在文件层
+        跳过，不解析被跳过的行）。
+
+        容错规则：
+        - 最后一行 JSON 解析失败 → 跳过 + warning（可能写入未完成）
+        - 中间行解析失败 → E002
+        """
+        if not self.ledger_path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        raw_lines: list[str] = []
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+        # 文件层跳过前 from_line-1 行：被跳过的行不参与解析（含损坏行）
+        start = max(0, from_line - 1)
+        for i in range(start, len(raw_lines)):
+            stripped = raw_lines[i].strip()
+            if not stripped:
+                continue
+            try:
+                events.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                # 末行（含末尾空行）损坏 → 可能写入未完成，仅 warning 跳过；
+                # 中间行损坏 → 数据损坏，抛 E002 中断。
+                is_last = i == len(raw_lines) - 1 or all(
+                    not raw_lines[j].strip() for j in range(i + 1, len(raw_lines))
+                )
+                if is_last:
+                    warnings.warn(
+                        f"ledger 最后一行解析失败，已跳过: {stripped[:80]}",
+                        stacklevel=2,
+                    )
+                else:
+                    raise OrchdError(
+                        ErrorCode.E002,
+                        f"ledger 中间行 JSON 解析失败（第 {i + 1} 行），数据可能损坏",
+                        [{"line": i + 1, "content": stripped[:200]}],
+                    )
+        return events
+
+    def event_count(self) -> int:
+        if not self.ledger_path.exists():
+            return 0
+        count = 0
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            for _ in f:
+                count += 1
+        return count
+
+    def load_checkpoint(self) -> dict[str, Any] | None:
+        if not self.checkpoint_path.exists():
+            return None
+        try:
+            return json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def save_checkpoint(self, data: dict[str, Any]) -> None:
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.checkpoint_path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(str(tmp_path), str(self.checkpoint_path))
 
     def acquire_lock(self) -> None:
-        """获取排他文件锁。重试 50/100/200ms，全部失败抛 E012。"""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR)
         for delay in _LOCK_RETRIES_FLAT:
@@ -202,7 +353,6 @@ class Store:
         )
 
     def release_lock(self) -> None:
-        """释放文件锁。"""
         if self._lock_fd is None:
             return
         try:
@@ -214,23 +364,84 @@ class Store:
             os.close(self._lock_fd)
             self._lock_fd = None
 
+
+class Store:
+    """事件存储引擎，封装 ledger / checkpoint / lock 的全部 I/O。
+
+    通过 :class:`StorageBackend` 访问底层存储，默认使用 :class:`FilesystemBackend`
+    （行为与路径和改造前完全一致）。可注入自定义后端以支持 ORCHD_HOME 重定向、
+    并行化 / 远程化等场景。
+    """
+
+    def __init__(self, orchd_dir: Path, backend: StorageBackend | None = None) -> None:
+        """初始化 Store，默认使用 :class:`FilesystemBackend`。
+
+        Args:
+            orchd_dir: ``.orchd`` 根目录（master 目录，含 ``_master.json`` +
+                ``shared/``，走 git）。账本根由此目录经 :func:`resolve_store_dir`
+                解析（ORCHD_HOME 设置时重定向到外部目录）。
+            backend: 可选的存储后端；缺省时按 ``resolve_store_dir(orchd_dir)``
+                构造 FilesystemBackend。
+
+        派生路径（委托给 backend，账本根 = ORCHD_HOME 或 orchd_dir）：
+            - ``ledger_path``:     ``<账本根>/_ledger.jsonl``，事件追加日志。
+            - ``checkpoint_path``: ``<账本根>/_checkpoint.json``，状态快照。
+            - ``lock_path``:       ``<账本根>/.lock``，排他文件锁。
+
+        ``_lock_fd`` 记录当前持有的锁文件描述符，未持锁时为 ``None``。
+        """
+        self.orchd_dir = orchd_dir
+        self.backend = backend or FilesystemBackend(resolve_store_dir(orchd_dir))
+        # H4（2026-08-13）：ledger 行数内存计数器。None = 未校准（惰性，
+        # 首次 _current_line_count() 时以实际文件行数为准）；append 成功后
+        # 已校准则 +1。避免每次写 checkpoint 全文件数行（O(L) → O(1)）。
+        # 注：orchd 命令均为短进程，写路径（append → update_checkpoint）
+        # 在文件锁内完成，校准必发生在 append 之后，故内存计数准确。
+        self._line_count: int | None = None
+
+    # 路径属性 / 锁 fd 转发到 backend（保持既有调用方与测试兼容）
+    @property
+    def ledger_path(self) -> Path:
+        return self.backend.ledger_path
+
+    @property
+    def checkpoint_path(self) -> Path:
+        return self.backend.checkpoint_path
+
+    @property
+    def lock_path(self) -> Path:
+        return self.backend.lock_path
+
+    @property
+    def _lock_fd(self) -> int | None:
+        return self.backend._lock_fd
+
+    @_lock_fd.setter
+    def _lock_fd(self, value: int | None) -> None:
+        self.backend._lock_fd = value
+
+    # ------------------------------------------------------------------
+    # 文件锁
+    # ------------------------------------------------------------------
+
+    def acquire_lock(self) -> None:
+        """获取排他文件锁。重试 50/100/200ms，全部失败抛 E012。"""
+        self.backend.acquire_lock()
+
+    def release_lock(self) -> None:
+        """释放文件锁。"""
+        self.backend.release_lock()
+
     # ------------------------------------------------------------------
     # Ledger 写入
     # ------------------------------------------------------------------
 
     def append_event(self, event: dict[str, Any]) -> None:
         """以 append 模式写入 JSONL，写入后 flush + fsync。"""
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(str(self.ledger_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-        try:
-            os.write(fd, line.encode("utf-8"))
-            os.fsync(fd)
-            # H4：已校准时追加 1 行（写入成功才递增；未校准则保持 None 惰性校准）
-            if self._line_count is not None:
-                self._line_count += 1
-        finally:
-            os.close(fd)
+        self.backend.append_event(event)
+        # H4：已校准时追加 1 行（写入成功才递增；未校准则保持 None 惰性校准）
+        if self._line_count is not None:
+            self._line_count += 1
 
     # ------------------------------------------------------------------
     # Replay
@@ -276,31 +487,121 @@ class Store:
             - ``dict[str, TaskState]``: 截至该行号的任务状态快照。
             - ``set[str]``: 已撤回的事件 ID 集合。
         """
-        if not self.checkpoint_path.exists():
-            return 0, {}, set()
-        try:
-            data = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
-            ledger_line = data.get("ledger_line", 0)
-            tasks = {
-                tid: TaskState.from_dict(ts) for tid, ts in data.get("tasks", {}).items()
-            }
-            retracted = set(data.get("retracted", []))
-            return ledger_line, tasks, retracted
-        except (json.JSONDecodeError, KeyError, TypeError):
+        data = self.backend.load_checkpoint()
+        if data is None:
+            # backend 返回 None：区分「checkpoint 不存在」与「解析失败」。
+            # 前者正常返回空快照；后者回退全量 replay（保持既有 warning 语义）。
+            if not self.checkpoint_path.exists():
+                return 0, {}, set()
             warnings.warn("checkpoint 解析失败，回退全量 replay", stacklevel=2)
             tasks = self.replay_full()
             # 返回一个特殊标记让调用者知道已全量 replay
             total_lines = self._count_ledger_lines()
             return total_lines, tasks, set()
+        # 兼容旧格式：tasks 为 dict[str, TaskState.from_dict]
+        ledger_line = data.get("ledger_line", 0)
+        tasks = {
+            tid: TaskState.from_dict(ts) for tid, ts in data.get("tasks", {}).items()
+        }
+        retracted = set(data.get("retracted", []))
+        return ledger_line, tasks, retracted
 
     def _count_ledger_lines(self) -> int:
-        if not self.ledger_path.exists():
-            return 0
-        count = 0
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            for _ in f:
-                count += 1
-        return count
+        return self.backend.event_count()
+
+    def _replay_prefix(self, n: int) -> dict[str, TaskState]:
+        """重放 ledger 前 ``n`` 条事件，返回派生任务状态（忽略 checkpoint）。
+
+        供 :meth:`check_integrity` 使用：以 checkpoint 声明的 ``ledger_line``
+        为界，重放该前缀事件并与 checkpoint 的 ``tasks`` 快照比对，检测运行时
+        文件（ledger / checkpoint）被手改的篡改。
+
+        注意：停用 RETRACT 递归（改用 :meth:`_apply_events_no_retract`）——
+        前缀重放只关心前 ``n`` 条事件的派生结果，若 RETRACT 触发全量重建会越过
+        前缀边界读到 ``n`` 之后的事件，破坏前缀语义。
+        """
+        events = self.backend.read_events()[:n]
+        tasks: dict[str, TaskState] = {}
+        retracted: set[str] = set()
+        # 与 _rebuild_after_retract 一致：先完整收集前缀内的 RETRACT 目标，
+        # 再应用非撤回事件，避免被撤回事件「复活」。
+        for ev in events:
+            if ev.get("type") == "RETRACT":
+                te = ev.get("target_event_id", "")
+                if te:
+                    retracted.add(te)
+        self._apply_events_no_retract(events, tasks, retracted)
+        return tasks
+
+    def check_integrity(self) -> list[dict[str, Any]]:
+        """校验 ledger 与 checkpoint 一致性（红线 8，R3，只读，不自动修复）。
+
+        检测手改运行时文件（``_ledger.jsonl`` / ``_checkpoint.json``）的篡改：
+        1. checkpoint.``ledger_line`` 必须 <= 实际 ledger 行数（ledger 被截断 /
+           checkpoint 行号被改大）；
+        2. 重放前 ``ledger_line`` 条事件，必须与 checkpoint 的 ``tasks`` 快照一致
+           （checkpoint 快照被改 / ledger 早期事件被改）。
+
+        返回告警列表；一致（或 checkpoint 缺失）时返回空列表。仅告警，不阻断
+        合法操作（对齐 §3 判据 3 降级路径）。告警用 ``code=E030``，不抛异常。
+        """
+        warnings_list: list[dict[str, Any]] = []
+        checkpoint = self.backend.load_checkpoint()
+        if checkpoint is None:
+            # checkpoint 缺失（未写过快照 / 解析失败）→ 视为未校验到篡改
+            return warnings_list
+
+        ledger_line = checkpoint.get("ledger_line")
+        if not isinstance(ledger_line, int) or ledger_line < 0:
+            warnings_list.append({
+                "code": ErrorCode.E030.name,
+                "severity": "warning",
+                "message": (
+                    f"checkpoint.ledger_line 非法（{ledger_line!r}），"
+                    "运行时文件疑似被篡改（不自动修复）"
+                ),
+                "path": str(self.checkpoint_path),
+            })
+            return warnings_list
+
+        actual = self._count_ledger_lines()
+        if ledger_line > actual:
+            warnings_list.append({
+                "code": ErrorCode.E030.name,
+                "severity": "warning",
+                "message": (
+                    f"checkpoint.ledger_line={ledger_line} 超过实际 ledger 行数 "
+                    f"{actual}，运行时文件疑似被篡改；建议人工核对（不自动修复）"
+                ),
+                "path": str(self.checkpoint_path),
+            })
+            return warnings_list
+
+        try:
+            derived = self._replay_prefix(ledger_line)
+        except OrchdError:
+            # ledger 中间行损坏（E002）——replay 处已抛，此处仅附加告警
+            warnings_list.append({
+                "code": ErrorCode.E030.name,
+                "severity": "warning",
+                "message": "ledger 中间行 JSON 解析失败，运行时文件疑似被篡改（不自动修复）",
+                "path": str(self.ledger_path),
+            })
+            return warnings_list
+
+        derived_dict = {tid: ts.to_dict() for tid, ts in derived.items()}
+        ck_tasks = checkpoint.get("tasks") or {}
+        if derived_dict != ck_tasks:
+            warnings_list.append({
+                "code": ErrorCode.E030.name,
+                "severity": "warning",
+                "message": (
+                    "checkpoint 快照与 ledger 重放结果不一致，运行时文件疑似被篡改"
+                    "（不自动修复）"
+                ),
+                "path": str(self.checkpoint_path),
+            })
+        return warnings_list
 
     def _current_line_count(self) -> int:
         """返回 ledger 当前行数：已校准则 O(1) 返回内存计数，未校准则
@@ -318,45 +619,13 @@ class Store:
         """读取 ledger 从 ``from_line``（1-based）起的所有事件。
 
         参数 ``from_line`` 使用 1-based 行号，即 ``from_line=1`` 表示从文件第一行开始读取。
-        内部实现通过 ``range(from_line - 1)`` 跳过前 N-1 行，从而定位到起始行。
+        内部实现委托 ``backend.read_events(from_line)``，在文件层先跳过前
+        ``from_line - 1`` 行，从而定位到起始行（B-1 修复：被跳过的早期损坏行
+        不参与解析，恢复 checkpoint 增量 replay 的容错语义）。
 
         容错：最后一行解析失败跳过+warning；中间行失败抛 E002。
         """
-        if not self.ledger_path.exists():
-            return []
-        events: list[dict[str, Any]] = []
-        raw_lines: list[str] = []
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            for _ in range(from_line - 1):
-                next(f, None)  # skip
-            for line in f:
-                raw_lines.append(line)
-
-        for i, line in enumerate(raw_lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                events.append(json.loads(stripped))
-            except json.JSONDecodeError:
-                # 判断当前损坏行是否为"最后一行"（含末尾空行的情况）：
-                # 若是最后一行，可能只是写入尚未完成，故仅 warning 跳过；
-                # 若是中间行，说明数据已损坏，必须抛错中断。
-                is_last = i == len(raw_lines) - 1 or all(
-                    not raw_lines[j].strip() for j in range(i + 1, len(raw_lines))
-                )
-                if is_last:
-                    warnings.warn(
-                        f"ledger 最后一行解析失败，已跳过: {stripped[:80]}",
-                        stacklevel=2,
-                    )
-                else:
-                    raise OrchdError(
-                        ErrorCode.E002,
-                        f"ledger 中间行 JSON 解析失败（第 {from_line + i} 行），数据可能损坏",
-                        [{"line": from_line + i, "content": stripped[:200]}],
-                    )
-        return events
+        return self.backend.read_events(from_line=from_line)
 
     def _apply_events(
         self,
@@ -615,12 +884,7 @@ class Store:
         if retracted:
             checkpoint["retracted"] = sorted(retracted)
 
-        tmp_path = self.checkpoint_path.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(checkpoint, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(str(tmp_path), str(self.checkpoint_path))
+        self.backend.save_checkpoint(checkpoint)
 
     def _collect_retracted_event_ids(self) -> set[str]:
         """扫描 ledger 中所有 RETRACT 事件的 ``target_event_id``，得到完整撤回集合。

@@ -16,9 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.ledger import Store
+from orchd.gitops import get_current_branch, get_default_branch
+from orchd.ledger import Store, resolve_store_dir
 from orchd.spec import (
     Master,
+    is_code_task,
     validate_quality,
     validate_references,
     validate_source,
@@ -107,6 +109,10 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
 
     orchd_dir.mkdir(parents=True, exist_ok=True)
     store = Store(orchd_dir)
+    # B-2 修复：mod-*/spec.json 快照与 ledger 同根（ORCHD_HOME 重定向后同落
+    # 外部账本根），对齐 ROADMAP 1.2「账本（ledger/checkpoint/lock/mod-*）由
+    # ORCHD_HOME 重定向」设计；未设 ORCHD_HOME 时 store_root == orchd_dir。
+    store_root = resolve_store_dir(orchd_dir)
 
     created_files: list[str] = []
     store.acquire_lock()
@@ -131,14 +137,14 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
                 "module_role": module.get("role", ""),
                 "tasks": mod_tasks,
             }
-            mod_dir = orchd_dir / mod_id
+            mod_dir = store_root / mod_id
             mod_dir.mkdir(parents=True, exist_ok=True)
             spec_path = mod_dir / "spec.json"
             spec_path.write_text(
                 json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            created_files.append(str(spec_path.relative_to(orchd_dir)))
+            created_files.append(str(spec_path.relative_to(store_root)))
 
         # 创建空 ledger（若不存在）
         if not store.ledger_exists():
@@ -169,12 +175,30 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
 
     新增任务始终允许。删除任务不阻止，但在摘要中报告 removed_tasks。
 
+    红线 7（task-redline7-amend-refuse，roadmap:constraint-hardening）：
+    amend 只在 default（main）分支执行。在非 main 分支上调用 amend 直接
+    拒绝注册（抛出 E007），而非降级为"仅不提交"——否则任务分支内仍会
+    注册任务并改写 master，污染 master 注册来源。分支判定仅在 amend 阶段
+    强制：init / validate / status 等只读或冷启动命令不受限。
+
     Returns:
         变更摘要。
     """
     orchd_dir = Path(orchd_dir)
     tasks = master.tasks
     modules = master.modules
+
+    # 红线 7：非 main 分支拒绝 amend 注册（best-effort 降级已移除）
+    project_root = orchd_dir.parent
+    current_branch = get_current_branch(project_root)
+    default_branch = get_default_branch(project_root) or "main"
+    if current_branch is not None and current_branch != default_branch:
+        raise OrchdError(
+            ErrorCode.E007,
+            "invalid_branch: amend 仅在 default（main）分支执行，"
+            f"当前分支 {current_branch} 拒绝注册（红线 7）",
+            [{"branch": current_branch, "default": default_branch}],
+        )
 
     errors: list[dict[str, Any]] = []
     updated_tasks: list[str] = []
@@ -201,9 +225,11 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                  for e in structure_errors],
             )
 
-        # 加载现有 snapshot 中的任务定义（用于 diff；扫描全部模块目录）
+        # 加载现有 snapshot 中的任务定义（用于 diff；扫描全部模块目录）。
+        # B-2 修复：快照与 ledger 同根（resolve_store_dir），与 init 写入路径一致。
+        store_root = resolve_store_dir(orchd_dir)
         existing_tasks: dict[str, dict[str, Any]] = {}
-        for spec_path in sorted(orchd_dir.glob("mod-*/spec.json")):
+        for spec_path in sorted(store_root.glob("mod-*/spec.json")):
             snapshot = json.loads(spec_path.read_text(encoding="utf-8"))
             for t in snapshot.get("tasks", []):
                 existing_tasks[t.get("id", "")] = t
@@ -394,11 +420,27 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                 errors,
             )
 
-        # L262：注册前质量校验（E022/E023/E024，warning 不阻断注册，附加到响应）
-        quality_warnings = [
-            {"code": str(e.code), "path": e.path, "message": e.message}
-            for e in validate_quality(master)
-        ]
+        # L262：注册前质量校验（E022/E023/E024/E029，warning 不阻断注册，附加到响应）。
+        # R5（task-constraint-quality-checks）：代码类任务缺 verify_command 升级为阻断。
+        raw_quality = validate_quality(master)
+        quality_warnings: list[dict[str, Any]] = []
+        for e in raw_quality:
+            entry = {"code": str(e.code), "path": e.path, "message": e.message}
+            # E022 代码类阻断：按 path 解析 task 下标，用 is_code_task 判定任务类型
+            if e.code is ErrorCode.E022:
+                m = re.match(r"\$\.tasks\[(\d+)\]\.verify_command$", e.path)
+                is_code = False
+                if m and m.group(1).isdigit():
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(tasks):
+                        is_code = is_code_task(tasks[idx])
+                if is_code:
+                    raise OrchdError(
+                        ErrorCode.E022,
+                        "注册前质量校验失败：代码类任务缺 verify_command，注册被阻断",
+                        [entry | {"blocking": True}],
+                    )
+            quality_warnings.append(entry)
 
         # 重新生成所有 snapshot（目录名 = module_id）
         for module in modules:
@@ -410,7 +452,7 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                 "module_role": module.get("role", ""),
                 "tasks": mod_tasks,
             }
-            mod_dir = orchd_dir / mod_id
+            mod_dir = store_root / mod_id
             mod_dir.mkdir(parents=True, exist_ok=True)
             spec_path = mod_dir / "spec.json"
             spec_path.write_text(

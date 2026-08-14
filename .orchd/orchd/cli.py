@@ -210,6 +210,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--role", default="implementer", choices=["implementer", "reviewer"])
     p.add_argument("--type", dest="review_type", choices=["spec", "code"],
                    help="reviewer 认领时指定审查阶段（默认锁任务当前阶段）")
+    p.add_argument("--confirm", action="store_true",
+                   help="确认执行认领（无 --confirm 时仅输出预览，不写事件、不建分支）")
     p.add_argument("--with-context", action="store_true",
                    help="显式附加全部共享上下文（architecture + conventions），默认按需")
     p.set_defaults(func=_cmd_claim)
@@ -428,7 +430,7 @@ def _cmd_amend(args) -> dict:
     import subprocess
 
     from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
-    from orchd.ledger import Store
+    from orchd.ledger import Store, resolve_workspace_root
     from orchd.onboard import _decode_subprocess_output
     from orchd.spec import load_master
     from orchd.split import amend
@@ -454,9 +456,12 @@ def _cmd_amend(args) -> dict:
             "branch": current_branch,
         }
     else:
+        # AC3（task-12-engine-path-abstraction）：IDEAS.md 走统一工作区根 helper
+        # （默认 .orchd/，兼容旧根路径）；commit 路径与 ensure_committed 期望一致。
+        ws_root = resolve_workspace_root(project_root)
         result["commit"] = ensure_committed(
             project_root,
-            [str(Path(args.master)), str(project_root / "IDEAS.md")],
+            [str(Path(args.master)), str(ws_root / "IDEAS.md")],
             f"chore(intake): orchd amend — {summary}",
         )
 
@@ -645,11 +650,111 @@ def _cmd_pool(args) -> dict:
     }
 
 
+def claim_preview(
+    store,
+    tasks: list[dict[str, Any]],
+    agent_id: str,
+    task_id: str,
+    role: str = "implementer",
+    project_root: Path | None = None,
+    review_type: str | None = None,
+) -> dict[str, Any]:
+    """claim 前确认闸门预览（task-claim-confirm-gate，只读，不写事件不建分支）。
+
+    显式 ``orchd claim``（无 ``--confirm``）先展示预览：claim_type
+    （implementer/reviewer）、任务基本信息、当前状态、git 状况（分支 + 工作区
+    干净度）、将执行动作，以及 reviewer 角色的 ``review_phase``（spec/code）、
+    ``reviewers`` 名单与 self-review 预期校验（E016）。用户确认无误后再以
+    ``--confirm`` 真正执行 claim（走 ``onboard.claim`` 的锁内 check-then-act）。
+
+    与 ``onboard.claim`` 的区别：本函数只读（replay + 派生缓存 + git 状态探测），
+    不写任何事件、不建分支；所有"校验预期"仅作透明展示，不抛错阻断。
+    预览逻辑归属 CLI 层：任务 files_to_edit 仅声明 orchd/cli.py（mod-core）。
+
+    Args:
+        store: ``orchd.ledger.Store`` 实例。
+        review_type: reviewer 认领时显式指定的审查阶段（spec/code）。
+    """
+    from orchd.gitops import check_workspace_state
+    from orchd.onboard import _extract_last_done
+
+    task_map = {t.get("id", ""): t for t in tasks}
+    task_def = task_map.get(task_id)
+    if task_def is None:
+        raise OrchdError(ErrorCode.E008, f"task '{task_id}' not found in master",
+                         [{"task_id": task_id}])
+
+    state = store.replay()
+    derived = store.scan_task_derived()
+    ts = state.get(task_id)
+    status = ts.status if ts else "pending"
+    current_phase = (ts.review_phase if ts else None) or "spec"
+
+    preview: dict[str, Any] = {
+        "claim_type": role,
+        "task_id": task_id,
+        "name": task_def.get("name", ""),
+        "brief": task_def.get("brief", ""),
+        "module": task_def.get("module", ""),
+        "depends_on": task_def.get("depends_on", []),
+        "reviewers": task_def.get("reviewers", []),
+        "current_status": status,
+        "review_phase": current_phase,
+    }
+
+    # git 状况（best-effort，非 git 环境降级为 available:false）
+    if project_root is not None:
+        ws = check_workspace_state(project_root)
+        preview["git"] = {
+            "available": ws.get("available", False),
+            "branch": ws.get("branch"),
+            "clean": ws.get("clean"),
+        }
+    else:
+        preview["git"] = {"available": False}
+
+    # 将执行动作（claim() 会做的事）
+    preview["actions"] = [
+        f"写 {'REVIEW_CLAIMED' if role == 'reviewer' else 'CLAIMED'} 事件到 ledger",
+        f"创建/切换 task/{task_id} 分支",
+    ]
+
+    # 校验预期（与 claim() 锁内校验一致，透明展示；失败仅提示不阻断预览）
+    if role == "reviewer":
+        done_author, _ = _extract_last_done(store, task_id, derived)
+        preview["done_by"] = done_author
+        preview["expected_checks"] = [
+            {"check": "任务处于 in_review（可认领审查）",
+             "expected_pass": status == "in_review"},
+            {"check": "agent 在任务 reviewers 名单内",
+             "expected_pass": agent_id in task_def.get("reviewers", [])},
+            {"check": "审查阶段与当前 review_phase 匹配",
+             "expected_pass": (not review_type) or review_type == current_phase},
+            {"check": "非自审（E016：实现者 ≠ 审查者）",
+             "expected_pass": not (done_author and done_author == agent_id)},
+        ]
+    else:
+        preview["expected_checks"] = [
+            {"check": "任务处于 pending（可认领）",
+             "expected_pass": status == "pending"},
+            {"check": "依赖全部满足",
+             "expected_pass": all(
+                 (state.get(d).status if state.get(d) else "pending")
+                 in ("completed", "cancelled") for d in task_def.get("depends_on", [])
+             )},
+            {"check": "未被其他 agent 认领",
+             "expected_pass": not (ts and ts.claimed_by and ts.claimed_by != agent_id)},
+        ]
+    return preview
+
+
 def _cmd_claim(args) -> dict:
     """认领指定任务。
 
-    CLI 参数: args.task（必需）、args.agent（必需）、args.role（implementer/reviewer）。
-    返回: 认领事件信息。
+    CLI 参数: args.task（必需）、args.agent（必需）、args.role（implementer/reviewer）、
+    args.confirm（--confirm，确认执行认领）。
+    返回: 认领事件信息；无 --confirm 时仅返回确认闸门预览
+    （confirm_required:true + preview，不写事件、不建分支）。
     """
     from orchd.ledger import Store
     from orchd.onboard import claim
@@ -657,9 +762,29 @@ def _cmd_claim(args) -> dict:
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
     shared = master.shared if hasattr(master, "shared") else None
+    project_root = orchd_dir.parent
+
+    # 确认闸门：无 --confirm 仅输出预览（只读，不写事件、不建分支）
+    if not getattr(args, "confirm", False):
+        preview = claim_preview(
+            store, tasks, agent_id=args.agent, task_id=args.task,
+            role=args.role, project_root=project_root,
+            review_type=getattr(args, "review_type", None),
+        )
+        result = {
+            "confirm_required": True,
+            "claim_type": preview["claim_type"],
+            "hint": "预览模式：确认无误后请加 --confirm 真正执行认领（写事件 + 建分支）",
+            "preview": preview,
+        }
+        warning = _identity_warning(args.agent, orchd_dir)
+        if warning:
+            result["warning"] = warning
+        return result
+
     result = claim(
         store, tasks, agent_id=args.agent, task_id=args.task,
-        role=args.role, project_root=orchd_dir.parent, shared=shared,
+        role=args.role, project_root=project_root, shared=shared,
         review_type=getattr(args, "review_type", None),
         with_context=getattr(args, "with_context", False),
     )
@@ -800,9 +925,18 @@ def _maybe_archive_ideas(orchd_dir: Path) -> dict:
                 "branch": current_branch,
             }
         else:
+            # AC3（task-12-engine-path-abstraction）：工作区文档走统一工作区根
+            # helper（默认 .orchd/，兼容旧根路径）——ensure_committed 用相对
+            # project_root 的路径，工作区根为 .orchd/ 时路径前缀 .orchd/。
+            from orchd.ledger import resolve_workspace_root
+            ws_root = resolve_workspace_root(project_root)
+
+            def _rel(name: str) -> str:
+                return str((ws_root / name).relative_to(project_root))
+
             result["commit"] = ensure_committed(
                 project_root,
-                ["IDEAS.md", "IDEAS-archive.md"],
+                [_rel("IDEAS.md"), _rel("IDEAS-archive.md")],
                 "chore(ideas): 自动归档已完结条目",
             )
     return result
@@ -845,9 +979,13 @@ def _cmd_status(args) -> dict:
 
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
+    # 红线 8（R3）：status 前置校验运行时文件完整性（只读告警，不阻断）
+    integrity_warnings = store.check_integrity()
     result = status(
         store, tasks, project=master.project, text=args.text, task_id=args.task
     )
+    if integrity_warnings:
+        result["integrity_warnings"] = integrity_warnings
     if args.audit_merge and args.task is None:
         result["merge_audit"] = merge_audit(store, tasks, orchd_dir.parent)
     if args.text and "_text" in result:

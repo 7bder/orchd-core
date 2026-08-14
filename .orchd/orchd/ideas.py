@@ -160,7 +160,7 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     """主入口：把已完结 idea 条目从 IDEAS.md 移入 IDEAS-archive.md。
 
     Args:
-        project_root: 项目根目录（IDEAS.md 与 IDEAS-archive.md 所在目录）。
+        project_root: 项目根目录。
         master: 已加载的 Master 对象。
 
     Returns:
@@ -170,7 +170,13 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
           读取失败 / 无可归档条目 / 写入失败（best-effort 降级）。
     """
     project_root = Path(project_root)
-    ideas_path = project_root / "IDEAS.md"
+    # AC3（task-12-engine-path-abstraction）：工作区文档（IDEAS.md /
+    # IDEAS-archive.md）走统一工作区根 helper（默认 .orchd/，兼容旧根路径）。
+    # Store 的账本根仍由 ORCHD_HOME 解析（与文档根分离）。
+    from orchd.ledger import resolve_workspace_root
+
+    workspace_root = resolve_workspace_root(project_root)
+    ideas_path = workspace_root / "IDEAS.md"
     if not ideas_path.exists():
         return {"archived": [], "kept": 0, "skipped": "no_ideas_file"}
 
@@ -200,7 +206,7 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     blocks = [extract_entry_block(text, e) for e in resolved]
     new_ideas = _remove_blocks(text, entries, resolved)
 
-    archive_path = project_root / "IDEAS-archive.md"
+    archive_path = workspace_root / "IDEAS-archive.md"
     try:
         if archive_path.exists():
             archive_text = archive_path.read_text(encoding="utf-8")

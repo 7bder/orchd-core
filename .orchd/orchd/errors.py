@@ -15,7 +15,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """20 个错误码。"""
+    """30 个错误码。"""
 
     E001 = "file_not_found"
     E002 = "invalid_json"
@@ -47,6 +47,8 @@ class ErrorCode(Enum):
     E026 = "unexempted_test_coupling"
     E027 = "verify_command_unsafe"  # 含不安全/不兼容段；2026-08-12 起含 --basetemp 路径非跨平台
     E028 = "dry_run_assertion_mismatch"
+    E029 = "granularity_overflow"  # 任务拆解粒度越界（R4，warning 级）
+    E030 = "runtime_file_integrity"  # 运行时文件完整性校验失败（红线 8 R3，warning 级）
 
 
 class OrchdError(Exception):

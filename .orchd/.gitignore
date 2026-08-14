@@ -30,10 +30,18 @@ htmlcov/
 pytest_tmp_*/
 .tmp-pytest/
 
-# orchd 自托管（§8.4）：任务定义与共享上下文跟踪，运行时状态忽略
+# orchd 自托管（§8.4）：工作区文档与共享上下文跟踪，运行时状态忽略
+# 工作区文档（task-12-workspace-docs：IDEAS/ROADMAP/IDEAS-archive/SKILL 归置 .orchd/；
+# task-skill-hub-refactor：规则目录 rules/ 归置 .orchd/rules/）
 .orchd/*
 !.orchd/_master.json
 !.orchd/shared/
+!.orchd/IDEAS.md
+!.orchd/ROADMAP.md
+!.orchd/IDEAS-archive.md
+!.orchd/SKILL.md
+!.orchd/__main__.py
+!.orchd/rules/
 .orchd-v0-archive/
 
 # agent 工作产物（摄入草稿 / 变更笔记 / 工具配置）

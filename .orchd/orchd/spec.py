@@ -324,6 +324,38 @@ _VAGUE_WORDS = [
 # 项目自 Windows 迁至 macOS，专用于跨平台校验提示文案。
 _CROSS_PLATFORM_BASETEMP = '--basetemp="${TMPDIR:-/tmp}/orchd-vf-$$"'
 
+# 文档后缀白名单（与 onboard.py _DOC_SINGLE_STAGE_SUFFIXES 对齐）：
+# files_to_edit 全部命中这些后缀 → 视为文档/基础设施类任务（R5 维持 warning）。
+# 未声明 files_to_edit 或含任意代码文件 → 视为代码类（R5 缺 verify_command 升级阻断）。
+_DOC_SUFFIXES = (".md", ".mdx", ".markdown", ".rst", ".txt")
+
+# R4 粒度锚点（与 SKILL.md 任务拆解粒度启发式一致）
+_GRANULARITY_MAX_FILES = 5
+_GRANULARITY_MAX_HOURS = 8
+_GRANULARITY_MAX_AC = 6
+
+
+def _is_doc_task(t: dict) -> bool:
+    """判定任务是否为文档/基础设施类（files_to_edit 全部为文档后缀）。
+
+    与 onboard._is_doc_single_stage 不同的是：此处不校验 blocked 约定文件集合，
+    仅按 files_to_edit 后缀白名单判定——空 files_to_edit 视为非文档（代码类），
+    避免漏校验。
+    """
+    files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
+    if not files_edit:
+        return False
+    return all(f.lower().endswith(_DOC_SUFFIXES) for f in files_edit)
+
+
+def is_code_task(t: dict) -> bool:
+    """判定任务是否为代码类（非文档/基础设施类）。
+
+    R5（task-constraint-quality-checks）：代码类任务缺 verify_command 在注册点阻断，
+    文档/基础设施类维持 warning。供 split.py amend 阻断判据复用，避免后缀白名单漂移。
+    """
+    return not _is_doc_task(t)
+
 
 def validate_quality(
     master: Master,
@@ -353,13 +385,59 @@ def validate_quality(
         tid = t.get("id", "")
 
         # E022: verify_command 必填
+        # R5（task-constraint-quality-checks）：缺 verify_command 是否阻断，取决于任务类型。
+        #   代码类（files_to_edit 含非文档文件）→ amend 注册点阻断；
+        #   文档/基础设施类（全部文档后缀）→ 维持 warning。
         verify_cmd = t.get("verify_command")
         if not verify_cmd or (isinstance(verify_cmd, str) and not verify_cmd.strip()):
+            is_code = not _is_doc_task(t)
             errors.append(
                 ValidationError(
                     code=ErrorCode.E022,
                     path=f"$.tasks[{i}].verify_command",
-                    message=f"task '{tid}' missing verify_command (required for automated validation)",
+                    message=(
+                        f"task '{tid}' missing verify_command (required for automated validation)"
+                        + ("" if not is_code else "；代码类任务缺 verify_command，注册被阻断")
+                    ),
+                )
+            )
+
+        # R4（task-constraint-quality-checks）：任务拆解粒度启发式越界（warning 级）。
+        # 越界即提示拆分，不做注册阻断（触碰 §9.2 内容域，硬阻断留待人工决策）。
+        files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
+        if len(files_edit) > _GRANULARITY_MAX_FILES:
+            errors.append(
+                ValidationError(
+                    code=ErrorCode.E029,
+                    path=f"$.tasks[{i}].files_to_edit",
+                    message=(
+                        f"task '{tid}' files_to_edit 数量 {len(files_edit)} 超过粒度锚点 "
+                        f"{_GRANULARITY_MAX_FILES}（建议拆分，warning 不阻断）"
+                    ),
+                )
+            )
+        est_hours = t.get("estimated_hours")
+        if isinstance(est_hours, (int, float)) and est_hours > _GRANULARITY_MAX_HOURS:
+            errors.append(
+                ValidationError(
+                    code=ErrorCode.E029,
+                    path=f"$.tasks[{i}].estimated_hours",
+                    message=(
+                        f"task '{tid}' estimated_hours {est_hours} 超过粒度锚点 "
+                        f"{_GRANULARITY_MAX_HOURS}（建议拆分，warning 不阻断）"
+                    ),
+                )
+            )
+        ac_list2 = [a for a in (t.get("acceptance_criteria") or []) if isinstance(a, str)]
+        if len(ac_list2) > _GRANULARITY_MAX_AC:
+            errors.append(
+                ValidationError(
+                    code=ErrorCode.E029,
+                    path=f"$.tasks[{i}].acceptance_criteria",
+                    message=(
+                        f"task '{tid}' acceptance_criteria 数量 {len(ac_list2)} 超过粒度锚点 "
+                        f"{_GRANULARITY_MAX_AC}（建议拆分，warning 不阻断）"
+                    ),
                 )
             )
 
@@ -487,6 +565,12 @@ def validate_source(
         project_root = master.source_path.parent.parent
     project_root = Path(project_root)
 
+    # AC3（task-12-engine-path-abstraction）：IDEAS.md / ROADMAP.md 走统一工作区根
+    # helper（默认 .orchd/，兼容旧根路径）。spec.py 依赖方向为 errors.py，此处
+    # 采用函数内惰性导入 ledger 的纯路径 helper（无循环依赖：ledger 不导入 spec）。
+    from orchd.ledger import resolve_workspace_root
+    workspace_root = resolve_workspace_root(project_root)
+
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
         source = t.get("source")
@@ -512,7 +596,7 @@ def validate_source(
             continue
 
         if prefix == "idea":
-            ideas_path = project_root / "IDEAS.md"
+            ideas_path = workspace_root / "IDEAS.md"
             if not ideas_path.exists():
                 errors.append(
                     ValidationError(
@@ -524,7 +608,7 @@ def validate_source(
                 continue
             errors.extend(_check_idea_reference(tid, i, ref_id, ideas_path))
         elif prefix == "roadmap":
-            roadmap_path = project_root / "ROADMAP.md"
+            roadmap_path = workspace_root / "ROADMAP.md"
             if not roadmap_path.exists():
                 errors.append(
                     ValidationError(
