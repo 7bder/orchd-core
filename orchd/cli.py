@@ -46,15 +46,45 @@ def main(argv: list[str] | None = None) -> int:
         # 支持命令返回 (dict, exit_code) 元组
         if isinstance(result, tuple):
             data, code = result
-            _output(data)
+            _output(_attach_guidance(data))
             return code
-        _output(result)
+        _output(_attach_guidance(result))
         return 0
     except OrchdError as exc:
         _output(to_json_response(exc))
         return 1
     except KeyboardInterrupt:
         return 130
+
+
+def _attach_guidance(data: Any) -> Any:
+    """为命令 JSON 响应统一附加 guidance 字段（task-guide-seamless-guidance）。
+
+    无感引导契约：
+    - **加法式**：只新增 ``guidance`` 键，不删不改既有字段（next_action 等保留）。
+    - **幂等**：已有 guidance 不覆盖。
+    - **best-effort**：读取 ledger / 构造引导的任何异常静默跳过，不阻塞主流程。
+
+    仅对 dict 响应生效；非 dict（如字符串/None）原样返回。
+    """
+    if not isinstance(data, dict) or "guidance" in data:
+        return data
+    try:
+        from orchd.ledger import Store
+        from orchd.spec import load_master
+
+        orchd_dir = _find_orchd_dir()
+        state = Store(orchd_dir).replay()
+        # master 任务定义始终在 .orchd/_master.json
+        master_path = orchd_dir / "_master.json"
+        tasks = load_master(master_path).tasks if master_path.exists() else []
+
+        from orchd.guide import next_guidance
+        data["guidance"] = next_guidance(state, tasks)
+    except Exception:
+        # best-effort：引导失败静默跳过，绝不阻塞命令主流程
+        pass
+    return data
 
 
 def _output(data: Any) -> None:
@@ -159,6 +189,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orchd",
         description="Cross-agent-platform task distribution CLI",
+        epilog=(
+            "无感引导：任意命令的 JSON 响应含 guidance 字段（step/command/hint，"
+            "指导下一步行动）；运行 'orchd status --text' 查看任务池与下一步引导。"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"orchd {__version__}")
     sub = parser.add_subparsers(dest="command")
@@ -259,6 +293,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", action="store_true")
     p.add_argument("--audit-merge", action="store_true",
                    help="附加 merge 巡检：completed 任务对应 task/{id} 分支未并入 main 的告警清单（只读）")
+    p.add_argument("--audit-intake", action="store_true",
+                   help="附加摄入产物审计：未提交的 IDEAS.md / ROADMAP.md / _master.json 改动告警（只读）")
     p.set_defaults(func=_cmd_status)
 
     # watchdog
@@ -274,6 +310,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="git 仓库完整性只读检测")
     p.add_argument("--path", default=".", help="项目根目录（含 .git），默认当前目录")
     p.set_defaults(func=_cmd_doctor)
+
+    # intake（2026-08-14 intake-commit-enforcement）
+    p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md / ROADMAP.md）并校验状态合法性")
+    p.set_defaults(func=_cmd_intake)
 
     return parser
 
@@ -489,11 +529,32 @@ def _cmd_amend(args) -> dict:
         # AC3（task-12-engine-path-abstraction）：IDEAS.md 走统一工作区根 helper
         # （默认 .orchd/，兼容旧根路径）；commit 路径与 ensure_committed 期望一致。
         ws_root = resolve_workspace_root(project_root)
-        result["commit"] = ensure_committed(
+        # intake-commit-enforcement（2026-08-14）：提交范围含 ROADMAP.md——
+        # roadmap 摄入改的 ROADMAP.md 此前不在范围，必然残留未提交改动
+        commit = ensure_committed(
             project_root,
-            [str(Path(args.master)), str(ws_root / "IDEAS.md")],
+            [str(Path(args.master)), str(ws_root / "IDEAS.md"), str(ws_root / "ROADMAP.md")],
             f"chore(intake): orchd amend — {summary}",
         )
+        result["commit"] = commit
+        # intake-commit-enforcement（2026-08-14）：commit 降级可审计化（对齐
+        # merge_warning 先例）——注册成功后 commit 未执行（非 no_changes）不再
+        # 静默：写入 commit_warning 供 status --audit-intake 巡检。git 环境不可用
+        # （not_a_git_repo / git_unavailable）保留 best-effort 降级（判据 3）；
+        # git 可用但提交失败（commit_failed）同样告警——"注册成功但改动未入库"
+        # 违背"强制提交"语义，须人工核对。
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"amend 注册成功但 commit 未执行（{commit.get('reason')}）："
+                    "摄入产物改动可能未入库"
+                ),
+                "hint": (
+                    "若为 git 环境异常，可运行 'orchd status --audit-intake' "
+                    "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"
+                ),
+            }
 
     # dry-run 试跑新增/变更任务的 verify_command（与 done 相同 shell 执行、同 cwd、
     # 限时 30s；2026-08-08 升级：assertion_mismatch 类失败阻断注册（E028），
@@ -997,6 +1058,18 @@ def _cmd_doctor(args):
     return result, 0
 
 
+def _cmd_intake(args) -> dict:
+    """提交摄入产物（IDEAS.md / ROADMAP.md）并校验条目状态（intake-commit-enforcement）。
+
+    CLI 参数: 无（项目根由 .orchd/ 定位）。
+    返回: 提交结果字典（committed / commit / 可选 status_warnings / commit_warning）。
+    """
+    from orchd.intake import intake_commit
+
+    orchd_dir = _find_orchd_dir()
+    return intake_commit(orchd_dir.parent)
+
+
 def _cmd_status(args) -> dict:
     """获取全局状态快照或单任务详情。
 
@@ -1005,7 +1078,7 @@ def _cmd_status(args) -> dict:
     返回: 全局状态字典或单任务详情字典；若 --text 模式则直接打印表格并返回 None。
     """
     from orchd.ledger import Store
-    from orchd.report import merge_audit, status
+    from orchd.report import intake_audit, merge_audit, status
 
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
@@ -1018,9 +1091,18 @@ def _cmd_status(args) -> dict:
         result["integrity_warnings"] = integrity_warnings
     if args.audit_merge and args.task is None:
         result["merge_audit"] = merge_audit(store, tasks, orchd_dir.parent)
+    if getattr(args, "audit_intake", False) and args.task is None:
+        result["intake_audit"] = intake_audit(orchd_dir.parent)
     if args.text and "_text" in result:
-        # --text 为人类可读展示层：只输出表格，不再混入 JSON
-        print(result.pop("_text"))
+        # --text 为人类可读展示层：只输出表格，不再混入 JSON。
+        # 末尾追加无感引导文字（task-guide-seamless-guidance，best-effort）。
+        table = result.pop("_text")
+        try:
+            from orchd.guide import status_guidance_text
+            table += status_guidance_text(store.replay(), tasks)
+        except Exception:
+            pass  # 引导失败静默跳过，不影响表格输出
+        print(table)
         return None
     return result
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.gitops import get_current_branch, get_default_branch
+from orchd.gitops import get_current_branch, get_default_branch, list_tracked_changes
 from orchd.ledger import Store, resolve_store_dir
 from orchd.spec import (
     Master,
@@ -26,6 +26,17 @@ from orchd.spec import (
     validate_source,
     validate_structure,
 )
+
+# intake-commit-enforcement（2026-08-14）：摄入产物文件白名单（两种布局）。
+# 摄入 → amend 的正当链路中，这些文件允许以未提交态进入 amend（引擎随后强制
+# 提交）；其余任何已跟踪改动视为非摄入脏改动，amend / intake 前置阻断（E017）。
+_INTAKE_PRODUCT_FILES = frozenset({
+    ".orchd/_master.json",
+    "IDEAS.md",
+    ".orchd/IDEAS.md",
+    "ROADMAP.md",
+    ".orchd/ROADMAP.md",
+})
 
 
 # M-2（2026-08-12 全面审计）：三处状态（claimed / done / in_review / 终态附加）
@@ -199,6 +210,30 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
             f"当前分支 {current_branch} 拒绝注册（红线 7）",
             [{"branch": current_branch, "default": default_branch}],
         )
+
+    # intake-commit-enforcement（2026-08-14）：amend 前置"非摄入产物干净"守卫。
+    # 摄入产物（IDEAS.md / ROADMAP.md / _master.json，两种布局）允许未提交态进入
+    # （摄入 → amend 的正当链路，引擎随后强制提交）；摄入产物之外的任何已跟踪
+    # 改动 → E017 阻断注册——避免脏工作区被 checkout -b 带进任务分支，对齐
+    # claim/done/review 的 require_clean 语义（lint：amend 是四条写命令中此前
+    # 唯一无干净度守卫的）。
+    dirty_files = list_tracked_changes(project_root)
+    if dirty_files is not None:
+        non_intake = [f for f in dirty_files if f not in _INTAKE_PRODUCT_FILES]
+        if non_intake:
+            raise OrchdError(
+                ErrorCode.E017,
+                "dirty_workspace: amend 要求除摄入产物（IDEAS.md / ROADMAP.md / "
+                "_master.json）外工作区干净",
+                [{
+                    "command": "amend",
+                    "dirty_files": non_intake,
+                    "hint": (
+                        "请先提交或还原摄入产物之外的文件改动"
+                        "（untracked 工具/配置文件不阻塞）"
+                    ),
+                }],
+            )
 
     errors: list[dict[str, Any]] = []
     updated_tasks: list[str] = []

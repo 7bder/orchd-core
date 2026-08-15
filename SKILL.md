@@ -1,31 +1,21 @@
 # Orchd Agent
 > agent 工作流协议（BOOTSTRAP / WORKER / SELF-HOSTED 三模式与纪律），存放于宿主项目 **`.orchd/SKILL.md`**（零根文件 + 自包含 `.orchd/` 模型，task-12-docs-roadmap）；面向**人**的安装、命令参考与故障排查使用指南见 [docs/user-manual.md](../docs/user-manual.md)。
 
+## 入口协议（MUST，每 session 首读）
+1. 读本文件 `.orchd/SKILL.md`（纪律红线优先级最高，见下 SELF-HOSTED 节）。
+2. 据此定位 `.orchd/` 资源：规则见 `.orchd/rules/`（索引 `rules/README.md`），模板见 `templates/`。
+3. 按任意命令响应的 `guidance` 字段导航下一步（知识路由 `read`/`template` + 动作路由 `command`）；遇具体问题按规则目录按需 Read。
+
 ## Determine your mode
 - If `.orchd/` exists AND `.orchd/shared/self-hosted` marker exists -> SELF-HOSTED (this repo only)
 - If `.orchd/` exists (no marker) -> WORKER
-- If `.orchd/` does NOT exist -> BOOTSTRAP
-## BOOTSTRAP mode (first agent in a new project)
-1. Read `requirements.md`; run `python .orchd/__main__.py bootstrap` — outputs master schema, architect prompt, decomposition guide
-2. Create `.orchd/_master.json` following the schema (write `.orchd/shared/architecture.md` + `conventions.md` before validate if `shared` declared, E005)
-3. Run `python .orchd/__main__.py validate`, then `python .orchd/__main__.py init` (snapshots + empty ledger)
-4. Project ready. Exit. Next session enters WORKER mode automatically.
+- If `.orchd/` does NOT exist -> BOOTSTRAP（无感安装协议与 BOOTSTRAP 细节见 `.orchd/rules/install.md`）
 
 ## WORKER mode (existing project)
 
-> **命令调用约定（零根入口，task-12-docs-roadmap）**：所有 `orchd` 命令统一用 **`python .orchd/__main__.py`** 调用——`python .orchd/__main__.py <子命令> ...` 与 `orchd <子命令> ...` 完全等价。宿主项目根**零额外文件**、无需安装 `orchd`。
-### Implementer workflow (repeat per session)
-1. `python .orchd/__main__.py request --agent {your_id} [--capabilities "lang"] [--exclude "task-id ..."] [--max-active N] [--auto-claim]`
-2. Present candidate to human: execute / skip / re-declare capabilities
-3. `python .orchd/__main__.py claim --task {id} --agent {your_id} [--with-context] [--confirm]` — 两段式/共享上下文/失败处理/审查冻结见 .orchd/rules/session.md
-4. Read files_to_read -> implement -> edit files_to_edit
-5. `python .orchd/__main__.py done --task {id} --agent {your_id} --changes "summary"`
-### Reviewer workflow (when asked to review)
-1. `python .orchd/__main__.py request --agent {your_id} --role reviewer`
-2. `python .orchd/__main__.py claim --task {id} --agent {your_id} --role reviewer [--confirm]`
-3. Review against `templates/spec-reviewer.md` / `templates/code-reviewer.md` — 清单化/证据分层/merge 前置/单阶段见 .orchd/rules/review.md
-4. `python .orchd/__main__.py review --task {id} --agent {your_id} --type spec|code --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`
-5. After spec APPROVED, request --role reviewer again for code review (both phases in same session).
+> **命令调用约定（零根入口，task-12-docs-roadmap）**：所有 `orchd` 命令统一用 **`python .orchd/__main__.py`** 调用——与 `orchd <子命令>` 完全等价。宿主项目根**零额外文件**、无需安装 `orchd`。
+
+> **无感引导（task-guide-seamless-guidance，2026-08-15）**：任意命令 JSON 响应自动附加 `guidance` 字段 `{step, read, template, command, hint}`——`read`（知识路由：该读的规则文件）、`template`（方法路由：该用的模板）、`command`（动作路由：下一步命令）。**据 `guidance` 逐层导航即可完成任何任务流程**（request/claim/done/review）；`guidance` 为加法式字段，不替换既有字段，也可忽略自行决策。
 ## SELF-HOSTED mode
 
 > **本节仅适用于本仓库（orchd 自托管），外部项目忽略。** 自托管 = WORKER 工作流 + 摄入/纪律协议；本仓库纪律与协议见 `.orchd/rules/`。
@@ -41,7 +31,10 @@
    写操作。git 操作只允许引擎自动执行（claim 建分支、code APPROVED merge、
    done/amend 自动提交）。**唯一豁免：任务分支上的 `git commit`（见 git
    纪律"本地提交自主执行"）**。确需其他手动 git 操作时，先向用户报告并获
-   明确许可。
+   明确许可。**merge 后分支清理（task-merge-auto-delete-branch，
+   2026-08-15）**：引擎 merge 成功后 best-effort 自动删除 `task/{id}` 分支，
+   agent **无需手动 `git branch -d` 清理**；仅当引擎自动删除失败、`status
+   --audit-merge` 告警兜底时，才需人工授权删除。
 2. **禁止破坏性 git 操作**：`git reset --hard`、`git gc --prune=now`、
    `git clean -fdx`、`git branch -D`、`git push --force` 一律禁止——
    对象清理后历史不可恢复（2026-08-05 实踩：main 被移回旧提交、20 个 blob
@@ -54,7 +47,10 @@
    session 以 workbuddy-1 实现 + reviewer-1 审查，属自审绕过）。
 5. **禁止未提交即中断**：改动文件后必须提交（或明确报告"未提交+原因"）才能
    结束 session；不得把未提交改动留在工作区后静默离开（2026-08-05 实踩：
-   trae-a1 改 SKILL.md 未提交即中断）。
+   trae-a1 改 SKILL.md 未提交即中断）。**引擎兜底（intake-commit-enforcement，
+   2026-08-14）**：摄入/注册流程由引擎强制提交——amend 前置"非摄入产物干净"
+   守卫（E017 阻断）+ commit 失败可审计（commit_warning）+ `orchd intake`
+   命令提交摄入产物 + `orchd status --audit-intake` 巡检未提交摄入产物。
 6. **禁止自动摄入**：摄入（intake）仅在用户明确指定时执行；不得主动摄入
    IDEAS.md 的 pending 条目（2026-08-05 用户裁定）。
 7. **禁止在任务分支执行 intake/amend**：intake/amend 只在 main 且工作区
@@ -81,16 +77,12 @@
 5. 任何异常（verify 失败、merge 冲突、状态不符）立即停止并报告，
    不自行猜测处置。
 6. session 结束时工作区必须干净（无未提交改动），或在报告中说明。
-## 规则目录（遇具体问题按需 Read 对应文件，勿全量载入；纪律红线见上，优先级最高）
-- Session 状态检查 / 工作优先级 / 接管中断任务 / claim 两段式 → .orchd/rules/session.md
-- 摄入 IDEAS.md → 注册任务（协议 v2 + 拆解粒度）→ .orchd/rules/intake.md
-- verify_command（120s 预算 / 模块定向 / --basetemp / cmd 兼容）→ .orchd/rules/verify.md
-- git 分支 / 提交 / merge / amend / L3 hook / exempt_files → .orchd/rules/git.md
-- 审查者 ID / 禁自审 / merge audit / 证据分层（templates/spec-reviewer.md、templates/code-reviewer.md）→ .orchd/rules/review.md
-- 测试纪律（复用 tests/conftest.py 的 make_task / orchd_dir，参数化，禁止在测试文件内另造副本）→ .orchd/rules/testing.md
-- 仓库对象/refs 丢失恢复 SOP → .orchd/rules/recovery.md
-- Windows 环境 / 管道编码 → .orchd/rules/windows.md
-- 引擎改动触碰 §9.1 停服边界 → .orchd/rules/safety.md
+## 规则目录（纪律红线见上，优先级最高；完整索引见 .orchd/rules/README.md，按需 Read，勿全量载入）
+- 会话/优先级/接管/claim 两段式 → rules/session.md   ·  摄入 IDEAS→注册 → rules/intake.md
+- verify_command（120s / --basetemp）→ rules/verify.md   ·  分支/提交/merge/exempt → rules/git.md
+- 审查（templates/spec-reviewer.md、templates/code-reviewer.md + 证据分层）→ rules/review.md
+- 测试纪律（复用 tests/conftest.py 的 make_task / orchd_dir，参数化，禁止在测试文件内另造副本）→ rules/testing.md
+- 安装 → rules/install.md   ·  事故/Windows/引擎边界 → rules/{recovery,windows,safety}.md
 ## Rules
 - One task per session. Exit after `python .orchd/__main__.py done`.
 - Reviewer exception: complete both review phases (spec + code) of one task in the same session.

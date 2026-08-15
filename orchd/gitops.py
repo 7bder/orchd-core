@@ -142,6 +142,46 @@ def check_workspace_state(project_root: Path) -> dict[str, Any]:
         return {"available": False}
 
 
+def list_tracked_changes(project_root: Path) -> list[str] | None:
+    """返回已跟踪文件的未提交改动路径列表（best-effort）。
+
+    用于 amend / intake 的"非摄入产物干净"守卫：区分「摄入产物（IDEAS.md /
+    ROADMAP.md / _master.json）允许未提交」与「其余已跟踪改动必须提交」。
+
+    Returns:
+        - ``list[str]``：已跟踪文件的改动路径（相对 project_root）。
+        - ``None``：非 git 仓库 / git 不可用 / 异常（调用方降级为不阻断）。
+
+    Note:
+        仅已跟踪文件（``--untracked-files=no``），与"工作区干净 = 无已跟踪
+        改动"的语义一致；untracked 工具/配置文件不列入。
+    """
+    if shutil.which("git") is None:
+        return None
+    try:
+        check = _run_git(project_root, ["rev-parse", "--is-inside-work-tree"])
+        if check.returncode != 0:
+            return None
+        status = _run_git(project_root, ["status", "--porcelain", "--untracked-files=no"])
+        if status.returncode != 0:
+            return None
+        files: list[str] = []
+        for line in status.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            # porcelain v1：`XY path`（XY 各 1 字符 + 空格）；rename 为
+            # `R  old -> new`（取箭头后路径，保守处理，避免把 rename 目标误列）
+            code, _, path = line[:2], line[2], line[3:]
+            if code == "R " or code.startswith("R"):
+                arrow = path.find(" -> ")
+                if arrow != -1:
+                    path = path[arrow + 4:]
+            files.append(path.strip())
+        return files
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
 def ensure_committed(
     project_root: Path,
     paths: list[str],
@@ -184,6 +224,20 @@ def ensure_committed(
             return {"performed": False, "reason": "not_a_git_repo"}
     except (subprocess.SubprocessError, FileNotFoundError):
         return {"performed": False, "reason": "not_a_git_repo"}
+
+    # intake-commit-enforcement（2026-08-14）：过滤不存在的路径（git 环境已确认
+    # 之后）——部分路径缺失（如 ROADMAP.md 尚未创建）不应导致整个 git add/commit
+    # 因 pathspec 不匹配而整体 fatal（git add 遇错误 pathspec 会中止，连带阻断
+    # 其余存在的摄入产物提交）。
+    existing_paths: list[str] = []
+    for p in paths:
+        ap = Path(p) if Path(p).is_absolute() else project_root / p
+        if ap.exists():
+            existing_paths.append(p)
+    if not existing_paths:
+        # 声明路径均不存在 → 范围内无实际文件改动可提交
+        return {"performed": False, "reason": "no_changes", "message": message}
+    paths = existing_paths
 
     # 只 add 声明范围。add 失败（如路径不存在）不阻断：
     # 是否真的"无改动"由下一步 diff 精确判断（diff 也限定 paths）。
@@ -342,18 +396,19 @@ if [ -z "$STAGED" ]; then
 fi
 
 # 4) 校验每个 staged 文件：固定资产豁免 或 在允许列表内
-OUT_OF_SCOPE=""
-for FILE in $STAGED; do
-    IN_SCOPE=no
-    # 固定资产豁免（引擎自动提交路径，不在任务 files_to_edit 内）：
-    # .orchd/_master.json、IDEAS.md（根布局）与 .orchd/IDEAS.md（发布态自包含
-    # .orchd 布局）——amend 在 main 分支提交它们，若不豁免会被本 hook 拦截
-    # （引擎自动提交零改动）。
-    case "$FILE" in
-        .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md)
-            IN_SCOPE=yes
-            ;;
-    esac
+    OUT_OF_SCOPE=""
+    for FILE in $STAGED; do
+        IN_SCOPE=no
+        # 固定资产豁免（引擎自动提交路径，不在任务 files_to_edit 内）：
+        # .orchd/_master.json、IDEAS.md（根布局）与 .orchd/IDEAS.md（发布态自包含
+        # .orchd 布局）、ROADMAP.md（根布局）与 .orchd/ROADMAP.md（发布态）——
+        # amend 在 main 分支提交它们，若不豁免会被本 hook 拦截
+        # （引擎自动提交零改动）。
+        case "$FILE" in
+            .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md|ROADMAP.md|.orchd/ROADMAP.md)
+                IN_SCOPE=yes
+                ;;
+        esac
 {files_check}
 {exempts_check}
     if [ "$IN_SCOPE" != "yes" ]; then

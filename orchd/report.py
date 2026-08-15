@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.gitops import session_lock_check, session_lock_release
-from orchd.ledger import Store, TaskState
+from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
+from orchd.ledger import Store, TaskState, resolve_workspace_root
 
 
 def status(
@@ -228,6 +228,42 @@ def merge_audit(
                         "且 task 分支已删除，无法从分支差异核对；"
                         "请人工确认 main 是否含实现",
             })
+    return {"skipped": False, "warnings": warnings}
+
+
+def intake_audit(project_root: Path) -> dict[str, Any]:
+    """只读巡检：检测未提交的摄入产物改动（intake-commit-enforcement，2026-08-14）。
+
+    摄入产物 = ``.orchd/_master.json``、``IDEAS.md`` / ``ROADMAP.md``（根布局与
+    发布态 ``.orchd`` 布局）。检测工作区中这些文件的未提交改动 → 告警清单，
+    让"摄入/注册后改动未入库"可被巡检发现（对齐 ``--audit-merge`` 只读先例）。
+
+    只读：不执行 add/commit/checkout/reset。非 git 仓库或 git 不可用返回 skipped。
+    """
+    root = Path(project_root)
+    dirty = list_tracked_changes(root)
+    if dirty is None:
+        return {"skipped": True, "reason": "git_unavailable"}
+    # 摄入产物白名单（两种布局，与 split._INTAKE_PRODUCT_FILES 对齐）
+    products = {
+        ".orchd/_master.json",
+        "IDEAS.md",
+        ".orchd/IDEAS.md",
+        "ROADMAP.md",
+        ".orchd/ROADMAP.md",
+    }
+    hit = sorted(f for f in dirty if f in products)
+    warnings = [
+        {
+            "file": f,
+            "reason": "uncommitted_intake_product",
+            "hint": (
+                "摄入/注册产物未提交：请运行 orchd intake（提交 IDEAS/ROADMAP）"
+                "或 orchd amend（注册+提交），或人工 git commit"
+            ),
+        }
+        for f in hit
+    ]
     return {"skipped": False, "warnings": warnings}
 
 

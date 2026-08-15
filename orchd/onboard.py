@@ -956,12 +956,20 @@ def claim(
         # E011: agent busy（implementer 与 reviewer 角色互斥：同一 agent 一次只能
         # 持有一个实现任务或一个审查任务，杜绝「实现 A + 审查 B」并行——
         # 2026-08-13 全面审核 §4.3 修复）
+        # 2026-08-15 e011-busy-lifecycle（worker-1 连领事故）：实现者 busy 判定从
+        # claimed 扩展为 claimed/done/in_review——claimed_by 在 done/in_review 状态
+        # 仍保留（DONE/REVIEW_READY 不清 claimed_by），任务未终态（completed/cancelled）
+        # 或打回（CHANGES_REQUESTED→pending）前，实现者不得再领取新实现任务，
+        # 否则会在上一任务审查/返工期间并发持有多个任务（无人值守 --auto-claim 连领）。
         for tid, t_state in state.items():
-            if t_state.status == "claimed" and t_state.claimed_by == agent_id:
+            if t_state.status in ("claimed", "done", "in_review") and t_state.claimed_by == agent_id:
                 raise OrchdError(
                     ErrorCode.E011,
-                    f"agent_busy: '{agent_id}' already holds task '{tid}'",
-                    [{"agent_id": agent_id, "blocking_task": tid}],
+                    f"agent_busy: '{agent_id}' already holds task '{tid}'"
+                    f" (status={t_state.status})",
+                    [{"agent_id": agent_id, "blocking_task": tid,
+                      "blocking_status": t_state.status,
+                      "hint": "任务完成审查（completed/cancelled）或被打回（pending）后才可领取新任务"}],
                 )
             if t_state.status == "in_review" and t_state.review_claimed_by == agent_id:
                 # 找该任务最近的 REVIEW_CLAIMED 事件 id，供中断的审查者 retract 自救
@@ -1748,6 +1756,11 @@ def review_submit(
                             f"merge 冲突已自动化解（abort + 分支预演合并），"
                             f"任务已 completed"
                         )
+                    # merge 成功 / 自动化解成功后 best-effort 删除任务分支
+                    # （task-merge-auto-delete-branch）；删除失败静默降级不影响 completed
+                    result["branch_deleted"] = _try_delete_task_branch(
+                        project_root, task_id
+                    )
 
     # L258 对称修复：review_submit 完成后释放 session lock
     # （校验锁 agent_id == review agent，防误释放他人锁；best-effort 不阻断审查结果）
@@ -2169,3 +2182,30 @@ def _try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
         return {"conflict": False}
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
+
+
+def _try_delete_task_branch(project_root: Path, task_id: str) -> bool:
+    """best-effort 删除任务分支 task/{task_id}（merge 成功后调用）。
+
+    merge 成功 / 自动化解成功后任务分支已并入 main，不再需要保留，自动
+    删除避免分支残留（task-merge-auto-delete-branch，2026-08-14 实踩：
+    task-121-sync-source 审查 APPROVED、merge 成功但分支残留需人工清理）。
+    仅删除 task/{task_id}，不触及其他分支/main；删除失败（git branch -d
+    非零退出）静默降级，不影响 completed 状态写入（--audit-merge 告警兜底）。
+
+    Returns:
+        True：删除成功；False：删除失败或环境不支持（best-effort，不抛异常）。
+    """
+    branch = f"task/{task_id}"
+    try:
+        result = subprocess.run(
+            ["git", "branch", "-d", branch],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False

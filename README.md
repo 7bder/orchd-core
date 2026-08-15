@@ -1,6 +1,6 @@
 # orchd-core
 
-跨 AI agent 平台的任务编排 CLI 核心套件。本仓库是 **orchd 引擎的最小可移植核心**，交付为**单一 `.orchd/` 自包含工作空间**——引擎、资源、协议层、打包配置全部在 `.orchd/` 内，宿主项目根**零额外文件**。
+跨 AI agent 平台的任务编排 CLI 核心套件。本仓库（orchd-core）是 **orchd 引擎的源码发行版**——宿主项目通过**安装器**把引擎与资源组装进自身 `.orchd/`，形成**单一 `.orchd/` 自包含工作空间**，宿主项目根**零额外文件**。
 
 orchd 不做需求推理、不内置 LLM 调用。它只为一个项目里的多个 AI agent 提供**可靠**的协作基础设施：
 
@@ -44,24 +44,33 @@ cancelled（强制取消）
 
 ---
 
-## 安装（零安装，零根文件模型）
+## 安装（源码仓库 + 安装器，零根文件模型）
 
 要求 Python >= 3.10，依赖仅 `jsonschema`。
 
+orchd-core 是**源码仓库**；安装 = `git clone` + 运行安装器 `install.py`，把源码组装进宿主项目的 `.orchd/`：
+
 ```bash
-# 把 orchd-core 的 .orchd/ 复制到你的项目根即可
-cp -R orchd-core/.orchd ./你的项目/.orchd
+# 1. 获取 orchd-core 源码
+git clone https://github.com/7bder/orchd-core.git
+# 2. 用安装器把源码安装进宿主项目（宿主机上需有 Python >= 3.10）
+python orchd-core/install.py ./你的项目
 cd 你的项目
 python .orchd/__main__.py --version
 ```
 
-`python .orchd/__main__.py <子命令> ...` 与 `orchd <子命令> ...` 完全等价——无需安装、不依赖 PATH、宿主项目根零额外文件。
+安装器 `install.py`（纯标准库，跨平台）：
+- 首次安装：完整组装 `.orchd/`（vendored 引擎 + schema/templates/docs + SKILL + 零根入口 + 打包配置 + `shared/`/`proposals/` 工作区骨架），清 `__pycache__`；
+- 已存在时：无 `--update`/`--force` → 非零退出并明确提示；`--update` 就地升级（保留宿主 `shared/`、`_master.json`、台账与运行时文件）；`--force` 覆盖安装；
+- `--agent`：仅输出最终 JSON（`installed`/`mode`/`host`/`orchd_dir`/`next`），供 agent 无人值守消费。
+
+安装后 `python .orchd/__main__.py <子命令> ...` 与 `orchd <子命令> ...` 完全等价——无需安装、不依赖 PATH、宿主项目根零额外文件。
 
 ---
 
 ## 快速开始：为你的新项目启动 orchd 托管
 
-1. 把 orchd-core 的 `.orchd/` 复制到项目根（见上 §安装），在项目根放 `requirements.md`（任意来源需求文档）。
+1. 用安装器把 orchd-core 源码安装到项目根（见上 §安装），在项目根放 `requirements.md`（任意来源需求文档）。
 2. 首个 agent 读 `.orchd/SKILL.md` 进入 **BOOTSTRAP 模式**：
 
 ```bash
@@ -100,7 +109,9 @@ python .orchd/__main__.py init                 # 生成 mod-*/spec.json 快照 +
 
 ---
 
-## 目录结构（单一 `.orchd/`）
+## 目录结构（安装后宿主单一 `.orchd/`）
+
+安装器把 orchd-core 源码组装进宿主项目，生成：
 
 ```
 你的项目/
