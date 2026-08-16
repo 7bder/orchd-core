@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 # IDEAS.md 条目 status 合法值白名单（与 IDEAS.md 模板状态流转一致）
-_VALID_IDEA_STATUSES = frozenset({"pending", "taskified", "questioning", "dropped"})
+# study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm/drop 裁决。
+_VALID_IDEA_STATUSES = frozenset({"pending", "taskified", "questioning", "dropped", "study"})
 
 # 摄入产物文件白名单（与 split._INTAKE_PRODUCT_FILES 对齐，两种布局）：
 # 摄入 → amend / intake 的正当链路中允许未提交态；其余已跟踪改动视为非摄入脏。
@@ -78,6 +79,43 @@ def check_idea_statuses(workspace_root: Path) -> list[dict[str, Any]]:
     return violations
 
 
+def _intake_guard(project_root: Path) -> dict[str, Any] | None:
+    """摄入前置守卫：main 分支 + 非摄入产物干净（对齐 amend 的 E017 语义）。
+
+    供 intake_commit / idea_propose / idea_confirm / idea_drop 复用（idea-write-gate）。
+
+    Returns:
+        - 通过: ``None``。
+        - 失败: 结构化错误 dict（not_on_main / dirty_workspace），调用方直接返回。
+    """
+    from orchd.gitops import get_current_branch, get_default_branch, list_tracked_changes
+
+    project_root = Path(project_root)
+    current_branch = get_current_branch(project_root)
+    default_branch = get_default_branch(project_root) or "main"
+    if current_branch is not None and current_branch != default_branch:
+        return {
+            "committed": False,
+            "reason": "not_on_main",
+            "branch": current_branch,
+            "hint": f"intake/idea 仅在 default（{default_branch}）分支执行，请先切回",
+        }
+    dirty_files = list_tracked_changes(project_root)
+    if dirty_files is not None:
+        non_intake = [f for f in dirty_files if f not in _INTAKE_PRODUCT_FILES]
+        if non_intake:
+            return {
+                "committed": False,
+                "reason": "dirty_workspace",
+                "dirty_files": non_intake,
+                "hint": (
+                    "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
+                    "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                ),
+            }
+    return None
+
+
 def intake_commit(
     project_root: Path,
     message: str | None = None,
@@ -97,39 +135,15 @@ def intake_commit(
         - 提交结果: ``{"committed": bool, "commit": {...}, 可选
           "status_warnings": [...], 可选 "commit_warning": {...}}``
     """
-    from orchd.gitops import (
-        ensure_committed,
-        get_current_branch,
-        get_default_branch,
-        list_tracked_changes,
-    )
+    from orchd.gitops import ensure_committed
     from orchd.ledger import resolve_workspace_root
 
     project_root = Path(project_root)
 
     # 1) 前置守卫：main 分支 + 非摄入产物干净（对齐 amend 的 E017 语义）
-    current_branch = get_current_branch(project_root)
-    default_branch = get_default_branch(project_root) or "main"
-    if current_branch is not None and current_branch != default_branch:
-        return {
-            "committed": False,
-            "reason": "not_on_main",
-            "branch": current_branch,
-            "hint": f"intake 仅在 default（{default_branch}）分支执行，请先切回",
-        }
-    dirty_files = list_tracked_changes(project_root)
-    if dirty_files is not None:
-        non_intake = [f for f in dirty_files if f not in _INTAKE_PRODUCT_FILES]
-        if non_intake:
-            return {
-                "committed": False,
-                "reason": "dirty_workspace",
-                "dirty_files": non_intake,
-                "hint": (
-                    "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
-                    "之外的文件改动（untracked 工具/配置文件不阻塞）"
-                ),
-            }
+    guard_err = _intake_guard(project_root)
+    if guard_err is not None:
+        return guard_err
 
     # 2) IDEAS 条目状态校验（warning 不阻断）
     workspace_root = resolve_workspace_root(project_root)
@@ -155,3 +169,350 @@ def intake_commit(
             ),
         }
     return result
+
+
+def _roadmap_land_entry(header: str, version: str, roadmap_rel: str) -> str:
+    """构造 ROADMAP 落地 IDEAS pending 条目（date 用运行日，标题取章节头）。"""
+    import datetime
+
+    date = datetime.date.today().isoformat()
+    return (
+        f"## {date} {header}\n"
+        f"- status: pending\n"
+        f"- goal: 把 ROADMAP §{version} 规划内容落地拆解为具体任务并注册到 _master.json。\n"
+        f"- idea: ROADMAP §{version}（{header}）落地。\n"
+        f"- detail: {roadmap_rel} §{version}\n"
+        f"- notes: 由 orchd roadmap-land 生成（intake-dual-path），待摄入拆解为任务。\n"
+    )
+
+
+def roadmap_land(
+    project_root: Path,
+    version: str,
+) -> dict[str, Any]:
+    """roadmap-land 落地：为 ROADMAP 规划章节生成 IDEAS pending 条目（intake-dual-path）。
+
+    双路径「有规划」入口：ROADMAP（意图层）→ 落地进 IDEAS（执行层）→ 摄入拆解 → 任务池。
+
+    Args:
+        project_root: 仓库根目录。
+        version: 规划章节版本（如 ``1.3``）。
+
+    Returns:
+        结构化结果，永不抛异常：
+        - 前置失败: ``{"landed": False, "reason": "not_on_main" | "dirty_workspace", ...}``
+        - 定位失败: ``{"landed": False, "reason": "roadmap_missing" | "section_not_found"
+          | "historical_section" | "no_section_id", ...}``
+        - 幂等跳过: ``{"landed": False, "reason": "already_landed", ...}``
+        - 成功: ``{"landed": True, "version", "section_id", "commit": {...}, 可选
+          "commit_warning": {...}}``
+    """
+    from orchd.gitops import (
+        ensure_committed,
+        get_current_branch,
+        get_default_branch,
+        list_tracked_changes,
+    )
+    from orchd.ledger import resolve_workspace_root
+    from orchd.spec import _parse_roadmap_sections
+
+    project_root = Path(project_root)
+
+    # 1) 前置守卫：main + 非摄入产物干净（对齐 intake_commit 语义）
+    current_branch = get_current_branch(project_root)
+    default_branch = get_default_branch(project_root) or "main"
+    if current_branch is not None and current_branch != default_branch:
+        return {
+            "landed": False,
+            "reason": "not_on_main",
+            "branch": current_branch,
+            "hint": f"roadmap-land 仅在 default（{default_branch}）分支执行，请先切回",
+        }
+    dirty_files = list_tracked_changes(project_root)
+    if dirty_files is not None:
+        non_intake = [f for f in dirty_files if f not in _INTAKE_PRODUCT_FILES]
+        if non_intake:
+            return {
+                "landed": False,
+                "reason": "dirty_workspace",
+                "dirty_files": non_intake,
+                "hint": (
+                    "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
+                    "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                ),
+            }
+
+    # 2) 定位 ROADMAP 规划章节（.orchd 布局 / 根布局）
+    ws = resolve_workspace_root(project_root)
+    roadmap = ws / "ROADMAP.md"
+    if not roadmap.exists():
+        return {"landed": False, "reason": "roadmap_missing", "hint": f"缺 {roadmap}"}
+    sections = _parse_roadmap_sections(roadmap.read_text(encoding="utf-8"))
+    sec = next((s for s in sections if s["version"] == version), None)
+    available = [s["version"] for s in sections if not s["historical"] and s["id"]]
+    if sec is None:
+        return {
+            "landed": False,
+            "reason": "section_not_found",
+            "version": version,
+            "available": available,
+        }
+    if sec["historical"]:
+        return {"landed": False, "reason": "historical_section", "version": version}
+    if not sec["id"]:
+        return {"landed": False, "reason": "no_section_id", "version": version}
+
+    # 3) 幂等：IDEAS 已有引用该章节的落地条目 → 跳过
+    ideas = ws / "IDEAS.md"
+    ideas_text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
+    if f"§{version}" in ideas_text:
+        return {
+            "landed": False,
+            "reason": "already_landed",
+            "version": version,
+            "hint": f"IDEAS.md 已有引用 ROADMAP §{version} 的落地条目",
+        }
+
+    # 4) 生成 IDEAS pending 条目（追加到 IDEAS.md 末尾）
+    roadmap_rel = roadmap.relative_to(project_root).as_posix()
+    entry = _roadmap_land_entry(sec["header"], version, roadmap_rel)
+    if ideas.exists():
+        existing = ideas.read_text(encoding="utf-8")
+        if not existing.endswith("\n"):
+            existing += "\n"
+        ideas.write_text(existing + "\n" + entry, encoding="utf-8")
+    else:
+        ideas.write_text("# IDEAS\n" + "\n" + entry, encoding="utf-8")
+
+    # 5) 强制提交摄入产物（IDEAS.md + ROADMAP.md）
+    commit = ensure_committed(
+        project_root,
+        [str(ws / "IDEAS.md"), str(ws / "ROADMAP.md")],
+        f"chore(intake): orchd roadmap-land — §{version}",
+    )
+    result: dict[str, Any] = {
+        "landed": True,
+        "version": version,
+        "section_id": sec["id"],
+        "commit": commit,
+    }
+    if commit.get("performed") is False and commit.get("reason") != "no_changes":
+        result["commit_warning"] = {
+            "reason": commit.get("reason"),
+            "message": (
+                f"roadmap-land 落地 commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                "可能未入库，请人工核对"
+            ),
+        }
+    return result
+
+
+def _find_idea_entry(text: str, title: str) -> dict[str, Any] | None:
+    """定位 IDEAS.md 中标题匹配 ``title`` 的条目（idea-write-gate）。
+
+    条目识别：``## `` 开头行为标题（约定格式 ``## YYYY-MM-DD <标题>``，日期为
+    条目内自带的自然日期前缀）；``title`` 匹配标题**去除日期前缀后的部分**
+    （整标题 == title，或以 ``" " + title`` 结尾），与 propose 写入的
+    ``## {date} {title}`` 格式对齐。其后、下一个 ``## `` 之前的行收集字段
+    （status / 其余 ``- key: value`` 或 ``key: value``）。
+
+    Returns:
+        ``{"header_line": int, "title": str, "status": str, "lines": [str], "end": int}``：
+        header_line 为标题行号（0 基），lines 为条目全部行（含标题），end 为条目结束行号
+        （不含，下一标题行号或文件末尾）。无匹配返回 None。
+    """
+    lines = text.splitlines()
+    target: dict[str, Any] | None = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            continue
+        header = stripped[3:].strip()
+        # 匹配标题本体：整标题相等，或标题以 " {title}" 结尾（去掉日期前缀）
+        if header == title or header.endswith(" " + title):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("## "):
+                j += 1
+            status = ""
+            for k in range(i + 1, j):
+                s = lines[k].strip()
+                for marker in ("- status:", "status:"):
+                    if s.startswith(marker):
+                        status = s[len(marker):].strip()
+                        break
+            target = {
+                "header_line": i,
+                "title": header,
+                "status": status,
+                "lines": lines[i:j],
+                "end": j,
+            }
+            break
+    return target
+
+
+def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, Any]:
+    """灵感写入 IDEAS 写入门禁：追加 status: study 条目（idea-write-gate，propose）。
+
+    执行权：agent 可执行（记录论证中的灵感，待用户 confirm/drop 裁决）。
+
+    Args:
+        project_root: 仓库根目录。
+        title: 灵感标题。
+        feasibility: 可行性论证（写入 ``- 论证:`` 字段）。
+
+    Returns:
+        结构化结果，永不抛异常：
+        - 前置失败: ``{"proposed": False, "reason": "not_on_main" | "dirty_workspace", ...}``
+        - 重复标题: ``{"proposed": False, "reason": "duplicate_title", ...}``
+        - 成功: ``{"proposed": True, "title", "commit": {...}, 可选 "commit_warning"}``
+    """
+    from orchd.gitops import ensure_committed
+    from orchd.ledger import resolve_workspace_root
+
+    project_root = Path(project_root)
+    guard_err = _intake_guard(project_root)
+    if guard_err is not None:
+        # guard 返回 committed 键，转换为该动作的键（proposed），保留 reason 与明细
+        return {"proposed": False, **{k: v for k, v in guard_err.items() if k != "committed"}}
+
+    ws = resolve_workspace_root(project_root)
+    ideas = ws / "IDEAS.md"
+    text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
+    if _find_idea_entry(text, title) is not None:
+        return {
+            "proposed": False,
+            "reason": "duplicate_title",
+            "title": title,
+            "hint": f"IDEAS.md 已存在标题为 '{title}' 的条目",
+        }
+
+    import datetime
+
+    date = datetime.date.today().isoformat()
+    entry = (
+        f"## {date} {title}\n"
+        f"- status: study\n"
+        f"- 论证: {feasibility}\n"
+        f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 drop 丢弃。\n"
+    )
+    if ideas.exists():
+        existing = text
+        if not existing.endswith("\n"):
+            existing += "\n"
+        ideas.write_text(existing + "\n" + entry, encoding="utf-8")
+    else:
+        ideas.write_text("# IDEAS\n" + "\n" + entry, encoding="utf-8")
+
+    commit = ensure_committed(
+        project_root,
+        [str(ideas)],
+        f"chore(idea): orchd idea propose — {title}",
+    )
+    result: dict[str, Any] = {"proposed": True, "title": title, "commit": commit}
+    if commit.get("performed") is False and commit.get("reason") != "no_changes":
+        result["commit_warning"] = {
+            "reason": commit.get("reason"),
+            "message": (
+                f"idea propose commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                "可能未入库，请人工核对"
+            ),
+        }
+    return result
+
+
+def _idea_transition(
+    project_root: Path,
+    title: str,
+    target_status: str,
+    action: str,
+) -> dict[str, Any]:
+    """idea confirm / drop 公共后端：把 status: study 条目改写为 target_status。
+
+    执行权：仅用户执行（confirm/drop 是裁决动作，agent 不得代行）。
+
+    Returns:
+        结构化结果，永不抛异常（结果键用动作过去式：confirm→confirmed / drop→dropped）：
+        - 前置失败: ``{"{key}": False, "reason": "not_on_main" | "dirty_workspace"}``
+        - 不存在: ``{"{key}": False, "reason": "not_found"}``
+        - 非 study: ``{"{key}": False, "reason": "not_study", "current_status": ...}``
+        - 成功: ``{"{key}": True, "title", "new_status", "commit": {...}}``
+    """
+    from orchd.gitops import ensure_committed
+    from orchd.ledger import resolve_workspace_root
+
+    # 动作 → 结果键（过去式）：confirm→confirmed，drop→dropped
+    key = "dropped" if action == "drop" else "confirmed"
+
+    project_root = Path(project_root)
+    guard_err = _intake_guard(project_root)
+    if guard_err is not None:
+        # guard 返回 committed 键，转换为该动作的过去式键，保留 reason 与明细
+        return {key: False, **{k: v for k, v in guard_err.items() if k != "committed"}}
+
+    ws = resolve_workspace_root(project_root)
+    ideas = ws / "IDEAS.md"
+    if not ideas.exists():
+        return {key: False, "reason": "not_found", "title": title}
+    text = ideas.read_text(encoding="utf-8")
+    entry = _find_idea_entry(text, title)
+    if entry is None:
+        return {key: False, "reason": "not_found", "title": title}
+    if entry["status"] != "study":
+        return {
+            key: False,
+            "reason": "not_study",
+            "title": title,
+            "current_status": entry["status"],
+            "hint": f"仅 status: study 条目可 {action}（当前 '{entry['status']}'）",
+        }
+
+    lines = entry["lines"]
+    new_lines: list[str] = []
+    replaced = False
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("- status:") or s.startswith("status:"):
+            indent = ln[: len(ln) - len(ln.lstrip())]
+            new_lines.append(f"{indent}- status: {target_status}")
+            replaced = True
+        else:
+            new_lines.append(ln)
+    if not replaced:
+        # 理论上不会走到（_find_idea_entry 已确认含 status），防御性兜底
+        new_lines.append(f"- status: {target_status}")
+
+    all_lines = text.splitlines()
+    new_content_lines = all_lines[: entry["header_line"]] + new_lines + all_lines[entry["end"]:]
+    ideas.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
+
+    commit = ensure_committed(
+        project_root,
+        [str(ideas)],
+        f"chore(idea): orchd idea {action} — {title}",
+    )
+    result: dict[str, Any] = {
+        key: True,
+        "title": title,
+        "new_status": target_status,
+        "commit": commit,
+    }
+    if commit.get("performed") is False and commit.get("reason") != "no_changes":
+        result["commit_warning"] = {
+            "reason": commit.get("reason"),
+            "message": (
+                f"idea {action} commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                "可能未入库，请人工核对"
+            ),
+        }
+    return result
+
+
+def idea_confirm(project_root: Path, title: str) -> dict[str, Any]:
+    """把 status: study 条目升为 pending（idea-write-gate，confirm，仅用户执行）。"""
+    return _idea_transition(project_root, title, "pending", "confirm")
+
+
+def idea_drop(project_root: Path, title: str) -> dict[str, Any]:
+    """把 status: study 条目降为 dropped（idea-write-gate，drop，仅用户执行）。"""
+    return _idea_transition(project_root, title, "dropped", "drop")

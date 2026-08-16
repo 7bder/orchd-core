@@ -1,24 +1,37 @@
 # Orchd Agent
-> agent 工作流协议（BOOTSTRAP / WORKER / SELF-HOSTED 三模式与纪律），存放于宿主项目 **`.orchd/SKILL.md`**（零根文件 + 自包含 `.orchd/` 模型，task-12-docs-roadmap）；面向**人**的安装、命令参考与故障排查使用指南见 [docs/user-manual.md](../docs/user-manual.md)。
+> agent 工作流协议（BOOTSTRAP / WORKER 两模式与纪律，SELF-HOSTED 已并入统一协议，`self-hosted` marker 仅作来源标记），存放于宿主项目 **`.orchd/SKILL.md`**（零根文件 + 自包含 `.orchd/` 模型，task-12-docs-roadmap）；面向**人**的安装、命令参考与故障排查使用指南见 [docs/user-manual.md](../docs/user-manual.md)；面向**skill 分发渠道**的独立引导包见 `skills/orchd/`（标准 Agent Skill，供 skills.sh / 千问广场 / Claude skills 发布用）。
 
 ## 入口协议（MUST，每 session 首读）
-1. 读本文件 `.orchd/SKILL.md`（纪律红线优先级最高，见下 SELF-HOSTED 节）。
+1. 读本文件 `.orchd/SKILL.md`（纪律红线优先级最高，见下纪律红线节）。
 2. 据此定位 `.orchd/` 资源：规则见 `.orchd/rules/`（索引 `rules/README.md`），模板见 `templates/`。
 3. 按任意命令响应的 `guidance` 字段导航下一步（知识路由 `read`/`template` + 动作路由 `command`）；遇具体问题按规则目录按需 Read。
+4. 若当前 session 经 skill 分发接入（非读本文件路径）：遵循 `skills/orchd/` 引导流程（检测 `.orchd/` → 无则自启安装 → 回到本文件）。
 
 ## Determine your mode
-- If `.orchd/` exists AND `.orchd/shared/self-hosted` marker exists -> SELF-HOSTED (this repo only)
-- If `.orchd/` exists (no marker) -> WORKER
-- If `.orchd/` does NOT exist -> BOOTSTRAP（无感安装协议与 BOOTSTRAP 细节见 `.orchd/rules/install.md`）
+- If `.orchd/` exists -> WORKER（已具备完整能力：摄入 / 纪律红线 / rules / guidance，协议一份不区分项目来源）
+- If `.orchd/` does NOT exist -> BOOTSTRAP（自启动安装，见下一节）
+- `.orchd/shared/self-hosted` marker（若存在）仅作"该项目是 orchd 自托管来源"的无害来源标记，**不是能力开关**，不改变任何行为。
+
+## BOOTSTRAP mode (new project, 自启动安装)
+
+> 宿主无 `.orchd/` 时，agent 凭本文件即可自我启动（不依赖 `.orchd/rules/install.md`，细节仍见该文件）：
+
+```bash
+git clone https://github.com/7bder/orchd-core.git
+python orchd-core/install.py . --agent
+python .orchd/__main__.py bootstrap   # 输出 schema + architect prompt + 拆解指南
+```
+
+安装后按 `bootstrap` 输出写 `.orchd/_master.json` → `validate` → `init`，项目即就绪，进入 WORKER 模式。
 
 ## WORKER mode (existing project)
 
 > **命令调用约定（零根入口，task-12-docs-roadmap）**：所有 `orchd` 命令统一用 **`python .orchd/__main__.py`** 调用——与 `orchd <子命令>` 完全等价。宿主项目根**零额外文件**、无需安装 `orchd`。
 
 > **无感引导（task-guide-seamless-guidance，2026-08-15）**：任意命令 JSON 响应自动附加 `guidance` 字段 `{step, read, template, command, hint}`——`read`（知识路由：该读的规则文件）、`template`（方法路由：该用的模板）、`command`（动作路由：下一步命令）。**据 `guidance` 逐层导航即可完成任何任务流程**（request/claim/done/review）；`guidance` 为加法式字段，不替换既有字段，也可忽略自行决策。
-## SELF-HOSTED mode
+## 纪律与协议（统一适用于所有项目）
 
-> **本节仅适用于本仓库（orchd 自托管），外部项目忽略。** 自托管 = WORKER 工作流 + 摄入/纪律协议；本仓库纪律与协议见 `.orchd/rules/`。
+> **通用性说明（mode-unify，2026-08-15）**：本节纪律红线 / 摄入协议 / rules 目录对**所有项目一视同仁**，不再区分"仅本仓库特供"。特定于 orchd 自托管仓库的**运维专属动作**（如 IDEAS 自动归档、摄入门禁巡检）对普通外部宿主项目**不要求执行**——外部项目只需遵守通用工作流纪律，无需执行自托管专属运维。
 ### 纪律红线（MUST / MUST NOT，2026-08-05 用户裁定）
 
 > 针对纪律遵守较弱的 agent 的硬约束。违反任意一条 = 事故，需人工介入，
@@ -51,16 +64,19 @@
    2026-08-14）**：摄入/注册流程由引擎强制提交——amend 前置"非摄入产物干净"
    守卫（E017 阻断）+ commit 失败可审计（commit_warning）+ `orchd intake`
    命令提交摄入产物 + `orchd status --audit-intake` 巡检未提交摄入产物。
-6. **禁止自动摄入**：摄入（intake）仅在用户明确指定时执行；不得主动摄入
-   IDEAS.md 的 pending 条目（2026-08-05 用户裁定）。
+6. **禁止自动摄入与自动写入（idea-write-gate，2026-08-15 扩展）**：摄入（intake）仅在用户明确指定时执行；不得主动摄入 IDEAS.md 的 pending 条目（2026-08-05 用户裁定）。灵感写入同样受限——对话讨论产生的灵感不得直接写 pending：agent 只能 `idea propose` 记入 study（论证中），**confirm/drop 仅用户可执行**（2026-08-15 用户裁定，把"值不值得做"的判断权交还用户）。
 7. **禁止在任务分支执行 intake/amend**：intake/amend 只在 main 且工作区
    干净时执行（引擎 not_on_main 兜底存在，但不得依赖）。
 8. **禁止手改 .orchd 运行时文件**：`_ledger.jsonl`、`_checkpoint.json`、
    `mod-*/spec.json` 等运行时状态由引擎维护，agent 一律不得手改。
-9. **禁止绕过 claim**：任务必须经 `python .orchd/__main__.py claim` 由引擎建分支；禁止手动
-   `git branch/checkout` 创建任务分支（含不规范命名，如 task/task-1——
-   2026-08-05 实踩：绕过 claim 手动建分支，实现悬空未 merge）。
-10. **禁止任务悬空**：claim 后必须走完 done → 双阶段审查 → merge；
+9. **版本进发先落地再摄入（intake-dual-path，2026-08-15）**：进入新版本规划时，
+   先把 ROADMAP 规划章节用 `python .orchd/__main__.py roadmap-land <版本>` 落地为
+   IDEAS pending 条目，再走摄入拆解；`validate` 以 E031 兜底检出带 id 且未落地的
+   规划章节。无规划的临时想法可直接写入 IDEAS.md 走摄入，不必落地。
+10. **禁止绕过 claim**：任务必须经 `python .orchd/__main__.py claim` 由引擎建分支；禁止手动
+    `git branch/checkout` 创建任务分支（含不规范命名，如 task/task-1——
+    2026-08-05 实踩：绕过 claim 手动建分支，实现悬空未 merge）。
+11. **禁止任务悬空**：claim 后必须走完 done → 双阶段审查 → merge；
     中断/放弃必须先 retract，不得让任务停在 claimed/pending 且实现悬空
     （2026-08-05 实踩：task-amend-branch-guard-patch 实现悬空、
     task-merge-audit-workflow 实现未提交）。

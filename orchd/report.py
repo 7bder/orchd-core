@@ -272,18 +272,27 @@ def watchdog(
     tasks: list[dict[str, Any]],
     timeout_min: int = 60,
 ) -> dict[str, Any]:
-    """巡检：检测两类僵死任务。
+    """巡检：检测两类僵死任务 + L2 session 锁僵死锁清理。
 
-    两类僵死：
+    两类僵死任务：
     - implementer（实现者僵死）：任务处于 claimed 状态且超过 timeout 分钟，
       说明实现者认领后长时间未交付。
     - reviewer（审查者僵死）：任务处于 in_review 状态、存在 review_claimed_by
       且超过 timeout 分钟，说明审查者认领评审后长时间未给出结论。
 
+    L2 session 锁：判定「审查中锁 ≠ 僵死锁」——锁有效（未超时）时核对
+    「锁持有者 agent_id + 活跃任务」：
+    - 持有者有进行中的实现（claimed_by == 持有者 && claimed）或审查
+      （review_claimed_by == 持有者 && in_review）→ 活锁，报告不释放；
+    - 持有者已无活跃任务 → 会话已结束但锁未释放（僵死锁），立即释放
+      （reason=no_active_task，即使锁年龄未达 timeout）；
+    - 锁已超时（timeout 自动释放锁）→ 释放（reason=timeout）。
+
     判定依据来自 ledger 中 CLAIMED / REVIEW_CLAIMED 事件的时间戳。
 
     Returns:
-        JSON 含 stuck 列表 + stuck_kind。exit code 由 CLI 层决定。
+        JSON 含 stuck 列表 + stuck_kind + session_lock 巡检结果。
+        exit code 由 CLI 层决定。
     """
     state = store.replay()
     now = datetime.now(timezone.utc)
@@ -349,16 +358,40 @@ def watchdog(
                 })
 
     # L2 session 锁巡检：超时自动释放僵死锁
+    # 判定语义（审查中锁 ≠ 僵死锁）：锁有效（未超时）时，不能仅凭锁年龄判活，
+    # 必须核对「锁持有者(agent_id) + 活跃任务」——
+    #   活跃实现   : status == claimed 且 claimed_by == 持有者
+    #   活跃审查   : status == in_review 且 review_claimed_by == 持有者
+    # 持有者仍有进行中的实现/审查 → 活锁（审查中锁），报告但不释放；
+    # 持有者已无活跃任务 → 会话已结束但锁未释放（僵死锁，如已交付实现者
+    # 遗留的年轻锁），即使未超时也立即释放，避免误触发 E019 workspace_busy。
     session_lock_stale: dict[str, Any] | None = None
     check = session_lock_check(store.orchd_dir, timeout_min=timeout_min)
     if check.get("locked"):
-        # 锁有效且未超时（在 watchdog 的 timeout_min 内）：报告但不释放
-        session_lock_stale = {
-            "status": "active",
-            "agent_id": check.get("agent_id"),
-            "branch": check.get("branch"),
-            "age_min": round(check.get("age_min", 0), 1),
-        }
+        lock_agent = check.get("agent_id")
+        has_active_task = any(
+            (t.claimed_by == lock_agent and t.status == "claimed")
+            or (t.review_claimed_by == lock_agent and t.status == "in_review")
+            for t in state.values()
+        )
+        if not has_active_task:
+            # 锁持有者已无活跃任务：会话已结束但锁未释放 → 立即释放（僵死锁）
+            release = session_lock_release(store.orchd_dir)
+            session_lock_stale = {
+                "status": "released",
+                "reason": "no_active_task",
+                "agent_id": lock_agent,
+                "age_min": round(check.get("age_min", 0), 1),
+                "release_result": release,
+            }
+        else:
+            # 持有者仍有进行中的实现或审查：审查中锁 ≠ 僵死锁，报告但不释放
+            session_lock_stale = {
+                "status": "active",
+                "agent_id": lock_agent,
+                "branch": check.get("branch"),
+                "age_min": round(check.get("age_min", 0), 1),
+            }
     elif check.get("reason") == "timeout":
         # 锁已超时：自动释放
         release = session_lock_release(store.orchd_dir)

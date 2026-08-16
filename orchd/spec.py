@@ -650,7 +650,11 @@ def _exact_ref_match(ref_id: str, title: str) -> bool:
 def _check_idea_reference(
     tid: str, task_idx: int, ref_id: str, ideas_path: Path
 ) -> list[ValidationError]:
-    """核对 IDEAS.md：存在 ``## YYYY-MM-DD <标题>`` 且引用 id 匹配（精确词）、status 为 pending。"""
+    """核对 IDEAS.md：存在 ``## YYYY-MM-DD <标题>`` 且引用 id 匹配（精确词）、status 为 pending。
+
+    idea-write-gate（2026-08-15）：status 仅 ``pending`` 可作为任务来源；``study``
+    （论证中，idea propose 写入）不可作为任务来源——须先 confirm 升 pending 才能引用。
+    """
     errors: list[ValidationError] = []
     text = ideas_path.read_text(encoding="utf-8")
     # 解析条目：## 标题行 + 后续行中的 status 字段（支持 "- status: pending" 列表格式）
@@ -727,6 +731,70 @@ def _check_roadmap_reference(
             )
         )
     return errors
+
+
+def _parse_roadmap_sections(text: str) -> list[dict[str, Any]]:
+    """解析 ROADMAP.md 的 ``## 版本 · 标题（id: xxx）`` 章节头（roadmap-land / validate 兜底复用）。
+
+    Returns:
+        [{version, header, id, historical}]：version 为章节头首个词（如 ``1.3``）；
+        id 为 ``id: xxx`` 内的 id（无则 None）；historical 为标题含"历史"。
+    """
+    import re as _re
+
+    sections: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            continue
+        header = stripped[3:].strip()
+        tokens = header.split()
+        version = tokens[0] if tokens else ""
+        id_m = _re.search(r"id:\s*([\w-]+)", header)
+        sections.append({
+            "version": version,
+            "header": header,
+            "id": id_m.group(1) if id_m else None,
+            "historical": "历史" in header,
+        })
+    return sections
+
+
+def _find_workspace_file(orchd_dir: Path, name: str) -> Path | None:
+    """在 .orchd 布局先、根布局次的顺序定位 IDEAS/ROADMAP（不依赖 ledger，spec 保持零依赖）。"""
+    in_orchd = orchd_dir / name
+    if in_orchd.is_file():
+        return in_orchd
+    root = orchd_dir.parent / name
+    return root if root.is_file() else None
+
+
+def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
+    """validate 落地兜底（intake-dual-path）：带 id 且非历史的规划章节须有 IDEAS 落地条目。
+
+    IDEAS 落地判据：IDEAS.md 存在引用该章节的条目（detail 含 ``§版本``）。缺失 → warning
+    （不判 invalid，对齐 E022/E023/E024 质量告警语义）。ROADMAP.md 缺失时返回空（跳过）。
+    """
+    roadmap = _find_workspace_file(orchd_dir, "ROADMAP.md")
+    if roadmap is None:
+        return []
+    ideas = _find_workspace_file(orchd_dir, "IDEAS.md")
+    ideas_text = ideas.read_text(encoding="utf-8") if ideas is not None else ""
+    warnings: list[dict[str, Any]] = []
+    for sec in _parse_roadmap_sections(roadmap.read_text(encoding="utf-8")):
+        if sec["historical"] or not sec["id"]:
+            continue
+        if f"§{sec['version']}" in ideas_text:
+            continue
+        warnings.append({
+            "code": "E031",
+            "path": f"roadmap §{sec['version']}",
+            "message": (
+                f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
+                "IDEAS.md 缺引用该章节的 detail；可运行 `orchd roadmap-land <版本>` 落地"
+            ),
+        })
+    return warnings
 
 
 def _runs_pytest(verify_cmd: str) -> bool:

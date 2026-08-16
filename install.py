@@ -46,6 +46,20 @@ _USER_PATHS = {
 
 _MODE_LABEL = {"install": "安装", "update": "升级", "force": "覆盖安装"}
 
+# AGENTS.md 入口指针（安装器维护）：供"不扫隐藏目录、无 orchd skill"的
+# 新 agent 在宿主根直接发现引擎入口 .orchd/SKILL.md。
+_AGENTS_MARKER = "<!-- orchd: agent 入口指针"
+_AGENTS_POINTER = """<!-- orchd: agent 入口指针（由 orchd 安装器维护；如需自定义请保留该标记以免重复追加） -->
+# AI agents
+
+本项目使用 [orchd](https://github.com/7bder/orchd-core) 编排 AI agent 任务协作。
+
+- 每个 AI agent 进场请先读 `.orchd/SKILL.md`（协议入口，含纪律红线与 guidance 导航）
+- 引擎命令统一用 `python .orchd/__main__.py <子命令>`
+- 具体规则按需读 `.orchd/rules/`（索引 `rules/README.md`）
+<!-- /orchd -->
+"""
+
 
 def _enable_utf8_stdio() -> None:
     """Windows 控制台按 GBK 解码 UTF-8 中文会乱码，强制 stdout 重配为 UTF-8。"""
@@ -120,11 +134,14 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         _mk_skeleton(orchd)
         mode = "install"
 
+    agents_entry = _ensure_agents_entry(host)
+
     return {
         "installed": True,
         "mode": mode,
         "host": str(host),
         "orchd_dir": str(orchd),
+        "agents_entry": agents_entry,
         "next": "python .orchd/__main__.py bootstrap 或 validate 开始使用",
     }
 
@@ -133,6 +150,27 @@ def _mk_skeleton(orchd: Path) -> None:
     """创建工作区骨架（shared/ 共享上下文 + proposals/ 提案目录）。"""
     (orchd / "shared").mkdir(exist_ok=True)
     (orchd / "proposals").mkdir(exist_ok=True)
+
+
+def _ensure_agents_entry(host: Path) -> str:
+    """确保宿主根 AGENTS.md 含 orchd 入口指针（幂等）。
+
+    供"不扫隐藏目录、无 orchd skill"的新 agent 进场后能直接发现引擎入口
+    ``.orchd/SKILL.md``。安装/升级/覆盖每次运行都会确保其存在：
+    - 无 AGENTS.md → 新建（created）
+    - 有但无 orchd 标记 → 末尾追加（appended，保留宿主已有内容）
+    - 已有 orchd 标记 → 不动（exists，幂等）
+    """
+    agents = host / "AGENTS.md"
+    if agents.exists():
+        text = agents.read_text(encoding="utf-8")
+        if _AGENTS_MARKER in text:
+            return "exists"
+        with agents.open("a", encoding="utf-8") as f:
+            f.write("\n\n" + _AGENTS_POINTER)
+        return "appended"
+    agents.write_text(_AGENTS_POINTER, encoding="utf-8")
+    return "created"
 
 
 def main(argv: list[str] | None = None) -> int:

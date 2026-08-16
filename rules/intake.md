@@ -2,6 +2,18 @@
 
 > 原 .orchd/SKILL.md「摄入协议 v2」+「任务拆解粒度启发式」，外置自 task-skill-hub-refactor。
 
+> **双路径（intake-dual-path，2026-08-15）**：摄入有两条合规入口，按是否已有明确规划分流——
+> **有规划**：先 `python .orchd/__main__.py roadmap-land <版本>` 把 ROADMAP 规划章节落地为 IDEAS pending 条目，再走本协议的拆解 / 查重 / 注册流程；
+> **无规划（临时想法）**：直接写入 IDEAS.md 为 pending 条目，再走本协议的拆解 / 查重 / 注册流程。
+> 两条路径最终汇合于「IDEAS pending → 拆解草案 → 任务池」；roadmap-land 由引擎兜底校验（validate E031 检出未落地规划章节）。
+
+> **写入门禁（idea-write-gate，2026-08-15）**：对话讨论产生的灵感不直接写 pending，先经 4 步流程——
+> ① 讨论：对话中沉淀灵感与可行性论证；
+> ② `python .orchd/__main__.py idea propose --title <t> --feasibility <论证>`：agent 将灵感**追加为 status: study 条目**（记入 IDEAS.md，非 pending）；
+> ③ 用户裁决：`idea confirm --title <t>` 升 pending，或 `idea drop --title <t>` 丢弃（**仅用户可执行 confirm/drop**，agent 不得代行）；
+> ④ 摄入：confirm 后的 pending 条目走本协议拆解 / 查重 / 注册流程。
+> 原因：把"谁做、值不值得做"的判断权交还用户，避免 agent 自作主张把论证中的灵感直接推入任务池。engine 已实现（idea 子命令组 + study 状态），本协议为流程契约。
+
 > 本协议 = 双闸门（闸门一：草案人工确认"做什么"；闸门二：claim 确认"谁做"）。
 > 设计依据：docs/self-hosting-design-merged.md §4.3。约定层实现，引擎/schema 零改动；引擎化（`orchd proposal/confirm` 命令 + 状态机"待确认"态）评估留待 v1.2（触碰 §9.1 边界）。
 

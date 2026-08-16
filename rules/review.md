@@ -10,7 +10,6 @@
 - 领审查前两项自查（引擎已覆盖核心阻断，此为双重保险）：
   - `python .orchd/__main__.py status` 中不存在本 session 实现 ID 名下的 claimed 任务（busy 检查按 ID 判定，换 ID 即可绕过，故必须先自查）
   - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 跳过该任务
-- 任务 completed 后，把实现者 ID 回写对应 IDEAS 条目 notes（弥补共享 reviewer-1 导致的审计缺口）。**责任方：完成 code review APPROVED 的 reviewer session**——在 APPROVED 后立即从 `python .orchd/__main__.py status` 读取该任务 `claimed_by`，写入对应 IDEAS 条目 notes（注明 `{agent_id}，reviewer-1 审查通过`），不再依赖人工/专门 commit
 - **code review APPROVED 后必须运行 merge audit 验证**：提交 code APPROVED 且 merge 成功（任务进入 completed）后，立即运行 `python .orchd/__main__.py status --audit-merge`，确认 `merge_audit.warnings` 为空（零告警）。若有告警（completed 任务对应分支仍悬空未入 main），立即在当前 reviewer session 内 cherry-pick 修复并重新验证，不得将漏 merge 遗留到下游
 
 ## 清单化模板与证据分层（M2-2，2026-08-06；证据分层 2026-08-08）

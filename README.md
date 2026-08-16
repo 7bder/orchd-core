@@ -11,6 +11,12 @@ orchd 不做需求推理、不内置 LLM 调用。它只为一个项目里的多
 
 任何平台的 agent（Claude Code / Qoder / Codex / …）只通过 `orchd` CLI 与编排系统交互，人作为最终调度器确认候选任务。
 
+> **新用户只需对 agent 说一句话：**
+>
+> > "请用 orchd 管理本项目，自动安装并完成引导。"
+>
+> agent 即自动完成：`git clone` 本仓库 → `python orchd-core/install.py . --agent` → 读 `.orchd/SKILL.md` 进入 BOOTSTRAP → `bootstrap` → 项目就绪。
+
 ---
 
 ## 核心概念
@@ -19,10 +25,15 @@ orchd 不做需求推理、不内置 LLM 调用。它只为一个项目里的多
 
 任务生命周期由 6 种状态驱动：
 
-```
-pending → claimed → done → in_review → completed
-                              ↘ CHANGES_REQUESTED → pending（打回返工）
-cancelled（强制取消）
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> claimed: claim
+    claimed --> done: done（verify 通过）
+    done --> in_review: review
+    in_review --> completed: code APPROVED + merge
+    in_review --> pending: CHANGES_REQUESTED 打回返工
+    [*] --> cancelled: 强制取消
 ```
 
 - `claimed`：已被某 agent 认领，执行中。
@@ -44,7 +55,69 @@ cancelled（强制取消）
 
 ---
 
-## 安装（源码仓库 + 安装器，零根文件模型）
+## 工作模式
+
+orchd 不是单个 agent 的助手，而是一个由**人调度、多 agent 执行、引擎兜底**的持续协作闭环。项目装好 orchd 后，任何 agent 都能进场干活，进度永远留在项目里，不在某个 agent 的会话里。
+
+```mermaid
+flowchart TD
+    A[人 调度者] -->|需求 想法| B[IDEAS.md]
+    B --> C[摄入与拆解]
+    C --> D[任务池 _master.json<br/>pending 任务集]
+    D --> E[任意 agent 进场<br/>读 SKILL.md → 三连检查]
+    E --> F[request → claim<br/>建 task/id 分支]
+    F --> G[实现 → done<br/>verify 自动校验]
+    G --> H[双阶段审查<br/>spec → code reviewer-1]
+    H --> I[merge 入 main → completed]
+    I -->|新想法 新版本| B
+```
+
+需求进、任务出，实现并审查后合入 main，再循环迭代。三方各司其职：
+
+| 角色 | 职责 |
+|------|------|
+| **人（调度者）** | 放需求/想法、确认摄入、裁决候选任务与审查结论 |
+| **agent（执行者）** | 任意平台，读 SKILL 自助接入，request / claim / 实现 / done / review |
+| **引擎（orchd）** | 事件溯源账本、文件锁、依赖感知任务池、两阶段审查、merge 自动化、guidance 导航 |
+
+三种进入模式：**BOOTSTRAP**（新项目安装，见下）→ **WORKER**（日常任务工作流）→ **SELF-HOSTED**（orchd 自托管，含摄入与纪律协议，仅主项目）。
+
+### 特性：任意 agent 随时接入、换 agent 接续执行
+
+这是工作模式里最值得说的一点：**今天 A agent 做了一半，明天换 B agent，接着做就行，进度不丢、不用重装、不挑平台。**
+
+```mermaid
+flowchart TD
+    A[agent A 领 task-x<br/>实现一半 分支 task/task-x]
+    A --> B[A 换走 中断 任务交接]
+    B --> C[agent B 进场 不同平台/LLM<br/>读 .orchd/SKILL.md → 三连检查 → orchd status]
+    C --> D[看到 task-x<br/>claimed by A 无 DONE]
+    D --> E[接管 查 ledger 断点<br/>清僵死锁 → retract A 的 claim]
+    E --> F[重新 claim → 从断点继续实现]
+    F --> G[done → 审查 → merge]
+```
+
+为什么能做到：
+
+- **进度在 `.orchd/` 不在 agent 内存**——任务状态全部写入事件溯源账本（`_ledger.jsonl`）与任务分支（`task/{id}`），任何 agent 进场跑一次 `status` 就能重建全局视图，换人零丢失
+- **不挑 agent、不挑 LLM**——agent 只通过 orchd CLI 交互（JSON 输出），`.orchd/SKILL.md` 是纯文本协议，任何平台都能读；不写平台专属插件
+- **换手三态**：A 中断（B 接管续作）/ A 完成（B 领新任务或审 A 的任务）/ A 半途交接（B 从断点续作）
+
+---
+
+## 一句话接入（给 agent 的指令，推荐）
+
+在项目 README.md 顶部放这一行，任何 agent 进场后自动完成安装，无需人工操作：
+
+```markdown
+> 🤖 AI agents: 用 orchd 管理本项目。如果 .orchd/ 不存在，请自动安装：
+> git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+> 然后读 .orchd/SKILL.md 按 guidance 导航。
+```
+
+agent 会自主完成：`git clone` 本仓库 → `python orchd-core/install.py . --agent` → 读 `.orchd/SKILL.md` 进入 BOOTSTRAP → `bootstrap` → `validate` → `init` → 项目就绪。全程**无感**：宿主项目根零额外文件、无需安装 `orchd`、无需配置 PATH。
+
+## 手动安装（源码仓库 + 安装器，零根文件模型）
 
 要求 Python >= 3.10，依赖仅 `jsonschema`。
 
@@ -66,12 +139,17 @@ python .orchd/__main__.py --version
 
 安装后 `python .orchd/__main__.py <子命令> ...` 与 `orchd <子命令> ...` 完全等价——无需安装、不依赖 PATH、宿主项目根零额外文件。
 
+> **新 agent 入口发现**：安装器每次运行都会确保宿主根存在 `AGENTS.md`（无则新建、有则追加，幂等），内容指向 `.orchd/SKILL.md`。这让不扫隐藏目录、无 orchd skill 的新 agent 在宿主根即可发现引擎入口。
+
+> **skill 分发（orchd 引导 Skill）**：主项目另附标准 Agent Skill 包 `skills/orchd/`（开放 Agent Skills 标准，SKILL.md + references/），供发布到 skills.sh / 千问广场 / Claude skills 等渠道。agent 安装该 skill 后即可在任何项目自主引导接入本套件。
+
 ---
 
 ## 快速开始：为你的新项目启动 orchd 托管
 
-1. 用安装器把 orchd-core 源码安装到项目根（见上 §安装），在项目根放 `requirements.md`（任意来源需求文档）。
-2. 首个 agent 读 `.orchd/SKILL.md` 进入 **BOOTSTRAP 模式**：
+1. **一句话接入**：在项目 README.md 顶部放上面的 agent 指针，首个 agent 进场后自动完成安装（或手动 `python orchd-core/install.py ./你的项目`）。
+2. 在项目根放 `requirements.md`（任意来源需求文档，人写的 / AI 对话生成 / 现有 PRD）。
+3. 首个 agent 读 `.orchd/SKILL.md` 进入 **BOOTSTRAP 模式**：
 
 ```bash
 python .orchd/__main__.py bootstrap            # 输出 schema + architect prompt + 分解指南
@@ -80,8 +158,8 @@ python .orchd/__main__.py validate .orchd/_master.json   # 结构 + 引用 + 质
 python .orchd/__main__.py init                 # 生成 mod-*/spec.json 快照 + 空 ledger + checkpoint
 ```
 
-3. 写项目共享上下文 `.orchd/shared/architecture.md` 与 `.orchd/shared/conventions.md`。
-4. agent 进入工作流：`python .orchd/__main__.py request → claim → 实现 → done → review`（见下方命令）。
+4. 写项目共享上下文 `.orchd/shared/architecture.md` 与 `.orchd/shared/conventions.md`。
+5. agent 进入工作流：`python .orchd/__main__.py request → claim → 实现 → done → review`（见下方命令）。每一步的下一步动作由命令响应的 `guidance` 字段自动提示，无需记命令。
 
 ---
 

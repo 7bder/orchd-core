@@ -315,6 +315,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md / ROADMAP.md）并校验状态合法性")
     p.set_defaults(func=_cmd_intake)
 
+    # roadmap-land（2026-08-15 intake-dual-path）：ROADMAP 规划章节 → IDEAS pending 落地
+    p = sub.add_parser("roadmap-land", help="为 ROADMAP 规划章节生成 IDEAS pending 落地条目")
+    p.add_argument("version", help="规划章节版本（如 1.3，匹配 ROADMAP ## 版本 章节头）")
+    p.set_defaults(func=_cmd_roadmap_land)
+
+    # idea（2026-08-15 idea-write-gate）：灵感写入 IDEAS 写入门禁（propose / confirm / drop）
+    p = sub.add_parser("idea", help="灵感写入 IDEAS 写入门禁：propose 记入 study，confirm/drop 裁决")
+    idea_sub = p.add_subparsers(dest="idea_action", required=True)
+
+    _p = idea_sub.add_parser("propose", help="为灵感追加 status: study 条目到 IDEAS.md（agent 执行）")
+    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.add_argument("--feasibility", required=True, help="可行性论证（写入 - 论证: 字段）")
+    _p.set_defaults(func=_cmd_idea_propose)
+
+    _p = idea_sub.add_parser("confirm", help="将 status: study 条目升为 pending（仅用户执行）")
+    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.set_defaults(func=_cmd_idea_confirm)
+
+    _p = idea_sub.add_parser("drop", help="将 status: study 条目降为 dropped（仅用户执行）")
+    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.set_defaults(func=_cmd_idea_drop)
+
     return parser
 
 
@@ -425,7 +447,13 @@ def _cmd_validate(args) -> dict:
     import re
 
     from orchd.ledger import Store
-    from orchd.spec import load_master, validate_quality, validate_references, validate_structure
+    from orchd.spec import (
+        load_master,
+        roadmap_landing_warnings,
+        validate_quality,
+        validate_references,
+        validate_structure,
+    )
 
     master = load_master(args.path)
     structure_errors = validate_structure(master) + validate_references(master)
@@ -451,16 +479,26 @@ def _cmd_validate(args) -> dict:
 
     quality_warnings = [e for e in quality_warnings if _keep_quality_warning(e)]
 
+    # intake-dual-path（2026-08-15）：ROADMAP 规划章节落地兜底（E031 告警，不判 invalid）。
+    # 独立追加：E031 非任务级质量项，不参与终态豁免过滤；dict 结构，与 ValidationError 并存。
+    quality_warnings += roadmap_landing_warnings(Path(args.path).parent)
+
+    def _warn_dict(e) -> dict:
+        """把 ValidationError 或告警 dict 归一化为输出结构（含 roadmap-land E031 dict）。"""
+        if isinstance(e, dict):
+            return {"code": e.get("code"), "path": e.get("path"), "message": e.get("message")}
+        return {"code": e.code.name, "path": e.path, "message": e.message}
+
     if structure_errors:
         return {
             "valid": False,
             "errors": [{"code": e.code.name, "path": e.path, "message": e.message} for e in structure_errors],
-            "warnings": [{"code": e.code.name, "path": e.path, "message": e.message} for e in quality_warnings],
+            "warnings": [_warn_dict(e) for e in quality_warnings],
         }
     return {
         "valid": True,
         "errors": [],
-        "warnings": [{"code": e.code.name, "path": e.path, "message": e.message} for e in quality_warnings],
+        "warnings": [_warn_dict(e) for e in quality_warnings],
     }
 
 
@@ -919,7 +957,7 @@ def _cmd_review(args) -> dict:
     返回: 审查事件信息。
     """
     from orchd.ledger import Store
-    from orchd.onboard import review_submit
+    from orchd.review import review_submit
 
     comments = _resolve_text_arg(
         args.comments, args.comments_file, "--comments", "--comments-file",
@@ -1068,6 +1106,54 @@ def _cmd_intake(args) -> dict:
 
     orchd_dir = _find_orchd_dir()
     return intake_commit(orchd_dir.parent)
+
+
+def _cmd_roadmap_land(args) -> dict:
+    """为 ROADMAP 规划章节生成 IDEAS pending 落地条目（intake-dual-path）。
+
+    CLI 参数: args.version — 规划章节版本（如 1.3）。
+    返回: 落地结果字典（landed / version / section_id / commit）。
+    """
+    from orchd.intake import roadmap_land
+
+    orchd_dir = _find_orchd_dir()
+    return roadmap_land(orchd_dir.parent, args.version)
+
+
+def _cmd_idea_propose(args) -> dict:
+    """为灵感追加 status: study 条目到 IDEAS.md（idea-write-gate，agent 执行）。
+
+    CLI 参数: args.title / args.feasibility。
+    返回: 提案结果字典（proposed / title / commit）。
+    """
+    from orchd.intake import idea_propose
+
+    orchd_dir = _find_orchd_dir()
+    return idea_propose(orchd_dir.parent, args.title, args.feasibility)
+
+
+def _cmd_idea_confirm(args) -> dict:
+    """将 status: study 条目升为 pending（idea-write-gate，仅用户执行）。
+
+    CLI 参数: args.title。
+    返回: 确认结果字典（confirmed / title / new_status / commit）。
+    """
+    from orchd.intake import idea_confirm
+
+    orchd_dir = _find_orchd_dir()
+    return idea_confirm(orchd_dir.parent, args.title)
+
+
+def _cmd_idea_drop(args) -> dict:
+    """将 status: study 条目降为 dropped（idea-write-gate，仅用户执行）。
+
+    CLI 参数: args.title。
+    返回: 丢弃结果字典（dropped / title / new_status / commit）。
+    """
+    from orchd.intake import idea_drop
+
+    orchd_dir = _find_orchd_dir()
+    return idea_drop(orchd_dir.parent, args.title)
 
 
 def _cmd_status(args) -> dict:
