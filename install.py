@@ -26,8 +26,11 @@ import shutil
 import sys
 from pathlib import Path
 
-# 资源根：本脚本所在目录的父目录（orchd-core 源码根）
-RESOURCE_ROOT = Path(__file__).resolve().parent.parent
+# 资源根：本脚本所在目录的父目录（orchd-core 源码根）。
+# 自适应两种布局：主项目内脚本位于 release/ 子目录（资源根在 parent.parent），
+# 发布到 orchd-core 后脚本位于根目录（扁平布局，资源根即 parent）。
+_SELF_DIR = Path(__file__).resolve().parent
+RESOURCE_ROOT = _SELF_DIR if (_SELF_DIR / "orchd").is_dir() else _SELF_DIR.parent
 
 # 组装进 .orchd/ 的内容清单（与 scripts/sync_orchd_core.sh / scripts/verify_release_self_contained.py 对齐）
 ENGINE_DIR = RESOURCE_ROOT / "orchd"
@@ -76,6 +79,14 @@ def _find_first(candidates: list[Path]) -> Path:
     raise FileNotFoundError(f"缺失资源: {candidates[0]}")
 
 
+def _resolve(src_name: str) -> Path:
+    """解析资源源路径，兼容主项目(带 .orchd/)与 orchd-core 扁平布局(rules 在根)两种形态。"""
+    p = RESOURCE_ROOT / src_name
+    if src_name == ".orchd/rules" and not p.is_dir():
+        p = RESOURCE_ROOT / "rules"
+    return p
+
+
 def _copy_tree(src: Path, dst: Path) -> None:
     """整目录拷贝（dst 已存在则先清空再拷贝，避免残留陈旧文件）。"""
     if dst.exists():
@@ -96,7 +107,7 @@ def _assemble_assets(orchd: Path) -> None:
     _copy_tree(ENGINE_DIR, orchd / "orchd")
     # schema / templates 资源
     for src_name, dst_name in RESOURCE_DIRS:
-        _copy_tree(RESOURCE_ROOT / src_name, orchd / dst_name)
+        _copy_tree(_resolve(src_name), orchd / dst_name)
     # docs/ 单文档
     for sub, name in RESOURCE_FILES:
         shutil.copy2(RESOURCE_ROOT / sub / name, orchd / "docs" / name)
