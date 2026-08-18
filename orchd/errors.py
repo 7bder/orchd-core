@@ -1,7 +1,7 @@
 """Orchd 统一错误处理模块。
 
 本模块提供三个核心组件：
-- ErrorCode 枚举：定义 E001-E015 共 15 个错误码。
+- ErrorCode 枚举：定义 E001-E030 + E033 共 31 个错误码（E031/E032 为告警/拒绝码，不入枚举）。
 - OrchdError 异常类：携带错误码、人类可读消息及结构化详情的业务异常基类。
 - to_json_response 格式化函数：将 OrchdError 转换为 CLI 统一 JSON 错误响应字典。
 
@@ -15,7 +15,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """30 个错误码。"""
+    """31 个错误码（E001-E030 + E033）。"""
 
     E001 = "file_not_found"
     E002 = "invalid_json"
@@ -49,6 +49,7 @@ class ErrorCode(Enum):
     E028 = "dry_run_assertion_mismatch"
     E029 = "granularity_overflow"  # 任务拆解粒度越界（R4，warning 级）
     E030 = "runtime_file_integrity"  # 运行时文件完整性校验失败（红线 8 R3，warning 级）
+    E033 = "session_identity_missing"  # 写命令需会话身份，但宿主未注入 ORCHD_SESSION_ID（session-id-fingerprint）
 
 
 class OrchdError(Exception):

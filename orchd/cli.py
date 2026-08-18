@@ -1,7 +1,8 @@
 """Orchd CLI 路由：argparse 子命令 + 统一 JSON 输出 + 错误捕获。
 
-提供 13 个子命令：validate、bootstrap、init、amend、request、pool、claim、
-done、review、retract、force-status、status、watchdog。
+提供 18 个子命令：validate、bootstrap、init、amend、request、pool、claim、
+done、review、retract、force-status、status、watchdog、ideas-archive、doctor、
+intake、roadmap-land、idea（含 propose/confirm/drop）。
 
 特性：
 - 所有命令统一输出 JSON（indent=2，ensure_ascii=False）。
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     例如 watchdog 在检测到僵死任务时返回 ``(result, 1)``。
     """
     _fix_windows_console_encoding()
+    _auto_inject_session_id()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -46,9 +49,13 @@ def main(argv: list[str] | None = None) -> int:
         # 支持命令返回 (dict, exit_code) 元组
         if isinstance(result, tuple):
             data, code = result
-            _output(_attach_guidance(data))
+            data = _attach_guidance(data)
+            _output(data)
+            _emit_guidance(data)
             return code
-        _output(_attach_guidance(result))
+        data = _attach_guidance(result)
+        _output(data)
+        _emit_guidance(data)
         return 0
     except OrchdError as exc:
         _output(to_json_response(exc))
@@ -64,6 +71,9 @@ def _attach_guidance(data: Any) -> Any:
     - **加法式**：只新增 ``guidance`` 键，不删不改既有字段（next_action 等保留）。
     - **幂等**：已有 guidance 不覆盖。
     - **best-effort**：读取 ledger / 构造引导的任何异常静默跳过，不阻塞主流程。
+    - **知识路由闭环**（task-guide-routing-loop）：附加 guidance 后透传
+      ``orchd_dir`` 调用 ``resolve_read_paths`` 过滤 read/template 路径，
+      只保留指向实际存在文件的路径，不存在时静默跳过。
 
     仅对 dict 响应生效；非 dict（如字符串/None）原样返回。
     """
@@ -79,12 +89,128 @@ def _attach_guidance(data: Any) -> Any:
         master_path = orchd_dir / "_master.json"
         tasks = load_master(master_path).tasks if master_path.exists() else []
 
-        from orchd.guide import next_guidance
-        data["guidance"] = next_guidance(state, tasks)
+        from orchd.guide import next_guidance, resolve_read_paths
+        # task-guidance-dual-view-engine：传 agent_id（_resolve_agent_id 解析）与
+        # has_master（master_path.exists()），支撑双视角与未初始化/空项目区分。
+        agent_id = _resolve_agent_id(orchd_dir)
+        has_master = master_path.exists()
+        data["guidance"] = resolve_read_paths(
+            next_guidance(state, tasks, agent_id=agent_id, has_master=has_master),
+            orchd_dir,
+        )
     except Exception:
         # best-effort：引导失败静默跳过，绝不阻塞命令主流程
         pass
     return data
+
+
+def _emit_guidance(data: Any) -> None:
+    """将 guidance 的人类可读提示块打印到 stderr（task-guide-seamless-guidance）。
+
+    设计契约：
+    - **不污染 stdout**：stdout 保持纯 JSON，供机器/agent 解析；人看的"下一步"提示块
+      打在 stderr，紧跟 JSON 之后，终端中人机同时可见。
+    - **醒目可辨**：用分隔线围成块状，一眼可区分是 orchd 系统输出而非命令结果。
+    - **best-effort**：非 dict / 无 guidance / 无 hint 时静默跳过，不影响主流程。
+    - **可配置开关**（task-guide-block-config）：config.guidance_stderr 为 false 时
+      跳过提示块打印；缺失/读取失败回退默认 true（向后兼容）。
+    """
+    if not isinstance(data, dict):
+        return
+    g = data.get("guidance")
+    if not isinstance(g, dict):
+        return
+    hint = g.get("hint")
+    if not hint:
+        return
+    if not _guidance_stderr_enabled():
+        return
+    command = g.get("command") or "<无命令>"
+    sep = "─" * 40
+    lines = [
+        "",
+        sep,
+        f"orchd ▸ {hint}",
+        f"建议执行：{command}",
+        sep,
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr)
+
+
+def resolve_guidance_paths(
+    guidance: dict[str, Any] | None,
+    orchd_dir: Path | None = None,
+) -> dict[str, Any]:
+    """将 guidance 的 read/template 路径解析为实际存在的文件条目（知识路由闭环）。
+
+    知识路由闭环的 agent 侧解析接口（task-guide-routing-loop）：agent 收到
+    guidance 后按 ``read`` 数组读规则文件、按 ``template`` 数组加载模板。
+    ``resolve_read_paths`` 已把两数组过滤为实际存在的路径；本接口进一步把每条
+    路径解析为**可读文件条目**（绝对路径 + 是否存在），供 agent 直接据以读取，
+    不要求引擎在此处自动读取文件内容（只提供可解析的路由数据，读取由 agent
+    按需进行）。
+
+    契约：
+    - 返回值与 guidance 同构：``{read: [{path, abs_path, exists}], template: [...]}``；
+      guidance 为空 / 缺键时对应数组为空（无害，向下兼容）。
+    - 空数组 / orchd_dir 缺失时原样返回空结构，不抛异常（best-effort）。
+
+    Args:
+        guidance: 含 read/template 数组的 guidance 字典（可为 None）。
+        orchd_dir: 规则/模板根目录（.orchd/）；None 时自动查找。
+
+    Returns:
+        解析后的 read/template 文件条目字典。
+    """
+    if orchd_dir is None:
+        orchd_dir = _find_orchd_dir()
+    root = str(orchd_dir)
+    parent = str(orchd_dir.parent)
+
+    def _entries(paths: list[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for p in paths:
+            if os.path.isabs(p):
+                abs_path = p
+            else:
+                candidate = os.path.join(root, p)
+                if not os.path.isfile(candidate):
+                    candidate = os.path.join(parent, p)
+                abs_path = candidate
+            out.append({
+                "path": p,
+                "abs_path": abs_path,
+                "exists": os.path.isfile(abs_path),
+            })
+        return out
+
+    g = guidance or {}
+    return {
+        "read": _entries(g.get("read") or []),
+        "template": _entries(g.get("template") or []),
+    }
+
+
+def _guidance_stderr_enabled() -> bool:
+    """读取 config.guidance_stderr 决定是否打印 stderr 提示块（task-guide-block-config）。
+
+    契约：
+    - 默认 true：config 缺失、键缺失或读取失败时回退 true（向后兼容，不影响旧项目）。
+    - 显式 false：跳过提示块打印，stdout 纯 JSON 契约不受影响。
+    """
+    try:
+        from orchd.spec import load_master
+
+        orchd_dir = _find_orchd_dir()
+        master_path = orchd_dir / "_master.json"
+        if not master_path.exists():
+            return True
+        master = load_master(master_path)
+        return bool(master.config.get("guidance_stderr", True))
+    except Exception:
+        # best-effort：读取失败回退默认 true，绝不阻塞主流程
+        return True
 
 
 def _output(data: Any) -> None:
@@ -109,6 +235,22 @@ def _fix_windows_console_encoding() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (ValueError, OSError):
                 pass
+
+
+# TRAE 宿主注入的每对话唯一会话码（session-id-fingerprint 宿主接入）。
+# 各 agent 宿主统一把各自会话唯一码写入 ORCHD_SESSION_ID；TRAE 已暴露
+# ICUBE_CODEMAIN_SESSION（UUID），此处在其缺省时自动搬运，TRAE 场景开箱即用；
+# codex / opencode / workbuddy 等由各自接入层注入同名变量。
+_TRAE_SESSION_ID_ENV = "ICUBE_CODEMAIN_SESSION"
+
+
+def _auto_inject_session_id() -> None:
+    """宿主会话身份自动注入：若 ORCHD_SESSION_ID 未设置，则用 TRAE 会话码兜底。"""
+    if os.environ.get("ORCHD_SESSION_ID"):
+        return
+    trae_sid = os.environ.get(_TRAE_SESSION_ID_ENV)
+    if trae_sid:
+        os.environ["ORCHD_SESSION_ID"] = trae_sid
 
 
 def _resolve_text_arg(
@@ -218,10 +360,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # request
     p = sub.add_parser("request", help="获取下一个候选任务")
-    p.add_argument("--agent", required=True)
     p.add_argument("--capabilities", nargs="*")
     p.add_argument("--exclude", nargs="*")
-    p.add_argument("--role", default="implementer", choices=["implementer", "reviewer"])
     p.add_argument("--sort", choices=["importance", "downstream", "hours"])
     p.add_argument("--auto-claim", action="store_true",
                    help="request 成功返回候选后自动执行 claim（绕过人工确认，适合无人值守场景）")
@@ -240,8 +380,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # claim
     p = sub.add_parser("claim", help="认领任务")
     p.add_argument("--task", required=True)
-    p.add_argument("--agent", required=True)
-    p.add_argument("--role", default="implementer", choices=["implementer", "reviewer"])
     p.add_argument("--type", dest="review_type", choices=["spec", "code"],
                    help="reviewer 认领时指定审查阶段（默认锁任务当前阶段）")
     p.add_argument("--confirm", action="store_true",
@@ -253,7 +391,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # done
     p = sub.add_parser("done", help="报告任务完成")
     p.add_argument("--task", required=True)
-    p.add_argument("--agent", required=True)
     p.add_argument("--changes")
     p.add_argument("--changes-file", help="从文件读取变更描述（UTF-8），与 --changes 二选一")
     p.add_argument("--concerns")
@@ -262,7 +399,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # review
     p = sub.add_parser("review", help="提交审查结果")
     p.add_argument("--task", required=True)
-    p.add_argument("--agent", required=True)
     p.add_argument("--type", required=True, choices=["spec", "code"])
     p.add_argument("--verdict", required=True, choices=["APPROVED", "CHANGES_REQUESTED"])
     p.add_argument("--comments")
@@ -272,7 +408,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # retract
     p = sub.add_parser("retract", help="撤回事件")
     p.add_argument("--event", required=True)
-    p.add_argument("--agent", required=True)
     p.add_argument("--reason", required=True)
     p.set_defaults(func=_cmd_retract)
 
@@ -280,7 +415,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("force-status", help="强制设置任务状态")
     p.add_argument("--task", required=True)
     p.add_argument("--status", required=True)
-    p.add_argument("--agent", required=True)
     p.add_argument("--reason", required=True)
     p.add_argument("--assignee")
     p.add_argument("--force", action="store_true",
@@ -383,14 +517,70 @@ def _flatten_nargs(values: list[str] | None) -> list[str] | None:
     return out
 
 
+def _resolve_agent_id(orchd_dir: Path | None = None) -> str:
+    """解析当前会话身份：由宿主注入的 ``ORCHD_SESSION_ID`` 派生（session-id-fingerprint）。
+
+    引擎统一从 ``orchd.ledger.resolve_agent_id`` 取 agent 身份：
+    - 有 ``ORCHD_SESSION_ID`` → 确定性派生 12 位 hex 指纹（同一对话内稳定，
+      切换对话换指纹）；
+    - 无该变量 → 返回空字符串（引擎不生成、不借用、不落盘任何身份）。
+    宿主（TRAE / codex / opencode / workbuddy）在启动 orchd 前统一把各自
+    会话唯一码注入 ``ORCHD_SESSION_ID``。写命令在身份为空时由调用方拒绝。
+    """
+    from orchd.ledger import resolve_agent_id
+
+    return resolve_agent_id(orchd_dir)
+
+
+def _require_agent_id(orchd_dir: Path | None = None) -> str:
+    """解析当前会话身份；为空（宿主未注入 ORCHD_SESSION_ID）则 E033 拒绝。
+
+    供写命令（claim / done / review / retract / force-status）调用：这些命令
+    需要把身份写进事件，身份缺失时不可静默降级，须明确报错提示宿主注入会话 ID。
+    """
+    agent_id = _resolve_agent_id(orchd_dir)
+    if not agent_id:
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_identity_missing: 宿主未注入 ORCHD_SESSION_ID，无法识别当前会话身份",
+            [{
+                "agent_id": agent_id,
+                "hint": (
+                    "本命令需要会话身份。请宿主在启动 orchd 前把当前会话唯一码注入 "
+                    "ORCHD_SESSION_ID（TRAE 会话自动注入；codex/opencode/workbuddy "
+                    "由各自接入层注入），再重试"
+                ),
+            }],
+        )
+    return agent_id
+
+
+def _detect_claim_role(store, tasks: list[dict[str, Any]], task_id: str) -> str:
+    """按任务当前状态自动判定认领角色（task-fp-identity-engine）。
+
+    - in_review → reviewer（审查认领，REVIEW_CLAIMED）
+    - 其他（pending / claimed 等）→ implementer（实现认领，CLAIMED）
+    引擎据此在 claim 时省略 --role，实现按状态自动分流。
+    """
+    state = store.replay()
+    ts = state.get(task_id)
+    return "reviewer" if (ts and ts.status == "in_review") else "implementer"
+
+
 def _identity_warning(agent_id: str, orchd_dir: Path) -> dict[str, Any] | None:
     """比对 git config user.name 与 agent_id，不一致返回 E021 warning（不阻断）。
 
     git 不可用 / user.name 未配置 / 与 agent_id 一致 → 返回 None（无 warning）。
+    指纹形态身份 agent_id（12 位 hex）豁免
+    E021——指纹为自动化 agent 身份锚定，不与人名 git user.name 硬比对。
     用于写命令（claim/done/review）前的身份审计（ROADMAP 1.1 L5）：
     仅提示，不阻断状态机。
     """
     import subprocess
+
+    # 指纹形态身份 agent_id 豁免 E021（12 位 hex）
+    if _is_fingerprint_agent_id(agent_id):
+        return None
 
     try:
         proc = subprocess.run(
@@ -411,6 +601,21 @@ def _identity_warning(agent_id: str, orchd_dir: Path) -> dict[str, Any] | None:
         "agent_id": agent_id,
         "hint": "git config user.name 与 agent_id 不一致，请核对身份（SKILL.md 命名规范：{provider}-{序号}）",
     }
+
+
+def _is_fingerprint_agent_id(agent_id: str) -> bool:
+    """判断 agent_id 是否为指纹形态身份（12 位 hex）。
+
+    稳定身份指纹（``orchd.ledger.resolve_agent_id``）为 12 位
+    SHA-256 短哈希；命中即视为自动化 agent 身份，E021 豁免（不与人名比对）。
+    """
+    if not agent_id or len(agent_id) != 12:
+        return False
+    try:
+        int(agent_id, 16)
+        return True
+    except ValueError:
+        return False
 
 
 def _load_tasks(master_path: str | None = None) -> tuple[list, Path, Any]:
@@ -685,9 +890,11 @@ def _cmd_amend(args) -> dict:
 def _cmd_request(args) -> dict:
     """获取下一个可认领的候选任务。
 
-    CLI 参数: args.agent（必需）、args.capabilities、args.exclude、
-    args.role（implementer/reviewer）、args.sort（importance/downstream/hours）、
-    args.auto_claim（--auto-claim，候选返回后自动 claim）。
+    CLI 参数: args.capabilities、args.exclude、
+    args.sort（importance/downstream/hours）、args.auto_claim（--auto-claim，
+    候选返回后自动 claim）。agent 身份由引擎按宿主注入的 ORCHD_SESSION_ID
+    （session-id-fingerprint）。
+    不再有 --agent/--role。
     返回: 匹配的任务信息或空结果。--auto-claim 时附加 claim 结果（或错误）。
     """
     from orchd.ledger import Store
@@ -695,28 +902,50 @@ def _cmd_request(args) -> dict:
 
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _resolve_agent_id(orchd_dir)
+    enforce_self_review_block = bool(
+        master.config.get("enforce_self_review_block") if hasattr(master, "config") else False
+    )
     result = request(
-        store, tasks, agent_id=args.agent,
+        store, tasks, agent_id=agent_id,
         capabilities=_flatten_nargs(args.capabilities),
         exclude=_flatten_nargs(args.exclude),
-        role=args.role,
         sort_key=args.sort,
         max_active=getattr(args, "max_active", None),
         importance_thresholds=(
             (master.config.get("importance") if hasattr(master, "config") else None)
             or None
         ),
+        enforce_self_review_block=enforce_self_review_block,
     )
 
     # --auto-claim：候选非空时自动 claim（绕过人工确认）。
-    # 候选为空（含 review_priority 提示）不触发 claim，原样返回。
+    # 默认禁用：仅当 _master.json 顶层 config.allow_auto_claim 显式为 true 时，
+    # agent 才可调用 --auto-claim（用户明确授权）；否则结构化拒绝，防止无人值守
+    # agent 绕过 claim 人工确认闸门连续领任务。
+    if getattr(args, "auto_claim", False):
+        allow_auto_claim = bool(
+            (master.config.get("allow_auto_claim") if hasattr(master, "config") else False)
+        )
+        if not allow_auto_claim:
+            result["auto_claim_disabled"] = True
+            result["error"] = {
+                "code": "E032",
+                "message": "自动认领（--auto-claim）默认禁用",
+                "details": (
+                    "agent 不得擅自使用 --auto-claim 连续领任务。仅在用户明确于 "
+                    "_master.json 顶层 config.allow_auto_claim 设为 true 后才允许。"
+                ),
+            }
+            return result
     if getattr(args, "auto_claim", False) and result.get("candidate"):
         candidate_id = result["candidate"]["task_id"]
         shared = master.shared if hasattr(master, "shared") else None
         claim_result = claim(
-            store, tasks, agent_id=args.agent, task_id=candidate_id,
-            role=args.role, project_root=orchd_dir.parent, shared=shared,
+            store, tasks, agent_id=agent_id, task_id=candidate_id,
+            project_root=orchd_dir.parent, shared=shared,
             with_context=getattr(args, "with_context", False),
+            enforce_self_review_block=enforce_self_review_block,
         )
         result["auto_claimed"] = True
         result["claimed"] = claim_result
@@ -787,6 +1016,7 @@ def claim_preview(
     role: str = "implementer",
     project_root: Path | None = None,
     review_type: str | None = None,
+    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """claim 前确认闸门预览（task-claim-confirm-gate，只读，不写事件不建分支）。
 
@@ -852,6 +1082,7 @@ def claim_preview(
     if role == "reviewer":
         done_author, _ = _extract_last_done(store, task_id, derived)
         preview["done_by"] = done_author
+        is_self = bool(done_author and done_author == agent_id)
         preview["expected_checks"] = [
             {"check": "任务处于 in_review（可认领审查）",
              "expected_pass": status == "in_review"},
@@ -859,9 +1090,14 @@ def claim_preview(
              "expected_pass": agent_id in task_def.get("reviewers", [])},
             {"check": "审查阶段与当前 review_phase 匹配",
              "expected_pass": (not review_type) or review_type == current_phase},
-            {"check": "非自审（E016：实现者 ≠ 审查者）",
-             "expected_pass": not (done_author and done_author == agent_id)},
         ]
+        # 自审（E016）降级为提示项：默认不阻断，仅标注；enable 时才作为检查生效
+        if is_self:
+            preview["expected_checks"].append({
+                "check": "自审提示（E016：实现者 = 审查者）",
+                "expected_pass": not enforce_self_review_block,
+                "note": "默认仅提示不阻断；线上版 config.enforce_self_review_block=true 时该检查才生效并阻断",
+            })
     else:
         preview["expected_checks"] = [
             {"check": "任务处于 pending（可认领）",
@@ -880,8 +1116,10 @@ def claim_preview(
 def _cmd_claim(args) -> dict:
     """认领指定任务。
 
-    CLI 参数: args.task（必需）、args.agent（必需）、args.role（implementer/reviewer）、
-    args.confirm（--confirm，确认执行认领）。
+    CLI 参数: args.task（必需）、args.confirm（--confirm，确认执行认领）。
+    agent 身份由引擎按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint）；claim 按任务
+    当前状态自动分流：in_review → 审查认领（REVIEW_CLAIMED），pending →
+    实现认领（CLAIMED），不再有 --agent/--role。
     返回: 认领事件信息；无 --confirm 时仅返回确认闸门预览
     （confirm_required:true + preview，不写事件、不建分支）。
     """
@@ -892,13 +1130,19 @@ def _cmd_claim(args) -> dict:
     store = Store(orchd_dir)
     shared = master.shared if hasattr(master, "shared") else None
     project_root = orchd_dir.parent
+    agent_id = _require_agent_id(orchd_dir)
+    role = _detect_claim_role(store, tasks, args.task)
+    enforce_self_review_block = bool(
+        master.config.get("enforce_self_review_block") if hasattr(master, "config") else False
+    )
 
     # 确认闸门：无 --confirm 仅输出预览（只读，不写事件、不建分支）
     if not getattr(args, "confirm", False):
         preview = claim_preview(
-            store, tasks, agent_id=args.agent, task_id=args.task,
-            role=args.role, project_root=project_root,
+            store, tasks, agent_id=agent_id, task_id=args.task,
+            role=role, project_root=project_root,
             review_type=getattr(args, "review_type", None),
+            enforce_self_review_block=enforce_self_review_block,
         )
         result = {
             "confirm_required": True,
@@ -906,18 +1150,19 @@ def _cmd_claim(args) -> dict:
             "hint": "预览模式：确认无误后请加 --confirm 真正执行认领（写事件 + 建分支）",
             "preview": preview,
         }
-        warning = _identity_warning(args.agent, orchd_dir)
+        warning = _identity_warning(agent_id, orchd_dir)
         if warning:
             result["warning"] = warning
         return result
 
     result = claim(
-        store, tasks, agent_id=args.agent, task_id=args.task,
-        role=args.role, project_root=project_root, shared=shared,
+        store, tasks, agent_id=agent_id, task_id=args.task,
+        project_root=project_root, shared=shared,
         review_type=getattr(args, "review_type", None),
         with_context=getattr(args, "with_context", False),
+        enforce_self_review_block=enforce_self_review_block,
     )
-    warning = _identity_warning(args.agent, orchd_dir)
+    warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
     return result
@@ -926,9 +1171,9 @@ def _cmd_claim(args) -> dict:
 def _cmd_done(args) -> dict:
     """报告任务完成，提交变更描述与可选的关切事项。
 
-    CLI 参数: args.task（必需）、args.agent（必需）、
-    args.changes / args.changes_file（二选一，变更描述）、
-    args.concerns（可选关切事项）。
+    CLI 参数: args.task（必需）、args.changes / args.changes_file（二选一，
+    变更描述）、args.concerns（可选关切事项）。agent 身份由引擎自动按宿主
+    注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 完成事件信息。
     """
     from orchd.ledger import Store
@@ -937,12 +1182,13 @@ def _cmd_done(args) -> dict:
     changes = _resolve_text_arg(args.changes, args.changes_file, "--changes", "--changes-file")
     tasks, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _require_agent_id(orchd_dir)
     result = done(
-        store, tasks, agent_id=args.agent, task_id=args.task,
+        store, tasks, agent_id=agent_id, task_id=args.task,
         changes_description=changes, concerns=args.concerns,
         project_root=orchd_dir.parent,
     )
-    warning = _identity_warning(args.agent, orchd_dir)
+    warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
     return result
@@ -951,9 +1197,10 @@ def _cmd_done(args) -> dict:
 def _cmd_review(args) -> dict:
     """提交审查结果（spec review 或 code review）。
 
-    CLI 参数: args.task（必需）、args.agent（必需）、args.type（spec/code）、
+    CLI 参数: args.task（必需）、args.type（spec/code）、
     args.verdict（APPROVED/CHANGES_REQUESTED）、
-    args.comments / args.comments_file（可选，二选一）。
+    args.comments / args.comments_file（可选，二选一）。agent 身份由引擎自动按
+    宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 审查事件信息。
     """
     from orchd.ledger import Store
@@ -965,12 +1212,13 @@ def _cmd_review(args) -> dict:
     )
     tasks, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _require_agent_id(orchd_dir)
     result = review_submit(
-        store, tasks, agent_id=args.agent, task_id=args.task,
+        store, tasks, agent_id=agent_id, task_id=args.task,
         review_type=args.type, verdict=args.verdict, comments=comments,
         project_root=orchd_dir.parent,
     )
-    warning = _identity_warning(args.agent, orchd_dir)
+    warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
@@ -982,7 +1230,8 @@ def _cmd_review(args) -> dict:
 def _cmd_retract(args) -> dict:
     """撤回已提交的事件。
 
-    CLI 参数: args.event（必需，事件 ID）、args.agent（必需）、args.reason（必需）。
+    CLI 参数: args.event（必需，事件 ID）、args.reason（必需）。agent 身份由
+    引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 撤回事件信息。
     """
     from orchd.ledger import Store
@@ -990,8 +1239,9 @@ def _cmd_retract(args) -> dict:
 
     _, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _require_agent_id(orchd_dir)
     return retract(
-        store, agent_id=args.agent, target_event_id=args.event,
+        store, agent_id=agent_id, target_event_id=args.event,
         reason=args.reason, project_root=orchd_dir.parent,
     )
 
@@ -1000,8 +1250,9 @@ def _cmd_force_status(args) -> dict:
     """强制设置任务状态（用于恢复僵死任务或手动干预）。
 
     CLI 参数: args.task（必需）、args.status（必需，目标状态）、
-    args.agent（必需）、args.reason（必需）、args.assignee（可选，指定认领人）、
+    args.reason（必需）、args.assignee（可选，指定认领人）、
     args.force（可选，逃生口二次确认——claimed→completed / cancelled→pending）。
+    agent 身份由引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 强制状态变更事件信息。
     """
     from orchd.ledger import Store
@@ -1009,8 +1260,9 @@ def _cmd_force_status(args) -> dict:
 
     _, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _require_agent_id(orchd_dir)
     result = force_status(
-        store, agent_id=args.agent, task_id=args.task,
+        store, agent_id=agent_id, task_id=args.task,
         target_status=args.status, reason=args.reason, assignee=args.assignee,
         force=args.force,
     )
@@ -1185,7 +1437,8 @@ def _cmd_status(args) -> dict:
         table = result.pop("_text")
         try:
             from orchd.guide import status_guidance_text
-            table += status_guidance_text(store.replay(), tasks)
+            # status 命令前置必有 master → has_master=True（空项目时显示 empty_project 而非 first_time）
+            table += status_guidance_text(store.replay(), tasks, has_master=True)
         except Exception:
             pass  # 引导失败静默跳过，不影响表格输出
         print(table)

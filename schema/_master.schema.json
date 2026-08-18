@@ -87,8 +87,7 @@
           "brief",
           "module",
           "acceptance_criteria",
-          "files_to_edit",
-          "reviewers"
+          "files_to_edit"
         ],
         "additionalProperties": false,
         "properties": {
@@ -201,8 +200,7 @@
             "items": {
               "type": "string"
             },
-            "minItems": 1,
-            "description": "审查者 agent ID 列表，至少 1 人。Agent ID 为自声明字符串，不预注册。"
+            "description": "审查者 agent ID 列表。task-fp-schema-reviewers 起不再必填；新的身份模型由会话指纹 + 防自审判定，审查者不再预写（存量任务已清理，字段仅为向后兼容保留）。"
           },
           "verify_command": {
             "type": "string",
@@ -415,10 +413,25 @@
             "type": "string"
           },
           "description": "文档单阶段审查 blocked 文件集合（可选）。含这些文件的任务保持双阶段审查。缺省回退硬编码 {SKILL.md, .orchd/shared/conventions.md, .orchd/_master.json}。"
+        },
+        "allow_auto_claim": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否允许无人值守自动认领（--auto-claim）。默认 false：未显式授权时 request --auto-claim 被拒绝（reason auto_claim_disabled）。仅当用户明确在 _master.json 配置为 true 时，agent 才可调用 --auto-claim 连续领任务。"
+        },
+        "guidance_stderr": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否在 stderr 打印 guidance 人类可读提示块。默认 true：命令 JSON 响应后附带\"下一步\"提示块（不污染 stdout 纯 JSON 契约）。设为 false 时引擎跳过提示块打印，stdout 仍保持纯 JSON。"
+        },
+        "enforce_self_review_block": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否强制阻断实现者审查自己实现的任务（线上版）。默认 false：单机模型下自审仅提示（self_review_notice / is_self_review 标注），不参与任务分配与认领决策。设 true 时恢复 E016 硬阻断（reviewer claim 拒绝、request 候选排除）。"
         }
       },
       "additionalProperties": false
     }
   },
-  "$comment": "JSON Schema 职责边界：本文件只校验结构层（字段类型、必选/可选、枚举值、数组长度）。以下跨引用约束由 orchd validate 的代码实现（spec.py），不属于 JSON Schema 表达范围：\n  1. DAG 无环（拓扑排序检测）\n  2. depends_on 引用的 task_id 存在\n  3. reviewers 非空且格式合法（agent ID 为自声明，不校验预注册）\n  4. task_id 全局唯一\n  5. task.module 指向已定义的 module_id\n  6. files_to_edit 路径格式合法\n实现时对照 docs/system-design.md §3.4 逐条编写 pytest。"
+  "$comment": "JSON Schema 职责边界：本文件只校验结构层（字段类型、必选/可选、枚举值、数组长度）。以下跨引用约束由 orchd validate 的代码实现（spec.py），不属于 JSON Schema 表达范围：\n  1. DAG 无环（拓扑排序检测）\n  2. depends_on 引用的 task_id 存在\n  3. task_id 全局唯一\n  4. task.module 指向已定义的 module_id\n  5. files_to_edit 路径格式合法\n实现时对照 docs/system-design.md §3.4 逐条编写 pytest。"
 }

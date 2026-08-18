@@ -6,11 +6,11 @@
 
 ## 工作流程
 
-1. **认领任务**：`orchd request --agent {your_id}` 获取候选 → 确认能力匹配 → `orchd claim --task {id} --agent {your_id}`
+1. **认领任务**：`orchd request` 获取候选 → 确认能力匹配 → `orchd claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
 2. **阅读上下文**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）
 3. **实现**：修改 files_to_edit 中列出的文件，交付功能代码 + 测试代码
 4. **自验**：执行 verify_command 确认通过
-5. **报告完成**：`orchd done --task {id} --agent {your_id} --changes "变更描述"`
+5. **报告完成**：`orchd done --task {id} --changes "变更描述"`
 
 ## 判定标准
 

@@ -142,7 +142,7 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "host": str(host),
         "orchd_dir": str(orchd),
         "agents_entry": agents_entry,
-        "next": "python .orchd/__main__.py bootstrap 或 validate 开始使用",
+        "next": "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用（与 guidance first_time 卡片 steps 顺序一致）",
     }
 
 

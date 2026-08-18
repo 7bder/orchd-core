@@ -338,7 +338,7 @@ def watchdog(
                 claim_event_id = review_claims[tid].get("event_id", "")
                 if claim_event_id:
                     action = (
-                        f"如审查已中断：orchd retract --agent {ts.review_claimed_by} "
+                        f"如审查已中断：orchd retract "
                         f"--event {claim_event_id} --reason 'abandoned review'（释放审查认领，"
                         f"任务保持 in_review 可被重新认领）；如审查无法继续也可 "
                         f"orchd force-status --task {tid} --status pending（打回实现，较重）"

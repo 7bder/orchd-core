@@ -29,14 +29,8 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from itertools import count as _count
 from pathlib import Path
 from typing import Any
-
-# L5 身份审计：进程内单调计数器——Windows 时钟粒度（~15.6ms）下连续两次
-# time.time_ns() 可能相同，计数器保证同进程内指纹必不同；hostname/pid/时间戳
-# 保证跨会话（重启、换机）可辨识。
-_FINGERPRINT_SEQ = _count()
 
 from orchd.errors import ErrorCode, OrchdError
 
@@ -140,19 +134,48 @@ class TaskDerived:
     review_baselines: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
-def generate_session_fingerprint() -> str:
-    """生成 session 指纹：hostname + pid + timestamp 的 SHA-256 短哈希（前 12 位）。
+# 宿主注入的每对话唯一会话标识环境变量（session-id-fingerprint）。
+# 由宿主在每次对话启动时注入，据此确定性派生 12 位 hex 指纹：
+# 同一对话内所有命令返回同一指纹，切换对话（新值）即换指纹。
+_ORCHD_SESSION_ID_ENV = "ORCHD_SESSION_ID"
 
-    用于事件溯源的身份审计（ROADMAP 1.1 L5）：区分同一 agent_id 的不同 session，
-    跨会话（hostname / pid 变化）可辨识。旧事件缺失该字段时 replay 兼容
-    （``_apply_event`` 只读已知键，未知键自然忽略），视为 None。
+# 会话身份完全由宿主注入的 ORCHD_SESSION_ID 派生，引擎不自持身份、不借用
+# 任何历史身份。据此彻底废除 .orchd/.agent_id 文件（读取与写入均删除）：
+# 未注入 ORCHD_SESSION_ID 时身份为空（None），引擎不生成、不落盘、不复用。
+
+
+def resolve_agent_id(orchd_dir: Path | None = None) -> str:
+    """解析当前 agent 身份，返回 12 位 hex 指纹（会话级，session-id-fingerprint）。
+
+    会话身份与宿主注入的 ``ORCHD_SESSION_ID`` 一一对应：
+    - 有值 → 确定性派生 ``sha256("orchd-session:" + SESSION_ID)[:12]``：
+      同一对话内所有命令返回同一指纹，切换对话（注入新值）即换指纹，
+      实现「一个对话一个永久指纹」。派生函数恒为 hex，天然满足 12 位指纹
+      形态判定（E021 豁免自动生效）。
+    - 无值（宿主未注入）→ 返回空字符串：引擎不生成、不借用、不落盘任何身份，
+      杜绝把工作区历史身份误当成当前会话。
+
+    用途（session-id-fingerprint）：
+    - 依据宿主注入的每对话唯一码锚定身份，实现者对话与审查者对话身份不同，
+      切换到新对话可正常领取 review（不被 E016 自审阻断）。
+    - 各 agent 宿主（TRAE / codex / opencode / workbuddy 等）在启动 orchd 前
+      统一把各自会话唯一码注入 ``ORCHD_SESSION_ID``，本函数只认该标准化变量。
     """
+    sid = os.environ.get(_ORCHD_SESSION_ID_ENV) or None
+    if not sid:
+        return ""
     import hashlib
-    import os
-    import socket
 
-    raw = f"{socket.gethostname()}|{os.getpid()}|{time.time_ns()}|{next(_FINGERPRINT_SEQ)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()[:12]
+
+
+def _find_orchd_dir() -> Path:
+    """从当前工作目录向上定位 .orchd 目录（发布态自包含布局）。"""
+    cwd = Path.cwd()
+    for parent in [cwd] + list(cwd.parents):
+        if (parent / ".orchd").is_dir():
+            return parent / ".orchd"
+    return cwd / ".orchd"
 
 
 def resolve_store_dir(orchd_dir: Path) -> Path:

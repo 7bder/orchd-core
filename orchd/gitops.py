@@ -527,6 +527,10 @@ def session_lock_acquire(
     Note:
         调用方应先调用 ``session_lock_check`` 确认无其他 session 持有锁，
         再调用本函数。本函数不校验锁是否已存在（覆盖写入）。
+
+        锁文件仅作并发互斥载体，不再承载身份：agent 身份由宿主注入的
+        ``ORCHD_SESSION_ID`` 派生（``orchd.ledger.resolve_agent_id``），
+        锁被覆盖 / 强释放不会改变 agent 身份（会话级身份稳定）。
     """
     import json
     from datetime import datetime, timezone

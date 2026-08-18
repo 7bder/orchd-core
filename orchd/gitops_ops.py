@@ -28,7 +28,7 @@ from orchd.gitops import (
     session_lock_acquire,
     session_lock_check,
 )
-from orchd.ledger import generate_event_id, generate_session_fingerprint
+from orchd.ledger import generate_event_id
 
 
 # ------------------------------------------------------------------
@@ -67,7 +67,6 @@ def make_event(
         "task_id": task_id,
         "agent_id": agent_id,
         "type": etype,
-        "session_fingerprint": generate_session_fingerprint(),
     }
     ev.update(extra)
     return ev

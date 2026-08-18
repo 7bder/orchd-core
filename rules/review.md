@@ -2,14 +2,15 @@
 
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
-## 审查者 ID 约定（禁止自审）
-- 实现任务用各 agent 唯一 ID，命名规范 **MUST** 遵守 `{provider}-{序号}`（provider 为平台/工具名小写，序号为数字，如 qoder-a1、claude-x、codex-1、workbuddy-1），**禁止跨 provider 复用同一序号**（如 qoder-a1 与 claude-a1 视为冲突）；审查一律以固定 ID `reviewer-1` 领取
-- **引擎层强制阻断**（task-claim-reviewer-independence，2026-08-06 落地）：
-  - **E016 self_review_blocked**：claim review 时，若该任务 DONE 事件的 `agent_id` 与当前 claim agent 相同，引擎拒绝并返回换 agent 指引
-  - **Review 优先调度**：implementer 请求任务时（`python .orchd/__main__.py request --agent X`），若存在该 agent 可认领的 in_review 任务，引擎返回 `next_action: "review_first"` + `review_priority` 提示先领取审查
-- 领审查前两项自查（引擎已覆盖核心阻断，此为双重保险）：
-  - `python .orchd/__main__.py status` 中不存在本 session 实现 ID 名下的 claimed 任务（busy 检查按 ID 判定，换 ID 即可绕过，故必须先自查）
-  - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 跳过该任务
+## 审查者身份约定（自审默认仅提示）
+- 实现任务用各 agent 会话级指纹（12 位 hex，由 `ORCHD_SESSION_ID` 派生），**禁止跨对话复用同一指纹**；审查以当前会话指纹领取（不再使用固定 `reviewer-1` ID）
+- **自审默认降级为仅提示**（2026-08-17，单机模型；线上版可设 `_master.json config.enforce_self_review_block=true` 恢复阻断）：
+  - **默认（enforce=false）**：claim review 时若 DONE 实现指纹 == 当前指纹，**照常放行**，认领结果附 `self_review_notice`（含 `done_by` + 引导）；request 候选 / review_first 中自审任务标注 `is_self_review: true`，不参与任何决策与阻断
+  - **enforce=true（线上版）**：恢复 `E016 self_review_blocked`——claim review 拒绝、request 候选排除自审任务
+- **Review 优先调度**：implementer 请求任务时，若存在该 agent 可认领的 in_review 任务，引擎返回 `next_action: "review_first"` + `review_priority` 提示先领取审查
+- 领审查前两项自查（决策权在人，此为可见性辅助）：
+  - `python .orchd/__main__.py status` 中不存在本 session 实现 ID 名下的 claimed 任务（busy 检查按 ID 判定，换 ID 即可绕过，故须自查）
+  - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 自审，默认仅标注提示（是否继续由人裁决）
 - **code review APPROVED 后必须运行 merge audit 验证**：提交 code APPROVED 且 merge 成功（任务进入 completed）后，立即运行 `python .orchd/__main__.py status --audit-merge`，确认 `merge_audit.warnings` 为空（零告警）。若有告警（completed 任务对应分支仍悬空未入 main），立即在当前 reviewer session 内 cherry-pick 修复并重新验证，不得将漏 merge 遗留到下游
 
 ## 清单化模板与证据分层（M2-2，2026-08-06；证据分层 2026-08-08）

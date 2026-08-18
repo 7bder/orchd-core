@@ -447,7 +447,6 @@ Spec reviewer 的核心问题不再是"代码对不对"，而是"测试有没有
 - [ ] 每个 task 的 module 指向已定义的 module id
 - [ ] 每个 task 有至少 1 条 acceptance_criteria
 - [ ] 每个 task 有至少 1 个 files_to_edit
-- [ ] 每个 task 有至少 1 个 reviewers
 - [ ] 所有 depends_on 引用的 task_id 存在
 - [ ] 无循环依赖
 
@@ -550,7 +549,7 @@ task-核心处理（转换/计算）     ← 可与加载并行（若接口已�
 | `acceptance_criteria` | 是 | 2-5 条，遵循 §5 规则 |
 | `files_to_read` | 否 | must_read ≤ 5，每条含 hint |
 | `files_to_edit` | 是 | 1-4 个，用于冲突检测 |
-| `reviewers` | 是 | ≥ 1 个 agent ID（自声明字符串） |
+| `reviewers` | 否 | 可选，仅向后兼容：名单非空时按名单门禁；空/缺失时按会话指纹分流，不要求填写 |
 | `verify_command` | 原则必填 | 执行覆盖全部 acceptance_criteria 的测试命令（见 §5.5）；豁免需满足 §5.5.4 |
 | `max_attempts` | 否 | 默认 3，高难度任务可放宽 |
 | `deliverables` | 否 | 定义对外契约（见 §5.7）。type 为 `code_api`（含 api.language + api.signatures）或 `data_format`（含 schema.file + schema.format + schema.fields）。仅对明确对外接口/格式的任务使用 |

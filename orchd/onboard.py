@@ -18,6 +18,7 @@ Git 辅助操作（_try_git_branch / _try_git_merge）均为 best-effort：
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,22 @@ from orchd.review import (  # noqa: E402  re-exports (backward compat)
 # force-status 合法目标：force_status() 只允许将任务强制设置到这四种状态，
 # 其余状态（如 in_review、done）由正常事件流驱动，不可被强制跳转。
 _FORCE_TARGETS = {"pending", "claimed", "completed", "cancelled"}
+
+
+def _is_fingerprint_agent_id(agent_id: str) -> bool:
+    """判断 agent_id 是否为指纹形态身份（12 位 hex，task-fp-identity-engine）。
+
+    稳定身份指纹（``orchd.ledger.resolve_agent_id``）为 12 位 SHA-256 短哈希。
+    指纹身份由引擎自动识别，无法预写入静态 reviewers 名单，
+    故在 E007 名单校验中豁免（审查独立性仍由 E016 防自审 + E011 忙度兜底）。
+    """
+    if not agent_id or len(agent_id) != 12:
+        return False
+    try:
+        int(agent_id, 16)
+        return True
+    except ValueError:
+        return False
 
 # M-3 逃生口（2026-08-12 全面审计）：默认跳转矩阵 _ALLOWED_FROM 外的两条
 # "合理但不鼓励"的跳转，仅当调用方显式 force=True（CLI --force 二次确认）时放行。
@@ -194,39 +211,65 @@ def _find_project_root() -> Path:
 def _find_review_priority_tasks(
     store: Store, state: dict[str, TaskState], tasks: list[dict[str, Any]],
     agent_id: str, derived: TaskDerived | None = None,
-) -> list[dict[str, Any]]:
+    enforce_self_review_block: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """查找该 agent 可审查的 in_review 任务（用于 implementer request 时的优先调度提示）。
 
-    过滤条件：
-    1. 任务状态为 in_review
-    2. 审查未被其他人认领（review_claimed_by is None）
-    3. agent 在任务的 reviewers 名单内
-    4. agent 不是该任务的实现者（排除 self-review）
+    返回 ``(review_tasks, excluded_self_review)`` 二元组：
+    - ``review_tasks``：可分配的审查任务（按 spec 阶段优先排序）。
+    - ``excluded_self_review``：自审任务列表。默认（enforce=False）仅标注、照常
+      进入 review_tasks；线上版 enforce=True 时改为排除（仅标注、不分配）。
+
+    过滤条件（task-fp-request-filter，指纹身份模型）：
+    1. 任务状态 in_review 且审查未被他人认领（review_claimed_by is None）。
+    2. reviewers 名单门禁仅作**向后兼容**：该字段存在且非空时，不在名单内
+       直接排除（不计入自审）；字段缺失/为空（生产 _master.json 已无
+       reviewers）则跳过名单门禁，仅按实现指纹去重。
+    3. self-review：DONE 实现指纹 == 当前 request 指纹时，默认仅标注
+       is_self_review（照常分配）；enforce_self_review_block=True 时归入
+       excluded_self_review（不分配，AC1）。
 
     H2（2026-08-13）：``derived`` 为 request 单次扫描的派生缓存，
     循环内查询实现者改为 O(1)（原实现对每个候选任务全扫一次 ledger）。
     """
     task_map = {t.get("id", ""): t for t in tasks}
     review_tasks: list[dict[str, Any]] = []
+    excluded_self_review: list[dict[str, Any]] = []
     for tid, ts in state.items():
         if ts.status != "in_review" or ts.review_claimed_by is not None:
             continue
         task_def = task_map.get(tid, {})
-        # 检查 agent 是否在 reviewers 名单内
-        if agent_id not in task_def.get("reviewers", []):
+        # 向后兼容：reviewers 字段存在且非空时仍按其门禁（旧契约/测试）。
+        # 字段缺失或为空（指纹身份模型）则跳过名单门禁，仅按实现指纹去重。
+        designated = task_def.get("reviewers")
+        if designated and agent_id not in designated:
             continue
-        # 排除 self-review：检查 DONE 事件的 agent_id
+        # self-review：DONE 实现指纹 == 当前 request 指纹。
+        # 默认仅标注 is_self_review 并照常分配；enforce=True 时归入
+        # excluded_self_review（不分配，保 AC1 可见性）。
         done_author, _ = _extract_last_done(store, tid, derived)
-        if done_author and done_author == agent_id:
+        is_self = bool(done_author and done_author == agent_id)
+        if is_self:
+            excluded_self_review.append({
+                "task_id": tid,
+                "review_phase": ts.review_phase or "spec",
+                "name": task_def.get("name", ""),
+                "done_author": done_author,
+                "is_self_review": True,
+            })
+        if is_self and enforce_self_review_block:
             continue
-        review_tasks.append({
+        entry = {
             "task_id": tid,
             "review_phase": ts.review_phase or "spec",
             "name": task_def.get("name", ""),
-        })
+        }
+        if is_self:
+            entry["is_self_review"] = True
+        review_tasks.append(entry)
     # spec 阶段优先
     review_tasks.sort(key=lambda c: (0 if c["review_phase"] == "spec" else 1))
-    return review_tasks
+    return review_tasks, excluded_self_review
 
 
 def request(
@@ -239,6 +282,7 @@ def request(
     sort_key: str | None = None,
     max_active: int | None = None,
     importance_thresholds: dict[str, Any] | None = None,
+    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """返回排序后第一个候选任务（或空池 JSON）。只读不加锁。
 
@@ -265,27 +309,41 @@ def request(
     derived = store.scan_task_derived()
 
     if role == "reviewer":
-        return _request_reviewer(store, state, tasks, agent_id, derived)
+        return _request_reviewer(
+            store, state, tasks, agent_id, derived,
+            enforce_self_review_block=enforce_self_review_block,
+        )
 
     # Review 优先调度：implementer 请求时，若有可认领的 review 任务，优先提示审查
-    review_priority = _find_review_priority_tasks(store, state, tasks, agent_id, derived)
+    review_priority, excluded_self_review = _find_review_priority_tasks(
+        store, state, tasks, agent_id, derived,
+        enforce_self_review_block=enforce_self_review_block,
+    )
     if review_priority:
         best_review = review_priority[0]
-        return {
+        rp_entry = {
+            "task_id": best_review["task_id"],
+            "review_phase": best_review["review_phase"],
+            "name": best_review["name"],
+            "total_available": len(review_priority),
+        }
+        if best_review.get("is_self_review"):
+            rp_entry["is_self_review"] = True
+        resp: dict[str, Any] = {
             "candidate": None,
-            "review_priority": {
-                "task_id": best_review["task_id"],
-                "review_phase": best_review["review_phase"],
-                "name": best_review["name"],
-                "total_available": len(review_priority),
-            },
+            "review_priority": rp_entry,
             "message": (
                 f"有 {len(review_priority)} 个待审查任务可领取，建议先完成审查再领取实现任务。"
-                f"使用 'orchd request --agent {agent_id} --role reviewer' 领取审查任务。"
+                f"使用 'orchd request' 领取审查任务。"
             ),
             "next_action": "review_first",
             "pool_size": 0,
         }
+        if excluded_self_review:
+            resp["excluded_self_review"] = excluded_self_review
+        return resp
+    # 审查优先级为空：若全部 in_review 任务都是自审（被指纹比对排除），
+    # 不返回 review_first，落回下方执行任务分配；excluded_self_review 仍标注（AC1）。
 
     # --max-active N 容量控制：全局活跃（claimed）任务数达到上限即拒绝新领取
     if max_active is not None:
@@ -400,7 +458,7 @@ def request(
             )
         else:
             message = "当前无就绪任务（所有任务已完成或被阻塞）"
-        return {
+        result: dict[str, Any] = {
             "candidate": None,
             "message": message,
             "next_action": "exit",
@@ -410,6 +468,9 @@ def request(
             "mismatched": mismatched,
             "excluded_conflicts": excluded_conflicts,
         }
+        if excluded_self_review:
+            result["excluded_self_review"] = excluded_self_review
+        return result
 
     best = candidates[0]
     task_id = best.task.get("id", "")
@@ -453,13 +514,16 @@ def request(
         if optional in best.task:
             candidate[optional] = best.task[optional]
 
-    return {
+    candidate_result: dict[str, Any] = {
         "candidate": candidate,
         "pool_size": len(candidates),
         "prompt": f"确认将此任务分配给 {agent_id}？(执行 / 跳过 / 重新声明能力)",
         "warnings": warnings,
         "excluded_conflicts": excluded_conflicts,
     }
+    if excluded_self_review:
+        candidate_result["excluded_self_review"] = excluded_self_review
+    return candidate_result
 
 
 def _is_high_risk(task_def: dict[str, Any]) -> bool:
@@ -503,13 +567,18 @@ def claim(
     tasks: list[dict[str, Any]],
     agent_id: str,
     task_id: str,
-    role: str = "implementer",
+    role: str | None = None,
     project_root: Path | None = None,
     shared: dict[str, Any] | None = None,
     review_type: str | None = None,
     with_context: bool = False,
+    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """认领任务。锁内 check-then-act。
+
+    角色按任务当前状态自动分流（task-fp-identity-engine，CLI 不再传 --role）：
+    in_review → reviewer（REVIEW_CLAIMED）；其他（pending）→ implementer（CLAIMED）。
+    ``role`` 参数保留为可选（向后兼容既有调用方）；None 时按状态自动判定。
 
     校验逻辑（锁内）：状态合法性、依赖满足、文件冲突、agent 繁忙等。
     事件写入（锁内）：CLAIMED 或 REVIEW_CLAIMED 事件追加到 ledger。
@@ -527,6 +596,12 @@ def claim(
     if task_def is None:
         raise OrchdError(ErrorCode.E008, f"task '{task_id}' not found in master",
                          [{"task_id": task_id}])
+
+    # 角色分流：显式 role 优先；None 时按任务当前状态自动判定
+    if role is None:
+        pre_state = store.replay()
+        pre_ts = pre_state.get(task_id)
+        role = "reviewer" if (pre_ts and pre_ts.status == "in_review") else "implementer"
 
     # L1 分支守卫 + L2 session 锁（锁外，best-effort）：
     # - implementer：须在默认分支（main/master）且工作区干净（引擎要从
@@ -563,6 +638,8 @@ def claim(
         derived = store.scan_task_derived()
         ts = state.get(task_id)
         status = ts.status if ts else "pending"
+        # E016 降级标记：实现者审查自己实现时默认仅提示（见 reviewer 分支）
+        is_self_review = False
 
         if role == "reviewer":
             # Reviewer claim：任务必须 in_review 且未被审查者认领
@@ -583,9 +660,12 @@ def claim(
                       "requested_phase": review_type,
                       "hint": "spec 审查 APPROVED 后任务自动进入 code 审查，届时再认领 code"}],
                 )
-            # 校验：只有任务指定的 reviewers 名单内的 agent 可认领审查
+            # 校验：只有任务指定的 reviewers 名单内的 agent 可认领审查。
+            # E007 豁免（task-fp-identity-engine）：会话指纹形态 agent_id（12 位 hex）
+            # 无法预写入静态 reviewers 名单，身份由引擎自动识别，故豁免名单校验
+            # （审查独立性仍由 E016 防自审 + E011 忙度校验兜底）。
             designated = task_def.get("reviewers", [])
-            if agent_id not in designated:
+            if agent_id not in designated and not _is_fingerprint_agent_id(agent_id):
                 raise OrchdError(
                     ErrorCode.E007,
                     f"not_designated_reviewer: '{agent_id}' 不在任务 '{task_id}' 的 reviewers 名单中",
@@ -599,15 +679,20 @@ def claim(
                     [{"task_id": task_id, "claimed_by": ts.review_claimed_by,
                       "hint": "如该审查已中断（不会继续提交），可 orchd retract 该 REVIEW_CLAIMED 事件释放认领"}],
                 )
-            # E016: self-review 阻断——实现者不得审查自己实现的任务
+            # E016: self-review——实现者审查自己实现的任务。
+            # 默认仅提示（enforce_self_review_block=False，单机模型）；线上版
+            # 设 `_master.json config.enforce_self_review_block=true` 时恢复阻断。
             done_author, _ = _extract_last_done(store, task_id, derived)
             if done_author and done_author == agent_id:
-                raise OrchdError(
-                    ErrorCode.E016,
-                    f"self_review_blocked: '{agent_id}' 是任务 '{task_id}' 的实现者，不能审查自己的实现",
-                    [{"task_id": task_id, "agent_id": agent_id, "done_by": done_author,
-                      "hint": "请使用其他 agent ID（如 reviewer-1）领取此审查任务，确保审查独立性"}],
-                )
+                if enforce_self_review_block:
+                    raise OrchdError(
+                        ErrorCode.E016,
+                        f"self_review_blocked: '{agent_id}' 是任务 '{task_id}' 的实现者，不能审查自己的实现",
+                        [{"task_id": task_id, "agent_id": agent_id, "done_by": done_author,
+                          "hint": "请使用其他 agent ID（如 reviewer-1）领取此审查任务，确保审查独立性"}],
+                    )
+                # 降级路径：仅提示、不阻断（self_review_notice 附到审查认领结果）
+                is_self_review = True
         else:
             # Implementer claim：必须 pending + 依赖满足
             if status != "pending":
@@ -651,7 +736,12 @@ def claim(
         # 或打回（CHANGES_REQUESTED→pending）前，实现者不得再领取新实现任务，
         # 否则会在上一任务审查/返工期间并发持有多个任务（无人值守 --auto-claim 连领）。
         for tid, t_state in state.items():
-            if t_state.status in ("claimed", "done", "in_review") and t_state.claimed_by == agent_id:
+            # E011 实现者持有检查：默认（enforce=False）下仅"自审"（认领审查的恰是自己
+            # 实现的那个任务）放行——允许单机模型下实现者自审；持有任务审查 *其它* 任务
+            # 仍阻断；enforce=True 时自审也恢复阻断（与 E016 一致）。
+            if (t_state.status in ("claimed", "done", "in_review")
+                    and t_state.claimed_by == agent_id
+                    and (tid != task_id or enforce_self_review_block)):
                 raise OrchdError(
                     ErrorCode.E011,
                     f"agent_busy: '{agent_id}' already holds task '{tid}'"
@@ -677,7 +767,7 @@ def claim(
                         "review_claim_event_id": review_claim_event_id,
                         "hint": (
                             "如该审查已中断（不会继续提交），可执行 "
-                            f"orchd retract --agent {agent_id} --event {review_claim_event_id} "
+                            f"orchd retract --event {review_claim_event_id} "
                             "--reason 'abandoned review' 释放认领后重新领取审查"
                             if review_claim_event_id else
                             "该任务无你的 REVIEW_CLAIMED 事件，请人工核对状态"
@@ -760,6 +850,14 @@ def claim(
             "review_comments": review_comments,
             "event_id": event["event_id"],
         }
+        # E016 降级（默认提示）：实现者审查自己实现时附加提示，不阻断认领
+        if is_self_review:
+            review_claim_result["self_review_notice"] = {
+                "message": "当前以实现者指纹认领审查自己实现的任务（E016 自审）",
+                "done_by": done_author,
+                "hint": "默认仅提示；线上版可设 _master.json config.enforce_self_review_block=true 恢复强制阻断",
+                "enforce_self_review_block": enforce_self_review_block,
+            }
         # P2（2026-08-08）：注入最近 DONE 事件的 verify 结果摘要
         # （ok / exit_code / elapsed_seconds / output_summary），reviewer 默认引用
         # 该结果而非重跑测试（证据分层）；旧事件无 verify 字段则省略（兼容）。
@@ -920,13 +1018,14 @@ def done(
         raise OrchdError(ErrorCode.E007, f"task '{task_id}' not found",
                          [{"task_id": task_id}])
 
-    # 预校验（无锁，快速失败）
+    # 预校验（无锁，快速失败）：仅要求任务处于 claimed 状态，不比对 caller 指纹与
+    # claimed_by——宿主会话身份漂移场景下，done 按认领者记账（见锁内 author_mismatch）。
     state = store.replay()
     ts = state.get(task_id)
-    if not ts or ts.status != "claimed" or ts.claimed_by != agent_id:
+    if not ts or ts.status != "claimed":
         raise OrchdError(
             ErrorCode.E007,
-            f"invalid_state: task '{task_id}' not claimed by '{agent_id}'",
+            f"invalid_state: task '{task_id}' not in claimed state",
             [{"task_id": task_id, "expected": "claimed", "actual": ts.status if ts else "pending"}],
         )
 
@@ -1095,8 +1194,14 @@ def done(
     ):
         reg_started = time.monotonic()
         try:
+            # P2-1（2026-08-19 审查）：回归子进程继承当前解释器（sys.executable），
+            # 避免裸 `python` 命中 PATH 上未装依赖的解释器导致误报。
+            reg_cmd = (
+                f'"{sys.executable}" -m pytest tests/ -q '
+                f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
+            )
             reg_result = subprocess.run(
-                "python -m pytest tests/ -q --basetemp=\"${TMPDIR:-/tmp}/orchd-vf-$$\"",
+                reg_cmd,
                 shell=True, cwd=str(project_root),
                 capture_output=True, timeout=_FULL_REGRESSION_TIMEOUT,
             )
@@ -1117,7 +1222,7 @@ def done(
                         f"after {reg_elapsed}s"
                     ),
                     "details": {
-                        "command": "python -m pytest tests/ -q",
+                        "command": f'"{sys.executable}" -m pytest tests/ -q',
                         "returncode": reg_result.returncode,
                         "elapsed_seconds": reg_elapsed,
                         "output_summary": _verify_output_summary(reg_result.stdout, reg_result.stderr),
@@ -1137,7 +1242,7 @@ def done(
                     f"(timeout={_FULL_REGRESSION_TIMEOUT}s)"
                 ),
                 "details": {
-                    "command": "python -m pytest tests/ -q",
+                    "command": f'"{sys.executable}" -m pytest tests/ -q',
                     "timeout": _FULL_REGRESSION_TIMEOUT,
                     "elapsed_seconds": reg_elapsed,
                     "partial_stdout": partial_out,
@@ -1150,16 +1255,20 @@ def done(
         integrity_warnings = store.check_integrity()
         state = store.replay()
         ts = state.get(task_id)
-        if not ts or ts.status != "claimed" or ts.claimed_by != agent_id:
+        if not ts or ts.status != "claimed":
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: TOCTOU - task state changed during verify",
                 [{"task_id": task_id}],
             )
 
+        # 记账一律以任务认领者 claimed_by 为准，忽略 caller 当前指纹：
+        # 宿主会话身份漂移时，caller 指纹与认领者不一致，仍正常放行并按认领者记账。
+        claimed_by = ts.claimed_by
+        author_mismatch = claimed_by != agent_id
         attempt_count = ts.attempt_count + 1
         done_event = _make_event(
-            task_id, agent_id, "DONE",
+            task_id, claimed_by, "DONE",
             changes_description=changes_description,
             attempt_count=attempt_count,
         )
@@ -1176,7 +1285,7 @@ def done(
         review_type = "code" if _is_doc_single_stage(
             task_def.get("files_to_edit", []), blocked=blocked_config
         ) else "spec"
-        review_event = _make_event(task_id, agent_id, "REVIEW_READY", review_type=review_type)
+        review_event = _make_event(task_id, claimed_by, "REVIEW_READY", review_type=review_type)
         store.append_event(review_event)
 
         new_state = store.replay()
@@ -1194,6 +1303,15 @@ def done(
     }
     if integrity_warnings:
         result["integrity_warnings"] = integrity_warnings
+    if author_mismatch:
+        result["author_mismatch"] = {
+            "claimed_by": claimed_by,
+            "caller_fingerprint": agent_id,
+            "message": (
+                "done 已按任务认领者 claimed_by 记账；caller 指纹与认领者不一致"
+                "（宿主会话身份可能漂移），仅提示、不阻断"
+            ),
+        }
     if full_regression is not None:
         result["full_regression"] = full_regression
     if commit_result is not None:

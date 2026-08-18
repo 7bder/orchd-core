@@ -46,7 +46,7 @@
 - `acceptance_criteria`: 2-5 条可量化验收标准
 - `files_to_read`: [{path, priority: "must_read"|"reference", hint}]
 - `files_to_edit`: 字符串列表（含测试文件）
-- `reviewers`: 至少 1 个审查者 ID
+- `reviewers`: 可选，仅向后兼容（会话指纹身份下不再预写；审查者由引擎按任务状态自动分流 + 防自审判定）
 - `verify_command`: 验证命令（原则必填）
 - `deliverables`: 可选，code_api 或 data_format 交付契约
 
@@ -88,7 +88,6 @@
     {"path": "src/parser.py", "priority": "must_read", "hint": "现有解析逻辑"}
   ],
   "files_to_edit": ["src/parser.py", "tests/test_parser.py"],
-  "reviewers": ["reviewer-1"],
   "verify_command": "python -m pytest tests/test_parser.py -v"
 }
 ```

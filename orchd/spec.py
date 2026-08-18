@@ -571,10 +571,27 @@ def validate_source(
     from orchd.ledger import resolve_workspace_root
     workspace_root = resolve_workspace_root(project_root)
 
+    # P2-2（2026-08-19 审查）：对终态任务（completed/cancelled）豁免 source 校验。
+    # ideas-archive 归档机制会把已完结的 IDEAS 条目移入 IDEAS-archive.md，终态任务的
+    # source 条目必然已被归档，全量调用（未来巡检/接入）不应报 E025 误报。
+    # 惰性加载 ledger 状态；拿不到（无 ledger / replay 异常）时保持全量校验（不豁免）。
+    terminal_ids: set[str] = set()
+    try:
+        from orchd.ledger import Store
+        store = Store(workspace_root)
+        for _tid, _ts in store.replay().items():
+            if _ts.status in ("completed", "cancelled"):
+                terminal_ids.add(_tid)
+    except Exception:
+        terminal_ids = set()
+
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
         source = t.get("source")
         if not source or not isinstance(source, str):
+            continue
+        if tid in terminal_ids:
+            # P2-2：终态任务（completed/cancelled）已关闭，来源条目归档属正常生命周期
             continue
 
         prefix, _, ref_id = source.partition(":")

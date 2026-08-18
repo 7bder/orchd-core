@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 # 引导语义：返回 {step, read, template, command, hint} 结构，供 agent/用户据以行动。
@@ -32,6 +33,80 @@ from typing import Any
 # 路由表（状态机 × 角色 → 知识+方法）为引擎侧单一事实源，顶层平铺、加法式：
 # 只新增 read/template 两键，与既有 {step, command, hint} 平铺兼容，后期扩展零迁移。
 # 边界：引擎不做内容域解析，read/template 是字符串常量路径，不读取 rules/ 文件内容。
+
+
+def _resolve_paths(
+    paths: list[str],
+    base_dir: str | os.PathLike[str] | None,
+) -> list[str]:
+    """将 read/template 路径过滤为实际存在的文件路径（知识路由闭环）。
+
+    路由闭环（task-guide-routing-loop）：guidance 的 read/template 字段由静态
+    字符串路径升级为**可执行闭环**——agent 收到 guidance 后按 read 数组读规则
+    文件、按 template 数组加载模板。为此引擎侧须保证字段指向实际存在的文件，
+    否则 agent 按路径读取会落空。
+
+    规则：
+    - ``paths`` 中的每条解析候选位置：``base_dir`` 下及其**父目录**下（规则在
+      ``.orchd/rules/``、模板在项目根 ``templates/``，故双候选兜底）；任一命中
+      实际文件即保留，都不存在则静默跳过（best-effort 降级，不抛异常）。
+    - 绝对路径直接判定，不做拼接。
+    - ``base_dir`` 为 None 或空 → 不做存在性校验，原样返回（纯函数 / 单测场景）。
+    - 空数组 → 返回空数组（无害，向下兼容）。
+
+    Args:
+        paths: read 或 template 路径数组。
+        base_dir: 规则/模板所在根目录（.orchd/）；None 时跳过校验。
+
+    Returns:
+        过滤后只含实际存在文件的路径数组（顺序保持）。
+    """
+    if not paths or base_dir is None:
+        return list(paths)
+    root = os.path.abspath(os.fspath(base_dir))
+    parent = os.path.dirname(root)
+    kept: list[str] = []
+    for p in paths:
+        if os.path.isabs(p):
+            if os.path.isfile(p):
+                kept.append(p)
+            continue
+        candidates = (os.path.join(root, p), os.path.join(parent, p))
+        if any(os.path.isfile(c) for c in candidates):
+            kept.append(p)
+    return kept
+
+
+def resolve_read_paths(
+    guidance: dict[str, Any],
+    base_dir: str | os.PathLike[str] | None,
+) -> dict[str, Any]:
+    """将 guidance 的 read/template 字段解析为指向实际存在文件的路径（纯函数）。
+
+    知识路由闭环的引擎侧接口（task-guide-routing-loop）：调用方（cli.py
+    ``_attach_guidance`` 注入点）在附加 guidance 后透传 ``base_dir``，本函数
+    返回**新增 ``read``/``template`` 键**的 guidance 副本，指向实际存在的规则/
+    模板文件，不存在时静默跳过。空数组 / base_dir None 时原样返回（无害降级）。
+
+    Args:
+        guidance: 原始 guidance 字典（含 read/template 数组）。
+        base_dir: 规则/模板根目录（.orchd/）；None 时跳过校验。
+
+    Returns:
+        过滤后的 guidance 字典（加法式，仅调整 read/template 两键，不碰
+        step/command/hint 结构；含 agent_view/project_view 时递归过滤，
+        保证双视角与顶层 read/template 一致）。
+    """
+    out = dict(guidance)
+    out["read"] = _resolve_paths(guidance.get("read") or [], base_dir)
+    out["template"] = _resolve_paths(guidance.get("template") or [], base_dir)
+    # 双视角（task-guidance-dual-view-engine）：递归过滤子视角的 read/template，
+    # 避免顶层已过滤而 agent_view/project_view 仍指向不存在路径的不一致。
+    for key in ("agent_view", "project_view"):
+        sub = guidance.get(key)
+        if isinstance(sub, dict):
+            out[key] = resolve_read_paths(sub, base_dir)
+    return out
 
 
 def _summarize(
@@ -70,12 +145,25 @@ def _summarize(
     return counts
 
 
-def first_time_guide() -> dict[str, Any]:
-    """未初始化项目 / 全新工作区的引导（bootstrap 后使用）。
+def first_time_guide(has_master: bool = False) -> dict[str, Any]:
+    """首次引导：区分「未初始化」与「空项目」（task-guidance-dual-view-engine）。
+
+    Args:
+        has_master: False → 未初始化项目（无 ``_master.json``）：step=first_time，
+            附 ``card`` 结构化字段（供接入层渲染 SVG 全貌卡片）；
+            True → 空项目（有 master 但 0 任务）：step=empty_project。
 
     Returns:
-        引导结构：指引先 bootstrap 获取分解套件，再 init 初始化快照。
+        引导结构 {step, read, template, command, hint}；first_time 另附 card。
     """
+    if has_master:
+        return {
+            "step": "empty_project",
+            "read": [],
+            "template": [],
+            "command": "orchd idea propose --title '<灵感>' --feasibility '<论证>'",
+            "hint": "项目已初始化但还没有任务：可提交新 idea 供拆解，或直接规划下一阶段。",
+        }
     return {
         "step": "first_time",
         "read": [],
@@ -83,29 +171,38 @@ def first_time_guide() -> dict[str, Any]:
         "command": "orchd bootstrap",
         "hint": "项目尚未初始化：先运行 orchd bootstrap 获取任务分解套件，"
                 "再 orchd init 初始化快照，之后即可 request/claim 领取任务。",
+        "card": {
+            "title": "Orchd 项目初始化引导",
+            "phase": "first_time",
+            "steps": ["bootstrap", "init", "request"],
+            "current": 0,
+            "next": "bootstrap",
+        },
     }
 
 
-def next_guidance(
+def _derive(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
-    agent_id: str | None = None,
+    agent_id: str | None,
+    has_master: bool,
 ) -> dict[str, Any]:
-    """按状态机+角色推导下一步引导（纯函数）。
+    """按状态机+角色推导单视角引导（内部函数，返回纯 {step, read, template, command, hint}）。
 
     Args:
         state: ``Store.replay()`` 产物。
         tasks: master 任务定义列表。
-        agent_id: 当前 agent 身份（可选）。
+        agent_id: 当前 agent 身份（None 表示未知/项目视角）。
+        has_master: 是否已存在 ``_master.json``（区分未初始化/空项目）。
 
     Returns:
-        引导结构 {step, read, template, command, hint}；无任务时返回 first_time 引导。
+        纯 5 键引导结构；无任务时返回 first_time/empty_project 引导。
     """
     c = _summarize(state, tasks, agent_id)
 
-    # 空项目 / 无任务 → 首次引导
+    # 空项目 / 无任务 → 首次引导（has_master 区分未初始化 vs 空项目）
     if c["total"] == 0:
-        return first_time_guide()
+        return first_time_guide(has_master=has_master)
 
     # 有 in_review 未审 → 优先引导领审查（知识：review 规则；方法：审查模板）
     if c.get("in_review", 0) > 0:
@@ -113,7 +210,7 @@ def next_guidance(
             "step": "request_review",
             "read": ["rules/review.md"],
             "template": ["templates/spec-reviewer.md", "templates/code-reviewer.md"],
-            "command": f"orchd request --agent {agent_id or '<你>'} --role reviewer",
+            "command": "orchd request",
             "hint": f"有 {c['in_review']} 个任务待审查：先领取审查任务，代码审查通过后任务才算完成。",
         }
 
@@ -123,7 +220,7 @@ def next_guidance(
             "step": "request_impl",
             "read": ["rules/intake.md", "rules/session.md"],
             "template": ["templates/implementer.md"],
-            "command": f"orchd request --agent {agent_id or '<你>'}",
+            "command": "orchd request",
             "hint": f"有 {c['pending']} 个待认领任务：现在没有活跃实现，可领取一个新任务。",
         }
 
@@ -134,7 +231,7 @@ def next_guidance(
             "step": "done",
             "read": ["rules/session.md", "rules/verify.md", "rules/git.md"],
             "template": ["templates/implementer.md"],
-            "command": f"orchd done --task {tid} --agent {agent_id or '<你>'} --changes '<描述>'",
+            "command": f"orchd done --task {tid} --changes '<描述>'",
             "hint": f"任务 {tid} 已认领给当前 agent：实现完成后用 orchd done 提交（verify 通过后进入审查）。",
         }
 
@@ -179,10 +276,51 @@ def next_guidance(
     }
 
 
+def next_guidance(
+    state: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    agent_id: str | None = None,
+    has_master: bool = False,
+) -> dict[str, Any]:
+    """按状态机+角色推导下一步引导（纯函数，双视角，task-guidance-dual-view-engine）。
+
+    双视角契约：
+    - 顶层 {step, read, template, command, hint} 5 键语义不变 = agent_view 推导结果
+      （向后兼容，既有消费方无感）。
+    - 新增 ``agent_view``（以传入 agent_id 推导）与 ``project_view``（以
+      agent_id=None 推导）两键（加法式，不破坏既有字段）。
+    - ``agent_id`` 未知（None/空串）时两视角相等（退化一致，接入层可据此
+      只呈现项目视角）。
+
+    Args:
+        state: ``Store.replay()`` 产物。
+        tasks: master 任务定义列表。
+        agent_id: 当前 agent 身份（可选；None/空 → agent_view 退化为项目视角）。
+        has_master: 是否已存在 ``_master.json``（区分未初始化/空项目）。
+
+    Returns:
+        引导结构：顶层 5 键 + agent_view + project_view。
+    """
+    agent_view = _derive(state, tasks, agent_id, has_master)
+    project_view = _derive(state, tasks, None, has_master)
+    # 顶层严格保持 5 键（= agent_view 的 5 键，向后兼容），双视角挂 agent_view/project_view
+    out = {
+        "step": agent_view["step"],
+        "read": agent_view["read"],
+        "template": agent_view["template"],
+        "command": agent_view["command"],
+        "hint": agent_view["hint"],
+        "agent_view": agent_view,
+        "project_view": project_view,
+    }
+    return out
+
+
 def status_guidance_text(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
     agent_id: str | None = None,
+    has_master: bool = False,
 ) -> str:
     """为 ``orchd status --text`` 生成表格末尾的引导文字（纯函数）。
 
@@ -190,9 +328,10 @@ def status_guidance_text(
         state: ``Store.replay()`` 产物。
         tasks: master 任务定义列表。
         agent_id: 当前 agent 身份（可选）。
+        has_master: 是否已存在 ``_master.json``（status 命令前置必有，传 True）。
 
     Returns:
         一行引导文字（含换行前缀），供追加到表格末尾。
     """
-    g = next_guidance(state, tasks, agent_id)
-    return f"\n下一步：{g['hint']}（{g['command']}）"
+    g = next_guidance(state, tasks, agent_id, has_master)
+    return f"\n下一步：{g['hint']}（{g['command']}）\n"

@@ -36,11 +36,15 @@ def request_reviewer(
     tasks: list[dict[str, Any]],
     agent_id: str,
     derived: TaskDerived | None = None,
+    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """查找处于 in_review 且未被审查者 claim 的任务。
 
     排序规则：spec 阶段的审查优先于 code 阶段。同等阶段内按 ledger 遍历顺序排列。
     调用方（onboard.request）在 reviewer 角色下转发到此函数。
+
+    self-review（实现者 == 审查者）：默认仅标注 ``is_self_review`` 并照常进入
+    候选；``enforce_self_review_block=True``（线上版）时排除（AC1）。
     """
     review_candidates: list[dict[str, Any]] = []
     not_in_list: list[dict[str, Any]] = []
@@ -48,21 +52,30 @@ def request_reviewer(
     for tid, ts in state.items():
         if ts.status == "in_review" and ts.review_claimed_by is None:
             task_def = task_map.get(tid, {})
-            if agent_id not in task_def.get("reviewers", []):
+            # 向后兼容：reviewers 名单存在且非空时不再名单内 → not_in_list；
+            # 字段缺失/为空（指纹身份模型）则跳过名单门禁，仅按实现指纹去重。
+            designated = task_def.get("reviewers")
+            if designated and agent_id not in designated:
                 not_in_list.append({
                     "task_id": tid,
                     "review_phase": ts.review_phase or "spec",
                     "reviewers": task_def.get("reviewers", []),
                 })
                 continue
+            # self-review：DONE 实现指纹 == 当前 reviewer 指纹。
+            # 默认仅标注照常分配；enforce=True 时排除（AC1）。
             done_author, _ = extract_last_done(store, tid, derived)
-            if done_author and done_author == agent_id:
+            is_self = bool(done_author and done_author == agent_id)
+            if is_self and enforce_self_review_block:
                 continue
-            review_candidates.append({
+            entry = {
                 "task_id": tid,
                 "task": task_def,
                 "review_phase": ts.review_phase,
-            })
+            }
+            if is_self:
+                entry["is_self_review"] = True
+            review_candidates.append(entry)
     review_candidates.sort(key=lambda c: (0 if c["review_phase"] == "spec" else 1))
     if not review_candidates:
         if not_in_list:
@@ -100,6 +113,8 @@ def request_reviewer(
     }
     if author:
         candidate["author"] = author
+    if best.get("is_self_review"):
+        candidate["is_self_review"] = True
 
     return {
         "candidate": candidate,

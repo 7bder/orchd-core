@@ -171,7 +171,7 @@ python .orchd/__main__.py init                 # 生成 mod-*/spec.json 快照 +
 | `validate <master>` | 校验任务清单（结构/引用/质量/source） |
 | `init` | 初始化快照 + 空 ledger + checkpoint |
 | `amend` | 增量更新快照（按状态约束矩阵过滤） |
-| `request` | 获取下一个候选任务（`--role reviewer` 领审查） |
+| `request` | 获取下一个候选任务（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示） |
 | `pool` | 列出就绪池（`--all` 含非就绪） |
 | `claim` | 认领任务（自动建 `task/{id}` 分支，`--confirm` 两段式确认） |
 | `done` | 报告完成（跑 verify_command → 自动进入审查） |
