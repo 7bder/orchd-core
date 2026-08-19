@@ -117,6 +117,45 @@ flowchart TD
 
 agent 会自主完成：`git clone` 本仓库 → `python orchd-core/install.py . --agent` → 读 `.orchd/SKILL.md` 进入 BOOTSTRAP → `bootstrap` → `validate` → `init` → 项目就绪。全程**无感**：宿主项目根零额外文件、无需安装 `orchd`、无需配置 PATH。
 
+---
+
+## 安装方式（按场景选一）
+
+> 要求 Python >= 3.10，依赖仅 `jsonschema`。
+
+### 方式 1 · 给 agent 一句话（推荐，零门槛）
+
+把下面这句直接发给任意 agent（Claude Code / Qoder / Codex / …），它会自动完成克隆、安装与引导：
+
+```text
+用这些命令把 orchd 接入当前项目并引导：
+git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+装好后读 .orchd/SKILL.md 进入工作流。
+```
+
+### 方式 2 · 项目 README 顶部放指针行（一劳永逸，供后续 agent 进入）
+
+把下面这段复制到宿主项目 `README.md` 顶部，团队任何 agent 进场都会自动检测并安装：
+
+```markdown
+> 🤖 AI agents: 用 orchd 管理本项目。如果 .orchd/ 不存在，请自动安装：
+> git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+> 然后读 .orchd/SKILL.md 按 guidance 导航。
+```
+
+### 方式 3 · 手动安装（无 agent 场景兜底）
+
+```bash
+git clone https://github.com/7bder/orchd-core.git
+python orchd-core/install.py ./你的项目
+cd 你的项目
+python .orchd/__main__.py --version
+```
+
+> 另可安装 orchd 引导 Agent Skill（skills.sh / 千问广场 / Claude skills），agent 在任意项目对你说「用 orchd 管理」即可自主接入。详见下方「skill 分发」。
+
+---
+
 ## 手动安装（源码仓库 + 安装器，零根文件模型）
 
 要求 Python >= 3.10，依赖仅 `jsonschema`。
