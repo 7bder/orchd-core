@@ -22,13 +22,20 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+# task-14-git-policy-layer：判定类逻辑（guard / checkout_default_strict /
+# ensure_session_lock / parse_conflicts）已收敛到 orchd.gitops（专用 git 判定模块，
+# 单一入口）；此处 re-import 保持旧导入路径兼容。
 from orchd.gitops import (
+    checkout_default_strict,
     check_workspace_state,
     ensure_committed,
-    session_lock_acquire,
-    session_lock_check,
+    ensure_session_lock,
+    get_default_branch,
+    guard_write_command,
+    main_worktree_root,
+    parse_conflicts,
 )
-from orchd.ledger import generate_event_id
+from orchd.ledger import generate_event_id, resolve_session_identity
 
 
 # ------------------------------------------------------------------
@@ -60,6 +67,7 @@ def make_event(
     **extra 中的键值对会直接合并到事件字典，用于各类型事件的差异化字段
     （如 changes_description、verdict、target_status 等）。
     """
+    session_identity = resolve_session_identity()
     ev = {
         "v": 1,
         "event_id": generate_event_id(),
@@ -67,38 +75,10 @@ def make_event(
         "task_id": task_id,
         "agent_id": agent_id,
         "type": etype,
+        "session_id": session_identity["session_id"],
     }
     ev.update(extra)
     return ev
-
-
-def ensure_session_lock(
-    orchd_dir: Path,
-    agent_id: str,
-    branch: str | None = None,
-) -> None:
-    """确保当前 session 可写入：检查 session lock，若被其他 agent 持有则 E019。
-
-    best-effort：锁获取失败（IO 错误）不抛异常，静默降级。
-    """
-    check = session_lock_check(orchd_dir)
-    if check.get("locked"):
-        holder = check.get("agent_id", "unknown")
-        if holder != agent_id:
-            raise OrchdError(
-                ErrorCode.E019,
-                f"workspace_busy: 工作区被 '{holder}' 占用（分支 {check.get('branch', 'N/A')}，"
-                f"已锁定 {check.get('age_min', 0):.1f} 分钟）",
-                [{
-                    "agent_id": agent_id,
-                    "holder": holder,
-                    "holder_branch": check.get("branch"),
-                    "holder_timestamp": check.get("timestamp"),
-                    "age_min": check.get("age_min"),
-                    "hint": "等待该 session 结束，或使用 watchdog --timeout 0 强制释放僵死锁",
-                }],
-            )
-    session_lock_acquire(orchd_dir, agent_id, branch)
 
 
 def decode_subprocess_output(raw: bytes) -> str:
@@ -127,56 +107,6 @@ def verify_output_summary(stdout: bytes, stderr: bytes, limit: int = 400) -> str
         err_s = err.strip()
         parts.append(f"stderr: {err_s[:200]}" + ("…" if len(err_s) > 200 else ""))
     return " | ".join(parts)
-
-
-def guard_write_command(
-    project_root: Path | None,
-    *,
-    allowed_branches: set[str] | None,
-    require_clean: bool,
-    command: str,
-    orchd_dir: Path | None = None,
-    agent_id: str | None = None,
-) -> None:
-    """L1 分支守卫 + L2 session 锁：写命令前校验当前分支、工作区干净度与 session 锁（best-effort）。
-
-    - ``project_root`` 为 None（单元测试）或 git 不可用/非 git 仓库
-      （``check_workspace_state`` 返回 available=False）→ 静默跳过。
-    - 分支不在 ``allowed_branches`` → E018 wrong_branch。
-    - ``require_clean`` 且工作区有已跟踪改动 → E017 dirty_workspace。
-    - git 可用且 ``orchd_dir`` 和 ``agent_id`` 均提供时，检查 session lock → E019。
-    """
-    branch = None
-    git_available = False
-    if project_root is not None:
-        state = check_workspace_state(project_root)
-        if state.get("available"):
-            git_available = True
-            branch = state.get("branch")
-            if allowed_branches is not None and branch not in allowed_branches:
-                expected = sorted(allowed_branches)
-                raise OrchdError(
-                    ErrorCode.E018,
-                    f"wrong_branch: {command} 须在 {expected} 分支执行，当前在 '{branch}'",
-                    [{
-                        "command": command,
-                        "current_branch": branch,
-                        "expected_branches": expected,
-                        "hint": f"请先切换到 {' 或 '.join(expected)} 分支再执行 {command}",
-                    }],
-                )
-            if require_clean and not state.get("clean"):
-                raise OrchdError(
-                    ErrorCode.E017,
-                    f"dirty_workspace: {command} 要求工作区干净（无已跟踪文件改动）",
-                    [{
-                        "command": command,
-                        "hint": "请先提交或还原已跟踪文件改动（untracked 工具/配置文件不阻塞）",
-                    }],
-                )
-
-    if git_available and orchd_dir is not None and agent_id is not None:
-        ensure_session_lock(orchd_dir, agent_id, branch)
 
 
 # ------------------------------------------------------------------
@@ -263,16 +193,19 @@ def sync_master_with_main(project_root: Path, branch: str) -> None:
 
 
 def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
-    """best-effort 将任务分支合并到 main。
+    """best-effort 将任务分支合并到主工作树的 main（task-14-merge-main-tree）。
+
+    始终在**主工作树**内执行（``git rev-parse --git-common-dir`` 定位；flat 单会话
+    即 project_root，零回归），任务 worktree 永不 checkout main。merge-wt 已废弃。
 
     - 成功：``{"conflict": False}``
     - 内容冲突：``{"conflict": True, "files": [...]}``
     - 环境异常：``None``（调用方按 best-effort 降级）。
     """
     try:
+        workdir = main_worktree_root(project_root)
         checkout = subprocess.run(
-            ["git", "checkout", "main"],
-            cwd=str(project_root),
+            ["git", "-C", str(workdir), "checkout", "main"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -281,21 +214,21 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
         if checkout.returncode != 0:
             return None
         result = subprocess.run(
-            ["git", "merge", f"task/{task_id}"],
-            cwd=str(project_root),
+            ["git", "-C", str(workdir), "merge", f"task/{task_id}"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=30,
         )
         if result.returncode != 0:
-            conflict_files: list[str] = []
-            for line in result.stdout.split("\n"):
-                if "CONFLICT" in line:
-                    parts = line.split()
-                    if parts:
-                        conflict_files.append(parts[-1])
+            conflict_files = parse_conflicts(result.stdout or "")
             if conflict_files:
+                # P2-7：冲突后立即 abort 清理 MERGE_HEAD，避免残留中间态阻塞后续 git 操作。
+                # try_auto_resolve_conflict 开头会再次 abort（幂等），此处先清理无副作用。
+                subprocess.run(
+                    ["git", "-C", str(workdir), "merge", "--abort"],
+                    capture_output=True, timeout=10,
+                )
                 return {"conflict": True, "files": conflict_files}
             return None
         return {"conflict": False}
@@ -306,21 +239,37 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
 def try_delete_task_branch(project_root: Path, task_id: str) -> bool:
     """best-effort 删除任务分支 task/{task_id}（merge 成功后调用）。
 
+    分支删除以**主工作树**为稳定 cwd（git -C）：容器布局下 project_root 是任务
+    worktree，task/{id} 曾由该 worktree checkout，git 拒绝删除被占用分支；worktree
+    已回收后（remove_task_wt 或分支已删）分支不再被占用，-d 成功或报分支不存在。
+    flat 布局 main_worktree_root 回退 project_root，cwd 即主工作树，零回归。
+
     Returns:
-        True：删除成功；False：删除失败或环境不支持（best-effort，不抛异常）。
+        True：删除成功，或分支已不存在（幂等视为成功，best-effort 不抛异常）。
+        False：删除失败或环境不支持。
     """
     branch = f"task/{task_id}"
     try:
+        workdir = main_worktree_root(project_root)
         result = subprocess.run(
-            ["git", "branch", "-d", branch],
-            cwd=str(project_root),
+            ["git", "-C", str(workdir), "branch", "-d", branch],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=10,
         )
-        return result.returncode == 0
-    except (subprocess.SubprocessError, FileNotFoundError):
+        if result.returncode == 0:
+            return True
+        # 分支已不存在（如 remove_task_wt 的 -D 已删）→ 幂等视为成功
+        err = (result.stderr or "").lower()
+        if (
+            "not found" in err
+            or "doesn't exist" in err
+            or "does not exist" in err
+        ):
+            return True
+        return False
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return False
 
 
@@ -329,17 +278,20 @@ def try_auto_resolve_conflict(
 ) -> dict[str, Any] | None:
     """L3：merge 冲突自动化解——恢复 main → 分支 merge main 预演 → 自动合并或返回清单。
 
+    全部 git 操作在**主工作树**内以 ``git -C`` 执行（``git rev-parse --git-common-dir``
+    定位；flat 单会话即 project_root，零回归），任务 worktree 永不 checkout main。
+    merge-wt 已废弃。
+
     Returns:
         ``{"resolved": True}``：自动化解成功（main 已含任务分支实现）。
         ``{"resolved": False, "conflict_files": [...], "action": "..."}``：仍需人工解决。
         ``None``：git 环境异常（best-effort 降级）。
     """
 
-    def run(*args: str, timeout: int = 30) -> subprocess.CompletedProcess | None:
+    def run(workdir: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess | None:
         try:
             return subprocess.run(
-                ["git", *args],
-                cwd=str(project_root),
+                ["git", "-C", str(workdir), *args],
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -348,25 +300,17 @@ def try_auto_resolve_conflict(
         except (subprocess.SubprocessError, FileNotFoundError):
             return None
 
-    def parse_conflicts(output: str) -> list[str]:
-        files: list[str] = []
-        for line in output.split("\n"):
-            if "CONFLICT" in line:
-                parts = line.split()
-                if parts:
-                    files.append(parts[-1])
-        return files
-
     try:
-        run("merge", "--abort")
-        co = run("checkout", f"task/{task_id}")
+        workdir = main_worktree_root(project_root)
+        run(workdir, "merge", "--abort")
+        co = run(workdir, "checkout", f"task/{task_id}")
         if co is None or co.returncode != 0:
             return None
-        pre = run("merge", "main")
+        pre = run(workdir, "merge", "main")
         if pre is None:
             return None
         if pre.returncode != 0:
-            run("merge", "--abort")
+            run(workdir, "merge", "--abort")
             files = parse_conflicts(pre.stdout or "")
             return {
                 "resolved": False,
@@ -377,10 +321,10 @@ def try_auto_resolve_conflict(
                     f"然后由同一 reviewer 重试 code APPROVED"
                 ),
             }
-        co2 = run("checkout", "main")
+        co2 = run(workdir, "checkout", "main")
         if co2 is None or co2.returncode != 0:
             return None
-        final = run("merge", f"task/{task_id}")
+        final = run(workdir, "merge", f"task/{task_id}")
         if final is None:
             return None
         if final.returncode != 0:

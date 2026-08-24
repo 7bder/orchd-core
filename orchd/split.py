@@ -27,6 +27,22 @@ from orchd.spec import (
     validate_structure,
 )
 
+_SAFE_MODULE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_module_id(mod_id: str) -> str:
+    """P2-3：module.id 仅允许 [A-Za-z0-9_-]，防止 ``../`` 或绝对路径越界写到 store 根之外。"""
+    if not mod_id or not _SAFE_MODULE_ID_RE.fullmatch(mod_id):
+        raise OrchdError(
+            ErrorCode.E003,
+            f"invalid_module_id: {mod_id!r}",
+            [{
+                "module_id": mod_id,
+                "hint": "module.id 须为 [A-Za-z0-9_-] 组成的相对目录名，禁止路径分隔/..",
+            }],
+        )
+    return mod_id
+
 # intake-commit-enforcement（2026-08-14）：摄入产物文件白名单（两种布局）。
 # 摄入 → amend 的正当链路中，这些文件允许以未提交态进入 amend（引擎随后强制
 # 提交）；其余任何已跟踪改动视为非摄入脏改动，amend / intake 前置阻断（E017）。
@@ -140,7 +156,7 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
         modules = master.modules
         tasks = master.tasks
         for module in modules:
-            mod_id = module.get("id", "")
+            mod_id = _validate_module_id(module.get("id", ""))
             mod_tasks = [t for t in tasks if t.get("module") == mod_id]
             snapshot = {
                 "module_id": mod_id,
@@ -245,13 +261,47 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     source_errors: list[dict[str, Any]] = []
     attachable_sync: list[dict[str, Any]] = []
 
+    # task-intake-file-lock（AC1/AC3）：准入写锁 + 提交前 HEAD 推进检测。
+    # 准入写（改 _master.json / IDEAS.md / ROADMAP.md）受独立 .intake.lock 串行，
+    # 不复用账本锁（避免一次 amend 阻塞并行 claim/done）；HEAD 漂移检测发现
+    # base 被并行推进则拒绝注册（git 层 TOCTOU）。两者 best-effort。
+    intake_lock: dict[str, Any] | None = None
+    drift_checked = False
+    try:
+        from orchd.gitops import head_drift_check
+        from orchd.ledger import intake_lock_acquire, intake_lock_release
+
+        if orchd_dir is not None:
+            from orchd.ledger import resolve_agent_id
+
+            intake_lock = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+        # 提交前 HEAD 推进检测：main 被并行推进则拒绝（AC3）
+        drift = head_drift_check(project_root, ref="HEAD", base_ref=default_branch)
+        if drift.get("drift"):
+            if intake_lock is not None:
+                intake_lock_release(intake_lock)
+                intake_lock = None
+            raise OrchdError(
+                ErrorCode.E007,
+                f"stale_base: main 已被并行推进（base {drift.get('base_sha')[:7]}"
+                " 与本地 HEAD 分叉），拒绝注册——请先更新工作区 main 后重试",
+                [{"base_sha": drift.get("base_sha"), "head_sha": drift.get("head_sha")}],
+            )
+        drift_checked = True
+    except OrchdError:
+        raise
+    except Exception:
+        # 准入锁/HEAD 检测属 best-effort：失败不阻断 amend 本身
+        drift_checked = False
+
     store.acquire_lock()
     try:
         state = store.replay()
 
         # L253：注册前结构校验——拦截非法字段入库（intake 期暴露，而非 done/validate 事后）
-        # 仅 validate_structure：shared 文件存在性（validate_references）归 init/BOOTSTRAP
-        structure_errors = validate_structure(master)
+        # P2-4：并补跨引用校验（E006 重复 id / E005 未知 depends_on·module / E004 DAG 环），
+        # 防止仅经 amend 注入坏引用；shared 文件存在性仅在 .orchd/ 目录时检查（无副作用）。
+        structure_errors = validate_structure(master) + validate_references(master)
         if structure_errors:
             raise OrchdError(
                 ErrorCode.E003,
@@ -479,7 +529,7 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
 
         # 重新生成所有 snapshot（目录名 = module_id）
         for module in modules:
-            mod_id = module.get("id", "")
+            mod_id = _validate_module_id(module.get("id", ""))
             mod_tasks = [t for t in tasks if t.get("module") == mod_id]
             snapshot = {
                 "module_id": mod_id,
@@ -496,6 +546,13 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
             )
     finally:
         store.release_lock()
+
+    # task-intake-file-lock：finally 释放准入写锁（异常路径也释放，防残留卡死后续准入）
+    if intake_lock is not None:
+        try:
+            intake_lock_release(intake_lock)
+        except Exception:
+            pass
 
     return {
         "amended": True,

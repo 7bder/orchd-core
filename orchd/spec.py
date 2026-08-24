@@ -357,26 +357,19 @@ def is_code_task(t: dict) -> bool:
     return not _is_doc_task(t)
 
 
-def validate_quality(
-    master: Master,
-    *,
-    strict_verify: bool = False,
-) -> list[ValidationError]:
+def validate_quality(master: Master) -> list[ValidationError]:
     """任务定义质量校验（弱 LLM 兜底）。
 
     加法式校验：不改变 validate_structure / validate_references 的既有行为，
     仅在它们之后追加质量层面的告警。
 
     校验项：
-    1. E022 —— verify_command 缺失（默认 warning 不阻断注册；strict_verify=True 时升级为 error）。
+    1. E022 —— verify_command 缺失（warning；代码类任务在 amend 注册点按
+       ``_is_doc_task`` 判定阻断，文档/基础设施类仅 warning）。
     2. E023 —— acceptance_criteria 含模糊词（warning），白名单豁免常见可验证语义。
 
-    Args:
-        master: 已加载的 Master 对象。
-        strict_verify: 是否将 E022 升级为 error（默认 False，仅 warning）。
-
     Returns:
-        ValidationError 列表（E022/E023）；合法时返回空列表。
+        ValidationError 列表（E022/E023/E024/E026/E027…）；合法时返回空列表。
     """
     errors: list[ValidationError] = []
     tasks = master.tasks
@@ -539,8 +532,9 @@ def validate_source(
     """source 字段溯源校验（E025，加法式：不改变 validate_structure/references 行为）。
 
     task 可选 ``source`` 字段（``^(idea|roadmap):[a-z0-9-]+$``）声明任务来源：
-    - ``idea:<id>``：引用 IDEAS.md 中 ``## YYYY-MM-DD <标题>`` 条目，且该条目
-      ``status: pending``（已 taskified/完成/dropped 的条目不可作为新任务来源）；
+    - ``idea:<id>``：引用 IDEAS.md 中 ``- id: <id>`` **精确匹配**的条目，且该条目
+      ``status: pending``（已 taskified/完成/dropped 的条目不可作为新任务来源；
+      日期词/标题词 ref 因无对应条目 id 必然被拒）；
     - ``roadmap:<id>``：引用 ROADMAP.md 中 ``## 版本`` 章节头包含的规划 id。
 
     校验规则：
@@ -667,14 +661,18 @@ def _exact_ref_match(ref_id: str, title: str) -> bool:
 def _check_idea_reference(
     tid: str, task_idx: int, ref_id: str, ideas_path: Path
 ) -> list[ValidationError]:
-    """核对 IDEAS.md：存在 ``## YYYY-MM-DD <标题>`` 且引用 id 匹配（精确词）、status 为 pending。
+    """核对 IDEAS.md：存在 ``- id: <ref_id>`` 精确匹配的条目且 status 为 pending。
+
+    ideas-archive-exact-match（2026-08-22）：idea ref 只匹配条目 ``- id: == ref``
+    （精确相等），废除标题完整词匹配——日期词 ref（如 ``idea:2026-08-22``）因无
+    对应条目 id 必然被拒，从数据模型杜绝同日条目标题词误命中。
 
     idea-write-gate（2026-08-15）：status 仅 ``pending`` 可作为任务来源；``study``
     （论证中，idea propose 写入）不可作为任务来源——须先 confirm 升 pending 才能引用。
     """
     errors: list[ValidationError] = []
     text = ideas_path.read_text(encoding="utf-8")
-    # 解析条目：## 标题行 + 后续行中的 status 字段（支持 "- status: pending" 列表格式）
+    # 解析条目：## 标题行 + 后续行中的 status / id 字段（支持列表与裸两种格式）
     entries: list[dict[str, str]] = []
     current: dict[str, str] | None = None
     for line in text.splitlines():
@@ -682,30 +680,32 @@ def _check_idea_reference(
         if stripped.startswith("## "):
             if current:
                 entries.append(current)
-            current = {"title": stripped[3:].strip(), "status": ""}
+            current = {"title": stripped[3:].strip(), "status": "", "id": ""}
         elif current is not None:
             # 匹配 "- status: pending" 或 "status: pending"
             for marker in ("- status:", "status:"):
                 if stripped.startswith(marker):
                     current["status"] = stripped[len(marker):].strip()
                     break
+            # 匹配 "- id: <slug>" 或 "id: <slug>"（显式 id 强约束锚点）
+            for marker in ("- id:", "id:"):
+                if stripped.startswith(marker):
+                    current["id"] = stripped[len(marker):].strip()
+                    break
     if current:
         entries.append(current)
 
-    matched = None
-    for e in entries:
-        # P3（2026-08-13 full-audit-v2）：子串匹配改精确匹配——ref_id 须为
-        # 标题的一个完整词（以空格/冒号/括号/结尾为边界），避免前缀误命中
-        # （如 idea:2026-08-1 命中多个 2026-08-1x 条目）
-        if _exact_ref_match(ref_id, e["title"]):
-            matched = e
-            break
+    # ideas-archive-exact-match：只按条目 `- id:` 精确匹配（废除标题完整词匹配）
+    matched = next(
+        (e for e in entries if (e.get("id") or "").strip() == ref_id),
+        None,
+    )
     if matched is None:
         errors.append(
             ValidationError(
                 code=ErrorCode.E025,
                 path=f"$.tasks[{task_idx}].source",
-                message=f"task '{tid}' 引用 idea '{ref_id}' 但 IDEAS.md 中无匹配条目（## 标题）",
+                message=f"task '{tid}' 引用 idea '{ref_id}' 但 IDEAS.md 中无匹配条目（- id: == {ref_id}）",
             )
         )
         return errors
@@ -814,6 +814,27 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
     return warnings
 
 
+def layout_marker_warnings(project_root: Path) -> list[dict[str, Any]]:
+    """validate 布局标记校验（task-14-worktree-layout，AC2）。
+
+    布局标记（``.orchd/.layout.json``）缺失或主工作树不一致时返回告警
+    （不判 invalid，对齐 E031 告警语义），并附自动探测结果——不静默跑错目录。
+    标记存在且有效 → 空列表。
+    """
+    from orchd.worktree import detect_layout
+
+    project_root = Path(project_root)
+    layout = detect_layout(project_root)
+    warnings: list[dict[str, Any]] = []
+    for msg in layout.get("warnings", []):
+        warnings.append({
+            "code": "LAYOUT",
+            "path": ".orchd/.layout.json",
+            "message": msg,
+        })
+    return warnings
+
+
 def _runs_pytest(verify_cmd: str) -> bool:
     """判定 verify_command 是否真正执行 pytest 子进程。
 
@@ -859,7 +880,46 @@ def _verify_unsafe_reasons(verify_cmd: str) -> list[str]:
     if m and _re.search(r"[\"']", m.group(2)):
         reasons.append("含嵌套 python -c 引号（JSON→cmd→shell 三层转义易失效）")
 
+    # d) P1-4 安全加固：shell 注入构式（命令替换/管道/命令链/重定向/危险命令）
+    reasons += _dangerous_shell_reasons(verify_cmd)
+
     return reasons
+
+
+def _dangerous_shell_reasons(verify_cmd: str) -> list[str]:
+    """检测 verify_command 中可用于 shell 注入的构式（P1-4）。
+
+    合法 verify 只应含 pytest / python -c / exit 等；命中以下构式即视为不可信：
+    命令替换、管道、命令链、重定向、危险外部命令。注册期 E027 warning，
+    执行期（done / amend dry-run）硬阻断。
+
+    Returns:
+        命中原因列表；无命中返回空列表。
+    """
+    import re as _re
+    reasons: list[str] = []
+    # 剥离引号内容后再查（合法 python -c "..." 内容里的 ; 等不参与构式判定；
+    # 但 $()/` 在引号外出现仍属 shell 语义）
+    stripped = _re.sub(r"([\"'])(.*?)\1", "", verify_cmd, flags=_re.DOTALL)
+    # 命令替换 / 反引号：任意代码执行，合法 verify 从不使用
+    if _re.search(r"\$\(|`", stripped):
+        reasons.append("含命令替换 $(...) 或反引号")
+    # sh/bash -c：执行任意命令串。不拦 bash -n（语法检查）与 .sh 后缀（合法）
+    if _re.search(r"\b(?:sh|bash)\s+-c\b", stripped):
+        reasons.append("含 sh/bash -c 任意命令执行")
+    # 危险外部命令：任意系统副作用 / 网络外联
+    # 注：不拦截管道 | 与重定向 >/< —— 现有 master 合法使用（>/dev/null、| grep），
+    # 其后的恶意命令由本清单（curl/wget/rm 等）覆盖。
+    for bad in ("rm", "curl", "wget", "nc", "chmod", "chown", "reboot", "shutdown", "mkfs", "dd"):
+        if _re.search(rf"\b{_re.escape(bad)}\b", stripped, _re.IGNORECASE):
+            reasons.append(f"含危险命令 {bad}")
+            break
+    return reasons
+
+
+def verify_command_dangerous_reasons(verify_cmd: str) -> list[str]:
+    """公开入口（P1-4）：返回 verify_command 的 shell 注入风险原因，供执行点硬阻断。"""
+    return _dangerous_shell_reasons(verify_cmd)
 
 
 def _basetemp_platform_issues(verify_cmd: str) -> list[str]:

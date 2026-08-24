@@ -62,6 +62,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:  # P1-6：兜底捕获意外异常，保证 stdout 恒为可解析 JSON
+        import traceback
+        traceback.print_exc()  # traceback 只进 stderr，不污染 stdout
+        _output({
+            "error": {
+                "code": "E999",
+                "message": f"unexpected_error: {exc}",
+                "details": [{"exception": type(exc).__name__}],
+            }
+        })
+        return 1
 
 
 def _attach_guidance(data: Any) -> Any:
@@ -82,11 +93,13 @@ def _attach_guidance(data: Any) -> Any:
     try:
         from orchd.ledger import Store
         from orchd.spec import load_master
+        from orchd.worktree import resolve_canonical_project_root
 
         orchd_dir = _find_orchd_dir()
         state = Store(orchd_dir).replay()
-        # master 任务定义始终在 .orchd/_master.json
-        master_path = orchd_dir / "_master.json"
+        # master 任务定义统一从 canonical 主工作树读（task-canonical-project-root）
+        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
+        master_path = canonical_root / ".orchd" / "_master.json"
         tasks = load_master(master_path).tasks if master_path.exists() else []
 
         from orchd.guide import next_guidance, resolve_read_paths
@@ -201,9 +214,11 @@ def _guidance_stderr_enabled() -> bool:
     """
     try:
         from orchd.spec import load_master
+        from orchd.worktree import resolve_canonical_project_root
 
         orchd_dir = _find_orchd_dir()
-        master_path = orchd_dir / "_master.json"
+        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
+        master_path = canonical_root / ".orchd" / "_master.json"
         if not master_path.exists():
             return True
         master = load_master(master_path)
@@ -419,7 +434,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--assignee")
     p.add_argument("--force", action="store_true",
                    help="显式确认走逃生口（claimed→completed / cancelled→pending）")
+    p.add_argument("--evidence-sha", default=None,
+                   help="复活已完成任务的 git 证据 commit SHA（仅 completed→pending 时需要）")
     p.set_defaults(func=_cmd_force_status)
+
+    # merge-ack（task-merge-warning-ack）
+    p = sub.add_parser("merge-ack", help="merge_warning 人工销账（merge-acks 确认清单）")
+    p.add_argument("--task", required=True, help="已人工确认的 task_id")
+    p.add_argument("--reason", required=True, help="确认原因（必填）")
+    p.set_defaults(func=_cmd_merge_ack)
 
     # status
     p = sub.add_parser("status", help="全局状态快照；可跟 task-id 查单任务详情")
@@ -429,11 +452,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="附加 merge 巡检：completed 任务对应 task/{id} 分支未并入 main 的告警清单（只读）")
     p.add_argument("--audit-intake", action="store_true",
                    help="附加摄入产物审计：未提交的 IDEAS.md / ROADMAP.md / _master.json 改动告警（只读）")
+    p.add_argument("--audit-revive", action="store_true",
+                   help="附加复活巡检：扫描 ledger 中 completed→pending 的强制复活操作，列告警（只读）")
+    p.add_argument("--audit-task", action="store_true",
+                   help="附加任务完整性巡检：merged 任务的历史缺失/残留（main 残留 + 分支 diff 缺失声明文件，只读）")
     p.set_defaults(func=_cmd_status)
 
     # watchdog
     p = sub.add_parser("watchdog", help="僵死任务巡检")
     p.add_argument("--timeout", type=int, default=60)
+    p.add_argument("--takeover", action="store_true",
+                   help="对 stale_claims 中确认会话已失效的任务执行 force-status 回退 pending（best-effort）")
     p.set_defaults(func=_cmd_watchdog)
 
     # ideas-archive
@@ -444,6 +473,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="git 仓库完整性只读检测")
     p.add_argument("--path", default=".", help="项目根目录（含 .git），默认当前目录")
     p.set_defaults(func=_cmd_doctor)
+
+    # layout-migrate（task-14-worktree-layout）：flat → container 迁移
+    p = sub.add_parser(
+        "layout-migrate", help="flat → container 布局迁移（保留 git 历史、可回滚）"
+    )
+    p.add_argument("--path", default=".", help="flat 主工作树根，默认当前目录")
+    p.set_defaults(func=_cmd_layout_migrate)
 
     # intake（2026-08-14 intake-commit-enforcement）
     p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md / ROADMAP.md）并校验状态合法性")
@@ -470,6 +506,20 @@ def _build_parser() -> argparse.ArgumentParser:
     _p = idea_sub.add_parser("drop", help="将 status: study 条目降为 dropped（仅用户执行）")
     _p.add_argument("--title", required=True, help="灵感标题")
     _p.set_defaults(func=_cmd_idea_drop)
+
+    # session（Session Identity Layer）：引擎显式会话生命周期
+    p = sub.add_parser("session", help="会话生命周期：start / current / end")
+    session_sub = p.add_subparsers(dest="session_action", required=True)
+
+    _p = session_sub.add_parser("start", help="开启新会话并输出 session_token/session_id")
+    _p.add_argument("--agent", default=None, help="具名 agent（可选，如 codex-1）")
+    _p.set_defaults(func=_cmd_session_start)
+
+    _p = session_sub.add_parser("current", help="显示当前会话")
+    _p.set_defaults(func=_cmd_session_current)
+
+    _p = session_sub.add_parser("end", help="结束当前会话")
+    _p.set_defaults(func=_cmd_session_end)
 
     return parser
 
@@ -606,29 +656,164 @@ def _identity_warning(agent_id: str, orchd_dir: Path) -> dict[str, Any] | None:
 def _is_fingerprint_agent_id(agent_id: str) -> bool:
     """判断 agent_id 是否为指纹形态身份（12 位 hex）。
 
-    稳定身份指纹（``orchd.ledger.resolve_agent_id``）为 12 位
-    SHA-256 短哈希；命中即视为自动化 agent 身份，E021 豁免（不与人名比对）。
+    task-fp-identity-single-source（2026-08-22）：单一事实源为
+    ``orchd.ledger.is_fingerprint_agent_id``，此处惰性导入转发（保持调用点
+    不变，避免模块级循环依赖），消除本地副本的同步漂移风险。
     """
-    if not agent_id or len(agent_id) != 12:
-        return False
+    from orchd.ledger import is_fingerprint_agent_id
+
+    return is_fingerprint_agent_id(agent_id)
+
+
+def _current_task_from_branch(project_root: Path) -> str | None:
+    """best-effort 从当前 git 分支名推导本流程归属任务（``task/<id>`` 前缀）。
+
+    容器布局（1.4）下 agent 在专属 task worktree 中工作，分支即 ``task/<id>``，
+    据此可将「本流程发起的任务」从并行活跃任务中排除，避免单任务流程误报。
+    无 git / 非 task 分支 / 调用失败 → 返回 None（调用方退化为更保守的阈值）。
+    """
     try:
-        int(agent_id, 16)
-        return True
-    except ValueError:
-        return False
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    branch = proc.stdout.strip()
+    if branch.startswith("task/"):
+        return branch[len("task/"):]
+    return None
+
+
+def _session_collision_warning(
+    agent_id: str,
+    store,
+    exclude_task_id: str | None = None,
+    review_task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """只读检测当前会话指纹的「并行会话碰撞」，返回 ``session_collision_warning`` 或 None。
+
+    host 注入项目级会话码（全项目同一 ``ORCHD_SESSION_ID``）时，所有并行对话派生出
+    **同一指纹**，引擎会把它们静默识别为同一身份、归属错乱。本函数仅只读 replay
+    ledger，**不修改身份机制（resolve_agent_id 不变）、不落状态（不写 ledger/checkpoint）、
+    不阻断命令**，只在命中时附加只读告警，提示 host 注入粒度违约。
+
+    触发条件（任一即告警）：
+
+    1. 并行活跃任务：当前指纹名下已存在非本流程发起的并行活跃任务
+       （``claimed``/``in_review``，owner 指纹 == 当前指纹，且 ``task_id != exclude_task_id``）；
+    2. 自审实现：``review_task_id`` 的实现者指纹 == 当前指纹（审查自己实现）。
+
+    非指纹身份（如 ``provider-{n}``）豁免——其粒度本就为 agent 级，碰撞语义不同，
+    不在此告警范围。
+
+    Args:
+        agent_id: 当前会话指纹（由 ``resolve_agent_id`` 派生）。
+        store: ledger Store（用于 replay 当前任务状态）。
+        exclude_task_id: 本流程正在操作/归属的任务（claim 传被认领任务，
+            status 传当前分支或显式 task_id）；命中后从并行集合排除，避免自指。
+        review_task_id: 若本流程为审查认领，传被审查任务，用于自审检测。
+
+    Returns:
+        告警 dict（含 ``code``/``warning``/``reason``/``colliding_tasks``/``hint``），
+        或 None（无碰撞、零误报）。
+    """
+    if not agent_id or not _is_fingerprint_agent_id(agent_id):
+        return None
+
+    from orchd.ledger import resolve_session_identity
+
+    current_session_id = resolve_session_identity(getattr(store, "orchd_dir", None))["session_id"]
+
+    def _same_owner(claimed_by: str | None, claimed_session: str | None) -> bool:
+        if claimed_session and current_session_id:
+            return claimed_session == current_session_id and claimed_by == agent_id
+        return bool(claimed_by and claimed_by == agent_id)
+
+    states = store.replay()
+
+    # 条件 2：审查自己实现（reviewer session == 实现者 session）
+    if review_task_id:
+        ts = states.get(review_task_id)
+        if ts is not None and _same_owner(ts.claimed_by, ts.claimed_session):
+            return _session_collision_warn_dict(
+                reason="self_implementation_review",
+                colliding_tasks=[review_task_id],
+                hint=(
+                    "当前会话与任务实现者 session 相同，疑似审查自己实现：host 注入的"
+                    "会话码可能为项目级（全项目同指纹/session），导致并行对话被识别为同一身份。"
+                    "请换一个独立会话（新对话 / 重新 session start 注入唯一会话码）担任 reviewer，或核对归属。"
+                ),
+            )
+
+    # 条件 1：当前 session 名下存在其他并行活跃任务
+    colliding: list[str] = []
+    for tid, ts in states.items():
+        if tid == exclude_task_id:
+            continue
+        if ts.status in ("claimed", "in_review"):
+            if _same_owner(ts.claimed_by, ts.claimed_session) or _same_owner(
+                ts.review_claimed_by, ts.review_claimed_session
+            ):
+                colliding.append(tid)
+
+    if colliding:
+        # 本流程有明确归属任务 → 其余活跃任务必为并行（误报概率低，直接告警）；
+        # 无明确归属任务 → 仅当指纹名下已并行多任务（>=2）才告警，避免单任务正常流误报。
+        if exclude_task_id is not None or len(colliding) >= 2:
+            return _session_collision_warn_dict(
+                reason="parallel_active_tasks",
+                colliding_tasks=colliding,
+                hint=(
+                    "当前会话指纹名下已存在其他并行活跃任务（claimed/in_review），"
+                    "但本流程并未发起它们：host 注入的会话码为项目级（全项目同指纹），"
+                    "导致并行对话被识别为同一身份、归属错乱。请为每次对话注入唯一会话码，"
+                    "或核对任务归属。"
+                ),
+            )
+    return None
+
+
+def _session_collision_warn_dict(
+    reason: str, colliding_tasks: list[str], hint: str,
+) -> dict[str, Any]:
+    """构造 ``session_collision_warning`` 告警 dict（E035 告警码，不阻断命令）。"""
+    return {
+        "code": "E035",
+        "warning": "session_collision_warning",
+        "reason": reason,
+        "colliding_tasks": colliding_tasks,
+        "hint": hint,
+    }
 
 
 def _load_tasks(master_path: str | None = None) -> tuple[list, Path, Any]:
-    """加载 master 并返回 (tasks, orchd_dir, master)。"""
+    """加载 master 并返回 (tasks, orchd_dir, master)。
+
+    canonical-master-read（task-canonical-project-root）：未显式指定
+    ``master_path`` 时，master 任务定义统一从 canonical 主工作树
+    ``.orchd/_master.json`` 读取（``resolve_canonical_project_root`` 定位），
+    避免任务 worktree 本地 checkout 副本与主工作树不同步导致的任务池不一致
+    （pool/status/request 等业务读与 main 一致）。flat 布局 canonical == 本地
+    → 零回归。返回的 ``orchd_dir`` 保持当前 worktree 定位语义不变（Store 账本
+    经 ``resolve_store_dir`` 解析到共享账本根；project_root 物理操作基准不受影响）。
+    """
     from orchd.spec import load_master
+    from orchd.worktree import resolve_canonical_project_root
 
     if master_path:
         path = Path(master_path)
+        orchd_dir = path.parent
     else:
         orchd_dir = _find_orchd_dir()
-        path = orchd_dir / "_master.json"
+        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
+        path = canonical_root / ".orchd" / "_master.json"
     master = load_master(path)
-    orchd_dir = path.parent
     return master.tasks, orchd_dir, master
 
 
@@ -653,6 +838,7 @@ def _cmd_validate(args) -> dict:
 
     from orchd.ledger import Store
     from orchd.spec import (
+        layout_marker_warnings,
         load_master,
         roadmap_landing_warnings,
         validate_quality,
@@ -687,6 +873,9 @@ def _cmd_validate(args) -> dict:
     # intake-dual-path（2026-08-15）：ROADMAP 规划章节落地兜底（E031 告警，不判 invalid）。
     # 独立追加：E031 非任务级质量项，不参与终态豁免过滤；dict 结构，与 ValidationError 并存。
     quality_warnings += roadmap_landing_warnings(Path(args.path).parent)
+    # task-14-worktree-layout：双布局标记校验（LAYOUT 告警，不判 invalid；缺失自动探测 + 告警）。
+    # 入参为项目根（master 目录的父级）；container 下为 <容器>/main。
+    quality_warnings += layout_marker_warnings(Path(args.path).parent.parent)
 
     def _warn_dict(e) -> dict:
         """把 ValidationError 或告警 dict 归一化为输出结构（含 roadmap-land E031 dict）。"""
@@ -723,12 +912,37 @@ def _cmd_init(args) -> dict:
 
     CLI 参数: args.master — master 文件路径（默认 .orchd/_master.json）。
     返回: {"initialized": True, "created_files": [...]}。
+
+    1.4 双布局（task-14-worktree-layout，AC2/AC3/AC5）：
+    - 新项目（master 不存在）→ 默认 container：自建默认 master + ``main/`` +
+      ``.orchd-runtime/`` + 布局标记（零额外操作）；
+    - 既有项目（master 已存在）→ flat：维持现状零回归，仅补写 flat 布局标记。
     """
     from orchd.spec import load_master
     from orchd.split import init
+    from orchd.worktree import bootstrap_container, read_layout, write_layout
 
-    master = load_master(args.master)
-    orchd_dir = Path(args.master).parent
+    master_path = Path(args.master).resolve()
+    orchd_dir = master_path.parent
+    project_root = orchd_dir.parent
+
+    # 新项目（无 master）→ 默认 container（AC3）
+    if not master_path.exists():
+        boot = bootstrap_container(project_root, master_path)
+        orchd_dir = Path(boot["main_worktree"]) / ".orchd"
+        master = load_master(orchd_dir / "_master.json")
+        result = init(orchd_dir, master)
+        result["container"] = boot["container"]
+        result["main_worktree"] = boot["main_worktree"]
+        result["runtime_root"] = boot["runtime_root"]
+        result["marker"] = boot["marker"]
+        result["created_files"] = boot["created"] + result.get("created_files", [])
+        return result
+
+    # 既有项目（master 已存在）→ flat（AC5 零回归）；标记缺失时补写 flat 标记（AC2）
+    if read_layout(orchd_dir) is None:
+        write_layout(orchd_dir, "flat", project_root)
+    master = load_master(master_path)
     return init(orchd_dir, master)
 
 
@@ -803,7 +1017,7 @@ def _cmd_amend(args) -> dict:
     # 限时 30s；2026-08-08 升级：assertion_mismatch 类失败阻断注册（E028），
     # E024/E027（缺 basetemp / 不安全段）阻断注册；expected_pending 仅提示）
     from orchd.split import classify_dry_run_failure
-    from orchd.spec import validate_quality
+    from orchd.spec import validate_quality, verify_command_dangerous_reasons
 
     task_map = {t.get("id", ""): t for t in master.tasks}
     dry_run_results: list[dict[str, Any]] = []
@@ -811,6 +1025,18 @@ def _cmd_amend(args) -> dict:
     for tid in changed:
         verify_cmd = task_map.get(tid, {}).get("verify_command")
         if not verify_cmd:
+            continue
+        _dangerous = verify_command_dangerous_reasons(verify_cmd)
+        if _dangerous:
+            blocking_errors.append({
+                "code": ErrorCode.E027.name,
+                "task_id": tid,
+                "verify_command": verify_cmd,
+                "reasons": _dangerous,
+                "message": (
+                    "verify_command 含 shell 注入风险，dry-run 拒绝执行（E027）"
+                ),
+            })
             continue
         try:
             proc = subprocess.run(
@@ -1036,6 +1262,7 @@ def claim_preview(
     """
     from orchd.gitops import check_workspace_state
     from orchd.onboard import _extract_last_done
+    from orchd.report import task_revive_markers
 
     task_map = {t.get("id", ""): t for t in tasks}
     task_def = task_map.get(task_id)
@@ -1110,6 +1337,11 @@ def claim_preview(
             {"check": "未被其他 agent 认领",
              "expected_pass": not (ts and ts.claimed_by and ts.claimed_by != agent_id)},
         ]
+    # 复活标记（task-force-status-revive-audit）：该任务曾有 completed→pending 复活
+    # 历史时透明展示（reason+evidence_sha+时间），正常任务不展示（零误伤）。
+    markers = task_revive_markers(store)
+    if task_id in markers:
+        preview["revive_marker"] = markers[task_id]
     return preview
 
 
@@ -1153,6 +1385,12 @@ def _cmd_claim(args) -> dict:
         warning = _identity_warning(agent_id, orchd_dir)
         if warning:
             result["warning"] = warning
+        collision = _session_collision_warning(
+            agent_id, store, exclude_task_id=args.task,
+            review_task_id=args.task if role == "reviewer" else None,
+        )
+        if collision:
+            result["session_collision_warning"] = collision
         return result
 
     result = claim(
@@ -1165,6 +1403,12 @@ def _cmd_claim(args) -> dict:
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
+    collision = _session_collision_warning(
+        agent_id, store, exclude_task_id=args.task,
+        review_task_id=args.task if role == "reviewer" else None,
+    )
+    if collision:
+        result["session_collision_warning"] = collision
     return result
 
 
@@ -1251,7 +1495,8 @@ def _cmd_force_status(args) -> dict:
 
     CLI 参数: args.task（必需）、args.status（必需，目标状态）、
     args.reason（必需）、args.assignee（可选，指定认领人）、
-    args.force（可选，逃生口二次确认——claimed→completed / cancelled→pending）。
+    args.force（可选，逃生口二次确认——claimed→completed / cancelled→pending）、
+    args.evidence_sha（可选，completed→pending 复活所需的 git 证据 commit SHA）。
     agent 身份由引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 强制状态变更事件信息。
     """
@@ -1264,12 +1509,27 @@ def _cmd_force_status(args) -> dict:
     result = force_status(
         store, agent_id=agent_id, task_id=args.task,
         target_status=args.status, reason=args.reason, assignee=args.assignee,
-        force=args.force,
+        force=args.force, project_root=orchd_dir.parent,
+        evidence_sha=args.evidence_sha,
     )
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
     if result.get("new_status") == "cancelled":
         result["ideas_archive"] = _maybe_archive_ideas(orchd_dir)
     return result
+
+
+def _cmd_merge_ack(args) -> dict:
+    """merge_warning 人工销账：登记 .orchd/merge-acks.json（task-merge-warning-ack）。
+
+    CLI 参数: args.task（必需，已人工确认的 task_id）、args.reason（必需，确认原因）。
+    与 resolve_sha 自动销账互补：人工路径兜底旧事件 / 无 sha 场景，登记后
+    audit-merge 不再报 merge_warning_unresolved。
+    返回: 登记结果 {acked, task_id, acked_at, reason}。
+    """
+    from orchd.report import merge_ack
+
+    _, orchd_dir, _ = _load_tasks()
+    return merge_ack(orchd_dir.parent, args.task, args.reason)
 
 
 def _maybe_archive_ideas(orchd_dir: Path) -> dict:
@@ -1280,17 +1540,32 @@ def _maybe_archive_ideas(orchd_dir: Path) -> dict:
     为不提交（对齐 amend 的 ``not_on_main`` 语义），避免把归档提交进任务分支。
     任何异常静默降级，不阻断调用方。
 
+    container 终态回收守卫（task-review-archive-crash-guard）：review code
+    APPROVED 终态回收会删除正在运行的任务 worktree（含 orchd/ 源码）。此后
+    ``_cmd_review`` 调本函数时，``orchd_dir`` 与其下的 orchd.ideas 等源码模块
+    已从磁盘消失——须在懒加载前先判 ``orchd_dir`` 是否仍存在，否则懒加载
+    ``from orchd.ideas import ...`` 抛 ModuleNotFoundError、命令 exit 1、
+    best-effort 分支清理被中断。此处降级跳过，并保证懒加载/归档任意异常
+    静默降级（对齐"任何异常静默降级"契约）。
+
     Returns:
         归档结果；若无可归档条目或异常，返回 ``{"archived": [], ...}``。
     """
-    from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
-    from orchd.ideas import archive_resolved_ideas
-    from orchd.spec import load_master
-
+    # 前置守卫：worktree 已终态回收 → orchd_dir（含 orchd/ 源码）消失，
+    # 必须在懒加载之前降级，避免 ModuleNotFoundError 阻断调用方。
+    if not orchd_dir.exists():
+        return {"archived": [], "kept": 0, "skipped": "worktree_recycled"}
     master_path = orchd_dir / "_master.json"
     if not master_path.exists():
         return {"archived": [], "kept": 0, "skipped": "no_master"}
-    master = load_master(master_path)
+    try:
+        from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
+        from orchd.ideas import archive_resolved_ideas
+        from orchd.spec import load_master
+
+        master = load_master(master_path)
+    except Exception:
+        return {"archived": [], "kept": 0, "skipped": "archive_error"}
     project_root = orchd_dir.parent
     try:
         result = archive_resolved_ideas(project_root, master)
@@ -1346,6 +1621,18 @@ def _cmd_doctor(args):
     if not result["repo_ok"]:
         return result, 1
     return result, 0
+
+
+def _cmd_layout_migrate(args) -> dict:
+    """flat → container 布局迁移（task-14-worktree-layout，AC4）。
+
+    CLI 参数: args.path（flat 主工作树根，默认当前目录）。
+    返回: 迁移结果字典（migrated / main_worktree / moved / marker /
+    runtime_root / 可选 reason + hint）。
+    """
+    from orchd.worktree import layout_migrate
+
+    return layout_migrate(Path(args.path))
 
 
 def _cmd_intake(args) -> dict:
@@ -1408,6 +1695,39 @@ def _cmd_idea_drop(args) -> dict:
     return idea_drop(orchd_dir.parent, args.title)
 
 
+def _cmd_session_start(args) -> dict:
+    """开启新的引擎级会话（Session Identity Layer）。
+
+    CLI 参数: args.agent（可选具名 agent）。
+    返回: session runtime 信息（session_id / session_token / fingerprint / path）。
+    宿主接入层应将 session_token 写入 ORCHD_SESSION_ID，供后续命令解析身份。
+    """
+    from orchd.ledger import session_start
+
+    orchd_dir = _find_orchd_dir()
+    return session_start(orchd_dir, agent_name=args.agent)
+
+
+def _cmd_session_current(args) -> dict:
+    """显示当前会话 runtime 信息；未开启时返回 E033。"""
+    from orchd.ledger import session_current
+
+    orchd_dir = _find_orchd_dir()
+    return session_current(orchd_dir)
+
+
+def _cmd_session_end(args) -> dict:
+    """结束当前会话：标记 runtime inactive + best-effort 释放 session lock。"""
+    from orchd.gitops import release_session_lock_if_owned
+    from orchd.ledger import session_end
+
+    orchd_dir = _find_orchd_dir()
+    result = session_end(orchd_dir)
+    agent_id = result.get("fingerprint") or _resolve_agent_id(orchd_dir)
+    result["session_lock_released"] = release_session_lock_if_owned(orchd_dir, agent_id)
+    return result
+
+
 def _cmd_status(args) -> dict:
     """获取全局状态快照或单任务详情。
 
@@ -1416,21 +1736,35 @@ def _cmd_status(args) -> dict:
     返回: 全局状态字典或单任务详情字典；若 --text 模式则直接打印表格并返回 None。
     """
     from orchd.ledger import Store
-    from orchd.report import intake_audit, merge_audit, status
+    from orchd.report import intake_audit, merge_audit, revive_audit, status, task_integrity_audit
 
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
+    agent_id = _resolve_agent_id(orchd_dir)
     # 红线 8（R3）：status 前置校验运行时文件完整性（只读告警，不阻断）
     integrity_warnings = store.check_integrity()
     result = status(
-        store, tasks, project=master.project, text=args.text, task_id=args.task
+        store, tasks, project=master.project, text=args.text, task_id=args.task,
+        project_root=orchd_dir.parent,
     )
+    # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
+    if not args.text:
+        exclude = args.task or _current_task_from_branch(orchd_dir.parent)
+        collision = _session_collision_warning(agent_id, store, exclude_task_id=exclude)
+        if collision:
+            result["session_collision_warning"] = collision
     if integrity_warnings:
         result["integrity_warnings"] = integrity_warnings
     if args.audit_merge and args.task is None:
         result["merge_audit"] = merge_audit(store, tasks, orchd_dir.parent)
     if getattr(args, "audit_intake", False) and args.task is None:
         result["intake_audit"] = intake_audit(orchd_dir.parent)
+    if getattr(args, "audit_revive", False) and args.task is None:
+        result["revive_audit"] = revive_audit(store, tasks, orchd_dir.parent)
+    if getattr(args, "audit_task", False) and args.task is None:
+        result["audit_task"] = task_integrity_audit(
+            store, tasks, orchd_dir.parent, scope="merged"
+        )
     if args.text and "_text" in result:
         # --text 为人类可读展示层：只输出表格，不再混入 JSON。
         # 末尾追加无感引导文字（task-guide-seamless-guidance，best-effort）。
@@ -1457,7 +1791,10 @@ def _cmd_watchdog(args):
 
     tasks, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
-    result = watchdog(store, tasks, timeout_min=args.timeout)
+    result = watchdog(
+        store, tasks, timeout_min=args.timeout, project_root=orchd_dir.parent,
+        agent_id=_resolve_agent_id(orchd_dir), takeover=args.takeover,
+    )
     if result["stuck_count"] > 0:
         return result, 1
     return result

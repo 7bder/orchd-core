@@ -126,22 +126,26 @@ def _summarize(
         agent_id: 当前 agent 身份（可选；用于"claimed 属于当前 agent"的判定）。
 
     Returns:
-        六状态计数 + 关键派生态。
+        六状态计数 + 关键派生态（含 rework 返工任务数）。
     """
     counts = {"pending": 0, "claimed": 0, "done": 0, "in_review": 0,
               "completed": 0, "cancelled": 0}
     my_claimed: list[str] = []
+    rework = 0
     for task in tasks:
         tid = task.get("id", "")
         ts = state.get(tid)
         s = ts.status if ts else "pending"
         counts[s] = counts.get(s, 0) + 1
+        if s == "pending" and ts and ts.attempt_count > 0:
+            rework += 1
         if s == "claimed" and agent_id and ts and ts.claimed_by == agent_id:
             my_claimed.append(tid)
         if s == "in_review" and agent_id and ts and ts.review_claimed_by == agent_id:
             counts["my_in_review"] = counts.get("my_in_review", 0) + 1
     counts["total"] = len(tasks)
     counts["my_claimed"] = my_claimed
+    counts["rework"] = rework
     return counts
 
 
@@ -212,6 +216,21 @@ def _derive(
             "template": ["templates/spec-reviewer.md", "templates/code-reviewer.md"],
             "command": "orchd request",
             "hint": f"有 {c['in_review']} 个任务待审查：先领取审查任务，代码审查通过后任务才算完成。",
+        }
+
+    # 有返工任务且无活跃认领 → 引导优先认领返工，避免积压
+    # （claimed==0 守卫与 request_impl 一致：本 agent 持有 claimed 时引导 done，
+    #  而非误导其认领新任务触发 E011 busy）
+    if c.get("rework", 0) > 0 and c["claimed"] == 0:
+        return {
+            "step": "rework_first",
+            "read": ["rules/review.md", "rules/session.md"],
+            "template": ["templates/implementer.md"],
+            "command": "orchd request",
+            "hint": (
+                f"有 {c['rework']} 个返工任务待认领（已被审查打回）：优先处理避免积压，"
+                "认领后请先读 review_comments 中的前次审查意见。"
+            ),
         }
 
     # 有 pending 且无 claimed → 引导领实现任务（知识：摄入/会话规则；方法：实现模板）

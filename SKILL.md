@@ -32,6 +32,8 @@ python .orchd/__main__.py bootstrap   # 输出 schema + architect prompt + 拆�
 > **命令调用约定（零根入口，task-12-docs-roadmap）**：所有 `orchd` 命令统一用 **`python .orchd/__main__.py`** 调用——与 `orchd <子命令>` 完全等价。宿主项目根**零额外文件**、无需安装 `orchd`。
 
 > **无感引导（task-guide-seamless-guidance，2026-08-15）**：任意命令 JSON 响应自动附加 `guidance` 字段 `{step, read, template, command, hint}`——`read`（知识路由：该读的规则文件）、`template`（方法路由：该用的模板）、`command`（动作路由：下一步命令）。**据 `guidance` 逐层导航即可完成任何任务流程**（request/claim/done/review）；`guidance` 为加法式字段，不替换既有字段，也可忽略自行决策。
+>
+> **多 worktree 并行（1.4，multi-worktree-m-p1，2026-08-22）**：仓库可开多个 worktree 并行推进多个任务——**任务 worktree 全生命周期由引擎自动管理**（claim 自动创建 + 绑定到共享账本、终态自动回收、孤儿惰性清理），agent **零 worktree 管理操作**（无感化，无需 git worktree 运维知识）。**双布局兼容**：container（`main/` 子目录 + 平级 `task-<id>/` worktree，推荐）与 flat（既有项目零迁移，任务 worktree 即主工作树本身）。**共享账本**：各 worktree 共享同一账本根（ledger / checkpoint / lock / 任务绑定，container 默认 `<容器>/.orchd-runtime/`，`ORCHD_HOME` 可覆盖），所有 worktree 的 agent 看到同一任务池与事件流。**merge 在主工作树内由引擎执行**（专用 merge-wt 已废弃），任务 worktree **永不 checkout main**。**依赖完成级串行（E008）**：并行仅限无依赖就绪任务，依赖链保持完成级串行。**弱 LLM 友好**：强约束（守卫 / 归属 / 文件冲突硬门 + 错误码 hint）+ 兜底（best-effort 降级、孤儿惰性清理、幂等重试）。详见 rules/git.md 与 docs/system-design.md §4.9。
 ## 纪律与协议（统一适用于所有项目）
 
 > **通用性说明（mode-unify，2026-08-15）**：本节纪律红线 / 摄入协议 / rules 目录对**所有项目一视同仁**，不再区分"仅本仓库特供"。特定于 orchd 自托管仓库的**运维专属动作**（如 IDEAS 自动归档、摄入门禁巡检）对普通外部宿主项目**不要求执行**——外部项目只需遵守通用工作流纪律，无需执行自托管专属运维。
@@ -86,6 +88,15 @@ python .orchd/__main__.py bootstrap   # 输出 schema + architect prompt + 拆�
    中断/放弃必须先 retract，不得让任务停在 claimed/pending 且实现悬空
    （2026-08-05 实踩：task-amend-branch-guard-patch 实现悬空、
     task-merge-audit-workflow 实现未提交）。
+13. **禁止声明文件漏提交/漏声明（task-engine-done-integrity-gate /
+    review-merge-diff-gate，2026-08-24）**：`files_to_edit` 声明文件必须
+    **随任务分支提交并进入 diff**，否则 `done` 与 `review`（code APPROVED）
+    均被引擎硬门禁拒绝（done → E010 `file_conflict` / E017 `dirty_workspace`；
+    review → E010 拒绝 merge）。不得在**主工作树**直接改任务文件（跨 worktree
+    脏写 = `main_dirty_overlap` / `main_residual` 告警来源），应在任务 worktree
+    内修改并由 done 提交；声明文件若确实无需改动，应走 `amend` 从
+    `files_to_edit` 移除或补充说明，**不得**静默跳过。任务完成后应运行
+    `status --audit-task` 实证告警清零。
 
 **MUST（强制动作）**：
 
@@ -99,23 +110,42 @@ python .orchd/__main__.py bootstrap   # 输出 schema + architect prompt + 拆�
 5. 任何异常（verify 失败、merge 冲突、状态不符）立即停止并报告，
    不自行猜测处置。
 6. session 结束时工作区必须干净（无未提交改动），或在报告中说明。
+7. completed 任务关闭前运行 `python .orchd/__main__.py status --audit-task`
+   实证声明文件完整性告警清零（`main_residual` / `historical_missing`）；
+   有告警立即报告，不自行处置。
 
 ### 身份约定（会话级指纹，session-id-fingerprint，2026-08-16）
 
 agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈希，如
-`a1b2c3d4e5f6`），由宿主注入的每对话唯一会话标识派生（`orchd.ledger.resolve_agent_id`）：
-- 宿主在每次对话启动时注入 `ORCHD_SESSION_ID`，orchd 据此确定性派生指纹
-  （同一对话内所有命令返回同一指纹，切换对话注入新值即换指纹），实现
-  「**一个对话一个永久指纹**」。
+`a1b2c3d4e5f6`），由宿主注入的每对话唯一会话标识派生（`orchd.ledger.resolve_agent_id`）。
+Session Identity Layer 在此基础上进一步由引擎显式管理会话生命周期：
+- 会话启动：`orchd session start [--agent NAME]` 生成唯一 `session_id` 与 `session_token`，
+  并写入 `.orchd-runtime/sessions/<session_id>.json`；宿主应把返回的
+  `session_token` 注入 `ORCHD_SESSION_ID`，该会话内所有命令恒同身份。
+- `orchd session current` 查看当前会话；`orchd session end` 结束会话并 best-effort
+  释放会话锁。会话锁为 flock 活性锁（内核托管 fd），进程异常退出后由引擎自动
+  清理（OS 探活判定 stale），无需手工清锁。
 - 各 agent 宿主统一接入：TRAE 会话由 `ICUBE_CODEMAIN_SESSION` **自动搬运**到
   `ORCHD_SESSION_ID`（开箱即用）；codex / opencode / workbuddy 等由各自接入层
-  把会话唯一码写入 `ORCHD_SESSION_ID`。
+  在会话启动时调用 `orchd session start` 并把 session_token 写入 `ORCHD_SESSION_ID`。
 - 已**彻底废除 `.orchd/.agent_id`**：引擎不再读写该文件，未注入 `ORCHD_SESSION_ID`
-  时不生成、不借用、不落盘任何身份（写命令由引擎拒绝并提示宿主注入；只读命令
-  可匿名运行）。存量历史 `.agent_id` 文件不再参与身份判定。
+  时不生成、不借用、不落盘任何身份（写命令由引擎拒绝并提示先 `session start`；
+  只读命令可匿名运行）。存量历史 `.agent_id` 文件不再参与身份判定。
+- **会话级判定**：归属 / 忙度 / 自审 / 锁所有权均以 `session_id` 为主键；
+  同 agent 不同 session 视为不同身份，可并行领取不同任务。
 
-- **指纹生命周期**：同一对话内指纹永不变；不同对话（不同 `ORCHD_SESSION_ID`）
-  返回不同指纹。切换对话即可获得新身份——这是「换对话领 review」的机制保证。
+- **指纹生命周期**：同一对话内指纹（fingerprint）与 `session_id` 永不变；
+  不同对话（不同 `ORCHD_SESSION_ID` / 不同 session runtime）返回不同指纹。
+  切换对话即可获得新身份——这是「换对话领 review」的机制保证。
+- **宿主注入契约**：`ORCHD_SESSION_ID` 最好是 `orchd session start` 返回的
+  `session_token`。若宿主自行注入，则必须是**会话级**标识——每个对话启动时
+  生成一个唯一值，并在该对话的所有命令中保持不变。项目级、工作区级或其他跨
+  对话共享的标识都不符合契约，宿主不得用它们顶替会话级标识。判定标准是：同一
+  对话的命令得到同一指纹，不同并行对话即使位于同一项目/工作区也必须得到不同指纹。
+- **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，
+  造成任务归属混淆、E011 单任务忙度冲突，以及实现者与审查者之间的 E016 自审纠缠。
+  发现同指纹并行时应先核对宿主注入粒度并切换到正确的会话级标识，不得通过伪造
+  agent ID 绕过身份校验。
 - **E021 对指纹形态豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，
   不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021
   `identity_mismatch` warning。

@@ -28,4 +28,4 @@ for _p in (_SCRIPT_DIR, _PROJECT_ROOT):
 from orchd.cli import main  # noqa: E402  (sys.path 调整后导入)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -22,6 +22,12 @@ _GIT_ENCODING = "utf-8"
 _GIT_ERRORS = "replace"
 _GIT_TIMEOUT = 10
 
+# refs/ 根目录扫描忽略的 OS 自动生成文件（macOS Finder 会在目录内生成
+# .DS_Store、Windows 生成 Thumbs.db）：此类文件由文件系统自动再生，不属于
+# 非法 loose ref，不应误报污染健康检查；与 worktree.py _JUNK_NAMES 中
+# OS 杂项语义一致（doctor 为叶子模块，零 orchd 内部依赖，故在本文件内定义）。
+_REFS_ROOT_IGNORE = frozenset({".DS_Store", "Thumbs.db"})
+
 
 def _run_git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
     """以 UTF-8 解码运行 git 命令（cwd 限定 project_root），超时降级。"""
@@ -186,6 +192,34 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
                     f"HEAD 无法解析（{head_text}）——指向的 ref 或对象已丢失",
                 )
             )
+
+    # 4a) refs/ 根目录非法 loose ref 检测（task-p1-doctor-refs-scan）
+    # refs/ 根目录下的非目录文件（如 .DS_Store、临时文件）属于非法 loose ref，
+    # 会污染 refs 命名空间；合法的直接子项只有 heads/tags/remotes 等目录。
+    # 注：仅扫描 refs/ 根目录一层，不递归到 refs/heads/* 等子目录（那是合法 ref）。
+    illegal_refs_root: list[str] = []
+    if refs_dir.is_dir():
+        for entry in sorted(refs_dir.iterdir()):
+            if entry.is_dir():
+                # 合法子目录（heads/tags/remotes/... 或命名空间目录），跳过
+                continue
+            # OS 自动生成文件（.DS_Store / Thumbs.db）不属于非法 loose ref，跳过
+            if entry.name in _REFS_ROOT_IGNORE:
+                continue
+            # 非目录文件即为非法 loose ref（临时文件 / 手工乱建等）
+            illegal_refs_root.append(entry.name)
+    if illegal_refs_root:
+        checks.append(
+            _make_check(
+                "refs_root",
+                "fail",
+                "refs/ 根目录存在非法 loose ref（非目录文件）："
+                + "、".join(illegal_refs_root)
+                + "——详见 SKILL.md 仓库事故恢复 SOP",
+            )
+        )
+    else:
+        checks.append(_make_check("refs_root", "ok", "refs/ 根目录无非法 loose ref"))
 
     # 4) 引用对象可达（refs/heads/* + reflog 最新哈希）
     # P2a：收集全部候选对象，一次 `git cat-file --batch-check` 批量查询（O(N)→O(1) 子进程）。

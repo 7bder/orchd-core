@@ -19,6 +19,19 @@ from orchd.ledger import Store, TaskState
 # importance 权重映射
 _IMPORTANCE_WEIGHT = {"critical": 4, "high": 3, "normal": 2, "low": 1}
 
+# 共享核心文件集合（task-concurrency-hardening）：
+# 多 agent 并行改动这些引擎/测试基础设施文件时冲突最密集（onboard/gitops/cli/
+# errors/spec/pool/review/worktree/ledger + tests/*），且纯声明级 files_to_edit
+# 重叠未必能反映（常因越界改动未声明而同文件）。摄入/注册 tip 将其冲突从
+# warning 升级为强约束：非依赖的并行任务命中共享核心文件重叠即硬串行化
+# （靠 request 依赖感知过滤 + claim E010 兜底），不允许静默并行。
+SHARED_CORE_FILES = frozenset({
+    "orchd/onboard.py", "orchd/gitops.py", "orchd/gitops_ops.py",
+    "orchd/cli.py", "orchd/errors.py", "orchd/spec.py", "orchd/pool.py",
+    "orchd/review.py", "orchd/worktree.py", "orchd/ledger.py",
+    "orchd/split.py", "orchd/intake.py", "orchd/report.py",
+})
+
 
 def derive_importance(
     blocked_downstream_count: int, thresholds: dict[str, Any] | None = None
@@ -66,10 +79,12 @@ class Candidate:
     Attributes:
         task: _master.json 中的完整任务定义字典。
         blocked_downstream_count: 被多少 pending 状态的下游任务依赖。
+        rework: 是否为返工任务（pending 且 attempt_count > 0，即曾被审查打回）。
     """
 
     task: dict[str, Any]  # _master.json 中的完整任务定义
     blocked_downstream_count: int = 0
+    rework: bool = False
 
 
 @dataclass
@@ -88,6 +103,9 @@ class Conflict:
     task_id: str
     files: list[str]
     claimed_by: str
+    # task-concurrency-hardening：重叠文件是否包含共享核心文件。摄入期据此把
+    # 「共享核心文件并行」从软 warning 升级为强串行约束（非依赖即硬排除）。
+    is_shared_core: bool = False
 
 
 def build_pool(
@@ -148,7 +166,11 @@ def build_pool(
                 continue
 
         candidates.append(
-            Candidate(task=task, blocked_downstream_count=blocked_counts.get(tid, 0))
+            Candidate(
+                task=task,
+                blocked_downstream_count=blocked_counts.get(tid, 0),
+                rework=bool(ts and ts.attempt_count > 0),
+            )
         )
 
     return candidates
@@ -180,11 +202,13 @@ def sort_candidates(
     elif sort_key == "hours":
         return sorted(candidates, key=lambda c: c.task.get("estimated_hours", 0))
     else:
-        # 默认复合排序
+        # 默认复合排序：importance desc → rework（返工优先）→ blocked_downstream desc
+        # → estimated_hours asc。rework 仅作同级内 tie-break，不跨 importance 层。
         return sorted(
             candidates,
             key=lambda c: (
                 _importance_key(c, importance_thresholds),
+                c.rework,
                 c.blocked_downstream_count,
                 -c.task.get("estimated_hours", 0),
             ),
@@ -230,7 +254,12 @@ def detect_file_conflict(
         overlap = target_files & set(files)
         if overlap:
             conflicts.append(
-                Conflict(task_id=tid, files=sorted(overlap), claimed_by=claimed_by)
+                Conflict(
+                    task_id=tid,
+                    files=sorted(overlap),
+                    claimed_by=claimed_by,
+                    is_shared_core=bool(overlap & SHARED_CORE_FILES),
+                )
             )
     return conflicts
 

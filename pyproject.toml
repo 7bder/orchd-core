@@ -42,6 +42,7 @@ orchd = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.0",
     "setuptools-scm>=8.0",
     "build>=1.0",
     "ruff>=0.6",
@@ -71,3 +72,6 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: 慢速测试（长锁等待/真安装/构建），常规集默认忽略（-m 'not slow' 或 CI 烟测子集）",
+]

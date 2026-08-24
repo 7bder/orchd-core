@@ -1,3 +1,7 @@
+"""``python -m orchd`` 零根入口：与 ``orchd`` 脚本一致，退出码透传 main()。"""
+import sys
+
 from orchd.cli import main
 
-main()
+if __name__ == "__main__":
+    sys.exit(main())

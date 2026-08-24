@@ -29,18 +29,18 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+from orchd.lockfile import ExclusiveFileLock
 
-# 跨平台文件锁
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
-
-_LOCK_RETRIES_FLAT = [0.05, 0.1, 0.2]  # 50ms, 100ms, 200ms
+# checkpoint 字段 schema 版本（P2-10 / ROADMAP 1.4.1 引擎性能）：
+# update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
+# schema_version 落后于本常量（新字段引入/升级）才 replay_full() 自愈一次。
+# 之后新增 TaskState 字段时递增本常量即可触发一次全量重建（字段漂移自愈）。
+_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -67,9 +67,11 @@ class TaskState:
 
     status: str = "pending"
     claimed_by: str | None = None
+    claimed_session: str | None = None
     attempt_count: int = 0
     review_phase: str | None = None
     review_claimed_by: str | None = None
+    review_claimed_session: str | None = None
     merge_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,10 +84,14 @@ class TaskState:
         d: dict[str, Any] = {"status": self.status, "attempt_count": self.attempt_count}
         if self.claimed_by:
             d["claimed_by"] = self.claimed_by
+        if self.claimed_session:
+            d["claimed_session"] = self.claimed_session
         if self.review_phase:
             d["review_phase"] = self.review_phase
         if self.review_claimed_by:
             d["review_claimed_by"] = self.review_claimed_by
+        if self.review_claimed_session:
+            d["review_claimed_session"] = self.review_claimed_session
         if self.merge_warning:
             d["merge_warning"] = self.merge_warning
         return d
@@ -100,9 +106,11 @@ class TaskState:
         return cls(
             status=d.get("status", "pending"),
             claimed_by=d.get("claimed_by"),
+            claimed_session=d.get("claimed_session"),
             attempt_count=d.get("attempt_count", 0),
             review_phase=d.get("review_phase"),
             review_claimed_by=d.get("review_claimed_by"),
+            review_claimed_session=d.get("review_claimed_session"),
             merge_warning=d.get("merge_warning"),
         )
 
@@ -160,13 +168,59 @@ def resolve_agent_id(orchd_dir: Path | None = None) -> str:
       切换到新对话可正常领取 review（不被 E016 自审阻断）。
     - 各 agent 宿主（TRAE / codex / opencode / workbuddy 等）在启动 orchd 前
       统一把各自会话唯一码注入 ``ORCHD_SESSION_ID``，本函数只认该标准化变量。
+
+    Note:
+        单一事实源为 :func:`resolve_session_identity`，本函数取其 ``fingerprint``。
+    """
+    return resolve_session_identity(orchd_dir)["fingerprint"]
+
+
+def resolve_session_identity(orchd_dir: Path | None = None) -> dict[str, str]:
+    """解析当前会话的引擎级身份，返回 ``{"session_id": ..., "fingerprint": ...}``。
+
+    Session Identity Layer：
+    - ``session_id`` 为会话级身份主键（64 位 SHA-256 十六进制），同一
+      ``ORCHD_SESSION_ID`` 会话内恒定，不同会话不同；
+    - ``fingerprint`` 为兼容旧的 12 位 hex 指纹（取 ``session_id`` 前 12 位）；
+    - 未注入 ``ORCHD_SESSION_ID`` 时返回 ``{"session_id": "", "fingerprint": ""}``，
+      引擎不生成、不借用、不落盘任何身份。
+
+    与 :func:`resolve_agent_id` 的区别：后者只返回指纹；本函数同时返回
+    session_id，供事件账本写入和 session 级并发判定使用。
     """
     sid = os.environ.get(_ORCHD_SESSION_ID_ENV) or None
     if not sid:
-        return ""
+        return {"session_id": "", "fingerprint": ""}
     import hashlib
 
-    return hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()[:12]
+    full = hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()
+    return {"session_id": full, "fingerprint": full[:12]}
+
+
+def is_fingerprint_agent_id(agent_id: str) -> bool:
+    """判断 agent_id 是否为指纹形态身份（12 位 hex，task-fp-identity-engine）。
+
+    :func:`resolve_agent_id` 派生的稳定身份指纹为 12 位 SHA-256 短哈希（恒为 hex）。
+    指纹身份由引擎自动识别、无法预写入静态 reviewers 名单，故在名单门禁
+    （claim E007 / request review_priority / request_reviewer）与 E021 身份
+    warning 中豁免——审查独立性仍由 E016 防自审 + E011 忙度兜底。
+
+    **单一事实源（task-fp-identity-single-source，2026-08-22）**：onboard.py /
+    review.py / cli.py 统一由此导入，消除三处副本的判定逻辑同步漂移风险。
+
+    Args:
+        agent_id: 待判定身份字符串。
+
+    Returns:
+        True：恰为 12 位 hex（指纹形态）；False：空 / None / 长度不符 / 非 hex。
+    """
+    if not agent_id or not isinstance(agent_id, str) or len(agent_id) != 12:
+        return False
+    try:
+        int(agent_id, 16)
+        return True
+    except ValueError:
+        return False
 
 
 def _find_orchd_dir() -> Path:
@@ -184,13 +238,157 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     账本（ledger / checkpoint / lock / mod-*）由环境变量 ``ORCHD_HOME`` 重定向到
     外部目录；未设置时回退到传入的 ``orchd_dir``（默认 ``<cwd 向上找的 .orchd/>``）。
 
+    1.4 共享账本默认（task-14-worktree-lifecycle，R3）：未设 ``ORCHD_HOME`` 时，
+    若主工作树存在 **container** 布局标记（``.orchd/.layout.json`` layout=container）
+    → 默认布局级 runtime 根（``<容器>/.orchd-runtime/``，多会话共享账本）；
+    flat（含标记与未迁移项目）→ 维持 ``orchd_dir`` 现状零回归
+    （flat 单会话账本仍在主工作树 .orchd/，共享账本留待 container 形态落地）。
+
     注意：``orchd_dir`` 语义是「master 目录」（含 ``_master.json`` + ``shared/``，
     走 git，不入 backend）；返回的账本根仅用于 FilesystemBackend 派生账本文件路径。
     """
     home = os.environ.get("ORCHD_HOME")
     if home:
         return Path(home)
+    # task-14-worktree-lifecycle：仅 container 布局 → 布局级 runtime 根（共享账本默认）
+    try:
+        from orchd.worktree import read_layout
+
+        marker = read_layout(orchd_dir)
+        if marker is not None and marker.get("layout") == "container":
+            main_wt = Path(marker["main_worktree"])
+            return main_wt.parent / ".orchd-runtime"
+    except Exception:
+        pass
     return orchd_dir
+
+
+# ------------------------------------------------------------------
+# Session runtime（task-session-cli-lifecycle，Session Identity Layer）
+# ------------------------------------------------------------------
+# 每个 session 由引擎显式开启：session start 生成唯一 session_token +
+# 派生 session_id/fingerprint，并写入共享账本根下的 sessions/<id>.json；
+# 后续命令通过 ORCHD_SESSION_ID 指向该 session。它把“会话边界”从宿主
+# 的隐式环境常量升级为引擎持有的运行时实体，避免多个对话共享同一指纹。
+
+_SESSION_RUNTIME_DIRNAME = "sessions"
+_SESSION_RUNTIME_ACTIVE = True
+
+
+def _derive_session_identity_from_token(sid: str) -> dict[str, str]:
+    """由会话 token 确定性派生 session_id/fingerprint（与 resolve_session_identity 同算法）。"""
+    import hashlib
+
+    full = hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()
+    return {"session_id": full, "fingerprint": full[:12]}
+
+
+def session_runtime_dir(orchd_dir: Path) -> Path:
+    """返回 session runtime 目录（共享账本根下，container/flat 兼容）。"""
+    return resolve_store_dir(orchd_dir) / _SESSION_RUNTIME_DIRNAME
+
+
+def _session_runtime_path(orchd_dir: Path, session_id: str) -> Path:
+    return session_runtime_dir(orchd_dir) / f"{session_id}.json"
+
+
+def session_start(
+    orchd_dir: Path,
+    agent_name: str | None = None,
+) -> dict[str, Any]:
+    """开启一个新的会话，返回 engine 生成的 session_id/fingerprint/token。
+
+    每次调用都会生成全新 ``session_token``（UUID），据此确定性派生
+    ``session_id`` 与兼容指纹。写入：
+    ``<runtime>/sessions/<session_id>.json``。
+
+    调用方（宿主接入层）应把返回的 ``session_token`` 注入
+    ``ORCHD_SESSION_ID`` 环境变量，使本会话后续命令解析到同一身份。
+    """
+    orchd_dir = Path(orchd_dir)
+    token = uuid.uuid4().hex
+    identity = _derive_session_identity_from_token(token)
+    now = datetime.now(timezone.utc).isoformat()
+    data: dict[str, Any] = {
+        "session_id": identity["session_id"],
+        "fingerprint": identity["fingerprint"],
+        "session_token": token,
+        "agent_name": agent_name or "",
+        "created_at": now,
+        "last_seen": now,
+        "active": _SESSION_RUNTIME_ACTIVE,
+    }
+    path = _session_runtime_path(orchd_dir, identity["session_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {**data, "path": str(path), "started": True}
+
+
+def session_current(orchd_dir: Path) -> dict[str, Any]:
+    """返回当前会话运行时信息；未开启（无 ORCHD_SESSION_ID/无 runtime 文件）→ E033。
+
+    判定：取 ``resolve_session_identity()`` 的 session_id，再在 runtime 目录中
+    定位同名 JSON。若 runtime 文件缺失或已 inactive，提示重新 session start。
+    """
+    orchd_dir = Path(orchd_dir)
+    identity = resolve_session_identity(orchd_dir)
+    if not identity["session_id"]:
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_identity_missing: 未开启 orchd session，无法识别当前会话身份",
+            [{
+                "hint": (
+                    "请先运行 'orchd session start' 并在后续命令中将返回的 "
+                    "session_token 注入 ORCHD_SESSION_ID"
+                ),
+            }],
+        )
+    path = _session_runtime_path(orchd_dir, identity["session_id"])
+    if not path.exists():
+        # 兼容：runtime 文件未被 session start 写入（如旧式指纹会话）
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_not_found: 当前指纹没有对应的 session runtime 文件",
+            [{
+                "session_id": identity["session_id"],
+                "hint": "请先运行 'orchd session start' 开启会话，并将 session_token 注入 ORCHD_SESSION_ID",
+            }],
+        )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not data.get("active"):
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_inactive: 当前 session 已结束，请重新 session start",
+            [{"session_id": data.get("session_id"), "path": str(path)}],
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    data["last_seen"] = now
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {**data, "path": str(path), "current": True}
+
+
+def session_end(orchd_dir: Path) -> dict[str, Any]:
+    """结束当前会话：标记 runtime 文件 inactive（best-effort，不删除）。"""
+    orchd_dir = Path(orchd_dir)
+    identity = resolve_session_identity(orchd_dir)
+    if not identity["session_id"]:
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_identity_missing: 未开启 orchd session，无法结束会话",
+            [{"hint": "无需结束：当前没有可识别的会话身份"}],
+        )
+    path = _session_runtime_path(orchd_dir, identity["session_id"])
+    if not path.exists():
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_not_found: 当前指纹没有对应的 session runtime 文件",
+            [{"session_id": identity["session_id"], "hint": "先 session start 再 session end"}],
+        )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["active"] = False
+    data["ended_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {**data, "path": str(path), "ended": True}
 
 
 _WORKSPACE_DOCS = ("IDEAS.md", "ROADMAP.md", "SKILL.md")
@@ -204,6 +402,13 @@ def resolve_workspace_root(project_root: Path) -> Path:
     - 发布态布局（自包含 ``.orchd/``）：工作区文档归置 ``.orchd/`` → 返回
       ``project_root / ".orchd"``。
 
+    task-canonical-workspace-docs（2026-08-25）canonical 化：入口先经
+    ``resolve_canonical_project_root`` 解析到 canonical 主工作树根——
+    container 布局返回 ``<容器>/main/``（布局标记权威），flat 布局返回本地。
+    再按上述布局规则定位文档根：intake/ideas/amend 在任务 worktree 内调用时
+    仍统一从主工作树读 IDEAS/ROADMAP/SKILL，避免 worktree 本地 ``.orchd/``
+    拷贝（引擎传播的 SKILL.md 等）过期导致摄入/引导不一致。
+
     判定：``.orchd/`` 下已存在任一工作区文档 → 发布态；否则若项目根存在 → 开发态；
     两者都无 → 默认返回 ``.orchd/``（发布态默认，AC3）。
 
@@ -211,12 +416,158 @@ def resolve_workspace_root(project_root: Path) -> Path:
     ``amend``/``ideas_archive``（cli.py）——统一经本 helper 解析 IDEAS/ROADMAP/SKILL 路径。
     """
     project_root = Path(project_root)
+    # task-canonical-workspace-docs（2026-08-25）：统一共享读入口，container 布局
+    # 解析到 canonical 主工作树根（flat 返回本地），worktree 本地副本不参与文档定位。
+    from orchd.worktree import resolve_canonical_project_root
+
+    project_root = resolve_canonical_project_root(project_root)
+    project_root = Path(project_root)
     orchd_dir = project_root / ".orchd"
     if any((orchd_dir / name).exists() for name in _WORKSPACE_DOCS):
         return orchd_dir
     if any((project_root / name).exists() for name in _WORKSPACE_DOCS):
         return project_root
     return orchd_dir
+
+
+# ------------------------------------------------------------------
+# 准入/公共文件锁（task-intake-file-lock）
+# ------------------------------------------------------------------
+# 背景：_master.json / IDEAS.md / ROADMAP.md 是 git 跟踪的全局文件、无进程级锁，
+# 与账本文件（被 Store.acquire_lock()) 的 flock 串行不对等。两个 agent 并行准入
+# （intake/amend）同时改写这几个文件会互相覆盖 / 全量 amend 撞车。这里提供一把
+# **独立快捷锁** ``.intake.lock``，落于共享账本根（resolve_store_dir，container/flat
+# 兼容），只用进程内 flock 互斥 + 超时判定，**不**复用账本 Store 锁——从而保证并行
+# claim/done（账本锁）不被一次 amend 阻塞。
+
+_INTAKE_LOCK_FILENAME = ".intake.lock"
+# 准入写最长持有锁的超时（秒）。超过视为僵死锁，可强制接管/清理。
+_INTAKE_LOCK_TIMEOUT = 120
+
+
+def intake_lock_path(orchd_dir: Path) -> Path:
+    """返回准入锁文件路径（共享账本根下，container/flat 兼容）。"""
+    return resolve_store_dir(orchd_dir) / _INTAKE_LOCK_FILENAME
+
+
+def intake_lock_check(
+    orchd_dir: Path, timeout_s: float = _INTAKE_LOCK_TIMEOUT
+) -> dict[str, Any]:
+    """检查准入锁状态（不阻塞），供 watchdog / caller 判定是否僵死。
+
+    以 :class:`ExclusiveFileLock` 的 flock 探测为权威：无 live flock 持有即未锁；
+    被持有则尽量读诊断标记（agent_id/timestamp）。为兼容旧调用方/测试，未持有但
+    存在**超时残留标记**时亦返回 ``reason="timeout"``（可续获取）。
+
+    Returns:
+        ``{"locked": False}`` 未被持有（无 live flock，可获取）。
+        ``{"locked": False, "reason": "timeout", "age_s"}`` 未被持有但残留标记超时。
+        ``{"locked": True, "agent_id", "timestamp", "age_s"}`` 被持有，诊断标记可读。
+        ``{"locked": True, "reason": "no_marker"}`` 被持有但标记不可读。
+    """
+    lock_path = intake_lock_path(orchd_dir)
+    probe = ExclusiveFileLock(lock_path).check()
+    if probe.get("held"):
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            ts = float(data.get("timestamp", 0))
+            return {
+                "locked": True,
+                "agent_id": data.get("agent_id") or "unknown",
+                "timestamp": data.get("timestamp", str(ts)),
+                "age_s": round(time.time() - ts, 1),
+            }
+        except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
+            return {"locked": True, "reason": "no_marker"}
+    # 未被持有：兼容旧"残留标记超时"判定（flock 是权威，此项仅诊断，不参与互斥）
+    try:
+        if lock_path.exists():
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            ts = float(data.get("timestamp", 0))
+            age = time.time() - ts
+            if age >= timeout_s and data.get("agent_id"):
+                return {"locked": False, "reason": "timeout", "age_s": round(age, 1)}
+    except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return {"locked": False}
+
+
+def intake_lock_acquire(
+    orchd_dir: Path, agent_id: str, timeout_s: float = _INTAKE_LOCK_TIMEOUT
+) -> dict[str, Any]:
+    """获取准入写锁（ExclusiveFileLock 原语，flock 为唯一互斥权威，无强夺接管）。
+
+    与账本 Store 锁解耦：这里锁 ``.intake.lock``，不阻塞并行 claim/done。
+    多进程尝试准入写时，后到者非阻塞获取失败即抛 E012——**无**旧实现的
+    "blocking-flock→释放→读JSON超时→覆盖" 强夺路径（flock 崩溃自动释放，
+    无需时间戳接管）。
+
+    Args:
+        orchd_dir: .orchd 目录。
+        agent_id: 当前 agent（仅写入诊断标记，不参与互斥）。
+        timeout_s: 保留形参（原超时接管语义已移除），与旧签名兼容。
+
+    Returns:
+        锁句柄 dict（传给 :func:`intake_lock_release`）。
+
+    Raises:
+        OrchdError: E012 获取失败（被其他进程持有）。
+    """
+    lock = ExclusiveFileLock(intake_lock_path(orchd_dir))
+    try:
+        lock.acquire(blocking=False)
+    except OrchdError as exc:
+        # 注入 intake 语义，保留 E012
+        raise OrchdError(
+            ErrorCode.E012,
+            "lock_timeout: failed to acquire .intake.lock (准入写被并发 agent 持有)",
+            [{"path": str(lock.lock_path.resolve()),
+              "hint": "另一 agent 正在执行 intake/amend。稍后重试，或对其僵死锁执行 watchdog 接管。"}],
+        ) from exc
+    # 诊断标记（best-effort，非互斥依据）：供 intake_lock_check 报障
+    try:
+        intake_lock_path(orchd_dir).write_text(
+            json.dumps({"agent_id": agent_id, "timestamp": str(time.time()),
+                        "path": str(lock.lock_path.resolve())}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return {"acquired": True, "agent_id": agent_id,
+            "path": str(lock.lock_path.resolve()), "_lock": lock}
+
+
+def intake_lock_release(lock: dict[str, Any]) -> None:
+    """释放准入锁（ExclusiveFileLock 原语释放）。
+
+    lock 为 intake_lock_acquire 返回值。**不 unlink 锁文件**：文件永久保留，
+    flock 释放后由 :func:`intake_lock_check` 判为未持有——避免"unlink 后新进程
+    建新 inode"导致的 flock 失效（unlink-alias），及"文件被删却仍认为持锁"。
+    """
+    lk = lock.get("_lock")
+    if lk is not None:
+        try:
+            lk.release()
+        except (OSError, IOError):
+            pass
+
+
+def intake_lock_clear(orchd_dir: Path) -> dict[str, Any]:
+    """强制清理残量准入锁（best-effort，watchdog 调用）。
+
+    仅当无 live flock 持有该锁文件时才删除（避免 unlink-alias）；若被持有则
+    返回 ``cleared=False``。正常 acquire/release 不删除文件，此处只兜底清残留。
+    """
+    lock_path = intake_lock_path(orchd_dir)
+    if not lock_path.exists():
+        return {"cleared": False, "path": str(lock_path)}
+    if ExclusiveFileLock(lock_path).check().get("held"):
+        return {"cleared": False, "path": str(lock_path), "reason": "held"}
+    try:
+        lock_path.unlink()
+        return {"cleared": True, "path": str(lock_path)}
+    except OSError:
+        return {"cleared": False, "path": str(lock_path)}
 
 
 class StorageBackend(ABC):
@@ -258,7 +609,7 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def acquire_lock(self) -> None:
-        """获取排他文件锁，重试 50/100/200ms，全部失败抛 E012。"""
+        """获取排他文件锁，指数退避重试（~3.55s 总窗口），全部失败抛 E012。"""
 
     @abstractmethod
     def release_lock(self) -> None:
@@ -278,7 +629,17 @@ class FilesystemBackend(StorageBackend):
         self.ledger_path = orchd_dir / "_ledger.jsonl"
         self.checkpoint_path = orchd_dir / "_checkpoint.json"
         self.lock_path = orchd_dir / ".lock"
-        self._lock_fd: int | None = None
+        self._file_lock = ExclusiveFileLock(self.lock_path)
+
+    @property
+    def _lock_fd(self) -> int | None:
+        """当前持有的 fd（兼容 Store._lock_fd 转发）；未持锁返回 None。"""
+        return self._file_lock._fd
+
+    @_lock_fd.setter
+    def _lock_fd(self, value: int | None) -> None:
+        """兼容旧接口（不应被外部直接设置；no-op）。"""
+        pass
 
     def append_event(self, event: dict[str, Any]) -> None:
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,36 +723,24 @@ class FilesystemBackend(StorageBackend):
         os.replace(str(tmp_path), str(self.checkpoint_path))
 
     def acquire_lock(self) -> None:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR)
-        for delay in _LOCK_RETRIES_FLAT:
-            try:
-                if sys.platform == "win32":
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._lock_fd = fd
-                return
-            except (OSError, IOError):
-                time.sleep(delay)
-        os.close(fd)
-        raise OrchdError(
-            ErrorCode.E012,
-            "lock_timeout: failed to acquire .orchd/.lock after 3 retries",
-            [{"path": str(self.lock_path), "message": "重试 50/100/200ms 均失败"}],
-        )
+        """获取排他文件锁（ExclusiveFileLock 原语，阻塞等待 + 超时）。
+
+        外部接口与改造前一致：失败抛 E012。
+        """
+        try:
+            self._file_lock.acquire(blocking=True, timeout_s=10.0)
+        except OrchdError:
+            raise
+        except Exception as exc:
+            raise OrchdError(
+                ErrorCode.E012,
+                "lock_timeout: failed to acquire .orchd/.lock",
+                [{"path": str(self.lock_path), "hint": str(exc)}],
+            ) from exc
 
     def release_lock(self) -> None:
-        if self._lock_fd is None:
-            return
-        try:
-            if sys.platform == "win32":
-                msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        """释放文件锁（ExclusiveFileLock 原语，depth 到 0 才真正释放）。"""
+        self._file_lock.release()
 
 
 class Store:
@@ -417,7 +766,7 @@ class Store:
             - ``checkpoint_path``: ``<账本根>/_checkpoint.json``，状态快照。
             - ``lock_path``:       ``<账本根>/.lock``，排他文件锁。
 
-        ``_lock_fd`` 记录当前持有的锁文件描述符，未持锁时为 ``None``。
+        ``_file_lock`` 为 ExclusiveFileLock 原语实例，未持锁时 ``_lock_fd`` 为 None。
         """
         self.orchd_dir = orchd_dir
         self.backend = backend or FilesystemBackend(resolve_store_dir(orchd_dir))
@@ -443,6 +792,7 @@ class Store:
 
     @property
     def _lock_fd(self) -> int | None:
+        """转发到 backend 的 ExclusiveFileLock fd（测试/审查兼容）。"""
         return self.backend._lock_fd
 
     @_lock_fd.setter
@@ -696,8 +1046,10 @@ class Store:
             if etype == "CLAIMED":
                 ts.status = "claimed"
                 ts.claimed_by = event.get("agent_id")
+                ts.claimed_session = event.get("session_id")
                 ts.review_phase = None
                 ts.review_claimed_by = None
+                ts.review_claimed_session = None
 
             elif etype == "DONE":
                 ts.status = "done"
@@ -707,9 +1059,11 @@ class Store:
                 ts.status = "in_review"
                 ts.review_phase = event.get("review_type")
                 ts.review_claimed_by = None
+                ts.review_claimed_session = None
 
             elif etype == "REVIEW_CLAIMED":
                 ts.review_claimed_by = event.get("agent_id")
+                ts.review_claimed_session = event.get("session_id")
 
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
@@ -720,6 +1074,7 @@ class Store:
                         ts.status = "completed"
                         ts.review_phase = None
                         ts.review_claimed_by = None
+                        ts.review_claimed_session = None
                         # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
                         # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
                         ts.merge_warning = event.get("merge_warning")
@@ -734,8 +1089,10 @@ class Store:
                     # 仅 force-status pending 才重置计数（人工恢复手段）。
                     ts.status = "pending"
                     ts.claimed_by = None
+                    ts.claimed_session = None
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
 
             elif etype == "FORCE_STATUS":
                 # 强制状态覆盖：根据 target_status 重置关联字段，
@@ -747,20 +1104,26 @@ class Store:
                     ts.attempt_count = 0
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
                     ts.claimed_by = None
+                    ts.claimed_session = None
                 elif target == "claimed":
                     # 强制认领：设置指派的 agent
                     ts.claimed_by = event.get("assignee")
+                    ts.claimed_session = event.get("session_id")
                 elif target == "cancelled":
                     # 强制取消：清空所有执行和审核相关字段
                     ts.claimed_by = None
+                    ts.claimed_session = None
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
                 elif target == "completed":
                     # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
                     # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
 
             elif etype == "RETRACT":
                 target_eid = event.get("target_event_id", "")
@@ -842,8 +1205,10 @@ class Store:
             if etype == "CLAIMED":
                 ts.status = "claimed"
                 ts.claimed_by = event.get("agent_id")
+                ts.claimed_session = event.get("session_id")
                 ts.review_phase = None
                 ts.review_claimed_by = None
+                ts.review_claimed_session = None
             elif etype == "DONE":
                 ts.status = "done"
                 ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
@@ -851,8 +1216,10 @@ class Store:
                 ts.status = "in_review"
                 ts.review_phase = event.get("review_type")
                 ts.review_claimed_by = None
+                ts.review_claimed_session = None
             elif etype == "REVIEW_CLAIMED":
                 ts.review_claimed_by = event.get("agent_id")
+                ts.review_claimed_session = event.get("session_id")
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
                 review_type = event.get("review_type", "")
@@ -871,8 +1238,10 @@ class Store:
                     # 供 request 的 max_attempts 上限警告；仅 force-status pending 重置。
                     ts.status = "pending"
                     ts.claimed_by = None
+                    ts.claimed_session = None
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
             elif etype == "FORCE_STATUS":
                 # 强制状态覆盖：与 _apply_events 中逻辑一致
                 target = event.get("target_status", "pending")
@@ -881,17 +1250,23 @@ class Store:
                     ts.attempt_count = 0
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
                     ts.claimed_by = None
+                    ts.claimed_session = None
                 elif target == "claimed":
                     ts.claimed_by = event.get("assignee")
+                    ts.claimed_session = event.get("session_id")
                 elif target == "cancelled":
                     ts.claimed_by = None
+                    ts.claimed_session = None
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
                 elif target == "completed":
                     # 与 _apply_events 一致：强制完成仅清空审查字段
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
 
     # ------------------------------------------------------------------
     # Checkpoint
@@ -910,14 +1285,36 @@ class Store:
         均不传 ``retracted``，导致 checkpoint 从不写入撤回集合；一旦 checkpoint
         之后又发生新 RETRACT，全量重建时会因撤回集合不完整而让已撤回事件「复活」，
         任务状态被静默改写。
+
+        字段漂移自愈（task-merge-failed-completed 附带修复，2026-08-25）：`state`
+        通常由增量 ``replay()`` 得到——若 checkpoint 早于某个 TaskState 字段引入
+        （如 review_claimed_session），增量 replay 会从旧 checkpoint 继承「缺该字段」
+        的状态，再把这些字段集写回 checkpoint，导致缺漏**自我传播**、E030
+        （checkpoint 快照与 ledger 重放不一致）持续无法自愈。因此这里改为基于
+        ``replay_full()``（从第 1 行重放，始终含全字段）构建快照；仅当全量重放
+        失败时回退到传入 ``state``。
         """
         if retracted is None:
             retracted = self._collect_retracted_event_ids()
         # H4：行数由内存计数器提供（O(1)），不再全文件数行
         total_lines = self._current_line_count()
+        # P2-10 / 1.4.1：稳态用增量 state（O(tail)）；仅 checkpoint schema 版本落后
+        # 时才 replay_full() 自愈字段漂移一次。这样写命令不再每次 O(L) 全量重放。
+        prev = self.backend.load_checkpoint() or {}
+        needs_full = prev.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION
+        if needs_full:
+            try:
+                full_state = self.replay_full()
+                tasks = {tid: ts.to_dict() for tid, ts in full_state.items()}
+            except Exception:
+                # 全量重放异常：回退到调用方传入的增量状态（best-effort，不静默丢写）
+                tasks = {tid: ts.to_dict() for tid, ts in state.items()}
+        else:
+            tasks = {tid: ts.to_dict() for tid, ts in state.items()}
         checkpoint = {
             "ledger_line": total_lines,
-            "tasks": {tid: ts.to_dict() for tid, ts in state.items()},
+            "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+            "tasks": tasks,
         }
         if retracted:
             checkpoint["retracted"] = sorted(retracted)

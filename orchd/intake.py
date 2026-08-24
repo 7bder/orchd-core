@@ -17,8 +17,17 @@ IDEAS/ROADMAP、暂不注册任务」场景的提交。
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """P2-12：原子写（tmp + os.replace），避免读-改-写中途崩溃产生半截 IDEAS.md。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(path))
 
 # IDEAS.md 条目 status 合法值白名单（与 IDEAS.md 模板状态流转一致）
 # study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm/drop 裁决。
@@ -139,6 +148,9 @@ def intake_commit(
     from orchd.ledger import resolve_workspace_root
 
     project_root = Path(project_root)
+    # canonical 共享读（task-canonical-workspace-docs，2026-08-25）：container 布局
+    # 下 resolve_workspace_root 解析到 canonical 主工作树根，摄入产物（IDEAS.md /
+    # ROADMAP.md）统一在 main 工作树定位与提交，任务 worktree 本地副本不参与。
 
     # 1) 前置守卫：main 分支 + 非摄入产物干净（对齐 amend 的 E017 语义）
     guard_err = _intake_guard(project_root)
@@ -146,6 +158,10 @@ def intake_commit(
         return guard_err
 
     # 2) IDEAS 条目状态校验（warning 不阻断）
+    # canonical 工作区根（task-canonical-workspace-docs，2026-08-25）：
+    # resolve_workspace_root 先解析到 canonical 主工作树根（container 布局返回
+    # main/，flat 返回本地），IDEAS.md / ROADMAP.md 以主工作树副本为权威，
+    # 避免任务 worktree 本地 .orchd/ 拷贝过期导致摄入不一致。
     workspace_root = resolve_workspace_root(project_root)
     status_warnings = check_idea_statuses(workspace_root)
 
@@ -280,9 +296,9 @@ def roadmap_land(
         existing = ideas.read_text(encoding="utf-8")
         if not existing.endswith("\n"):
             existing += "\n"
-        ideas.write_text(existing + "\n" + entry, encoding="utf-8")
+        _atomic_write_text(ideas, existing + "\n" + entry)
     else:
-        ideas.write_text("# IDEAS\n" + "\n" + entry, encoding="utf-8")
+        _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
 
     # 5) 强制提交摄入产物（IDEAS.md + ROADMAP.md）
     commit = ensure_committed(
@@ -400,9 +416,9 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         existing = text
         if not existing.endswith("\n"):
             existing += "\n"
-        ideas.write_text(existing + "\n" + entry, encoding="utf-8")
+        _atomic_write_text(ideas, existing + "\n" + entry)
     else:
-        ideas.write_text("# IDEAS\n" + "\n" + entry, encoding="utf-8")
+        _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
 
     commit = ensure_committed(
         project_root,
@@ -484,7 +500,7 @@ def _idea_transition(
 
     all_lines = text.splitlines()
     new_content_lines = all_lines[: entry["header_line"]] + new_lines + all_lines[entry["end"]:]
-    ideas.write_text("\n".join(new_content_lines) + "\n", encoding="utf-8")
+    _atomic_write_text(ideas, "\n".join(new_content_lines) + "\n")
 
     commit = ensure_committed(
         project_root,

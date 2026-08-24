@@ -32,12 +32,13 @@ _ARCHIVE_HEADER = (
 
 
 def parse_ideas(text: str) -> list[dict[str, Any]]:
-    """解析 IDEAS.md 条目，返回条目列表（含标题、状态、原始行区间）。
+    """解析 IDEAS.md 条目，返回条目列表（含标题、状态、id、原始行区间）。
 
     条目识别规则（复用 ``spec._check_idea_reference`` 的解析逻辑）：
     - 以 ``## `` 开头的行为条目标题行；
-    - 该行之后、下一个 ``## `` 之前的行用于提取 ``status`` 字段，
-      支持 ``- status: pending``（列表）与 ``status: pending`` 两种格式。
+    - 该行之后、下一个 ``## `` 之前的行用于提取 ``status`` 与 ``id`` 字段，
+      支持 ``- status: pending``（列表）与 ``status: pending`` 两种格式；
+      ``- id: <slug>``（列表）与 ``id: <slug>`` 两种格式（缺失为空串）。
 
     Args:
         text: IDEAS.md 全文。
@@ -46,6 +47,8 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
         条目字典列表，每项含：
         - ``title``: 条目标题（去掉 ``## `` 前缀并 strip）。
         - ``status``: 条目状态（未声明则为空串）。
+        - ``id``: 条目显式 id（``- id:`` 字段，缺失则为空串）——归档按 id
+          精确归属的权威锚点（ideas-archive-exact-match）。
         - ``start_line`` / ``end_line``: 原始行为区间（0-based，半开区间
           ``[start_line, end_line)``），用于 ``extract_entry_block`` 精确切块。
     """
@@ -61,6 +64,7 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
             current = {
                 "title": stripped[3:].strip(),
                 "status": "",
+                "id": "",
                 "start_line": i,
                 "end_line": None,
             }
@@ -68,6 +72,10 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
             for marker in ("- status:", "status:"):
                 if stripped.startswith(marker):
                     current["status"] = stripped[len(marker):].strip()
+                    break
+            for marker in ("- id:", "id:"):
+                if stripped.startswith(marker):
+                    current["id"] = stripped[len(marker):].strip()
                     break
     if current:
         current["end_line"] = len(lines)
@@ -99,7 +107,7 @@ def find_resolved_entries(
     """判定哪些条目已完结（对应任务全部终态）。
 
     遍历任务 ``source: idea:<ref>``，按 ``ref_id`` 分组；某 ``ref_id`` 下
-    **全部**任务处于终态（completed / cancelled）→ 该条目（``ref_id in title``）
+    **全部**任务处于终态（completed / cancelled）→ 该条目（``- id == ref_id``）
     标记 resolved。无 source 的任务不影响判定。
 
     Args:
@@ -134,8 +142,27 @@ def find_resolved_entries(
 
     return [
         e for e in entries
-        if any(ref in e["title"] for ref in resolved_refs)
+        if _entry_is_resolved(e, resolved_refs)
     ]
+
+
+def _entry_is_resolved(entry: dict[str, Any], resolved_refs: set[str]) -> bool:
+    """条目是否应自动归档（显式 id 强约束 + 保守兜底）。
+
+    主机制：条目 ``- id:`` 与 resolved ref **精确相等**（id 权威，废除标题
+    裸子串匹配——日期词 ref 因无对应条目 id 必然被拒，从数据模型杜绝歧义）。
+
+    保守兜底：无 id 条目**永不自动归档**（即使标题完整词命中 ref 也不归档，
+    防未来遗漏 id 的条目被日期词/标题词 ref 误伤）。
+
+    防御纵深：精确完整词标题匹配（``spec._exact_ref_match``）保留用于 roadmap
+    溯源，此处不启用——日期词 ref（如 ``2026-08-22``）在标题中同样是完整词，
+    无法防误伤，故以「id 权威 + 无 id 保守」为唯一归档路径。
+    """
+    eid = (entry.get("id") or "").strip()
+    if not eid:
+        return False
+    return eid in resolved_refs
 
 
 def _remove_blocks(
@@ -173,8 +200,15 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     # AC3（task-12-engine-path-abstraction）：工作区文档（IDEAS.md /
     # IDEAS-archive.md）走统一工作区根 helper（默认 .orchd/，兼容旧根路径）。
     # Store 的账本根仍由 ORCHD_HOME 解析（与文档根分离）。
+    # canonical 共享读（task-canonical-workspace-docs，2026-08-25）：container 布局
+    # 下 resolve_workspace_root 解析到 canonical 主工作树根，归档源（IDEAS.md）与
+    # 归档目标（IDEAS-archive.md）统一在主工作树读写，任务 worktree 本地副本不参与。
     from orchd.ledger import resolve_workspace_root
 
+    # canonical 工作区根（task-canonical-workspace-docs，2026-08-25）：
+    # resolve_workspace_root 先解析到 canonical 主工作树根（container 布局返回
+    # main/，flat 返回本地），IDEAS.md / IDEAS-archive.md 以主工作树副本为权威，
+    # 避免任务 worktree 本地 .orchd/ 拷贝过期导致归档/引导不一致。
     workspace_root = resolve_workspace_root(project_root)
     ideas_path = workspace_root / "IDEAS.md"
     if not ideas_path.exists():
