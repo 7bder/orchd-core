@@ -35,6 +35,14 @@
           "type": "string",
           "minLength": 1,
           "description": "一句话项目描述。"
+        },
+        "review_mode": {
+          "type": "string",
+          "enum": [
+            "unified",
+            "two_phase"
+          ],
+          "description": "审查模式（review-unify-r2）：unified=单阶段一次 APPROVED 即 merge；two_phase=两阶段（spec→code）。缺省 two_phase（观察期兼容）。"
         }
       }
     },

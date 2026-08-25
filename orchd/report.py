@@ -519,7 +519,11 @@ def _scan_revive_markers(store: Store) -> dict[str, dict[str, Any]]:
         elif etype == "DONE":
             status_by_task[tid] = "done"
         elif etype == "REVIEW_SUBMITTED":
-            if ev.get("verdict") == "APPROVED" and ev.get("review_type") == "code":
+            # review-unify-r2：unified 单阶段（无 review_type）或 code APPROVED
+            # 均视为终审完成；老事件含 review_type: spec 保持两阶段语义。
+            if ev.get("verdict") == "APPROVED" and (
+                ev.get("review_type") == "code" or ev.get("review_type") is None
+            ):
                 status_by_task[tid] = "completed"
         elif etype == "FORCE_STATUS":
             target = ev.get("target_status", "pending")

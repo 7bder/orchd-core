@@ -414,7 +414,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # review
     p = sub.add_parser("review", help="提交审查结果")
     p.add_argument("--task", required=True)
-    p.add_argument("--type", required=True, choices=["spec", "code"])
+    # review-unify-r2：unified 单阶段模式下无需 --type（一次 APPROVED 即 merge）；
+    # two_phase 模式仍须传 spec/code。
+    p.add_argument("--type", required=False, choices=["spec", "code"],
+                   help="审查阶段（spec/code）；unified 单阶段模式下可省略")
     p.add_argument("--verdict", required=True, choices=["APPROVED", "CHANGES_REQUESTED"])
     p.add_argument("--comments")
     p.add_argument("--comments-file", help="从文件读取审查意见（UTF-8），与 --comments 二选一")
@@ -451,7 +454,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audit-merge", action="store_true",
                    help="附加 merge 巡检：completed 任务对应 task/{id} 分支未并入 main 的告警清单（只读）")
     p.add_argument("--audit-intake", action="store_true",
-                   help="附加摄入产物审计：未提交的 IDEAS.md / ROADMAP.md / _master.json 改动告警（只读）")
+                   help="附加摄入产物审计：未提交的 IDEAS.md / _master.json 改动告警（只读）")
     p.add_argument("--audit-revive", action="store_true",
                    help="附加复活巡检：扫描 ledger 中 completed→pending 的强制复活操作，列告警（只读）")
     p.add_argument("--audit-task", action="store_true",
@@ -482,7 +485,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_layout_migrate)
 
     # intake（2026-08-14 intake-commit-enforcement）
-    p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md / ROADMAP.md）并校验状态合法性")
+    p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md；ROADMAP.md 不纳入 git，自动跳过）并校验状态合法性")
     p.set_defaults(func=_cmd_intake)
 
     # roadmap-land（2026-08-15 intake-dual-path）：ROADMAP 规划章节 → IDEAS pending 落地
@@ -1274,7 +1277,13 @@ def claim_preview(
     derived = store.scan_task_derived()
     ts = state.get(task_id)
     status = ts.status if ts else "pending"
-    current_phase = (ts.review_phase if ts else None) or "spec"
+    # review-unify-r2：unified 模式下审查阶段显示为 unified（单阶段），
+    # 不再回落 spec；two_phase 模式保持 spec/code 展示。
+    from orchd.ledger import resolve_review_mode
+    if resolve_review_mode(store.orchd_dir) == "unified":
+        current_phase = "unified"
+    else:
+        current_phase = (ts.review_phase if ts else None) or "spec"
 
     preview: dict[str, Any] = {
         "claim_type": role,

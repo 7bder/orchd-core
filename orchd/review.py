@@ -41,6 +41,7 @@ from orchd.ledger import (
     # task-fp-identity-single-source：指纹判定单一事实源（本子域不导入 onboard，
     # 统一从 ledger 导入，消除私有副本的同步漂移风险）
     is_fingerprint_agent_id as _is_fingerprint_agent_id,
+    resolve_review_mode,
     resolve_store_dir,
 )
 
@@ -154,7 +155,8 @@ def request_reviewer(
 
     candidate: dict[str, Any] = {
         "task_id": task_id,
-        "review_type": best["review_phase"],
+        # review-unify-r2：unified 单阶段（review_phase 为 None）展示为 unified。
+        "review_type": best["review_phase"] or "unified",
         "module": task_def.get("module", ""),
         "brief": task_def.get("brief", ""),
         "importance": task_def.get("importance", "normal"),
@@ -270,12 +272,14 @@ def review_submit(
     tasks: list[dict[str, Any]],
     agent_id: str,
     task_id: str,
-    review_type: str,
+    review_type: str | None,
     verdict: str,
     comments: str | None = None,
     project_root: Path | None = None,
 ) -> dict[str, Any]:
     """提交审查结果（task-session-lock-lifecycle：异常路径也保证释放会话锁）。
+
+    review_type 为 None 表示 unified 单阶段审查（review-unify-r2）。
 
     ``_review_submit_impl`` 的包装：``finally`` 中经 :func:`release_session_lock_if_owned`
     条件释放本 agent 的 session 锁（仅持有者==本 agent 才释放，幂等）。正常路径
@@ -296,12 +300,14 @@ def _review_submit_impl(
     tasks: list[dict[str, Any]],
     agent_id: str,
     task_id: str,
-    review_type: str,
+    review_type: str | None,
     verdict: str,
     comments: str | None = None,
     project_root: Path | None = None,
 ) -> dict[str, Any]:
     """提交审查结果（APPROVED 或 CHANGES_REQUESTED）。
+
+    review_type 为 None 表示 unified 单阶段审查（review-unify-r2）。
 
     锁内校验：任务必须处于 in_review 状态，审查阶段（spec/code）须匹配，
     且审查者须为当前 agent。
@@ -366,9 +372,13 @@ def _review_submit_impl(
 
         event = make_event(
             task_id, agent_id, "REVIEW_SUBMITTED",
-            review_type=review_type,
             verdict=verdict,
         )
+        # review-unify-r2：unified 单阶段（review_type 为 None）不写 review_type
+        # 字段（R2-b：新事件无 review_type）；two_phase 保留 spec/code 供 replay
+        # 按两阶段语义解释，与老事件兼容。
+        if review_type is not None:
+            event["review_type"] = review_type
         if comments:
             event["comments"] = comments
 
@@ -399,7 +409,9 @@ def _review_submit_impl(
             new_state = store.replay()
             store.update_checkpoint(new_state)
 
-        elif verdict == "APPROVED" and review_type == "code":
+        elif verdict == "APPROVED" and (review_type == "code" or review_type is None):
+            # review-unify-r2：unified 单阶段（review_type 为 None）与 code 终审
+            # 一样走 merge → completed；two_phase 的 spec APPROVED 走上一分支。
             result["task_status"] = "in_review"
             pending_code_event = event
 

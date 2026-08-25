@@ -44,6 +44,7 @@ from orchd.ledger import (
     TaskState,
     # task-fp-identity-single-source：指纹判定单一事实源（本模块调用点沿用旧名）
     is_fingerprint_agent_id as _is_fingerprint_agent_id,
+    resolve_review_mode,
     resolve_store_dir,
 )
 from orchd.pool import (
@@ -884,14 +885,22 @@ def claim(
         # 写事件
         files_claimed = task_def.get("files_to_edit", [])
         if role == "reviewer":
-            review_phase = ts.review_phase if ts else "spec"
+            review_phase = ts.review_phase if ts else None
             # R1: 记录 baseline_sha（认领时的 HEAD commit），用于审查期间漂移检测
             baseline_sha = get_head_commit(project_root) if project_root else None
-            event = _make_event(
-                task_id, agent_id, "REVIEW_CLAIMED",
-                review_type=review_phase,
-                baseline_sha=baseline_sha,
-            )
+            # review-unify-r2：unified 单阶段（review_phase 为 None）时事件不带
+            # review_type 字段（单阶段语义）；two_phase 保留 review_type: spec/code。
+            if review_phase:
+                event = _make_event(
+                    task_id, agent_id, "REVIEW_CLAIMED",
+                    review_type=review_phase,
+                    baseline_sha=baseline_sha,
+                )
+            else:
+                event = _make_event(
+                    task_id, agent_id, "REVIEW_CLAIMED",
+                    baseline_sha=baseline_sha,
+                )
         else:
             event = _make_event(
                 task_id, agent_id, "CLAIMED",
@@ -954,12 +963,27 @@ def claim(
                         "path": arch, "priority": "reference",
                         "hint": "架构上下文（spec review 自动附加）",
                     })
-            else:
+            elif review_phase == "code":
                 conv = shared.get("conventions")
                 if conv:
                     files_to_review.append({
                         "path": conv, "priority": "must_read",
                         "hint": "编码规范（code review 自动附加）",
+                    })
+            else:
+                # review-unify-r2：unified 单阶段审查同时覆盖设计契约 + 代码实现
+                # （R2-b），架构上下文作 reference、编码规范作 must_read 一并附加。
+                arch = shared.get("architecture")
+                if arch:
+                    files_to_review.append({
+                        "path": arch, "priority": "reference",
+                        "hint": "架构上下文（unified review 自动附加）",
+                    })
+                conv = shared.get("conventions")
+                if conv:
+                    files_to_review.append({
+                        "path": conv, "priority": "must_read",
+                        "hint": "编码规范（unified review 自动附加）",
                     })
         done_event = _find_last_done_event(store, task_id, derived)
         changes_description = done_event.get("changes_description") if done_event else None
@@ -1595,14 +1619,21 @@ def _done_impl(
             done_event["verify"] = verify_record
         store.append_event(done_event)
 
-        # 自动 REVIEW_READY：文档类单阶段（跳过 spec 直接 code 终审，Q2 分级），
-        # 常规任务双阶段（spec → code）。C5：blocked 集合从 master config 读取
-        # （doc_single_stage_blocked），缺省回退硬编码集合。
-        blocked_config = _load_config_blocked(store)
-        review_type = "code" if _is_doc_single_stage(
-            task_def.get("files_to_edit", []), blocked=blocked_config
-        ) else "spec"
-        review_event = _make_event(task_id, claimed_by, "REVIEW_READY", review_type=review_type)
+        # 自动 REVIEW_READY（review-unify-r2）：
+        # - unified 模式：单阶段，事件不带 review_type（replay 按单阶段语义解释），
+        #   一次 APPROVED 即 merge；
+        # - two_phase 模式：文档类单阶段（跳过 spec 直接 code 终审，Q2 分级），
+        #   常规任务双阶段（spec → code）。C5：blocked 集合从 master config 读取
+        #   （doc_single_stage_blocked），缺省回退硬编码集合。
+        if resolve_review_mode(store.orchd_dir) == "unified":
+            review_type: str | None = None
+            review_event = _make_event(task_id, claimed_by, "REVIEW_READY")
+        else:
+            blocked_config = _load_config_blocked(store)
+            review_type = "code" if _is_doc_single_stage(
+                task_def.get("files_to_edit", []), blocked=blocked_config
+            ) else "spec"
+            review_event = _make_event(task_id, claimed_by, "REVIEW_READY", review_type=review_type)
         store.append_event(review_event)
 
         new_state = store.replay()
@@ -1615,7 +1646,8 @@ def _done_impl(
         "task_id": task_id,
         "status": "done",
         "attempt_count": attempt_count,
-        "review_created": {"type": review_type},
+        # review-unify-r2：unified 单阶段（review_type 为 None）展示为 unified。
+        "review_created": {"type": review_type or "unified"},
         "event_id": done_event["event_id"],
     }
     if integrity_warnings:
@@ -1778,7 +1810,11 @@ def _task_completed_epoch(store: Store, task_id: str) -> float | None:
             continue
         etype = ev.get("type")
         if etype == "REVIEW_SUBMITTED":
-            if ev.get("verdict") == "APPROVED" and ev.get("review_type") == "code":
+            # review-unify-r2：unified 单阶段（无 review_type）与 code APPROVED
+            # 均视为进入 completed 的终审。
+            if ev.get("verdict") == "APPROVED" and (
+                ev.get("review_type") == "code" or ev.get("review_type") is None
+            ):
                 completed_iso = ev.get("timestamp")
         elif etype == "FORCE_STATUS" and ev.get("target_status") == "completed":
             completed_iso = ev.get("timestamp")

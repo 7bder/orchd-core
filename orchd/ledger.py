@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.lockfile import ExclusiveFileLock
+from orchd.lockfile import ExclusiveFileLock, read_locked_text
 
 # checkpoint 字段 schema 版本（P2-10 / ROADMAP 1.4.1 引擎性能）：
 # update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
@@ -263,6 +263,32 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     return orchd_dir
 
 
+def resolve_review_mode(orchd_dir: Path) -> str:
+    """解析项目审查模式（review-unify-r2：unified / two_phase）。
+
+    读 ``.orchd/_master.json`` 顶层 ``project.review_mode``：
+    - ``"unified"``  → 单阶段审查：一次 APPROVED 即 merge；
+    - ``"two_phase"``/缺失/非法值 → 两阶段审查（spec → code），保持旧行为。
+
+    缺省 two_phase 保证观察期兼容：旧项目 / 测试 / 老事件均不受影响，
+    显式配置 ``project.review_mode: "unified"`` 才启用单阶段链路。
+    best-effort：master 缺失/解析失败返回 ``"two_phase"``（不抛异常）。
+    """
+    try:
+        master_path = Path(orchd_dir) / "_master.json"
+        if not master_path.exists():
+            return "two_phase"
+        import json as _json
+
+        master = _json.loads(master_path.read_text(encoding="utf-8"))
+        mode = (master.get("project") or {}).get("review_mode")
+        if mode == "unified":
+            return "unified"
+        return "two_phase"
+    except (OSError, ValueError):
+        return "two_phase"
+
+
 # ------------------------------------------------------------------
 # Session runtime（task-session-cli-lifecycle，Session Identity Layer）
 # ------------------------------------------------------------------
@@ -468,8 +494,17 @@ def intake_lock_check(
     lock_path = intake_lock_path(orchd_dir)
     probe = ExclusiveFileLock(lock_path).check()
     if probe.get("held"):
+        # 优先走本进程持锁 fd 读取标记（Windows msvcrt 字节锁阻止新句柄读取）
+        content = read_locked_text(lock_path)
+        if content is None:
+            try:
+                content = lock_path.read_text(encoding="utf-8")
+            except (OSError, IOError):
+                content = None
+        if content is None:
+            return {"locked": True, "reason": "no_marker"}
         try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            data = json.loads(content)
             ts = float(data.get("timestamp", 0))
             return {
                 "locked": True,
@@ -526,10 +561,9 @@ def intake_lock_acquire(
         ) from exc
     # 诊断标记（best-effort，非互斥依据）：供 intake_lock_check 报障
     try:
-        intake_lock_path(orchd_dir).write_text(
+        lock.write_text(
             json.dumps({"agent_id": agent_id, "timestamp": str(time.time()),
-                        "path": str(lock.lock_path.resolve())}, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+                        "path": str(lock.lock_path.resolve())}, ensure_ascii=False) + "\n"
         )
     except OSError:
         pass
@@ -1067,10 +1101,13 @@ class Store:
 
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
-                review_type = event.get("review_type", "")
+                review_type = event.get("review_type")
                 if verdict == "APPROVED":
-                    if review_type == "code":
-                        # code review 通过 → 任务彻底完成
+                    if review_type == "code" or review_type is None:
+                        # review-unify-r2：code review 通过，或 unified 单阶段
+                        # （事件无 review_type 字段）APPROVED → 任务彻底完成；
+                        # 老事件含 review_type: spec 仍按两阶段语义（仅 spec 通过，
+                        # 等待 code），保持 checkpoint 与历史一致。
                         ts.status = "completed"
                         ts.review_phase = None
                         ts.review_claimed_by = None
@@ -1222,8 +1259,10 @@ class Store:
                 ts.review_claimed_session = event.get("session_id")
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
-                review_type = event.get("review_type", "")
-                if verdict == "APPROVED" and review_type == "code":
+                review_type = event.get("review_type")
+                if verdict == "APPROVED" and (review_type == "code" or review_type is None):
+                    # review-unify-r2：unified 单阶段（无 review_type）或 code
+                    # APPROVED → completed；老事件含 review_type: spec 保持两阶段语义。
                     ts.status = "completed"
                     ts.review_phase = None
                     ts.review_claimed_by = None

@@ -634,6 +634,24 @@ def ensure_committed(
         return {"performed": False, "reason": "no_changes", "message": message}
     paths = existing_paths
 
+    # roadmap-untracked（2026-08-25）：过滤被 .gitignore 忽略的路径（如
+    # .orchd/ROADMAP.md 已从 git 移除、仅作本地工作文档）——git add 遇到被忽略
+    # 路径会 fatal 中止，连带阻断其余已跟踪路径的提交；用 check-ignore 精确判定
+    # 忽略状态，被忽略路径直接剔除（未跟踪但未被忽略的新文件仍保留，维持引擎
+    # 兜底提交语义）。
+    non_ignored_paths: list[str] = []
+    for p in paths:
+        try:
+            proc = _run_git(project_root, ["check-ignore", "-q", "--", p])
+            if proc.returncode != 0:
+                non_ignored_paths.append(p)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+    if not non_ignored_paths:
+        # 声明路径均被 git 忽略 → 范围内无实际可提交改动
+        return {"performed": False, "reason": "no_changes", "message": message}
+    paths = non_ignored_paths
+
     # 只 add 声明范围。add 失败（如路径不存在）不阻断：
     # 是否真的"无改动"由下一步 diff 精确判断（diff 也限定 paths）。
     try:
@@ -1114,9 +1132,7 @@ def session_lock_acquire(
         # 本进程已持同一锁：复用 fd（同 session 刷新覆盖写，ExclusiveFileLock 可重入）
         existing = _SESSION_LOCK_REGISTRY.get(str(lock_path))
         if existing is not None:
-            lock_path.write_text(
-                json.dumps(lock_data, ensure_ascii=False), encoding="utf-8"
-            )
+            existing.write_text(json.dumps(lock_data, ensure_ascii=False))
             return {"acquired": True, "reused": True, "path": str(lock_path)}
         # 先持有 OS flock（非阻塞，被他人持有即失败），再写 JSON 标记。
         # flock 由内核托管：本进程退出/崩溃时自动释放，检查方可探活判定 stale。
@@ -1129,7 +1145,7 @@ def session_lock_acquire(
                 "reason": "io_error",
                 "error": f"flock acquire failed: {exc}",
             }
-        lock_path.write_text(json.dumps(lock_data, ensure_ascii=False), encoding="utf-8")
+        flock.write_text(json.dumps(lock_data, ensure_ascii=False))
         _SESSION_LOCK_REGISTRY[str(lock_path)] = flock
         return {"acquired": True, "path": str(lock_path)}
     except (OSError, IOError) as exc:
@@ -1273,10 +1289,24 @@ def session_lock_check(
     if not lock_path.exists():
         return {"locked": False}
 
+    # 读取锁内容：优先走本进程持锁 fd（Windows msvcrt 字节锁阻止新句柄读取）
+    from orchd.lockfile import read_locked_text
+
+    content = read_locked_text(lock_path)
+    if content is None:
+        try:
+            content = lock_path.read_text(encoding="utf-8")
+        except (OSError, IOError):
+            content = None
+    if content is None:
+        # 读取失败：Windows 下多为「他进程持锁」字节锁阻止读取；探活判定
+        probe = _probe_session_lock_os_active(lock_path)
+        if probe.get("active"):
+            return {"locked": True, "reason": "no_marker"}
+        return {"locked": False, "reason": "corrupted"}
     try:
-        content = lock_path.read_text(encoding="utf-8")
         data = json.loads(content)
-    except (OSError, IOError, json.JSONDecodeError):
+    except json.JSONDecodeError:
         # 锁文件损坏：视为可覆盖
         return {"locked": False, "reason": "corrupted"}
 

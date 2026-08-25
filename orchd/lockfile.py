@@ -160,6 +160,41 @@ class ExclusiveFileLock:
         self._fd = None
         return True
 
+    def write_text(self, content: str, encoding: str = "utf-8") -> None:
+        """通过持锁 fd 覆写文件内容（Windows msvcrt 字节锁下避免新句柄写入冲突）。
+
+        仅在持锁（fd 非 None）时可用；写后截断到精确长度并 seek 回 0，
+        保证 msvcrt LK_UNLCK 从文件头解锁命中锁定区域。
+        """
+        if self._fd is None:
+            raise OSError("ExclusiveFileLock not held")
+        data = content.encode(encoding)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        view = memoryview(data)
+        total = 0
+        while total < len(view):
+            total += os.write(self._fd, view[total:])
+        os.ftruncate(self._fd, total)
+        os.fsync(self._fd)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        """通过持锁 fd 读取文件内容（Windows msvcrt 字节锁下避免新句柄读取冲突）。
+
+        仅在持锁（fd 非 None）时可用；读后 seek 回 0，保持后续写入/解锁位置一致。
+        """
+        if self._fd is None:
+            raise OSError("ExclusiveFileLock not held")
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        return b"".join(chunks).decode(encoding)
+
     def _release_flock(self, fd: int) -> None:
         """释放 flock 并 close fd（best-effort）。"""
         try:
@@ -225,6 +260,29 @@ class ExclusiveFileLock:
         self._depth = 0
 
 
+def read_locked_text(lock_path: Path | str, encoding: str = "utf-8") -> str | None:
+    """读取本进程持有的锁文件内容（Windows msvcrt 字节锁阻止新句柄读取）。
+
+    仅当本进程正持有该锁（``_depth_registry`` 有登记）时可用；否则返回 None。
+    供 session_lock_check / intake_lock_check 在持锁进程内读取 JSON 标记，
+    避免 Windows 下字节锁导致的新句柄读取 Permission denied。
+    """
+    key = str(Path(lock_path).resolve())
+    entry = _depth_registry.get(key)
+    if entry is None:
+        return None
+    fd, _ = entry
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return b"".join(chunks).decode(encoding)
+
+
 def probe_lock_support(target_dir: Path | str) -> dict[str, Any]:
     """探测目标目录所在文件系统是否支持可靠的排他 flock。
 
@@ -245,6 +303,7 @@ def probe_lock_support(target_dir: Path | str) -> dict[str, Any]:
         dir=str(target_dir), prefix=".probe_lock_", suffix=".tmp", delete=False
     )
     tmp_path = Path(tmp.name)
+    tmp.close()  # 关闭句柄；delete=False 保证文件保留，Windows 下才能 unlink
     fd1 = os.open(str(tmp_path), os.O_CREAT | os.O_RDWR)
     try:
         # fd1 获取排他 flock

@@ -123,7 +123,8 @@ def read_layout(orchd_dir: Path) -> dict[str, Any] | None:
         标记 dict（含 layout / version / main_worktree），或 None。
     """
     try:
-        data = json.loads(marker_path(orchd_dir).read_text(encoding="utf-8"))
+        # utf-8-sig 兼容 Windows 编辑器写入的 BOM（BOM 会导致 json.loads 失败）
+        data = json.loads(marker_path(orchd_dir).read_text(encoding="utf-8-sig"))
         layout = data.get("layout")
         main_worktree = data.get("main_worktree")
         if layout in ("container", "flat") and isinstance(main_worktree, str) and main_worktree:

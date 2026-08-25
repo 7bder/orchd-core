@@ -171,7 +171,7 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
                 json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            created_files.append(str(spec_path.relative_to(store_root)))
+            created_files.append(spec_path.relative_to(store_root).as_posix())
 
         # 创建空 ledger（若不存在）
         if not store.ledger_exists():

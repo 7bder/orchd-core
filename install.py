@@ -34,11 +34,15 @@ RESOURCE_ROOT = _SELF_DIR if (_SELF_DIR / "orchd").is_dir() else _SELF_DIR.paren
 
 # 组装进 .orchd/ 的内容清单（与 scripts/sync_orchd_core.sh / scripts/verify_release_self_contained.py 对齐）
 ENGINE_DIR = RESOURCE_ROOT / "orchd"
-RESOURCE_DIRS = [("schema", "schema"), ("templates", "templates"), (".orchd/rules", "rules")]
+RESOURCE_DIRS = [("schema", "schema"), ("templates", "templates"), ("skill/rules", "rules")]
 RESOURCE_FILES = [("docs", "decomposition-guide.md")]
 PACKAGING_FILES = ["pyproject.toml", "MANIFEST.in", "LICENSE", ".gitignore"]
-# SKILL / 零根入口归置 .orchd/（task-12-workspace-docs）；兼容旧根布局
-SKILL_CANDIDATES = [RESOURCE_ROOT / ".orchd" / "SKILL.md", RESOURCE_ROOT / "SKILL.md"]
+# SKILL / 零根入口归置 .orchd/（task-12-workspace-docs）；兼容 orchd-core skill/ 与旧根布局
+SKILL_CANDIDATES = [
+    RESOURCE_ROOT / "skill" / "SKILL.md",   # orchd-core 发布版 skill/ 子目录
+    RESOURCE_ROOT / ".orchd" / "SKILL.md",  # 主项目布局
+    RESOURCE_ROOT / "SKILL.md",             # 旧扁平布局
+]
 LAUNCHER_CANDIDATES = [RESOURCE_ROOT / ".orchd" / "__main__.py", RESOURCE_ROOT / "__main__.py"]
 
 # 宿主用户数据（--update 时保留，不覆盖）
@@ -88,10 +92,13 @@ def _find_first(candidates: list[Path]) -> Path:
 
 
 def _resolve(src_name: str) -> Path:
-    """解析资源源路径，兼容主项目(带 .orchd/)与 orchd-core 扁平布局(rules 在根)两种形态。"""
+    """解析资源源路径，兼容主项目(.orchd/rules)、orchd-core(skill/rules)与旧扁平(rules/)三种形态。"""
     p = RESOURCE_ROOT / src_name
-    if src_name == ".orchd/rules" and not p.is_dir():
-        p = RESOURCE_ROOT / "rules"
+    if src_name == "skill/rules":
+        if not p.is_dir():
+            p = RESOURCE_ROOT / ".orchd" / "rules"
+        if not p.is_dir():
+            p = RESOURCE_ROOT / "rules"
     return p
 
 
