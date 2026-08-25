@@ -31,6 +31,8 @@ Thumbs.db
 htmlcov/
 pytest_tmp_*/
 .tmp-pytest/
+# 全量测试 basetemp 残留（2026-08-26 误入跟踪，移除后防再跟踪）
+.pytest_tmp_full/
 
 # orchd 自托管（§8.4）：工作区文档与共享上下文跟踪，运行时状态忽略
 # 工作区文档（task-12-workspace-docs：IDEAS/ROADMAP/IDEAS-archive/SKILL 归置 .orchd/；

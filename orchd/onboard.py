@@ -55,6 +55,7 @@ from orchd.pool import (
     get_dependency_closure,
     sort_candidates,
 )
+from orchd.subproc import run_shell
 
 # 子域外置（task-refactor-onboard-domain-split）：
 # - 共享辅助（guard/event/decoder/session-lock）→ orchd.gitops_ops
@@ -1306,10 +1307,7 @@ def _done_impl(
         import time as _time
         started = _time.monotonic()
         try:
-            result = subprocess.run(
-                verify_cmd, shell=True, cwd=str(project_root),
-                capture_output=True, timeout=verify_timeout,
-            )
+            result = run_shell(verify_cmd, str(project_root), verify_timeout)
             elapsed = round(_time.monotonic() - started, 1)
             verify_record = {
                 "ok": result.returncode == 0,
@@ -1358,7 +1356,9 @@ def _done_impl(
                         "stdout": _decode_subprocess_output(result.stdout)[:300],
                         "hint": (
                             "verify 失败可能因断言不匹配或环境问题；若为 pytest 超长执行，"
-                            "按 SKILL.md 自检约定改用模块定向 verify_command"
+                            "按 SKILL.md 自检约定改用模块定向 verify_command；"
+                            "若在 Windows 上 verify 失败，请确认已安装 Git Bash"
+                            "（verify_command 以 POSIX 语法经 Git Bash 执行）"
                         ),
                     }],
                 )
@@ -1533,11 +1533,7 @@ def _done_impl(
                 f'"{sys.executable}" -m pytest tests/ -q '
                 f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
             )
-            reg_result = subprocess.run(
-                reg_cmd,
-                shell=True, cwd=str(project_root),
-                capture_output=True, timeout=_FULL_REGRESSION_TIMEOUT,
-            )
+            reg_result = run_shell(reg_cmd, str(project_root), _FULL_REGRESSION_TIMEOUT)
             reg_elapsed = round(time.monotonic() - reg_started, 1)
             if reg_result.returncode == 0:
                 full_regression = {

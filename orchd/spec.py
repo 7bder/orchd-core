@@ -322,6 +322,8 @@ _VAGUE_WORDS = [
 
 # 跨平台 basetemp 模板（task-cross-platform-release / task-cross-platform-validation）
 # 项目自 Windows 迁至 macOS，专用于跨平台校验提示文案。
+# 执行模型（task-cross-platform-verify）：verify_command 在 Windows 上经 Git Bash
+# （orchd.subproc.run_shell）执行，${TMPDIR:-/tmp} 由 bash 展开 → 真正跨平台。
 _CROSS_PLATFORM_BASETEMP = '--basetemp="${TMPDIR:-/tmp}/orchd-vf-$$"'
 
 # 文档后缀白名单（与 onboard.py _DOC_SINGLE_STAGE_SUFFIXES 对齐）：
@@ -925,7 +927,8 @@ def verify_command_dangerous_reasons(verify_cmd: str) -> list[str]:
 def _basetemp_platform_issues(verify_cmd: str) -> list[str]:
     """检测 verify_command 中 --basetemp 路径的平台性（E027，2026-08-12 实踩）。
 
-    跨平台 basetemp 应使用 `${TMPDIR:-/tmp}/orchd-vf-$$`（POSIX 展开 + 回退）。
+    跨平台 basetemp 应使用 `${TMPDIR:-/tmp}/orchd-vf-$$`——verify_command 在
+    Windows 上经 Git Bash（orchd.subproc.run_shell）执行，由 bash 展开，真正跨平台。
     命中两类平台专用片段即判定为非跨平台：
     - Windows 专用：`%LOCALAPPDATA%` / `%TEMP%` / `%RANDOM%` / 反斜杠路径（`\\Temp` 式）
     - POSIX 专用：`${TMPDIR`（无 `:-` 回退） / `$(mktemp`

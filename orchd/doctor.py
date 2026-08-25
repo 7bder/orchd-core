@@ -13,6 +13,7 @@ task-git-doctor-command（2026-08-12，来源 IDEAS L295）：
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -206,7 +207,14 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
             # OS 自动生成文件（.DS_Store / Thumbs.db）不属于非法 loose ref，跳过
             if entry.name in _REFS_ROOT_IGNORE:
                 continue
-            # 非目录文件即为非法 loose ref（临时文件 / 手工乱建等）
+            # 内容为合法 40 位 hex 对象哈希的 loose ref（如 refs/stash 等 git 合法
+            # 伪 ref）属于合法 ref，跳过；仅内容非哈希的才是非法 loose ref
+            try:
+                if re.fullmatch(r"[0-9a-fA-F]{40}", entry.read_text(encoding="ascii").strip()):
+                    continue
+            except OSError:
+                pass
+            # 非目录文件且非合法 loose ref 即为非法（临时文件 / 手工乱建等）
             illegal_refs_root.append(entry.name)
     if illegal_refs_root:
         checks.append(

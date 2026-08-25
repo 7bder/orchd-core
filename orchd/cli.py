@@ -1021,6 +1021,7 @@ def _cmd_amend(args) -> dict:
     # E024/E027（缺 basetemp / 不安全段）阻断注册；expected_pending 仅提示）
     from orchd.split import classify_dry_run_failure
     from orchd.spec import validate_quality, verify_command_dangerous_reasons
+    from orchd.subproc import run_shell
 
     task_map = {t.get("id", ""): t for t in master.tasks}
     dry_run_results: list[dict[str, Any]] = []
@@ -1042,10 +1043,7 @@ def _cmd_amend(args) -> dict:
             })
             continue
         try:
-            proc = subprocess.run(
-                verify_cmd, shell=True, cwd=str(project_root),
-                capture_output=True, timeout=30,
-            )
+            proc = run_shell(verify_cmd, str(project_root), 30)
             failure_class = None
             if proc.returncode != 0:
                 failure_class = classify_dry_run_failure(
