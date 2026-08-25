@@ -14,15 +14,19 @@
   shared/、_master.json、IDEAS/ROADMAP、ledger/checkpoint、session 锁）；
   --force 覆盖安装（重建 .orchd/，覆盖全部）；
 - --agent：仅输出最终 JSON（installed/mode/host/orchd_dir/next），无交互提示。
+- --cleanup：安装成功后删除克隆源目录（orchd-core/），实现无痕安装（仅当脚本位于
+  克隆根且目录名为 orchd-core 时删除，主项目布局安全跳过）。
 
 用法：
-    python release/install.py <host> [--update] [--force] [--agent]
+    python release/install.py <host> [--update] [--force] [--agent] [--cleanup]
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -68,7 +72,7 @@ _AGENTS_POINTER = """<!-- orchd: agent 入口指针（由 orchd 安装器维护�
 若本目录尚无 `.orchd/`（新环境或尚未安装），可自行执行安装接入：
 
 ```bash
-git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
 ```
 
 装好后读 `.orchd/SKILL.md` 进入工作流。
@@ -199,6 +203,34 @@ def _ensure_agents_entry(host: Path) -> str:
     return "created"
 
 
+def _force_rmtree(path: Path) -> None:
+    """跨平台删除目录；Windows 上先清只读属性（git 对象文件只读会阻止 rmtree）。"""
+    if os.name == "nt":
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files + dirs:
+                try:
+                    os.chmod(os.path.join(root, name), stat.S_IWRITE)
+                except OSError:
+                    pass
+    shutil.rmtree(path)
+
+
+def _cleanup_source() -> str:
+    """--cleanup：安装成功后删除克隆源目录（orchd-core/），实现无痕安装。
+
+    安全保护：仅当脚本位于克隆根（扁平布局，_SELF_DIR == RESOURCE_ROOT）且
+    目录名为 orchd-core 时删除；主项目布局（release/install.py）或目录名
+    不符时安全跳过，防止误删主项目源码。
+    """
+    if _SELF_DIR != RESOURCE_ROOT or RESOURCE_ROOT.name != "orchd-core":
+        return "skipped"
+    try:
+        _force_rmtree(RESOURCE_ROOT)
+        return "removed"
+    except OSError:
+        return "failed"
+
+
 def main(argv: list[str] | None = None) -> int:
     _enable_utf8_stdio()
 
@@ -213,10 +245,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="已存在时覆盖安装（重建 .orchd/，覆盖全部）")
     parser.add_argument("--agent", action="store_true",
                         help="非交互：仅输出最终 JSON（installed/mode/host/orchd_dir/next）")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="安装成功后删除克隆源目录（orchd-core/），实现无痕安装")
     args = parser.parse_args(argv)
 
     try:
         result = _install(Path(args.host), args.update, args.force)
+        if args.cleanup:
+            result["cleanup"] = _cleanup_source()
     except Exception as exc:  # noqa: BLE001 - 统一收敛为错误输出
         if args.agent:
             print(json.dumps(

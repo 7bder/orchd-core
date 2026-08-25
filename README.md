@@ -20,11 +20,11 @@ orchd 不推理需求、不内置 LLM 调用。它只为一个项目里的多个
 
 ```bash
 git clone <GitHub 或 Gitee 仓库>        # 见「接入方式」
-python <仓库>/install.py . --agent
+python <仓库>/install.py . --agent --cleanup
 python .orchd/__main__.py --version
 ```
 
-安装后 `python .orchd/__main__.py <子命令> ...` 即完整命令入口（无需安装、不依赖 PATH）。
+安装后 `python .orchd/__main__.py <子命令> ...` 即完整命令入口（无需安装、不依赖 PATH；`--cleanup` 安装成功后自动删除克隆源，宿主根零残留）。
 
 ## 接入方式
 
@@ -34,7 +34,7 @@ python .orchd/__main__.py --version
 
 ```text
 用这些命令把 orchd 接入当前项目并引导：
-git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
 装好后读 .orchd/SKILL.md 进入工作流。
 ```
 
@@ -42,7 +42,7 @@ git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.p
 
 ```text
 用这些命令把 orchd 接入当前项目并引导：
-git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.py . --agent
+git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
 装好后读 .orchd/SKILL.md 进入工作流。
 ```
 
@@ -50,7 +50,7 @@ git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.
 >
 > ```markdown
 > > 🤖 AI agents: 用 orchd 管理本项目。如果 .orchd/ 不存在，请自动安装：
-> > git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent
+> > git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
 > > 然后读 .orchd/SKILL.md 按 guidance 导航。
 > ```
 

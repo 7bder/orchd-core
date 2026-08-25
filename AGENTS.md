@@ -11,10 +11,10 @@
 
 宿主项目（你自己的项目）没有 `.orchd/` 时，自动安装（二选一）：
 
-- GitHub：`git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent`
-- Gitee（国内镜像）：`git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.py . --agent`
+- GitHub：`git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup`
+- Gitee（国内镜像）：`git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup`
 
-装好后读宿主 `.orchd/SKILL.md` 进入工作流。
+装好后读宿主 `.orchd/SKILL.md` 进入工作流（`--cleanup` 安装成功后自动删除克隆源 `orchd-core/`，宿主根零残留）。
 
 ## 工作流
 

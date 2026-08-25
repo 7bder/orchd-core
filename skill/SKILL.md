@@ -19,7 +19,7 @@
 
 ```bash
 git clone https://github.com/7bder/orchd-core.git   # 国内镜像：git clone https://gitee.com/QQ7bder/orchd-core.git
-python orchd-core/install.py . --agent
+python orchd-core/install.py . --agent --cleanup    # --cleanup 安装后自动删除克隆源 orchd-core/（无痕安装）
 python .orchd/__main__.py bootstrap
 ```
 
