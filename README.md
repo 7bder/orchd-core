@@ -42,7 +42,7 @@ git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.p
 
 ```text
 用这些命令把 orchd 接入当前项目并引导：
-git clone https://gitee.com/QQ7bder/orchestra.git && python orchestra/install.py . --agent
+git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.py . --agent
 装好后读 .orchd/SKILL.md 进入工作流。
 ```
 

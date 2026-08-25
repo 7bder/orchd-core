@@ -18,7 +18,7 @@
 宿主无 `.orchd/` 时，agent 凭本文件即可自我启动：
 
 ```bash
-git clone https://github.com/7bder/orchd-core.git   # 国内镜像：git clone https://gitee.com/QQ7bder/orchestra.git
+git clone https://github.com/7bder/orchd-core.git   # 国内镜像：git clone https://gitee.com/QQ7bder/orchd-core.git
 python orchd-core/install.py . --agent
 python .orchd/__main__.py bootstrap
 ```
