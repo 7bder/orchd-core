@@ -185,11 +185,28 @@ def first_time_guide(has_master: bool = False) -> dict[str, Any]:
     }
 
 
+def stop_wait_guidance() -> dict[str, Any]:
+    """request 无候选时的停止引导（task-request-no-task-stop）。
+
+    引擎未分配任务（candidate=None / next_action=exit|wait）时返回：agent 应
+    停止，不得自行 claim / 重试 request / --auto-claim，等待用户下一条指令。
+    command 为空（无可执行命令），hint 明确停止语义。
+    """
+    return {
+        "step": "stop_wait",
+        "read": [],
+        "template": [],
+        "command": "",
+        "hint": "引擎未分配任务：停止，不得自行 claim 或重试 request，等待用户下一条指令。",
+    }
+
+
 def _derive(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
     agent_id: str | None,
     has_master: bool,
+    review_mode: str = "two_phase",
 ) -> dict[str, Any]:
     """按状态机+角色推导单视角引导（内部函数，返回纯 {step, read, template, command, hint}）。
 
@@ -198,6 +215,9 @@ def _derive(
         tasks: master 任务定义列表。
         agent_id: 当前 agent 身份（None 表示未知/项目视角）。
         has_master: 是否已存在 ``_master.json``（区分未初始化/空项目）。
+        review_mode: 审查模式（review-unify-r2）：``"unified"`` 单阶段
+            （in_review 模板用 reviewer.md），``"two_phase"`` 双阶段
+            （spec-reviewer.md + code-reviewer.md）。缺省 two_phase 向后兼容。
 
     Returns:
         纯 5 键引导结构；无任务时返回 first_time/empty_project 引导。
@@ -209,11 +229,18 @@ def _derive(
         return first_time_guide(has_master=has_master)
 
     # 有 in_review 未审 → 优先引导领审查（知识：review 规则；方法：审查模板）
+    # review-unify-r2：按 review_mode 分流模板——unified 单阶段 reviewer.md，
+    # two_phase 双阶段 spec-reviewer.md + code-reviewer.md。
     if c.get("in_review", 0) > 0:
+        review_templates = (
+            ["templates/reviewer.md"]
+            if review_mode == "unified"
+            else ["templates/spec-reviewer.md", "templates/code-reviewer.md"]
+        )
         return {
             "step": "request_review",
             "read": ["rules/review.md"],
-            "template": ["templates/spec-reviewer.md", "templates/code-reviewer.md"],
+            "template": review_templates,
             "command": "orchd request",
             "hint": f"有 {c['in_review']} 个任务待审查：先领取审查任务，代码审查通过后任务才算完成。",
         }
@@ -300,6 +327,7 @@ def next_guidance(
     tasks: list[dict[str, Any]],
     agent_id: str | None = None,
     has_master: bool = False,
+    review_mode: str = "two_phase",
 ) -> dict[str, Any]:
     """按状态机+角色推导下一步引导（纯函数，双视角，task-guidance-dual-view-engine）。
 
@@ -316,12 +344,14 @@ def next_guidance(
         tasks: master 任务定义列表。
         agent_id: 当前 agent 身份（可选；None/空 → agent_view 退化为项目视角）。
         has_master: 是否已存在 ``_master.json``（区分未初始化/空项目）。
+        review_mode: 审查模式（review-unify-r2）：``"unified"`` 单阶段模板，
+            ``"two_phase"`` 双阶段模板。缺省 two_phase 向后兼容。
 
     Returns:
         引导结构：顶层 5 键 + agent_view + project_view。
     """
-    agent_view = _derive(state, tasks, agent_id, has_master)
-    project_view = _derive(state, tasks, None, has_master)
+    agent_view = _derive(state, tasks, agent_id, has_master, review_mode)
+    project_view = _derive(state, tasks, None, has_master, review_mode)
     # 顶层严格保持 5 键（= agent_view 的 5 键，向后兼容），双视角挂 agent_view/project_view
     out = {
         "step": agent_view["step"],
@@ -340,6 +370,7 @@ def status_guidance_text(
     tasks: list[dict[str, Any]],
     agent_id: str | None = None,
     has_master: bool = False,
+    review_mode: str = "two_phase",
 ) -> str:
     """为 ``orchd status --text`` 生成表格末尾的引导文字（纯函数）。
 
@@ -348,9 +379,10 @@ def status_guidance_text(
         tasks: master 任务定义列表。
         agent_id: 当前 agent 身份（可选）。
         has_master: 是否已存在 ``_master.json``（status 命令前置必有，传 True）。
+        review_mode: 审查模式（review-unify-r2），透传 next_guidance。
 
     Returns:
         一行引导文字（含换行前缀），供追加到表格末尾。
     """
-    g = next_guidance(state, tasks, agent_id, has_master)
+    g = next_guidance(state, tasks, agent_id, has_master, review_mode)
     return f"\n下一步：{g['hint']}（{g['command']}）\n"

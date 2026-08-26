@@ -7,6 +7,7 @@
 ## 工作流程
 
 1. **认领任务**：`orchd request` 获取候选 → 确认能力匹配 → `orchd claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
+   - **若 `request` 返回无候选（`candidate=None` / `next_action=exit`）**：立即停止，不尝试 `claim`、不重试 `request`、不 `--auto-claim`；向用户报告并等待下一条指令（引擎分配为准）。
 2. **阅读上下文**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）
 3. **实现**：修改 files_to_edit 中列出的文件，交付功能代码 + 测试代码
 4. **自验**：执行 verify_command 确认通过

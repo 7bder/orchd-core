@@ -105,10 +105,14 @@ def _attach_guidance(data: Any) -> Any:
         from orchd.guide import next_guidance, resolve_read_paths
         # task-guidance-dual-view-engine：传 agent_id（_resolve_agent_id 解析）与
         # has_master（master_path.exists()），支撑双视角与未初始化/空项目区分。
+        # review-unify-r2：传 review_mode，in_review 模板按 unified/two_phase 分流。
+        from orchd.ledger import resolve_review_mode
         agent_id = _resolve_agent_id(orchd_dir)
         has_master = master_path.exists()
+        review_mode = resolve_review_mode(orchd_dir)
         data["guidance"] = resolve_read_paths(
-            next_guidance(state, tasks, agent_id=agent_id, has_master=has_master),
+            next_guidance(state, tasks, agent_id=agent_id, has_master=has_master,
+                          review_mode=review_mode),
             orchd_dir,
         )
     except Exception:
@@ -1146,6 +1150,14 @@ def _cmd_request(args) -> dict:
         enforce_self_review_block=enforce_self_review_block,
     )
 
+    # 无候选（candidate=None / next_action=exit|wait）：以引擎分配为准，
+    # 附加 stop_wait 引导，明确"停止等待用户指令"，防止 agent 自行 claim/重试。
+    # _attach_guidance 幂等（已有 guidance 不覆盖），此处预置即生效。
+    if result.get("candidate") is None and result.get("next_action") in ("exit", "wait"):
+        from orchd.guide import stop_wait_guidance
+
+        result["guidance"] = stop_wait_guidance()
+
     # --auto-claim：候选非空时自动 claim（绕过人工确认）。
     # 默认禁用：仅当 _master.json 顶层 config.allow_auto_claim 显式为 true 时，
     # agent 才可调用 --auto-claim（用户明确授权）；否则结构化拒绝，防止无人值守
@@ -1778,8 +1790,12 @@ def _cmd_status(args) -> dict:
         table = result.pop("_text")
         try:
             from orchd.guide import status_guidance_text
+            from orchd.ledger import resolve_review_mode
             # status 命令前置必有 master → has_master=True（空项目时显示 empty_project 而非 first_time）
-            table += status_guidance_text(store.replay(), tasks, has_master=True)
+            # review-unify-r2：传 review_mode，引导文字按模式分流（模板路径不影响文字，但保持一致）
+            review_mode = resolve_review_mode(store.orchd_dir)
+            table += status_guidance_text(store.replay(), tasks, has_master=True,
+                                           review_mode=review_mode)
         except Exception:
             pass  # 引导失败静默跳过，不影响表格输出
         print(table)

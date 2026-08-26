@@ -47,6 +47,7 @@ python .orchd/__main__.py bootstrap
 11. **禁止绕过 claim**：任务必须经 `claim` 由引擎建分支；禁止手动 `git branch/checkout` 创建任务分支。
 12. **禁止任务悬空**：claim 后必须走完 done → 审查 → merge；中断/放弃必须先 retract。
 13. **禁止声明文件漏提交/漏声明**：`files_to_edit` 声明文件必须随任务分支提交并进入 diff，否则 done 与 review 均被引擎硬门禁拒绝。不得在主工作树直接改任务文件；声明文件确无需改动时走 `amend` 移除或补充说明。
+14. **禁止无候选自行领任务**：`request` 返回 `candidate=None` / `next_action=exit`（无就绪任务）时，禁止自行 `claim`、禁止重试 `request`、禁止 `--auto-claim`；立即停止并报告，等待用户下一条指令。
 
 **MUST（强制动作）**：
 1. session 开始三连检查：`git status` + `git branch --show-current` + `python .orchd/__main__.py status`。
@@ -73,7 +74,7 @@ python .orchd/__main__.py bootstrap
 ## Rules
 - One task per session. Exit after `python .orchd/__main__.py done`.
 - Reviewer exception: complete both review phases (spec + code) of one task in the same session.
-- Maintain --exclude list across retries. Feed it back to step 1.
+- request 无候选（`candidate=None` / `next_action=exit`）即停止：不重试、不自行 claim，报告后等待用户下一条指令。
 - 认领角色由引擎按任务状态自动分流（in_review→审查，pending→实现），身份由 `ORCHD_SESSION_ID` 自动派生会话指纹。
 - 实现者禁自审（E016 防自审指纹校验），不再依赖任务的 `reviewers` 名单字段。
 - Never read files outside the file list provided by CLI (WORKER mode). In BOOTSTRAP mode, reading `requirements.md` is required.
