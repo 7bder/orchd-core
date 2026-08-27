@@ -53,8 +53,14 @@ _tmp_*
 .workbuddy/
 reasonix.toml
 
+# session 运行时凭据/锁（宿主接入层写入的本地会话 token 与锁文件，不入库）
+.session_token.txt
+.session-*.lock
+
 # pytest 临时目录（误入跟踪，2026-08-05 恢复时清理）
 .pytest-tmp/
+# pytest --basetemp 误入跟踪（2026-08-28 done 命令误提交，清理后加入防再犯）
+.pytest-basetmp/
 
 # 构建/部署产物
 orchd-dashboard/

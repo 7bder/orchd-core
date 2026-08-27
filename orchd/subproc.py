@@ -4,6 +4,11 @@ verify_command 以 POSIX shell 语法书写（${TMPDIR:-/tmp}、ORCHD_SESSION_ID
 test -f、bash -n、>/dev/null、| grep），Windows 的 cmd.exe（subprocess shell=True）
 不识别这些构式 → done E014。本模块在 Windows 上优先用 Git Bash 执行命令串，
 POSIX 平台保持 shell=True 原行为。
+
+与 guide 层零根入口的分工：guide.py 下发的 command 已收敛为零根入口
+``python .orchd/__main__.py``（纯 Python 进程，不依赖 shell 语法，PowerShell/
+cmd/Git Bash 下均可直接执行，无需本模块兜底）；本模块只负责引擎侧 verify_command
+这类 POSIX 语法命令串的 Git Bash 兜底，两层职责不同、互不干扰。
 """
 from __future__ import annotations
 

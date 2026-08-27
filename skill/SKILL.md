@@ -67,13 +67,24 @@ python .orchd/__main__.py bootstrap
 ## 规则目录（纪律红线见上，优先级最高；完整索引见 .orchd/rules/README.md，按需 Read，勿全量载入）
 - 会话/优先级/接管/claim 两段式 → rules/session.md   ·  摄入 IDEAS→注册 → rules/intake.md
 - verify_command（120s / --basetemp）→ rules/verify.md   ·  分支/提交/merge/exempt → rules/git.md
-- 审查（templates/spec-reviewer.md、templates/code-reviewer.md + 证据分层）→ rules/review.md
+- 审查（two_phase：templates/spec-reviewer.md + templates/code-reviewer.md；unified 单阶段：templates/reviewer.md；+ 证据分层）→ rules/review.md
 - 测试纪律（复用 tests/conftest.py 的 make_task / orchd_dir，参数化，禁止在测试文件内另造副本）→ rules/testing.md
 - 安装 → rules/install.md   ·  事故/Windows/引擎边界 → rules/{recovery,windows,safety}.md
 
+## 经验回灌（lesson）命令入口
+
+agent 在执行中可静默打点、人可在收尾统一审核（设计见 `design/lesson-feedback-design-20260828.md`）：
+
+- `lesson stage --trigger <key> --symptom "..." [--solution "..." --resolved] [--severity blocking|warning] [--scene <scene>] [--urgent]`：执行中**静默打点**至任务暂存区（带 task_id），不实时入库、不打断流程；`--urgent` 即时提示人工。
+- `lesson review --task <id> [--approve-all | --reject <idx>]`：人工批量确认暂存建议（approve → `verified` 候选 / `proposed`；reject → 丢弃）。
+- `lesson add / report / resolve / list / show / archive`：人工 / 事后路径（不经任务流程）；`report --guidance-flaw` 标记指引缺陷。
+- 打点义务与自愈边界（含补丁 1-4、IDEAS vs lesson 分流）见 `.orchd/rules/recovery.md`「经验回灌（lesson）」小节。
+- 纪律：执行中只打点不入库；`proposed → verified` 必须人工 `resolve --approve`；solution 只提示不代行；根因在引擎代码内走 `idea` 而非 `lesson`。
+
 ## Rules
 - One task per session. Exit after `python .orchd/__main__.py done`.
-- Reviewer exception: complete both review phases (spec + code) of one task in the same session.
+- Reviewer exception: complete all review phases of one task in the same session（two_phase：spec + code；unified：单阶段一次 APPROVED 即 merge）。
+- 审查模式：缺省 two_phase（spec → code 两阶段，旧行为）；`._master.json` 顶层 `project.review_mode: "unified"` 显式启用单阶段（done 后 REVIEW_READY 不带 review_type，`orchd review` 不传 `--type`，一次 APPROVED 即 merge）。
 - request 无候选（`candidate=None` / `next_action=exit`）即停止：不重试、不自行 claim，报告后等待用户下一条指令。
 - 认领角色由引擎按任务状态自动分流（in_review→审查，pending→实现），身份由 `ORCHD_SESSION_ID` 自动派生会话指纹。
 - 实现者禁自审（E016 防自审指纹校验），不再依赖任务的 `reviewers` 名单字段。

@@ -1,5 +1,7 @@
 # 仓库事故恢复（git 对象/refs 丢失 SOP）
 
+> TL;DR: ① 仓库对象/refs 丢失按 SOP 恢复 ② 先报告再操作，不自行猜测处置
+
 > 原 .orchd/SKILL.md「仓库事故恢复」，外置自 task-skill-hub-refactor。
 
 > 2026-08-06 repack 事故 + 2026-08-08 refs/ 目录被删 + loose objects 丢失，两次实踩后沉淀。
@@ -18,3 +20,45 @@
 
 > 关联：IDEAS L272（unlink 沙箱拦截，同源环境限制——safe-delete 拦删除不拦写入，是本法依据）；
 > 工具化检测见 `python .orchd/__main__.py doctor`（task-git-doctor-command）。
+
+## 经验回灌（lesson）：自愈边界与打点义务
+
+> 关联设计：`design/lesson-feedback-design-20260828.md`。lesson 功能把「引擎未覆盖、agent 自行解决」的问题沉淀为可复用 guidance；本小节承载 agent 执行纪律（自愈边界 + 打点义务 + warning 决策树），命令契约见设计文档 §7。
+
+### 自愈边界规则（含补丁 1-4）
+
+| 情况 | 行为 |
+|---|---|
+| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 14 个 + 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
+| **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --resolved` 沉淀；未解决 → 停止报告 |
+| **红线 14 纪律场景**（candidate=None / next_action=exit） | 维持不变：停止等待，**不**视为自愈 |
+
+- **补丁 1（关键）**：`_FALLBACK_ERROR_GUIDANCE`（"立即停止并报告"）**不算"明确指引"**，归入"无 guidance"→ 允许自愈。否则所有未映射错误码都有 fallback 指引，自愈永不触发，功能失效。
+- **补丁 2**：触发键不限于错误码，扩展为场景键（`command + step + symptom`），覆盖非错误码场景（平台问题、流程缺口、命令成功但结果异常）。
+- **补丁 3**：自愈"成功"需客观信号（verify 通过 / 后续命令成功），不靠 agent 自述；否则只能 `lesson report`（记问题），不能 `lesson stage --resolved`（记解法）。引擎侧交叉验证：done hook 对 `resolved=true` 条目回溯当前任务 verify 事件，不存在或 `exit_code ≠ 0` 则降级 `resolved=false` 并在 review 汇总标注。
+- **补丁 4（IDEAS vs lesson 边界）**：自愈中若判定根因为**引擎自身缺陷**（代码 bug / 状态机异常 / schema 不一致），应走 `idea` 命令 propose（进入任务管线），而非 `lesson stage`；lesson 仅承载**环境/平台/配置层面**应对经验（Windows 编码、git 配置差异、worktree 路径陷阱等），不承载引擎 bug 报告。
+
+### 打点义务（6 条）
+
+1. 遇"无具体 guidance"错误且自愈成功 → `lesson stage --resolved`（以 verify 通过 / 后续命令成功为客观信号）。
+2. 遇"无具体 guidance"错误且未解决 → `lesson stage`（只记问题，`resolved=false`）。
+3. 遇"有具体 guidance 但判定不适用" → `lesson stage --guidance-flaw`（`resolved=false`，标记指引缺陷）。
+4. **收尾统一审核**：打点仅入暂存区，不实时入库；任务 done 时统一汇总，人工 `lesson review` 确认后入库（§8.6）。
+5. 仅对 **blocking 级**打点（warning 级按下方决策树三重信号判断；E030 例外，§5）。
+6. **补丁 4 边界**：自愈中若判定为引擎缺陷 → 走 `idea` 命令 propose，不 `lesson stage`；仅环境/平台/配置层面应对经验才 lesson 打点。
+
+### warning 上报决策树
+
+遇 warning 级错误（不阻断，agent 应继续）：
+
+- **信号 A（引擎预判）**：warning 响应带 `suggest_report=true`（引擎维护清单：E030=true，其余默认 false）→ 触发上报判断。
+- **信号 B（影响推进）**：warning 所指问题**阻碍任务正确推进 / 结果判断** → 触发上报判断。
+- **信号 C（高频 / 缺陷征兆）**：同 session 同一 warning **复现 ≥3 次**；或指向**引擎 / 平台自身缺陷征兆** → 触发上报判断。
+- **三信号均未命中** → 静默继续，不上报。
+
+触发上报判断后：
+
+- 已解决（verify 通过）→ `lesson stage --resolved`（记解法，P0 价值）。
+- 未深入解决 → `lesson stage`（记问题，标记"值得关注"）。
+
+> 来源可追溯：每条 lesson 记录 source（agent 指纹 / session / engine_version）；信任分级 `proposed`（未验证·参考）→ 人工 `resolve --approve` 后 `verified`（正式触发）；solution 只提示不代行。详见 `design/lesson-feedback-design-20260828.md`。

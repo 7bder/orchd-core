@@ -1,5 +1,7 @@
 # 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
 
+> TL;DR: ① 审查者不得自审（E016）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract
+
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
 ## 审查者身份约定（自审默认仅提示）

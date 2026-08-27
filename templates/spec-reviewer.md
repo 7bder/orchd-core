@@ -13,11 +13,11 @@
 
 ## 工作流程
 
-1. **认领审查**：`orchd request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `orchd claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
+1. **认领审查**：`python .orchd/__main__.py request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `python .orchd/__main__.py claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
 2. **阅读材料**：任务的 acceptance_criteria、deliverables（若有）、实现者的 changes_description、DONE 事件（ledger）
 3. **收集验证证据（分层，默认不重跑）**：① 引擎保证——任务 in_review = verify_command 已通过（done 成功前提）；② 实现者 changes_description 中的自检声明；③ 仅在上述不可信或需确认特定行为时，重跑**定向**测试（`pytest tests/test_<相关>.py -q --basetemp="${TMPDIR:-/tmp}/orchd-vf-$$"`），禁止全量 pytest
 4. **逐条判定**：对照验收标准逐条勾选三态清单（见下）
-5. **提交审查**：`orchd review --task {id} --type spec --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`
+5. **提交审查**：`python .orchd/__main__.py review --task {id} --type spec --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`
 
 ## 三态判定清单（每条验收标准必填一项）
 

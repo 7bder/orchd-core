@@ -102,14 +102,20 @@ def status(
     text: bool = False,
     task_id: str | None = None,
     project_root: Path | None = None,
+    active_only: bool = True,
 ) -> dict[str, Any]:
     """全局状态快照；给定 task_id 时返回单任务详情。
 
     当 text=True 时，返回结果中额外包含 ``_text`` 字段，其值为人类可读的
     纯文本表格（由 _format_text 生成），供 CLI 层直接打印，不混入 JSON 输出。
 
+    Args:
+        active_only: 仅输出活跃任务（status ∈ pending/claimed/done/in_review），
+            终态 completed/cancelled 默认隐藏（task-status-active-only）。
+            传 False 回退全量。summary.total 恒为全量任务数，另增 active（活跃数）。
+
     Returns:
-        JSON 结构：project + tasks[] + summary（total + 六状态计数）；
+        JSON 结构：project + tasks[] + summary（total + active + 六状态计数）；
         或单任务详情 {"task": {...}}。
 
     Raises:
@@ -169,6 +175,10 @@ def status(
         ts = state.get(tid)
         s = ts.status if ts else "pending"
         counts[s] = counts.get(s, 0) + 1
+        # task-status-active-only：默认仅输出活跃任务（非终态），
+        # 终态 completed/cancelled 在 tasks[] 中隐藏；summary 计数不受影响。
+        if active_only and s in ("completed", "cancelled"):
+            continue
         entry: dict[str, Any] = {
             "task_id": tid,
             "name": task.get("name", ""),
@@ -187,7 +197,15 @@ def status(
             entry["revive_marker"] = revive_by_task[tid]
         task_statuses.append(entry)
 
-    summary = {"total": len(tasks), **counts}
+    # task-status-active-only：summary 增 active 计数且保留 total。
+    # active = 活跃任务数（非终态）；total 恒为全量任务数。
+    summary = {
+        "total": len(tasks),
+        "active": sum(
+            counts[k] for k in ("pending", "claimed", "done", "in_review")
+        ),
+        **counts,
+    }
     result = {
         "project": dict(project) if project else {},
         "tasks": task_statuses,
@@ -828,12 +846,15 @@ def watchdog(
             or (t.review_claimed_by == lock_agent and t.status == "in_review")
             for t in state.values()
         )
-        if not has_active_task:
-            # 锁持有者已无活跃任务：会话已结束但锁未释放 → 立即释放（僵死锁）
+        # P0-2：timeout <= 0 语义为"强制清理"——无论持锁者是否有活跃任务，
+        # 一律释放锁（用户显式要求强制解锁僵死会话）。
+        force_release = timeout_min <= 0
+        if force_release or not has_active_task:
+            # 锁持有者已无活跃任务（僵死锁）或用户强制清理 → 立即释放
             release = session_lock_release(store.orchd_dir)
             session_lock_stale = {
                 "status": "released",
-                "reason": "no_active_task",
+                "reason": "force_release" if force_release else "no_active_task",
                 "agent_id": lock_agent,
                 "session_id": check.get("session_id") or "",
                 "age_min": round(check.get("age_min", 0), 1),
@@ -912,9 +933,8 @@ def _format_text(result: dict[str, Any]) -> str:
     表格格式：
     - 表头行：ID（20 字符左对齐）、Status（12 字符）、Claimed By（15 字符）、Name
     - 分隔线：70 个连字符
-    - 每行一个任务，字段对齐方式同表头
-    - 末尾空行后跟一行汇总：Total / pending / claimed / done / in_review /
-      completed / cancelled 各自的计数
+    - 每行一个任务，字段对齐方式同表头（默认仅活跃任务，--all 时含终态）
+    - 末尾空行后跟一行汇总：Total / active + 六状态各自的计数
 
     Args:
         result: status() 返回的字典，需包含 tasks[] 和 summary 字段。
@@ -933,6 +953,7 @@ def _format_text(result: dict[str, Any]) -> str:
     summary = result["summary"]
     lines.append(
         f"Total: {summary['total']} | "
+        f"active={summary.get('active', 0)} "
         f"pending={summary['pending']} claimed={summary['claimed']} "
         f"done={summary['done']} in_review={summary['in_review']} "
         f"completed={summary['completed']} cancelled={summary['cancelled']}"

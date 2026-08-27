@@ -143,7 +143,7 @@ def bootstrap(project_root: Path | None = None) -> dict[str, Any]:
 
     不调用 LLM、不访问网络、不写文件。
     注意：此函数仅读取项目静态文件（schema / templates / docs），
-    不要求 .orchd/ 目录已存在——它可在项目初始化（orchd init）之前安全调用。
+    不要求 .orchd/ 目录已存在——它可在项目初始化（python .orchd/__main__.py init）之前安全调用。
 
     资源根双态兼容（task-12-engine-path-abstraction，AC1）：
     开发态在项目根（``schema/`` 等），发布态在 ``.orchd/``（引擎资源归置）。
@@ -351,7 +351,7 @@ def request(
             "review_priority": rp_entry,
             "message": (
                 f"有 {len(review_priority)} 个待审查任务可领取，建议先完成审查再领取实现任务。"
-                f"使用 'orchd request' 领取审查任务。"
+                f"使用 'python .orchd/__main__.py request' 领取审查任务。"
             ),
             "next_action": "review_first",
             "pool_size": 0,
@@ -383,11 +383,14 @@ def request(
     candidates = sort_candidates(candidates, sort_key=sort_key,
                                  importance_thresholds=importance_thresholds)
 
-    # L1 pending 级文件冲突预检 → 依赖感知强制过滤（2026-08-08 重构）：
-    # 与池内 claimed+pending 任务 files_to_edit 冲突的候选分类处理：
+    # L1 pending 级文件冲突预检 → 依赖感知过滤（2026-08-08 重构；
+    # 2026-08-28 放宽 pending 冲突软处理，消除「多任务共享核心文件互相排除
+    # → 全池假死锁」）：与池内 claimed+pending 任务 files_to_edit 冲突的候选：
     # - 与 claimed 活跃任务冲突 → 硬排除（领取必撞 claim E010，提前拦截）
-    # - 与 pending 非依赖任务冲突 → 硬排除（同批次并行会撞，强制串行化）
-    # - 与 pending 依赖任务冲突（依赖闭包内）→ 放行（依赖链串行正确）
+    # - 实际改动冲突（活跃分支真实改动重叠，非依赖链内）→ 硬排除
+    # - 与 pending 任务冲突（无论依赖链内外）→ 软处理：候选保留 + conflict_with
+    #   标注 + 排序降级。pending 任务不会被同时执行（单 agent 串行），不构成真实
+    #   并发占用；多 agent 并行领取由 claim E010 兜底。
     # 被排除项保留在响应 excluded_conflicts 中供可见性；无 --force 绕行通道
     # （claim E010 仍是不可绕过的最终边界）。
     excluded_conflicts: list[dict[str, Any]] = []
@@ -416,26 +419,25 @@ def request(
                 )
             except Exception:
                 actual_conflicts = []
-        if not conflicts and not actual_conflicts:
-            kept.append(cand)
-            continue
         dep_closure = get_dependency_closure(cand.task.get("id", ""), tasks)
         excluded: list[dict[str, Any]] = []
         allowed: list[dict[str, Any]] = []
+        pending_soft: list[dict[str, Any]] = []
         for c in conflicts:
-            if c.claimed_by == "pending" and c.task_id in dep_closure:
-                allowed.append({
+            if c.claimed_by == "pending":
+                # pending 冲突软处理：候选保留，conflict_with 标注（并发兜底在 claim E010）
+                pending_soft.append({
                     "task_id": c.task_id,
                     "files": c.files,
                     "claimed_by": c.claimed_by,
-                })  # 依赖链上的 pending 冲突：串行正确，放行
+                })
             else:
                 excluded.append({
                     "task_id": c.task_id,
                     "files": c.files,
                     "claimed_by": c.claimed_by,
                 })
-        # 实际改动冲突同样遵循依赖感知：依赖链上的实际冲突放行，其余硬排除。
+        # 实际改动冲突遵循依赖感知：依赖链上的实际冲突放行，其余硬排除。
         for c in actual_conflicts:
             if c.get("task_id") in dep_closure:
                 allowed.append({
@@ -456,12 +458,16 @@ def request(
                 "task_id": cand.task.get("id", ""),
                 "conflicts": excluded,
             })
-        if not excluded:
-            # 无硬冲突（或仅依赖链冲突）：保留候选；有任一硬冲突即整体排除
-            kept.append(cand)
-            if allowed:
-                candidate_conflicts[cand.task.get("id", "")] = allowed
-    candidates = kept  # 硬冲突候选已被排除
+            continue  # 有任一硬冲突即整体排除
+        kept.append(cand)
+        if pending_soft:
+            candidate_conflicts[cand.task.get("id", "")] = pending_soft
+        if allowed:
+            candidate_conflicts.setdefault(cand.task.get("id", ""), []).extend(allowed)
+    candidates = kept
+    # 排序降级（2026-08-28）：有 pending 软冲突的候选排到无冲突候选之后
+    # （稳定排序保持各自重要性顺序），无冲突候选优先返回。
+    candidates.sort(key=lambda c: c.task.get("id", "") in candidate_conflicts)
 
     if not candidates:
         # 区分空池原因：能力不匹配（存在就绪候选但 requires 不满足）vs 真无就绪
@@ -560,8 +566,9 @@ def request(
     if task_id in candidate_conflicts:
         candidate["conflict_with"] = candidate_conflicts[task_id]
         warnings.append(
-            f"file_conflict_pending: 与依赖链任务文件冲突 {len(candidate_conflicts[task_id])} 处"
-            f"（{candidate_conflicts[task_id][0]['task_id']} 等），依赖串行放行"
+            f"file_conflict_pending: 与池内 {len(candidate_conflicts[task_id])} 个任务共享声明文件"
+            f"（{candidate_conflicts[task_id][0]['task_id']} 等），软提示：多 agent 并行领取时"
+            f"claim E010 兜底"
         )
     if ts and ts.attempt_count > 0:
         candidate["rework"] = True
@@ -664,6 +671,20 @@ def claim(
         pre_ts = pre_state.get(task_id)
         role = "reviewer" if (pre_ts and pre_ts.status == "in_review") else "implementer"
 
+    # E018 降级自愈（reviewer，2026-08-28）：容器布局下任务无独立 worktree
+    # （ensure_task_wt 降级）时，done 把主工作树强制切回 main，而
+    # guard_claim(reviewer) 要求处于 task/{id} 分支 → E018 死胡同。此处
+    # best-effort 先切回任务分支（分支已存在则 checkout 复用），使守卫通过；
+    # 正常容器布局（任务 worktree 存在）不触发——reviewer 本就在任务 worktree 内。
+    if role == "reviewer" and project_root:
+        from orchd.worktree import _task_wt_name, detect_layout
+
+        _layout = detect_layout(project_root)
+        if _layout.get("layout") == "container":
+            _wt_dir = _layout["task_wt_root"] / _task_wt_name(task_id)
+            if not (_wt_dir / ".git").exists():
+                _try_git_branch(project_root, task_id)
+
     # L1 分支守卫 + L2 session 锁（锁外，best-effort，意图化：guard_claim 内部
     # 按角色派生 allowed_branches / require_clean）：
     # - implementer：须在默认分支（main/master）且工作区干净（引擎要从
@@ -720,7 +741,7 @@ def claim(
                     ErrorCode.E007,
                     f"not_designated_reviewer: '{agent_id}' 不在任务 '{task_id}' 的 reviewers 名单中",
                     [{"task_id": task_id, "agent": agent_id, "reviewers": designated,
-                      "hint": "请使用名单内的 agent ID，或先 orchd amend 修改 reviewers"}],
+                      "hint": "请使用名单内的 agent ID，或先 python .orchd/__main__.py amend 修改 reviewers"}],
                 )
             # 防御纵深（task-retract-ownership-guard）：实现者抢占独立审查者已认领
             # 的审查 → E011。配合 E034（撤认归属守卫）双保险，杜绝实现者借
@@ -741,11 +762,34 @@ def claim(
                       "hint": "实现者不得抢占独立审查；如审查中断，由审查者本人 retract 释放后重新认领"}],
                 )
             if ts and ts.review_claimed_by:
+                # P0-12：E009 补 claimed_session / event_id / 操作路径
+                # 查找该任务最近的 REVIEW_CLAIMED 事件 event_id
+                _claimed_event_id = None
+                for _ev in reversed(store._read_ledger_lines(from_line=1)):
+                    if (_ev.get("task_id") == task_id
+                            and _ev.get("type") == "REVIEW_CLAIMED"
+                            and not _ev.get("retracted")):
+                        _claimed_event_id = _ev.get("event_id")
+                        break
+                _e009_details: dict[str, Any] = {
+                    "task_id": task_id,
+                    "claimed_by": ts.review_claimed_by,
+                    "claimed_session": ts.review_claimed_session or "",
+                }
+                if _claimed_event_id:
+                    _e009_details["claimed_event_id"] = _claimed_event_id
+                _e009_details["hint"] = (
+                    f"审查已被 '{ts.review_claimed_by}' 认领（session: "
+                    f"{ts.review_claimed_session or 'unknown'}）；"
+                    f"如该审查已中断，可执行 "
+                    f"python .orchd/__main__.py retract --task {task_id} --type REVIEW_CLAIMED "
+                    f"释放认领后重新认领"
+                )
                 raise OrchdError(
                     ErrorCode.E009,
-                    f"already_claimed: review claimed by '{ts.review_claimed_by}'",
-                    [{"task_id": task_id, "claimed_by": ts.review_claimed_by,
-                      "hint": "如该审查已中断（不会继续提交），可 orchd retract 该 REVIEW_CLAIMED 事件释放认领"}],
+                    f"already_claimed: review claimed by '{ts.review_claimed_by}' "
+                    f"(session: {ts.review_claimed_session or 'unknown'})",
+                    [_e009_details],
                 )
             # E016: self-review——实现者审查自己实现的任务。
             # 默认仅提示（enforce_self_review_block=False，单机模型）；线上版
@@ -875,7 +919,7 @@ def claim(
                         "review_claim_event_id": review_claim_event_id,
                         "hint": (
                             "如该审查已中断（不会继续提交），可执行 "
-                            f"orchd retract --event {review_claim_event_id} "
+                            f"python .orchd/__main__.py retract --event {review_claim_event_id} "
                             "--reason 'abandoned review' 释放认领后重新领取审查"
                             if review_claim_event_id else
                             "该任务无你的 REVIEW_CLAIMED 事件，请人工核对状态"
@@ -919,6 +963,7 @@ def claim(
 
     # git 分支 + 任务 worktree（best-effort，锁外）
     worktree_path: str | None = None
+    degraded_warning: str | None = None
     if role == "implementer" and project_root:
         from orchd.worktree import bind_task_wt, ensure_task_wt
 
@@ -931,6 +976,14 @@ def claim(
             pass
         else:
             _try_git_branch(project_root, task_id)
+        # 降级告警（2026-08-28，禁止静默降级）：独立 worktree 创建失败时显式
+        # 暴露失败原因，供 agent 排查环境问题（如 Windows 路径锁），并提示
+        # 本次任务将以降级模式（主工作树 + 任务分支）运行。
+        if wt_info.get("degraded"):
+            degraded_warning = (
+                "独立任务 worktree 创建失败，任务以降级模式（主工作树）执行。"
+                f"原因: {wt_info.get('reason')}"
+            )
         # L3 pre-commit hook 安装（best-effort，锁外）
         files_to_edit = task_def.get("files_to_edit", [])
         if files_to_edit:
@@ -1013,7 +1066,7 @@ def claim(
             review_claim_result["verify"] = done_event["verify"]
         try:
             from orchd.worktree import (
-                missing_declared_branch_files,
+                diagnose_missing_branch_files,
                 task_branch_files,
             )
 
@@ -1022,7 +1075,7 @@ def claim(
                 project_root, task_id
             ) if project_root else []
             review_claim_result["missing_declared_files"] = (
-                missing_declared_branch_files(project_root, task_id, declared)
+                diagnose_missing_branch_files(project_root, task_id, declared)
                 if project_root else []
             )
         except Exception:
@@ -1076,6 +1129,8 @@ def claim(
         result["worktree_path"] = worktree_path
     if integrity_warnings:
         result["integrity_warnings"] = integrity_warnings
+    if degraded_warning:
+        result["degraded_warning"] = degraded_warning
 
     # task-session-lock-lifecycle（改 C）：container 下 claim 在 main 维度建的 session
     # 锁于实现完成后清理——实现在任务 worktree，main 锁无跨会话价值、只会挡并行认领
@@ -1185,6 +1240,7 @@ def done(
     changes_description: str,
     concerns: str | None = None,
     project_root: Path | None = None,
+    skip_lesson_review: bool = False,
 ) -> dict[str, Any]:
     """报告任务完成（task-session-lock-lifecycle：异常路径也保证释放会话锁）。
 
@@ -1195,7 +1251,8 @@ def done(
     """
     try:
         return _done_impl(
-            store, tasks, agent_id, task_id, changes_description, concerns, project_root
+            store, tasks, agent_id, task_id, changes_description, concerns,
+            project_root, skip_lesson_review,
         )
     finally:
         if project_root:
@@ -1210,6 +1267,7 @@ def _done_impl(
     changes_description: str,
     concerns: str | None = None,
     project_root: Path | None = None,
+    skip_lesson_review: bool = False,
 ) -> dict[str, Any]:
     """报告任务完成。verify_command 锁外执行，锁内二次校验 + 写事件。
 
@@ -1423,21 +1481,47 @@ def _done_impl(
     # 声明文件必须进入任务分支 diff（task-engine-done-integrity-gate）。
     if project_root and files_to_edit:
         try:
-            from orchd.worktree import missing_declared_branch_files
+            from orchd.worktree import diagnose_missing_branch_files
 
-            missing = missing_declared_branch_files(project_root, task_id, files_to_edit)
-            if missing:
+            diagnosed = diagnose_missing_branch_files(
+                project_root, task_id, files_to_edit
+            )
+            if diagnosed:
+                missing_names = [d["file"] for d in diagnosed]
+                reason_summary = {
+                    d["file"]: d["reason"] for d in diagnosed
+                }
+                # 按 reason 生成针对性 hint
+                reasons = {d["reason"] for d in diagnosed}
+                hints = []
+                if "path_not_found" in reasons:
+                    hints.append(
+                        "path_not_found: 文件在磁盘不存在，请修正 files_to_edit "
+                        "路径或从声明中移除"
+                    )
+                if "gitignored" in reasons:
+                    ignored = [
+                        f"{d['file']} ({d['detail']})"
+                        for d in diagnosed if d["reason"] == "gitignored"
+                    ]
+                    hints.append(
+                        f"gitignored: 文件被 .gitignore 忽略 — {'; '.join(ignored)}。"
+                        "请调整 ignore 规则或从 files_to_edit 移除"
+                    )
+                if "not_committed" in reasons:
+                    hints.append(
+                        "not_committed: 文件已修改但未提交到任务分支，"
+                        "请 git add + commit"
+                    )
                 raise OrchdError(
                     ErrorCode.E010,
-                    "file_conflict: 声明文件未进入任务分支 diff（疑似漏提交）",
+                    "file_conflict: 声明文件未进入任务分支 diff",
                     [{
                         "task_id": task_id,
-                        "missing_declared_files": missing,
+                        "missing_declared_files": missing_names,
+                        "reasons": reason_summary,
                         "files_to_edit": files_to_edit,
-                        "hint": (
-                            "请确认这些文件在任务 worktree 中已修改并提交；"
-                            "若文件本就不需改动，请从 files_to_edit 移除或说明"
-                        ),
+                        "hint": " | ".join(hints),
                     }],
                 )
         except OrchdError:
@@ -1521,18 +1605,55 @@ def _done_impl(
     # 锁外执行（约 35s），避免长时间持锁；锁内二次校验仍兜底 TOCTOU。
     full_regression: dict[str, Any] | None = None
     files_to_edit = task_def.get("files_to_edit", [])
-    if project_root and any(
+    # P1-17：config.full_regression 开关——false 时用定向测试替代全量回归。
+    # 默认 True（向后兼容，全量回归不变）；设为 false 后仅跑 files_to_edit 对应
+    # 的 test 文件（orchd/foo.py → tests/test_foo.py），大幅缩短 done 耗时。
+    _full_reg_enabled = True
+    try:
+        _mp = store.orchd_dir / "_master.json"
+        if _mp.exists():
+            import json as _json17
+            _master_cfg = _json17.loads(_mp.read_text(encoding="utf-8"))
+            _fr_val = (_master_cfg.get("config") or {}).get("full_regression")
+            if _fr_val is not None:
+                _full_reg_enabled = bool(_fr_val)
+    except (OSError, ValueError):
+        pass
+
+    _has_engine_files = any(
         (f.startswith("orchd/") or f.startswith(".orchd/orchd/")) and f.endswith(".py")
         for f in files_to_edit
-    ):
+    )
+    if project_root and _has_engine_files:
+        # 定向测试文件推导（P1-17）：orchd/foo.py → tests/test_foo.py
+        _targeted_tests: list[str] = []
+        if not _full_reg_enabled:
+            for f in files_to_edit:
+                # 归一化路径前缀
+                stem = f
+                if stem.startswith(".orchd/"):
+                    stem = stem[len(".orchd/"):]
+                if stem.startswith("orchd/") and stem.endswith(".py"):
+                    mod_name = stem[len("orchd/"):-len(".py")]
+                    test_path = f"tests/test_{mod_name}.py"
+                    if (project_root / test_path).exists():
+                        _targeted_tests.append(test_path)
+
         reg_started = time.monotonic()
         try:
             # P2-1（2026-08-19 审查）：回归子进程继承当前解释器（sys.executable），
             # 避免裸 `python` 命中 PATH 上未装依赖的解释器导致误报。
-            reg_cmd = (
-                f'"{sys.executable}" -m pytest tests/ -q '
-                f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
-            )
+            if _full_reg_enabled or not _targeted_tests:
+                reg_cmd = (
+                    f'"{sys.executable}" -m pytest tests/ -q '
+                    f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
+                )
+            else:
+                _test_args = " ".join(_targeted_tests)
+                reg_cmd = (
+                    f'"{sys.executable}" -m pytest {_test_args} -q '
+                    f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
+                )
             reg_result = run_shell(reg_cmd, str(project_root), _FULL_REGRESSION_TIMEOUT)
             reg_elapsed = round(time.monotonic() - reg_started, 1)
             if reg_result.returncode == 0:
@@ -1637,6 +1758,30 @@ def _done_impl(
     finally:
         store.release_lock()
 
+    # ── 经验回灌 done 收尾 hook（设计 §8.6）──
+    # 检测本任务 staged 暂存建议 → resolved 交叉验证 + detected_at 打点；
+    # 硬门禁（require_review=true）下注入 next_action=await_review（收尾挂起待审）。
+    # --skip-lesson-review 或 lessons 关闭 → 跳过，暂存保留不丢失。
+    # best-effort：hook 任何异常绝不阻断 done 收尾。
+    lessons_summary: dict[str, Any] | None = None
+    lessons_require_review = False
+    try:
+        from orchd.lessons import (
+            is_lessons_enabled,
+            load_lessons_config,
+            run_done_lesson_hook,
+        )
+        if not skip_lesson_review and is_lessons_enabled(store.orchd_dir):
+            verify_passed = verify_record.get("ok") if verify_record else None
+            hook_out = run_done_lesson_hook(store.orchd_dir, task_id, verify_passed)
+            if hook_out.get("has_lessons"):
+                lessons_summary = hook_out
+                lessons_require_review = bool(
+                    load_lessons_config(store.orchd_dir).get("require_review", True)
+                )
+    except Exception:
+        pass
+
     result: dict[str, Any] = {
         "done": True,
         "task_id": task_id,
@@ -1663,6 +1808,15 @@ def _done_impl(
         result["commit"] = commit_result
     if checked_out_main is not None:
         result["checked_out_main"] = checked_out_main
+    # 经验回灌收尾汇总注入（§8.6）：硬门禁下 next_action=await_review（收尾挂起）
+    if lessons_summary is not None:
+        result["lessons"] = lessons_summary
+        if lessons_require_review:
+            result["next_action"] = "await_review"
+            result["lesson_review_hint"] = (
+                f"本任务有 {lessons_summary.get('count', 0)} 条 guidance 增补建议待审核，"
+                f"收尾挂起：请运行 `orchd lesson review --task {task_id}` 确认后完成收尾"
+            )
 
     # L3 pre-commit hook 卸载（best-effort，锁外）
     if project_root:
@@ -1688,11 +1842,18 @@ def _done_impl(
 def retract(
     store: Store,
     agent_id: str,
-    target_event_id: str,
-    reason: str,
+    target_event_id: str | None = None,
+    reason: str = "",
     project_root: Path | None = None,
+    *,
+    task_id: str | None = None,
+    event_type: str | None = None,
 ) -> dict[str, Any]:
     """撤回事件（级联）。
+
+    支持两种定位方式：
+    - ``target_event_id``：按事件 ID 精确撤回（向后兼容）；
+    - ``task_id`` + ``event_type``：自动定位该任务最近一条匹配类型的事件（P0-10）。
 
     找到目标事件后，自动撤回该事件及其后同 task_id 的所有后续事件（级联撤回）。
     注意：FORCE_STATUS 事件不可撤回——它是管理员强制操作，具有不可逆语义，
@@ -1703,6 +1864,31 @@ def retract(
         integrity_warnings = store.check_integrity()
         # 读取全部事件找 target
         all_events = store._read_ledger_lines(from_line=1)
+
+        # P0-10：task_id + event_type 自动定位最近匹配事件
+        if target_event_id is None and task_id and event_type:
+            target_event = None
+            for ev in reversed(all_events):
+                if (ev.get("task_id") == task_id
+                        and ev.get("type") == event_type
+                        and not ev.get("retracted")):
+                    target_event = ev
+                    target_event_id = ev.get("event_id")
+                    break
+            if target_event is None:
+                raise OrchdError(
+                    ErrorCode.E007,
+                    f"invalid_state: no active {event_type} event found for task '{task_id}'",
+                    [{"task_id": task_id, "event_type": event_type,
+                      "hint": "确认任务 ID 和事件类型是否正确；可用 python .orchd/__main__.py status 查看事件历史"}],
+                )
+        elif target_event_id is None:
+            raise OrchdError(
+                ErrorCode.E007,
+                "invalid_state: retract requires --event <id> or --task <id> --type <type>",
+                [{"hint": "请提供事件 ID 或任务 ID + 事件类型"}],
+            )
+
         target_event = None
         for ev in all_events:
             if ev.get("event_id") == target_event_id:

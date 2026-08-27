@@ -60,6 +60,9 @@ _INTAKE_PRODUCT_FILES = frozenset({
 # 阶段被误拦导致语义不连贯。
 _AMEND_ATTACHABLE_FIELDS = frozenset({
     "exempt_files", "verify_command", "verify_timeout_seconds", "reviewers",
+    # Bug #20c（2026-08-27）：files_to_edit / files_to_read 加入白名单，
+    # claimed 状态可修正无效路径（无需 force-status 回退 pending）。
+    "files_to_edit", "files_to_read",
 })
 _CLAIMED_WHITELIST_FIELDS = tuple(_AMEND_ATTACHABLE_FIELDS)
 
@@ -69,7 +72,11 @@ _CLAIMED_WHITELIST_FIELDS = tuple(_AMEND_ATTACHABLE_FIELDS)
 # verify_command）。其余字段变更仍触发 E007 终态保护。
 #
 # 核心字段集合由"任务全部 schema 字段 - 附加字段"推导，避免硬编码漂移。
-_TERMINAL_ATTACHABLE_FIELDS = _AMEND_ATTACHABLE_FIELDS
+# Bug #20c（2026-08-27）：终态白名单排除 files_to_edit / files_to_read——
+# 已完成/取消的任务不应再改文件声明（仅 claimed/done/in_review 允许修正路径）。
+_TERMINAL_ATTACHABLE_FIELDS = _AMEND_ATTACHABLE_FIELDS - {
+    "files_to_edit", "files_to_read",
+}
 
 
 def _derive_task_schema_fields() -> frozenset[str]:
@@ -427,10 +434,11 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                         "message": f"{status} 为终态，不可修改",
                     })
             elif status in ("done", "in_review"):
-                # T2（2026-08-08）+ M-2（2026-08-12）：仅允许修改附加字段白名单
-                # （reviewers / verify_command / exempt_files / verify_timeout_seconds）。
-                # 把新定义的附加字段全部还原为旧值后与旧定义比对，
-                # 相等才说明"只有白名单字段变了"。
+                # T2（2026-08-08）+ M-2（2026-08-12）+ Bug #20c（2026-08-27）：
+                # 仅允许修改附加字段白名单（reviewers / verify_command /
+                # exempt_files / verify_timeout_seconds / files_to_edit /
+                # files_to_read）。把新定义的附加字段全部还原为旧值后与旧定义
+                # 比对，相等才说明"只有白名单字段变了"。
                 normalized = dict(task)
                 for field in _AMEND_ATTACHABLE_FIELDS:
                     if field in old_task:
@@ -526,6 +534,25 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                         [entry | {"blocking": True}],
                     )
             quality_warnings.append(entry)
+
+        # Bug #20a（2026-08-27）：files_to_edit / exempt_files 路径存在性校验。
+        # 摄入时检测声明了但不存在的路径，写入 conflict_warnings 供人工核对。
+        # 不硬阻断（路径可能是待创建的新文件），仅告警。
+        for task in tasks:
+            tid = task.get("id", "")
+            for field in ("files_to_edit", "exempt_files"):
+                for fp in task.get(field, []):
+                    full = project_root / fp
+                    if not full.exists():
+                        conflict_warnings.append({
+                            "task_id": tid,
+                            "type": f"{field}_path_not_found",
+                            "file": fp,
+                            "message": (
+                                f"{field} 声明的路径 '{fp}' 在项目中不存在"
+                                f"。若为待创建新文件可忽略，否则请修正路径。"
+                            ),
+                        })
 
         # 重新生成所有 snapshot（目录名 = module_id）
         for module in modules:

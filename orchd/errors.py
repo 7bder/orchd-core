@@ -53,6 +53,31 @@ class ErrorCode(Enum):
     E034 = "retract_not_authorized"  # 撤认归属守卫：仅事件作者本人或 admin 可撤回，跨 agent 撤认他人事件被拒（task-retract-ownership-guard）
 
 
+# warning 级错误码（设计 §5）：不阻断操作，默认不触发 lesson 注入，仅 agent 主动打点。
+WARNING_CODES = frozenset({
+    "E023",  # vague_acceptance_criteria
+    "E026",  # unexempted_test_coupling
+    "E028",  # dry_run_assertion_mismatch
+    "E029",  # granularity_overflow
+    "E030",  # runtime_file_integrity
+})
+
+# 引擎预判「值得上报」的 warning 码（设计 §5.1 信号 A：suggest_report=true）。
+SUGGEST_REPORT_CODES = frozenset({
+    "E030",  # runtime_file_integrity：深层问题征兆，允许主动 lesson 沉淀
+})
+
+
+def is_warning_code(code_name: str) -> bool:
+    """错误码是否为 warning 级（§5）。"""
+    return code_name in WARNING_CODES
+
+
+def is_suggest_report_code(code_name: str) -> bool:
+    """错误码是否引擎预判值得上报（§5.1 信号 A）。"""
+    return code_name in SUGGEST_REPORT_CODES
+
+
 class OrchdError(Exception):
     """Orchd 业务异常。
 
@@ -88,13 +113,21 @@ def to_json_response(error: OrchdError) -> dict[str, Any]:
     注意：该函数由 cli.py 统一调用，用于将所有业务异常转换为标准 JSON 输出，
     确保 CLI 的退出码与响应体格式一致。
 
+    设计 §5 扩展：错误响应附加 ``severity``（warning/error）与 ``suggest_report``
+    （引擎预判是否值得上报）字段，供 warning 级错误走独立指引、agent 决策是否
+    打点 lesson（§5.1 信号 A）。
+
     返回:
-        {"error": {"code": "E003", "message": "...", "details": [...]}}
+        {"error": {"code": "E003", "message": "...", "details": [...],
+                   "severity": "error", "suggest_report": false}}
     """
+    code_name = error.code.name
     return {
         "error": {
-            "code": error.code.name,
+            "code": code_name,
             "message": error.message,
             "details": error.details,
+            "severity": "warning" if is_warning_code(code_name) else "error",
+            "suggest_report": is_suggest_report_code(code_name),
         }
     }

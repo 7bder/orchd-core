@@ -46,6 +46,27 @@ from orchd.ledger import (
 )
 
 
+def _recent_transitions(
+    store: Store, task_id: str, limit: int = 5, derived: TaskDerived | None = None,
+) -> list[dict[str, Any]]:
+    """提取任务最近 N 条状态变迁事件（P0-9 E007 信息增强）。
+
+    从 ledger 中提取该任务最近的 type/agent_id/timestamp，用于 E007 报错时
+    展示状态迁移轨迹，帮助用户定位"为什么任务不在预期状态"。
+    """
+    events = store._read_ledger_lines(from_line=1)
+    transitions = [
+        {
+            "type": ev.get("type"),
+            "agent_id": ev.get("agent_id"),
+            "timestamp": ev.get("timestamp"),
+        }
+        for ev in events
+        if ev.get("task_id") == task_id and ev.get("type")
+    ]
+    return transitions[-limit:]
+
+
 def _task_branch_tip(project_root: Path, task_id: str) -> str | None:
     """best-effort 取 ``task/{task_id}`` 分支 tip SHA（task-merge-warning-resolve-sha）。
 
@@ -336,17 +357,28 @@ def _review_submit_impl(
         derived = store.scan_task_derived()
         ts = state.get(task_id)
 
+        # P0-9：预计算最近状态变迁（仅 E007 路径使用，happy path 不触发开销）
+        def _err_transitions() -> list[dict[str, Any]]:
+            return _recent_transitions(store, task_id, derived=derived)
+
         if not ts or ts.status != "in_review":
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: task '{task_id}' not in_review",
-                [{"task_id": task_id, "actual": ts.status if ts else "pending"}],
+                [{"task_id": task_id, "actual": ts.status if ts else "pending",
+                  "recent_transitions": _err_transitions(),
+                  "hint": f"任务当前状态为 {ts.status if ts else 'pending'}（非 in_review），"
+                          f"可能尚未 done 或已被审查打回 pending"}],
             )
         if ts.review_phase != review_type:
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: review phase mismatch (expected '{ts.review_phase}', got '{review_type}')",
-                [{"task_id": task_id, "expected_phase": ts.review_phase}],
+                [{"task_id": task_id, "expected_phase": ts.review_phase,
+                  "got_phase": review_type,
+                  "recent_transitions": _err_transitions(),
+                  "hint": f"审查阶段不匹配：任务处于 {ts.review_phase} 阶段，"
+                          f"你提交的是 {review_type}，请确认审查类型"}],
             )
         from orchd.ledger import resolve_session_identity
         current_session = resolve_session_identity(store.orchd_dir)["session_id"]
@@ -363,7 +395,11 @@ def _review_submit_impl(
                 f"invalid_state: review not claimed by this session "
                 f"(claimed_by='{ts.review_claimed_by}', claimed_session='{ts.review_claimed_session}')",
                 [{"task_id": task_id, "claimed_by": ts.review_claimed_by,
-                  "claimed_session": ts.review_claimed_session, "agent": agent_id}],
+                  "claimed_session": ts.review_claimed_session, "agent": agent_id,
+                  "current_session": current_session,
+                  "recent_transitions": _err_transitions(),
+                  "hint": "审查已被其他 session 认领或当前 session 不匹配；"
+                          "可用 orchd retract --task <id> --type REVIEW_CLAIMED 释放后重新认领"}],
             )
 
         baseline_sha = extract_review_baseline(store, task_id, agent_id, derived)
@@ -498,25 +534,39 @@ def _review_submit_impl(
                     result["reason"] = "merge_conflict"
                     result["conflict_files"] = conflict_files
                     result["task_status"] = "in_review"
-                    result["action"] = (auto or {}).get("action") or (
-                        f"merge 冲突已发生（main 已恢复）：请在 task 分支 task/{task_id} "
-                        f"上执行 git merge main 解决冲突并提交，然后由同一 reviewer "
-                        f"重试 code APPROVED"
-                    )
+                    # P0-18：增强冲突指引——worktree 位置、文件清单、重试路径、回退命令
+                    _auto_action = (auto or {}).get("action")
+                    if _auto_action:
+                        result["action"] = _auto_action
+                    else:
+                        _cf_list = ", ".join(conflict_files) if conflict_files else "未知"
+                        result["action"] = (
+                            f"merge 冲突（main 已恢复）。冲突文件：{_cf_list}。\n"
+                            f"【解决步骤】\n"
+                            f"  1. 进入任务 worktree 目录：cd ../task-{task_id}/\n"
+                            f"     （container 布局下主工作树内无法 checkout task/{task_id} 分支）\n"
+                            f"  2. 执行 git merge main，解决冲突后 git commit\n"
+                            f"  3. 由同一 reviewer 重试 code APPROVED\n"
+                            f"【放弃本次审查】\n"
+                            f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'merge冲突放弃'\n"
+                            f"  orchd force-status --task {task_id} --status pending --reason 'merge冲突回退'"
+                        )
 
             if merge_result is None and project_root is not None:
-                # 有 git 上下文但合并未执行（git 不可用 / 非 git 仓库 / 环境异常）：
-                # 不得标 completed、不得回收任务 worktree/分支——保持 in_review，供修复
-                # git 后由同一 reviewer 重试 code APPROVED。修复 task-merge-failed-completed：
-                # 原实现此处落到 completed 路径并标记完成，导致合并失败仍 completed。
-                # （project_root=None 属单元测试/无仓库，无合并上下文，走 best-effort completed。）
+                # P0-18：rename merge_not_executed → merge_env_error（语义更精确）
                 result["merged"] = False
-                result["reason"] = "merge_not_executed"
+                result["reason"] = "merge_env_error"
                 result["task_status"] = "in_review"
                 result["action"] = (
                     "git merge 未执行（git 不可用 / 非 git 仓库 / 环境异常）：任务保持 "
-                    "in_review，未标记完成、未回收任务 worktree。请修复 git 状态后由同一 "
-                    "reviewer 重试 code APPROVED。"
+                    "in_review，未标记完成、未回收任务 worktree。\n"
+                    "【修复步骤】\n"
+                    "  1. 确认 git 可用且当前目录是有效 git 仓库\n"
+                    "  2. 运行 orchd doctor 检查 git 完整性\n"
+                    "  3. 修复后由同一 reviewer 重试 code APPROVED\n"
+                    "【放弃本次审查】\n"
+                    f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'git环境异常'\n"
+                    f"  orchd force-status --task {task_id} --status pending --reason 'git环境异常回退'"
                 )
             elif merge_result is None or not merge_result.get("conflict") or auto_resolved:
                 # project_root 为 None（非 git / 无 worktree）时不进入 merge 分支，

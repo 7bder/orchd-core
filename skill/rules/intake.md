@@ -1,5 +1,7 @@
 # 摄入协议 v2（IDEAS.md pending → orchd 任务）
 
+> TL;DR: ① 三条铁律：原文可追溯 / 推断项标注 / 全量查重 ② 双闸门：草案人工确认"做什么"、claim 确认"谁做" ③ 仅在 main 且工作区干净时 amend ④ 撞车条目置 taskified 或 questioning，不得重复注册
+
 > 原 .orchd/SKILL.md「摄入协议 v2」+「任务拆解粒度启发式」，外置自 task-skill-hub-refactor。
 
 > **双路径（intake-dual-path，2026-08-15）**：摄入有两条合规入口，按是否已有明确规划分流——

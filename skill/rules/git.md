@@ -1,5 +1,7 @@
 # git 纪律（引擎 best-effort 建分支/merge + done/amend 自动提交，从不 push）
 
+> TL;DR: ① 禁手动 git 写操作（checkout/branch/reset/stash/merge/push 等），唯一豁免任务分支 git commit ② 禁破坏性 git 操作 ③ 声明文件必须随任务分支提交进 diff，否则 done/review 被拒 ④ worktree 全生命周期由引擎管理，agent 零操作
+
 > 原 .orchd/SKILL.md「git 纪律」，外置自 task-skill-hub-refactor。
 
 - **实现者**：实现过程中可自行多次提交（细粒度保留）；未提交的 `files_to_edit` 范围内改动由引擎在 `done`（verify 通过后）自动兜底提交，不重复提交、不 squash；verify 失败不影响已产生的提交，修复后追加提交再重试

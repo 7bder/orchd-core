@@ -6,12 +6,12 @@
 
 ## 工作流程
 
-1. **认领任务**：`orchd request` 获取候选 → 确认能力匹配 → `orchd claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
+1. **认领任务**：`python .orchd/__main__.py request` 获取候选 → 确认能力匹配 → `python .orchd/__main__.py claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
    - **若 `request` 返回无候选（`candidate=None` / `next_action=exit`）**：立即停止，不尝试 `claim`、不重试 `request`、不 `--auto-claim`；向用户报告并等待下一条指令（引擎分配为准）。
 2. **阅读上下文**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）
 3. **实现**：修改 files_to_edit 中列出的文件，交付功能代码 + 测试代码
 4. **自验**：执行 verify_command 确认通过
-5. **报告完成**：`orchd done --task {id} --changes "变更描述"`
+5. **报告完成**：`python .orchd/__main__.py done --task {id} --changes "变更描述"`
 
 ## 判定标准
 
@@ -33,3 +33,4 @@
 - 不修改其他任务正在 claim 的文件（CLI 会自动检测冲突）
 - 一次只持有一个任务（agent_busy 约束）
 - 遇到阻塞（依赖不满足、需求不清）时报告 concerns 而非猜测
+- **AC 与 files_to_edit 边界核对（2026-08-27 新增）**：若发现 acceptance_criteria 为泛化表述（如 `templates/*.md`）而 files_to_edit 未覆盖部分目标文件，按 files_to_edit 具体声明执行（不越权修改声明外文件）；确需连带修改时，在 main 且工作区干净时用 `python .orchd/__main__.py amend` 把文件纳入声明后重试，或把缺口写入 `--concerns` 报告交审查裁决

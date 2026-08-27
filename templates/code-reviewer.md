@@ -13,10 +13,10 @@
 
 ## 工作流程
 
-1. **认领审查**：`orchd request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `orchd claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
+1. **认领审查**：`python .orchd/__main__.py request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `python .orchd/__main__.py claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
 2. **阅读材料**：shared/conventions.md（必读）、shared/architecture.md（参考）、实现者变更的文件（git diff）
 3. **分组核验（证据分层）**：先看 diff 是否触及测试链路（tests/*.py 或 orchd/*.py 行为变更）——**未触及则不重跑测试**，verify 证据引用引擎 in_review 保证状态；触及则重跑对应定向测试文件收集证据。机器可辅助项逐项核验 → 人工复核项评估（存疑默认放行）
-4. **提交审查**：`orchd review --task {id} --type code --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`
+4. **提交审查**：`python .orchd/__main__.py review --task {id} --type code --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`
 
 ## 分组判定清单
 

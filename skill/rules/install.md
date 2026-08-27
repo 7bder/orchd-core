@@ -1,5 +1,7 @@
 # 安装规则（Agent 无感安装协议 + BOOTSTRAP mode）
 
+> TL;DR: ① BOOTSTRAP 自启动安装流程 ② --cleanup 安装后自动删除克隆源（无痕安装）
+
 > 低频块外置自 `.orchd/SKILL.md`（task-skill-as-entry-docs，2026-08-15）：SKILL 仅留一句指针，本文件承载全文，零信息丢失。
 > 适用场景：新项目首次进入（项目无 `.orchd/`）时阅读；已有 `.orchd/` 的项目无需每次读本文件。
 

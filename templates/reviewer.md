@@ -10,15 +10,15 @@
 - **证据分层（2026-08-08 优化）**：任务处于 in_review = 引擎已保证 verify_command 执行且通过（done 成功的前提，否则 E014 拒绝写 DONE）——**默认不重跑 verify_command**。reviewer claim 响应会附带最近 DONE 的 **`verify` 摘要**（ok / exit_code / elapsed_seconds / output_summary，P2 注入），直接引用即可。仅当以下情形才重跑：verify 摘要缺失 / 不可信 / 实现者声明跳过 / 需确认特定 AC 的行为细节 / diff 触及测试链路（tests/*.py 或被测 orchd/*.py 的行为变更）。重跑必须**轻量定向**（只跑相关测试文件，禁全量 pytest，禁 build/venv 重活——引擎 verify 上限 120s）。
 - **禁止以逻辑推演替代测试**：任何"我认为应该能工作 / 看起来没问题"的判定都无效——判定必须基于实际证据：引擎 verify 状态（in_review）+ 定向测试运行结果 / 输出比对 / diff 比对。
 - **判定必须是勾选清单 + 证据**：每条验收标准逐项勾选，且必须引用证据（验收标准编号 + verify 状态 / 定向测试结果 / diff 比对），不允许无证据的自由裁量结论。
-- **unified 模式无 --type 参数**：单阶段审查不区分 spec/code，`orchd review` 命令不传 `--type`（事件不带 review_type）。
+- **unified 模式无 --type 参数**：单阶段审查不区分 spec/code，`python .orchd/__main__.py review` 命令不传 `--type`（事件不带 review_type）。
 
 ## 工作流程
 
-1. **认领审查**：`orchd request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `orchd claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
+1. **认领审查**：`python .orchd/__main__.py request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `python .orchd/__main__.py claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
 2. **阅读材料**：任务的 acceptance_criteria、deliverables（若有）、实现者的 changes_description、DONE 事件（ledger）、shared/conventions.md（必读）、shared/architecture.md（参考）、实现者变更的文件（git diff）
 3. **收集验证证据（分层，默认不重跑）**：① 引擎保证——任务 in_review = verify_command 已通过（done 成功前提）；② 实现者 changes_description 中的自检声明；③ 仅在上述不可信或需确认特定行为时，重跑**定向**测试（`pytest tests/test_<相关>.py -q --basetemp="${TMPDIR:-/tmp}/orchd-vf-$$"`），禁止全量 pytest
 4. **逐条判定**：对照验收标准逐条勾选三态清单（规格维度）+ 分组核验（代码维度，见下）
-5. **提交审查**：`orchd review --task {id} --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`（unified 模式不传 --type）
+5. **提交审查**：`python .orchd/__main__.py review --task {id} --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`（unified 模式不传 --type）
 
 ## 三态判定清单（规格维度，每条验收标准必填一项）
 
@@ -40,6 +40,7 @@
 | 检查项 | 判定（通过/不通过） | 证据（实际比对结果） |
 |---|---|---|
 | diff 与 files_to_edit 对齐 | 通过 / 不通过 | <变更文件 ⊆ files_to_edit ∪ exempt_files ∪ 固定资产(.orchd/_master.json、IDEAS.md)；范围外无改动> |
+| AC 表述与 files_to_edit 边界一致 | 通过 / 不通过 | <泛化 AC（如 `templates/*.md`）与 files_to_edit 声明范围一致；不一致时实现者按 files_to_edit 执行合规，comments 标注并交人工裁决后续补齐> |
 | verify_command 状态 | 通过 / 不通过 | <引擎 in_review 保证（默认）；或 diff 触及测试链路时重跑定向测试的退出码> |
 | 测试覆盖（关键路径有测试） | 通过 / 不通过 | <新增/相关测试文件与用例名> |
 | 依赖方向正确（conventions.md） | 通过 / 不通过 | <底层未导入上层模块> |
@@ -91,4 +92,4 @@
 - 审查意见必须具体可操作（"第 3 条标准未满足：空文件应返回 E002 但实际返回 None"）
 - 每条判定必须附带证据（验收标准编号 + 运行结果引用 / diff 比对），禁止空泛结论
 - conventions.md 未规定的风格偏好不作为 CHANGES_REQUESTED 理由
-- unified 模式下 `orchd review` 不传 `--type`（事件不带 review_type）
+- unified 模式下 `python .orchd/__main__.py review` 不传 `--type`（事件不带 review_type）

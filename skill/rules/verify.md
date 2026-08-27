@@ -1,5 +1,7 @@
 # 自检约定（verify_command）
 
+> TL;DR: ① verify_command 120s 内完成（引擎硬上限）② 代码类模块定向 pytest，禁全量 ③ 用 --basetemp 指向系统临时目录 ④ orchd 命令统一 python .orchd/__main__.py 形式
+
 > 原 .orchd/SKILL.md「自检约定（verify_command）」，外置自 task-skill-hub-refactor。
 
 - **⏱ 120s 预算硬约束（2026-08-08 新增）**：引擎 verify 上限 `_VERIFY_TIMEOUT=120s`（onboard.py），**verify_command 必须在 120s 内完成**——写 verify_command 时先预算：模块定向 pytest（只跑相关文件，秒级）+ 轻量断言；**禁止** `python -m build` / `pip install` / `venv` / 全量 pytest（无 -k/-p 定向）等重命令段（重活留给 CI，不在 verify 跑）。2026-08-08 实踩两例：task-auto-claim 全量 pytest 210s 超时、task-release-pipeline build+venv 段 144.7s 超时 → done E014 卡死

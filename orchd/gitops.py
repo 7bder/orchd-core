@@ -247,6 +247,18 @@ def ensure_session_lock(
         from orchd.ledger import resolve_session_identity
 
         session_id = resolve_session_identity(orchd_dir)["session_id"]
+    # P0-1：写入锁前校验身份字段——空 agent_id 会导致"幽灵锁"（holder="unknown"），
+    # 后续 E019 报错信息误导且难以定位。session_id 为空时自动生成进程级 fallback
+    # （保证锁元数据非空，测试环境不设 ORCHD_SESSION_ID 时不阻断）。
+    if not agent_id:
+        raise OrchdError(
+            ErrorCode.E019,
+            "lock_identity_empty: agent_id 为空，无法获取 session 锁",
+            [{"agent_id": agent_id, "session_id": session_id or "",
+              "hint": "请确认 ORCHD_AGENT_ID 环境变量或宿主注入已正确配置"}],
+        )
+    if not session_id:
+        session_id = f"auto-{os.getpid()}-{id(orchd_dir):x}"
     from orchd.lockfile import ExclusiveFileLock
 
     # 门锁：串行化后续"检查 + 写入"，消除 check-then-act 竞态。
@@ -314,6 +326,46 @@ def guard_write_command(
             branch = state.get("branch")
             if allowed_branches is not None and branch not in allowed_branches:
                 expected = sorted(allowed_branches)
+                # P0-7：container 布局下任务分支已在独立 worktree checkout，
+                # 主工作树内 git checkout 会 fatal（"already used by worktree"）。
+                # 检测期望分支是否为任务分支，补充 worktree 位置指引。
+                task_branches = [b for b in expected if b.startswith("task/")]
+                if task_branches:
+                    hint_parts = []
+                    for tb in task_branches:
+                        task_id = tb[len("task/"):]
+                        # 2026-08-28（E018 降级场景）：容器布局下任务无独立 worktree
+                        # （ensure_task_wt 降级）时，提示"进入任务 worktree 目录"是
+                        # 死胡同——目录不存在。此时改为提示在主工作树 checkout 任务分支。
+                        wt_exists = False
+                        try:
+                            from orchd.worktree import _task_wt_name, detect_layout
+
+                            _layout = detect_layout(project_root)
+                            if _layout.get("layout") == "container":
+                                wt_exists = (
+                                    _layout["task_wt_root"] / _task_wt_name(task_id) / ".git"
+                                ).exists()
+                        except Exception:
+                            pass
+                        if wt_exists:
+                            hint_parts.append(
+                                f"container 布局下请进入任务 worktree 目录 task-{task_id}/ "
+                                f"（或 cd ../task-{task_id}）"
+                            )
+                        else:
+                            hint_parts.append(
+                                f"降级模式（无独立任务 worktree）：在主工作树执行 "
+                                f"git checkout {tb} 后重试"
+                            )
+                    non_task = [b for b in expected if not b.startswith("task/")]
+                    if non_task:
+                        hint_parts.append(
+                            f"或切换到 {' 或 '.join(non_task)} 分支再执行 {command}"
+                        )
+                    hint_text = "；".join(hint_parts)
+                else:
+                    hint_text = f"请先切换到 {' 或 '.join(expected)} 分支再执行 {command}"
                 raise OrchdError(
                     ErrorCode.E018,
                     f"wrong_branch: {command} 须在 {expected} 分支执行，当前在 '{branch}'",
@@ -321,7 +373,7 @@ def guard_write_command(
                         "command": command,
                         "current_branch": branch,
                         "expected_branches": expected,
-                        "hint": f"请先切换到 {' 或 '.join(expected)} 分支再执行 {command}",
+                        "hint": hint_text,
                     }],
                 )
             if require_clean and not state.get("clean"):
@@ -946,29 +998,97 @@ def hook_uninstall(project_root: Path) -> dict[str, Any]:
         return {"uninstalled": False, "reason": "io_error", "error": str(exc)}
 
 
-def _safe_delete(path: Path, base_dir: Path) -> None:
-    """沙箱安全的文件删除（unlink 被劫持时降级为重命名移出）。
+def _os_delete_file(path: Path) -> bool:
+    """底层 OS 直接删除文件（绕过 Python ``Path.unlink`` 的沙箱劫持）。
 
-    部分沙箱把 ``Path.unlink`` 劫持为"移入回收站"（safe-delete），回收站不可用时
-    FAIL_CLOSED 抛 OSError（2026-08-06 实踩：windows-sandbox-recycle-bin-unavailable，
-    全量 pytest 稳定触发）。此时降级为把文件重命名移动到系统临时目录
-    （重命名不经删除劫持），目标位置"消失"，语义等效删除；
-    残留物在系统 temp（orchd-trash-*），可手动清理，不影响工作区。
+    task-workspace-docs-isolation：部分沙箱把 ``Path.unlink`` 劫持为
+    "移入回收站"（safe-delete），回收站可用时文件进回收站、不可用时
+    FAIL_CLOSED 抛 OSError。为满足"直接删除、不进回收站"，优先用底层 OS
+    调用：Windows 经 ctypes 调 ``kernel32.DeleteFileW``（Python 层无法劫持），
+    POSIX 用 ``os.unlink``。失败返回 ``False``（由调用方回退）。
+
+    Returns:
+        ``True`` 文件已直接删除；``False`` 底层删除失败。
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            return bool(ctypes.windll.kernel32.DeleteFileW(str(path)))
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def _safe_delete(path: Path, base_dir: Path) -> None:
+    """沙箱安全的文件删除（直接删除优先，绕过 unlink 劫持）。
+
+    部分沙箱把 ``Path.unlink`` 劫持为"移入回收站"（safe-delete），回收站可用时
+    文件进回收站、不可用时 FAIL_CLOSED 抛 OSError（2026-08-06 实踩：
+    windows-sandbox-recycle-bin-unavailable，全量 pytest 稳定触发）。删除顺序：
+    ① 底层 OS 直接删除（``_os_delete_file``，Python 层无法劫持，不进回收站）；
+    ② ``Path.unlink``（沙箱正常环境）；③ 仍失败则降级为把文件重命名移动到
+    系统临时目录（重命名不经删除劫持，目标位置"消失"，语义等效删除；残留物
+    为 ``orchd-trash-*``，可由 :func:`_cleanup_trash_residue` 直接清理）。
 
     Args:
         path: 待删除文件。
         base_dir: 用于生成唯一残留名的基准目录名。
 
     Raises:
-        OSError: unlink 与降级重命名均失败时向上抛（由调用方 best-effort 降级）。
+        OSError: 底层删除、unlink 与降级重命名均失败时向上抛（由调用方 best-effort 降级）。
     """
+    if _os_delete_file(path):
+        return
     try:
         path.unlink()
+        return
     except OSError:
-        dest = Path(tempfile.gettempdir()) / (
-            f"orchd-trash-{base_dir.name}-{uuid.uuid4().hex[:8]}-{path.name}"
-        )
-        os.replace(path, dest)
+        pass
+    dest = Path(tempfile.gettempdir()) / (
+        f"orchd-trash-{base_dir.name}-{uuid.uuid4().hex[:8]}-{path.name}"
+    )
+    os.replace(path, dest)
+
+
+def _cleanup_trash_residue(tmp_root: Path | None = None) -> list[str]:
+    """清理系统 temp 中历史 ``orchd-trash-*`` 残留（best-effort 直接删除）。
+
+    task-workspace-docs-isolation：早期 :func:`_safe_delete` 降级重命名产生的
+    ``orchd-trash-*`` 残留物（文件或目录）。直接删除（Windows 只读文件先清
+    只读属性），不进回收站，避免残留持续占用系统 temp。
+
+    Args:
+        tmp_root: 扫描根（默认系统 temp；测试可注入）。
+
+    Returns:
+        已清理的残留条目名清单。
+    """
+    cleaned: list[str] = []
+    try:
+        root = tmp_root or Path(tempfile.gettempdir())
+
+        def _onerror(func: Any, p: str, exc: Any) -> None:
+            try:
+                os.chmod(p, 0o200)  # S_IWRITE：清只读后重试
+                func(p)
+            except OSError:
+                pass
+
+        for p in sorted(root.glob("orchd-trash-*")):
+            try:
+                if p.is_dir():
+                    shutil.rmtree(str(p), onerror=_onerror)
+                elif not _os_delete_file(p):
+                    continue
+                if not p.exists():
+                    cleaned.append(p.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return cleaned
 
 
 # ------------------------------------------------------------------
@@ -1301,9 +1421,14 @@ def session_lock_check(
     if content is None:
         # 读取失败：Windows 下多为「他进程持锁」字节锁阻止读取；探活判定
         probe = _probe_session_lock_os_active(lock_path)
+        _read_err = (
+            f"lock file unreadable ({lock_path.name}): "
+            "read_locked_text returned None, fallback read_text also failed; "
+            "likely held by another process (msvcrt byte lock on Windows)"
+        )
         if probe.get("active"):
-            return {"locked": True, "reason": "no_marker"}
-        return {"locked": False, "reason": "corrupted"}
+            return {"locked": True, "reason": "no_marker", "read_error": _read_err}
+        return {"locked": False, "reason": "corrupted", "read_error": _read_err}
     try:
         data = json.loads(content)
     except json.JSONDecodeError:

@@ -1,5 +1,7 @@
 # Session 规则（状态检查 / 接管 / 优先级 / claim 细节）
 
+> TL;DR: ① session 开始三连检查（git status + branch + status）② 有在握任务回 task 分支继续，无则 main 且工作区干净 ③ 优先级：清审查积压→领实现→三者皆空即停不重试 ④ claim 两段式需 --confirm，auto-claim 默认禁用 ⑤ 摄入仅用户指定
+
 > 原 .orchd/SKILL.md「Session 开始」「接管中断 agent 任务」「工作优先级」及 WORKER implementer workflow 的 claim 细节，外置自 task-skill-hub-refactor。
 
 ## Session 开始：状态检查（必做）
@@ -16,7 +18,7 @@
 ## 接管中断 agent 任务（2026-08-08 补充：opencode-1 token 耗尽中断实踩）
 - **识别**：`python .orchd/__main__.py status` 存在 claimed 任务，但该 agent 已不可用（session 中断/token 耗尽）；或 ledger 有该任务 CLAIMED 但无 DONE/RETRACT，且无活跃 session（session 锁超 60min watchdog 阈值）
 - **标准流程**：
-  1. 查 ledger 断点：`grep '<task_id>' .orchd/_ledger.jsonl | tail`——确认实现进行到哪一步（已提交？已 done？）
+  1. 查 ledger 断点（用 python 替代 grep|tail，跨平台无 POSIX 工具依赖）：`python -c "import pathlib; ls=[l for l in pathlib.Path('.orchd/_ledger.jsonl').read_text(encoding='utf-8').splitlines() if '<task_id>' in l]; print(chr(10).join(ls[-10:]))"`——确认实现进行到哪一步（已提交？已 done？）
   2. **清理僵死锁**：`.orchd/.session.lock` 超 60min → 按 L2 watchdog 语义释放（`python .orchd/__main__.py watchdog --timeout 0` 或 Python 删除）；`.git/index.lock` 无 git 进程 → 直接删
   3. **确认实现完整性**：检查 task 分支是否有已提交实现（`git log task/{id}`）；工作区未提交改动若属于该任务 files_to_edit → 提交到 task 分支（不丢实现）
   4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）

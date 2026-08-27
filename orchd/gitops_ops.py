@@ -118,7 +118,8 @@ def try_git_branch(project_root: Path, task_id: str) -> None:
     """best-effort 切换到任务分支 task/{task_id}。
 
     返工场景分支已存在则 checkout 复用，并同步 master 与 main 的差异。
-    首次 claim 才 checkout -b 新建。异常静默降级。
+    首次 claim 才 checkout -b 新建——**显式从默认分支(main/master) fork**，
+    避免游离 HEAD / 孤儿分支（2026-08-28 仓库损坏根因修复）。异常静默降级。
     """
     branch = f"task/{task_id}"
     try:
@@ -142,8 +143,9 @@ def try_git_branch(project_root: Path, task_id: str) -> None:
             if checkout.returncode == 0:
                 sync_master_with_main(project_root, branch)
         else:
+            default = get_default_branch(project_root) or "main"
             subprocess.run(
-                ["git", "checkout", "-b", branch],
+                ["git", "checkout", "-b", branch, default],
                 cwd=str(project_root),
                 capture_output=True,
                 encoding="utf-8",

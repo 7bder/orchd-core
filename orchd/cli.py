@@ -58,7 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         _emit_guidance(data)
         return 0
     except OrchdError as exc:
-        _output(to_json_response(exc))
+        resp = to_json_response(exc)
+        # task-guidance-rule-summary：错误响应也附加恢复指引（只提示不代行）
+        from orchd.guide import attach_error_guidance
+        resp = attach_error_guidance(resp, exc.code.name, _find_orchd_dir())
+        _output(resp)
+        _emit_guidance(resp)
         return 1
     except KeyboardInterrupt:
         return 130
@@ -79,16 +84,21 @@ def _attach_guidance(data: Any) -> Any:
     """为命令 JSON 响应统一附加 guidance 字段（task-guide-seamless-guidance）。
 
     无感引导契约：
-    - **加法式**：只新增 ``guidance`` 键，不删不改既有字段（next_action 等保留）。
-    - **幂等**：已有 guidance 不覆盖。
+    - **加法式**：只新增 ``guidance`` 键（含转换感知上下文新键），不删不改既有
+      字段（next_action 等保留）。
+    - **幂等**：已有 guidance（如 stop_wait 预设）不覆盖既有字段，仅追加转换感知
+      上下文新键。
     - **best-effort**：读取 ledger / 构造引导的任何异常静默跳过，不阻塞主流程。
     - **知识路由闭环**（task-guide-routing-loop）：附加 guidance 后透传
       ``orchd_dir`` 调用 ``resolve_read_paths`` 过滤 read/template 路径，
       只保留指向实际存在文件的路径，不存在时静默跳过。
+    - **转换感知**（task-guide-transition-aware）：每次命令响应统一附加
+      ``branch_ctx``（当前分支纪律）与 ``transition``（聚焦任务的状态由来），
+      agent 无需任何额外操作即可获得分支切换/状态机转换后的引导。
 
     仅对 dict 响应生效；非 dict（如字符串/None）原样返回。
     """
-    if not isinstance(data, dict) or "guidance" in data:
+    if not isinstance(data, dict):
         return data
     try:
         from orchd.ledger import Store
@@ -102,19 +112,52 @@ def _attach_guidance(data: Any) -> Any:
         master_path = canonical_root / ".orchd" / "_master.json"
         tasks = load_master(master_path).tasks if master_path.exists() else []
 
-        from orchd.guide import next_guidance, resolve_read_paths
+        from orchd.guide import (
+            next_guidance, resolve_read_paths, attach_rule_summaries,
+            context_guidance,
+        )
         # task-guidance-dual-view-engine：传 agent_id（_resolve_agent_id 解析）与
         # has_master（master_path.exists()），支撑双视角与未初始化/空项目区分。
         # review-unify-r2：传 review_mode，in_review 模板按 unified/two_phase 分流。
         from orchd.ledger import resolve_review_mode
+        from orchd.gitops import get_current_branch
         agent_id = _resolve_agent_id(orchd_dir)
         has_master = master_path.exists()
         review_mode = resolve_review_mode(orchd_dir)
-        data["guidance"] = resolve_read_paths(
-            next_guidance(state, tasks, agent_id=agent_id, has_master=has_master,
-                          review_mode=review_mode),
-            orchd_dir,
-        )
+        # 分支以命令实际所在 worktree 为准（容器布局下 agent 在独立 task worktree
+        # 跑命令），避免 ORCHD_HOME 指向 canonical 主工作树时误判成主分支。
+        branch = get_current_branch(Path.cwd()) or get_current_branch(orchd_dir.parent)
+
+        guidance = data.get("guidance")
+        if not isinstance(guidance, dict):
+            guidance = resolve_read_paths(
+                next_guidance(state, tasks, agent_id=agent_id, has_master=has_master,
+                              review_mode=review_mode),
+                orchd_dir,
+            )
+            # task-guidance-rule-summary：read 过滤后追加 rules 键（TL;DR 摘要）
+            guidance = attach_rule_summaries(guidance, orchd_dir)
+            data["guidance"] = guidance
+
+        # task-guide-transition-aware：分支纪律 + 聚焦任务状态由来（加法式新键，
+        # 已有 guidance 的既有字段保持不变）
+        ctx = context_guidance(state, tasks, agent_id=agent_id,
+                               review_mode=review_mode, branch=branch)
+        if ctx:
+            guidance.update(ctx)
+            # 双视角同步（与 resolve_read_paths 递归语义一致；project 视角以
+            # agent_id=None 推导）
+            for view_key, view_agent in (("agent_view", agent_id),
+                                         ("project_view", None)):
+                view = guidance.get(view_key)
+                if isinstance(view, dict):
+                    vctx = context_guidance(state, tasks, agent_id=view_agent,
+                                            review_mode=review_mode, branch=branch)
+                    if vctx:
+                        view.update(vctx)
+            guidance = resolve_read_paths(guidance, orchd_dir)
+            guidance = attach_rule_summaries(guidance, orchd_dir)
+            data["guidance"] = guidance
     except Exception:
         # best-effort：引导失败静默跳过，绝不阻塞命令主流程
         pass
@@ -137,21 +180,41 @@ def _emit_guidance(data: Any) -> None:
     g = data.get("guidance")
     if not isinstance(g, dict):
         return
-    hint = g.get("hint")
+    hint = g.get("hint") or g.get("recovery")
     if not hint:
         return
     if not _guidance_stderr_enabled():
         return
     command = g.get("command") or "<无命令>"
+    rules = g.get("rules") or []
     sep = "─" * 40
     lines = [
         "",
         sep,
         f"orchd ▸ {hint}",
         f"建议执行：{command}",
-        sep,
-        "",
     ]
+    # task-guide-transition-aware：转换感知上下文块（分支纪律 + 状态由来）
+    transition = g.get("transition")
+    if isinstance(transition, dict) and transition.get("hint"):
+        lines.append(f"orchd ▸ [转换] {transition['hint']}")
+    branch_ctx = g.get("branch_ctx")
+    if isinstance(branch_ctx, dict) and branch_ctx.get("hint"):
+        lines.append(f"orchd ▸ [分支] {branch_ctx['hint']}")
+    if rules:
+        lines.append("关键红线：")
+        lines.extend(f"  · {r}" for r in rules)
+    # 经验回灌注入（设计 §8.4）：错误响应命中 lesson cases 时打印历史经验参考。
+    cases = g.get("cases")
+    if cases:
+        lines.append("历史经验参考：")
+        for c in cases:
+            tag = "（未验证·参考）" if c.get("status") == "proposed" else ""
+            drift = c.get("drift_note")
+            drift_text = f" [版本漂移:{drift}]" if drift and drift != "same" else ""
+            lines.append(f"  · [{c.get('id')}] {c.get('symptom')}{tag}{drift_text}")
+            lines.append(f"    解法：{c.get('solution')}")
+    lines.extend([sep, ""])
     print("\n".join(lines), file=sys.stderr)
 
 
@@ -413,6 +476,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--changes")
     p.add_argument("--changes-file", help="从文件读取变更描述（UTF-8），与 --changes 二选一")
     p.add_argument("--concerns")
+    p.add_argument("--skip-lesson-review", dest="skip_lesson_review",
+                   action="store_true",
+                   help="跳过 lesson 收尾 hook（CI/CD/自动化场景，§8.6 bypass）")
     p.set_defaults(func=_cmd_done)
 
     # review
@@ -429,7 +495,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # retract
     p = sub.add_parser("retract", help="撤回事件")
-    p.add_argument("--event", required=True)
+    p.add_argument("--event", required=False, default=None,
+                   help="事件 ID（精确撤回）；与 --task + --type 二选一")
+    p.add_argument("--task", required=False, default=None,
+                   help="任务 ID（配合 --type 自动定位最近匹配事件）")
+    p.add_argument("--type", required=False, default=None, dest="event_type",
+                   choices=["CLAIMED", "DONE", "REVIEW_CLAIMED", "REVIEW_SUBMITTED",
+                            "REVIEW_READY", "AMEND", "MERGE_WARNING"],
+                   help="事件类型（配合 --task 自动定位最近匹配事件）")
     p.add_argument("--reason", required=True)
     p.set_defaults(func=_cmd_retract)
 
@@ -455,6 +528,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="全局状态快照；可跟 task-id 查单任务详情")
     p.add_argument("task", nargs="?", default=None, help="可选：任务 ID，查询单任务详情")
     p.add_argument("--text", action="store_true")
+    p.add_argument("--all", action="store_true",
+                   help="显示全量任务（含终态 completed/cancelled）；默认仅活跃任务")
     p.add_argument("--audit-merge", action="store_true",
                    help="附加 merge 巡检：completed 任务对应 task/{id} 分支未并入 main 的告警清单（只读）")
     p.add_argument("--audit-intake", action="store_true",
@@ -527,6 +602,72 @@ def _build_parser() -> argparse.ArgumentParser:
 
     _p = session_sub.add_parser("end", help="结束当前会话")
     _p.set_defaults(func=_cmd_session_end)
+
+    # lesson（经验回灌引擎，task-lesson-feedback-engine）：stage/add/report/review/
+    # resolve/list/show/archive 七子命令。
+    p = sub.add_parser("lesson", help="经验回灌：自愈经验沉淀与触发注入")
+    lesson_sub = p.add_subparsers(dest="lesson_action", required=True)
+
+    _p = lesson_sub.add_parser("stage", help="执行中静默打点到任务暂存区")
+    _p.add_argument("--task", required=True)
+    _p.add_argument("--trigger", required=True, help="触发键：错误码名或 <command>/<step>")
+    _p.add_argument("--type", dest="trigger_type", default="error_code",
+                    choices=["error_code", "scene"], help="触发键类型（默认 error_code）")
+    _p.add_argument("--scene", default=None, help="场景补充上下文（如 container/flat）")
+    _p.add_argument("--symptom", required=True)
+    _p.add_argument("--solution", default="")
+    _p.add_argument("--resolved", action="store_true", help="已自愈解决（verify 通过）")
+    _p.add_argument("--severity", default="blocking", choices=["blocking", "warning"])
+    _p.add_argument("--urgent", action="store_true", help="紧急：即时提示人工")
+    _p.set_defaults(func=_cmd_lesson_stage)
+
+    _p = lesson_sub.add_parser("add", help="人工/事后手动入库（不经任务流程）")
+    _p.add_argument("--trigger", required=True)
+    _p.add_argument("--type", dest="trigger_type", default="error_code",
+                    choices=["error_code", "scene"])
+    _p.add_argument("--scene", default=None)
+    _p.add_argument("--symptom", required=True)
+    _p.add_argument("--solution", required=True)
+    _p.add_argument("--severity", default="blocking", choices=["blocking", "warning"])
+    _p.set_defaults(func=_cmd_lesson_add)
+
+    _p = lesson_sub.add_parser("report", help="只记问题不记解法（--guidance-flaw 标记指引缺陷）")
+    _p.add_argument("--trigger", required=True)
+    _p.add_argument("--type", dest="trigger_type", default="error_code",
+                    choices=["error_code", "scene"])
+    _p.add_argument("--scene", default=None)
+    _p.add_argument("--symptom", required=True)
+    _p.add_argument("--severity", default="blocking", choices=["blocking", "warning"])
+    _p.add_argument("--guidance-flaw", dest="guidance_flaw", action="store_true")
+    _p.set_defaults(func=_cmd_lesson_report)
+
+    _p = lesson_sub.add_parser("review", help="人工批量确认任务暂存建议")
+    _p.add_argument("--task", required=True)
+    _p.add_argument("--approve-all", dest="approve_all", action="store_true")
+    _p.add_argument("--reject", type=int, nargs="*", default=None,
+                    help="拒绝的暂存条目序号（0-based）")
+    _p.set_defaults(func=_cmd_lesson_review)
+
+    _p = lesson_sub.add_parser("resolve", help="人工确认信任分级（proposed↔verified/archived）")
+    _p.add_argument("--id", required=True)
+    _p.add_argument("--approve", action="store_true", help="→ verified（正式触发）")
+    _p.add_argument("--reject", dest="reject_flag", action="store_true", help="→ archived")
+    _p.set_defaults(func=_cmd_lesson_resolve)
+
+    _p = lesson_sub.add_parser("archive", help="手动归档（不再触发）")
+    _p.add_argument("--id", required=True)
+    _p.set_defaults(func=_cmd_lesson_archive)
+
+    _p = lesson_sub.add_parser("list", help="查看 lesson 库/暂存区")
+    _p.add_argument("--status", default=None, choices=["proposed", "verified", "archived"])
+    _p.add_argument("--trigger", default=None)
+    _p.add_argument("--staged", action="store_true", help="查看暂存区")
+    _p.add_argument("--all", dest="all_flag", action="store_true")
+    _p.set_defaults(func=_cmd_lesson_list)
+
+    _p = lesson_sub.add_parser("show", help="查看完整条目（含完整 solution）")
+    _p.add_argument("--id", required=True)
+    _p.set_defaults(func=_cmd_lesson_show)
 
     return parser
 
@@ -1450,6 +1591,7 @@ def _cmd_done(args) -> dict:
         store, tasks, agent_id=agent_id, task_id=args.task,
         changes_description=changes, concerns=args.concerns,
         project_root=orchd_dir.parent,
+        skip_lesson_review=getattr(args, "skip_lesson_review", False),
     )
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
@@ -1493,8 +1635,8 @@ def _cmd_review(args) -> dict:
 def _cmd_retract(args) -> dict:
     """撤回已提交的事件。
 
-    CLI 参数: args.event（必需，事件 ID）、args.reason（必需）。agent 身份由
-    引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
+    CLI 参数: args.event（可选，事件 ID 精确撤回）或 args.task + args.event_type
+    （可选，按任务+类型自动定位最近匹配事件）、args.reason（必需）。
     返回: 撤回事件信息。
     """
     from orchd.ledger import Store
@@ -1503,9 +1645,18 @@ def _cmd_retract(args) -> dict:
     _, orchd_dir, _ = _load_tasks()
     store = Store(orchd_dir)
     agent_id = _require_agent_id(orchd_dir)
+
+    event_id = getattr(args, "event", None)
+    task_id = getattr(args, "task", None)
+    event_type = getattr(args, "event_type", None)
+
+    if not event_id and not (task_id and event_type):
+        return {"error": "retract 需要 --event <事件ID> 或 --task <任务ID> --type <事件类型>"}
+
     return retract(
-        store, agent_id=agent_id, target_event_id=args.event,
+        store, agent_id=agent_id, target_event_id=event_id,
         reason=args.reason, project_root=orchd_dir.parent,
+        task_id=task_id, event_type=event_type,
     )
 
 
@@ -1751,6 +1902,7 @@ def _cmd_status(args) -> dict:
     """获取全局状态快照或单任务详情。
 
     CLI 参数: args.task（可选，任务 ID）、args.text（--text，人类可读表格输出）、
+    args.all（--all，显示全量任务含终态；默认仅活跃任务）、
     args.audit_merge（--audit-merge，附加只读 merge 巡检）。
     返回: 全局状态字典或单任务详情字典；若 --text 模式则直接打印表格并返回 None。
     """
@@ -1765,6 +1917,7 @@ def _cmd_status(args) -> dict:
     result = status(
         store, tasks, project=master.project, text=args.text, task_id=args.task,
         project_root=orchd_dir.parent,
+        active_only=not getattr(args, "all", False),
     )
     # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
     if not args.text:
@@ -1821,6 +1974,169 @@ def _cmd_watchdog(args):
     if result["stuck_count"] > 0:
         return result, 1
     return result
+
+
+# ------------------------------------------------------------------
+# lesson 子命令（经验回灌引擎，task-lesson-feedback-engine）
+# ------------------------------------------------------------------
+def _cmd_lesson_stage(args) -> dict:
+    """lesson stage：执行中静默打点（设计 §7/§8.6）。需会话身份。"""
+    from orchd import __version__
+    from orchd.lessons import is_lessons_enabled, stage
+
+    orchd_dir = _find_orchd_dir()
+    if not is_lessons_enabled(orchd_dir):
+        raise OrchdError(
+            ErrorCode.E007,
+            "lessons_disabled: lessons.enabled=false，stage 被拒绝",
+            [{"hint": "经验回灌功能已关闭"}],
+        )
+    agent_id = _require_agent_id(orchd_dir)
+    source = {
+        "agent": agent_id,
+        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "engine_version": __version__,
+    }
+    result = stage(
+        orchd_dir,
+        task_id=args.task,
+        trigger_type=args.trigger_type,
+        trigger_key=args.trigger,
+        scene=args.scene,
+        symptom=args.symptom,
+        solution=args.solution,
+        resolved=args.resolved,
+        severity=args.severity,
+        urgent=args.urgent,
+        source=source,
+    )
+    # 紧急通道（§8.6）：stage --urgent 即时提示人工
+    if args.urgent and not result.get("skipped"):
+        print("orchd ▸ 存在紧急 guidance 建议，建议尽快处理", file=sys.stderr)
+    return result
+
+
+def _cmd_lesson_add(args) -> dict:
+    """lesson add：人工/事后手动入库（设计 §7）。"""
+    from orchd import __version__
+    from orchd.lessons import add, is_lessons_enabled
+
+    orchd_dir = _find_orchd_dir()
+    if not is_lessons_enabled(orchd_dir):
+        raise OrchdError(
+            ErrorCode.E007,
+            "lessons_disabled: lessons.enabled=false，add 被拒绝",
+            [{"hint": "经验回灌功能已关闭"}],
+        )
+    agent_id = _resolve_agent_id(orchd_dir) or "human"
+    source = {
+        "agent": agent_id,
+        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "engine_version": __version__,
+    }
+    return add(
+        orchd_dir,
+        trigger_type=args.trigger_type,
+        trigger_key=args.trigger,
+        scene=args.scene,
+        symptom=args.symptom,
+        solution=args.solution,
+        severity=args.severity,
+        source=source,
+    )
+
+
+def _cmd_lesson_report(args) -> dict:
+    """lesson report：只记问题不记解法（设计 §7）。"""
+    from orchd import __version__
+    from orchd.lessons import is_lessons_enabled, report
+
+    orchd_dir = _find_orchd_dir()
+    if not is_lessons_enabled(orchd_dir):
+        raise OrchdError(
+            ErrorCode.E007,
+            "lessons_disabled: lessons.enabled=false，report 被拒绝",
+            [{"hint": "经验回灌功能已关闭"}],
+        )
+    agent_id = _resolve_agent_id(orchd_dir) or "human"
+    source = {
+        "agent": agent_id,
+        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "engine_version": __version__,
+    }
+    return report(
+        orchd_dir,
+        trigger_type=args.trigger_type,
+        trigger_key=args.trigger,
+        scene=args.scene,
+        symptom=args.symptom,
+        severity=args.severity,
+        source=source,
+        guidance_flaw=args.guidance_flaw,
+    )
+
+
+def _cmd_lesson_review(args) -> dict:
+    """lesson review：人工批量确认任务暂存建议（设计 §7/§8.6）。"""
+    from orchd.lessons import review_task
+
+    orchd_dir = _find_orchd_dir()
+    reject = args.reject if args.reject else None
+    return review_task(
+        orchd_dir,
+        task_id=args.task,
+        approve_all=args.approve_all,
+        reject_indices=reject,
+    )
+
+
+def _cmd_lesson_resolve(args) -> dict:
+    """lesson resolve：人工确认信任分级（设计 §7/§9）。"""
+    from orchd.lessons import resolve_lesson
+
+    orchd_dir = _find_orchd_dir()
+    if not (args.approve or args.reject_flag):
+        raise OrchdError(
+            ErrorCode.E007,
+            "lesson_resolve: 须指定 --approve 或 --reject",
+            [{"hint": "--approve → verified；--reject → archived"}],
+        )
+    return resolve_lesson(orchd_dir, lesson_id=args.id, approve=args.approve)
+
+
+def _cmd_lesson_archive(args) -> dict:
+    """lesson archive：手动归档（设计 §7/§9）。"""
+    from orchd.lessons import archive_lesson
+
+    orchd_dir = _find_orchd_dir()
+    return archive_lesson(orchd_dir, lesson_id=args.id)
+
+
+def _cmd_lesson_list(args) -> dict:
+    """lesson list：查看 lesson 库/暂存区（设计 §7）。"""
+    from orchd.lessons import list_lessons
+
+    orchd_dir = _find_orchd_dir()
+    rows = list_lessons(
+        orchd_dir,
+        status=args.status,
+        trigger=args.trigger,
+        staged=args.staged,
+        all=args.all_flag,
+    )
+    return {"lessons": rows, "count": len(rows)}
+
+
+def _cmd_lesson_show(args) -> dict:
+    """lesson show：查看完整条目（设计 §7）。"""
+    from orchd.lessons import show_lesson
+
+    orchd_dir = _find_orchd_dir()
+    entry = show_lesson(orchd_dir, lesson_id=args.id)
+    if entry is None:
+        raise OrchdError(ErrorCode.E007, f"lesson '{args.id}' 不存在",
+                         [{"lesson_id": args.id}])
+    return {"lesson": entry}
 
 
 if __name__ == "__main__":

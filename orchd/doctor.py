@@ -284,6 +284,37 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
             )
         )
 
+    # 5) P0-19：残留任务 worktree 空目录检测（Windows git worktree remove 不完整）。
+    # 扫描主工作树父目录（container 布局的 task_wt_root）下 task-* 目录：
+    # 无 .git 文件 + 无绑定 → 残留空目录，报告供 prune_orphans 清理。
+    try:
+        main_wt = Path(project_root).resolve()
+        task_wt_root = main_wt.parent  # container: 平级目录；flat: 同级
+        if task_wt_root.is_dir():
+            residuals = []
+            for entry in sorted(task_wt_root.iterdir()):
+                if (entry.is_dir()
+                        and entry.name.startswith("task-")
+                        and not (entry / ".git").exists()):
+                    residuals.append(entry.name)
+            if residuals:
+                checks.append(
+                    _make_check(
+                        "worktree_residual",
+                        "fail",
+                        f"发现 {len(residuals)} 个残留任务 worktree 目录（无 .git 登记）："
+                        + "、".join(residuals[:10])
+                        + ("..." if len(residuals) > 10 else "")
+                        + "。运行 orchd watchdog 或 orchd status 可自动清理。",
+                    )
+                )
+            else:
+                checks.append(
+                    _make_check("worktree_residual", "ok", "无残留任务 worktree 目录")
+                )
+    except OSError:
+        pass
+
     return checks
 
 

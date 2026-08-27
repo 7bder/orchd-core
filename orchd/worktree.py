@@ -671,12 +671,23 @@ def _propagate_container_marker(task_wt: Path, main_wt: Path) -> None:
     账本，共享任务状态不可见（done 报 "not in claimed"）。写入标记后 worktree
     自识别 container 布局 → 共享账本根（``<容器>/.orchd-runtime/``）生效。
     失败静默降级（仍可经 ORCHD_HOME 指向共享账本根）。
+
+    task-workspace-docs-isolation：同步工作区规划文档 ROADMAP.md（gitignore
+    不入库 → 任务 worktree 缺副本，roadmap_landing_warnings 读本地缺失被跳过，
+    与 main 行为不一致）。best-effort 从 main 拷贝，缺失静默跳过；ROADMAP.md
+    未跟踪，拷贝不产生未提交改动（不触发 E017）。
     """
     try:
         orchd = task_wt / ".orchd"
         orchd.mkdir(parents=True, exist_ok=True)
         write_layout(orchd, "container", main_wt)
     except Exception:
+        pass
+    try:
+        src = main_wt / ".orchd" / "ROADMAP.md"
+        if src.exists():
+            shutil.copy2(str(src), str(task_wt / ".orchd" / "ROADMAP.md"))
+    except OSError:
         pass
 
 
@@ -688,8 +699,10 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
     （任务 worktree 即主工作树本身，维持现状零回归）。
 
     Returns:
-        ``{"worktree": <Path>, "separate": bool, "created": bool}``
-        失败时 best-effort 返回主工作树降级（不抛异常，不阻断 claim）。
+        ``{"worktree": <Path>, "separate": bool, "created": bool}``；
+        container 下独立 worktree 创建失败时返回 ``{"worktree": 主工作树,
+        "separate": False, "created": False, "degraded": True, "reason": str}``
+        （不抛异常、不阻断 claim，但**降级原因必须显式记录**，禁止静默）。
     """
     project_root = Path(project_root).resolve()
     layout = detect_layout(project_root)
@@ -730,10 +743,26 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             # 任务 worktree 自识别容器布局（共享账本根），见 _propagate_container_marker
             _propagate_container_marker(wt_path, project_root)
             return {"worktree": wt_path, "separate": True, "created": True}
-        # worktree add 失败（如分支已在别处 checkout）→ best-effort 降级主工作树
-        return {"worktree": project_root, "separate": False, "created": False}
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return {"worktree": project_root, "separate": False, "created": False}
+        # worktree add 失败（如分支已在别处 checkout）→ best-effort 降级主工作树，
+        # 但降级原因显式记录（供 claim 告警 / 后续排查，禁止静默降级）。
+        reason = (proc.stderr or "").strip()[:300] or (
+            f"git worktree add {str(wt_path)} 失败（exit {proc.returncode}）"
+        )
+        return {
+            "worktree": project_root,
+            "separate": False,
+            "created": False,
+            "degraded": True,
+            "reason": reason,
+        }
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return {
+            "worktree": project_root,
+            "separate": False,
+            "created": False,
+            "degraded": True,
+            "reason": f"worktree add 异常: {exc}",
+        }
 
 
 def remove_task_wt(
@@ -785,6 +814,22 @@ def remove_task_wt(
             removed = True  # 独立 worktree 本就不存在 → 视为已回收
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         removed = False
+    # P0-19：Windows 下 git worktree remove 可能删除内容但残留空目录
+    # （文件句柄 / .lock / 杀毒扫描导致目录删除不完整）。best-effort 清理残留。
+    residual_cleaned = False
+    if wt_path.exists() and not (wt_path / ".git").exists():
+        try:
+            # 先尝试 rmdir（仅空目录成功，安全）
+            wt_path.rmdir()
+            residual_cleaned = True
+        except OSError:
+            # 非空目录或权限问题 → 尝试 rmtree（兜底，可能因杀毒/句柄失败）
+            try:
+                shutil.rmtree(str(wt_path), ignore_errors=True)
+                if not wt_path.exists():
+                    residual_cleaned = True
+            except Exception:
+                pass
     # 删任务分支（best-effort，未合并时 -d/-D 失败不阻断）
     # 以主工作树为稳定 cwd（git -C）：worktree 已回收时 task/{id} 不再被占用可删除；
     # project_root（任务 worktree）可能已被 git worktree remove 删除，不能作为 cwd。
@@ -802,7 +847,107 @@ def remove_task_wt(
     result = {"removed": removed, "unbound": unbound.get("unbound", False)}
     if discarded_uncommitted:
         result["discarded_uncommitted"] = True
+    if residual_cleaned:
+        result["residual_cleaned"] = True
     return result
+
+
+def _cleanup_stale_session_locks(store_root: Path, task_wt_root: Path) -> list[str]:
+    """清理 worktree 已不存在的会话锁残留（best-effort）。
+
+    task-workspace-docs-isolation：任务 worktree 终态回收后，其会话锁标记
+    （``.session-<wt>.lock`` / ``.session-gate-<wt>.lock``）残留在共享账本根。
+    仅清理 worktree 名以 ``task-`` 开头且对应目录已不存在的锁；删除前探活
+    flock（他人仍持活锁则跳过，防 flock-unlink 竞态，见
+    ``gitops._probe_session_lock_os_active``）。主 worktree 锁
+    （``.session.lock`` / ``.session.gate.lock``）不在匹配范围，不触碰。
+
+    Returns:
+        已清理的锁文件名清单。
+    """
+    from orchd.gitops import _probe_session_lock_os_active
+
+    cleaned: list[str] = []
+    try:
+        for pattern in (".session-*.lock", ".session-gate-*.lock"):
+            for p in sorted(store_root.glob(pattern)):
+                name = p.name
+                if name.startswith(".session-gate-"):
+                    wt = name[len(".session-gate-"):-len(".lock")]
+                elif name.startswith(".session-"):
+                    wt = name[len(".session-"):-len(".lock")]
+                else:
+                    continue
+                if not wt.startswith(_TASK_WT_PREFIX):
+                    continue  # 仅任务 worktree 维度锁；主 worktree / 其他锁不碰
+                if (task_wt_root / wt).exists():
+                    continue  # worktree 仍存在 → 活跃，跳过
+                if _probe_session_lock_os_active(p).get("active"):
+                    continue  # 他人仍持活锁 → 不删（flock-unlink 竞态）
+                try:
+                    p.unlink()
+                    cleaned.append(name)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return cleaned
+
+
+def _rmtree_force(path: Path) -> bool:
+    """删除目录树；Windows 下先清只读属性再删（git 对象文件只读导致 rmtree 失败）。
+
+    task-workspace-docs-isolation：测试残留（如 .pytest-tmp 内 git 仓库）对象文件
+    带只读属性，``shutil.rmtree`` 在 Windows 上删除失败（PermissionError WinError 5）。
+    onerror 回调清只读后重试单文件删除，其余错误静默跳过。
+
+    Returns:
+        ``True`` 目录已不存在（删除成功或本就不存在）。
+    """
+    if not path.exists():
+        return True
+    try:
+        def _onerror(func: Any, p: str, exc: Any) -> None:
+            try:
+                os.chmod(p, 0o200)  # S_IWRITE：清只读后重试
+                func(p)
+            except OSError:
+                pass
+
+        shutil.rmtree(str(path), onerror=_onerror)
+    except OSError:
+        pass
+    return not path.exists()
+
+
+def _cleanup_container_root_junk(task_wt_root: Path) -> list[str]:
+    """清理容器根可再生杂项（best-effort）。
+
+    task-workspace-docs-isolation：测试/缓存杂项（``.pytest-tmp`` /
+    ``.pytest_cache`` 等）可能落在容器根（main/ 之外）。复用 ``_is_junk_entry``
+    保守名单，绝不触碰 .git / .orchd / 工具目录 / 被跟踪文件。
+
+    Returns:
+        已清理的条目名清单。
+    """
+    cleaned: list[str] = []
+    try:
+        for entry in sorted(task_wt_root.iterdir()):
+            if not _is_junk_entry(entry.name):
+                continue
+            try:
+                if entry.is_dir():
+                    removed = _rmtree_force(entry)
+                else:
+                    entry.unlink()
+                    removed = not entry.exists()
+                if removed:
+                    cleaned.append(entry.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return cleaned
 
 
 def prune_orphans(
@@ -812,30 +957,99 @@ def prune_orphans(
 ) -> dict[str, Any]:
     """孤儿 worktree 惰性清理（watchdog / status 调用，best-effort）。
 
-    清理两类：
+    清理三类：
     - 绑定任务已终态（completed/cancelled）但 worktree 仍在 → remove；
-    - 绑定任务已不在 master / 无对应活跃任务 → remove + 解绑。
+    - 绑定任务已不在 master / 无对应活跃任务 → remove + 解绑；
+    - 文件系统残留 task-* 空目录（P0-19，Windows git worktree remove 不完整）→ 清理。
 
     Returns:
-        ``{"pruned": [<str>], "orphans_found": int}``
+        ``{"pruned": [<str>], "orphans_found": int, "residual_cleaned": [<str>]}``
     """
     from orchd.gitops import _has_linked_worktrees
 
     project_root = Path(project_root).resolve()
-    if not _has_linked_worktrees(project_root):
-        return {"pruned": [], "orphans_found": 0}
-
     bindings = load_bindings(store_root)
     pruned: list[str] = []
-    for task_id, entry in list(bindings.items()):
-        ts = state.get(task_id)
-        status = ts.status if ts else "pending"
-        if status in ("completed", "cancelled"):
-            # 终态：回收 worktree + 解绑
-            result = remove_task_wt(project_root, task_id, store_root)
-            if result.get("removed"):
-                pruned.append(task_id)
-    return {"pruned": pruned, "orphans_found": len(pruned)}
+    residual_cleaned: list[str] = []
+
+    # 既有绑定任务清理（需要 git 层 linked worktrees 存在才执行 git worktree remove）
+    if _has_linked_worktrees(project_root):
+        for task_id, entry in list(bindings.items()):
+            ts = state.get(task_id)
+            status = ts.status if ts else "pending"
+            if status in ("completed", "cancelled"):
+                # 终态：回收 worktree + 解绑
+                result = remove_task_wt(project_root, task_id, store_root)
+                if result.get("removed"):
+                    pruned.append(task_id)
+
+    # P0-19：扫描文件系统残留 task-* 目录（git 不登记但目录仍存在）。
+    # 不依赖 _has_linked_worktrees——Windows 下 git worktree remove 成功但目录残留。
+    try:
+        layout = detect_layout(project_root)
+        task_wt_root = layout["task_wt_root"]
+        if task_wt_root.exists():
+            for entry in sorted(task_wt_root.iterdir()):
+                if (not entry.is_dir()
+                        or not entry.name.startswith(_TASK_WT_PREFIX)):
+                    continue
+                # 是 task-* 目录 → 检查是否有活跃绑定
+                # 从目录名反推 task_id（task-<short> → task-<short> 或 task/<short>）
+                short = entry.name[len(_TASK_WT_PREFIX):]
+                candidate_ids = [f"task-{short}", short]
+                has_active_binding = False
+                for cid in candidate_ids:
+                    if cid in bindings:
+                        ts = state.get(cid)
+                        status = ts.status if ts else "pending"
+                        if status not in ("completed", "cancelled"):
+                            has_active_binding = True
+                        break
+                if has_active_binding:
+                    continue
+                # 无活跃绑定 → 尝试清理残留目录
+                if not (entry / ".git").exists():
+                    try:
+                        entry.rmdir()  # 仅空目录
+                        residual_cleaned.append(entry.name)
+                    except OSError:
+                        try:
+                            shutil.rmtree(str(entry), ignore_errors=True)
+                            if not entry.exists():
+                                residual_cleaned.append(entry.name)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    # task-workspace-docs-isolation：容器级卫生清理（best-effort）——
+    # ① worktree 已不存在的会话锁残留；② 容器根可再生杂项；③ 系统 temp 中
+    # 历史 orchd-trash-* 残留（早期 _safe_delete 降级重命名产物）。
+    stale_locks_cleaned: list[str] = []
+    junk_cleaned: list[str] = []
+    trash_residue_cleaned: list[str] = []
+    try:
+        layout = detect_layout(project_root)
+        task_wt_root = layout["task_wt_root"]
+        if task_wt_root.exists():
+            stale_locks_cleaned = _cleanup_stale_session_locks(store_root, task_wt_root)
+            junk_cleaned = _cleanup_container_root_junk(task_wt_root)
+        from orchd.gitops import _cleanup_trash_residue
+
+        trash_residue_cleaned = _cleanup_trash_residue()
+    except Exception:
+        pass
+
+    result: dict[str, Any] = {"pruned": pruned, "orphans_found": len(pruned)}
+    if residual_cleaned:
+        result["residual_cleaned"] = residual_cleaned
+    if stale_locks_cleaned:
+        result["stale_locks_cleaned"] = stale_locks_cleaned
+    if junk_cleaned:
+        result["junk_cleaned"] = junk_cleaned
+    if trash_residue_cleaned:
+        result["trash_residue_cleaned"] = trash_residue_cleaned
+    return result
 
 
 def _git_diff_names(project_root: Path, task_id: str) -> list[str]:
@@ -908,6 +1122,73 @@ def missing_declared_branch_files(
             return []
         declared = set(declared_files)
         return sorted(declared - branch_files)
+    except Exception:
+        return []
+
+
+def diagnose_missing_branch_files(
+    project_root: Path,
+    task_id: str,
+    declared_files: list[str] | set[str],
+) -> list[dict[str, str]]:
+    """返回缺失声明文件的结构化诊断（Bug #20b，2026-08-27）。
+
+    对每个缺失文件做三路判定：
+    - path_not_found：文件在磁盘不存在
+    - gitignored：文件存在但被 .gitignore 忽略（附命中规则）
+    - not_committed：文件存在且未被忽略，但未进入任务分支 diff（漏提交）
+
+    flat / 非任务 worktree 场景返回空列表（与原函数行为一致）。
+    """
+    try:
+        from orchd.gitops import is_task_worktree
+
+        pr = Path(project_root)
+        if not is_task_worktree(pr):
+            return []
+        branch_files = set(task_branch_files(pr, task_id))
+        if not branch_files:
+            return []
+        declared = set(declared_files)
+        missing = sorted(declared - branch_files)
+        if not missing:
+            return []
+
+        results: list[dict[str, str]] = []
+        for fp in missing:
+            full = pr / fp
+            if not full.exists():
+                results.append({
+                    "file": fp,
+                    "reason": "path_not_found",
+                    "detail": f"路径 {fp} 在磁盘不存在",
+                })
+                continue
+            # git check-ignore：退出码 0 = 被忽略，1 = 未被忽略
+            try:
+                proc = subprocess.run(
+                    ["git", "check-ignore", "-v", fp],
+                    cwd=str(pr),
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    results.append({
+                        "file": fp,
+                        "reason": "gitignored",
+                        "detail": proc.stdout.strip(),
+                    })
+                    continue
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                pass
+            results.append({
+                "file": fp,
+                "reason": "not_committed",
+                "detail": "文件存在且未被 .gitignore 忽略，但未出现在任务分支 diff 中",
+            })
+        return results
     except Exception:
         return []
 

@@ -40,7 +40,9 @@ from orchd.lockfile import ExclusiveFileLock, read_locked_text
 # update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
 # schema_version 落后于本常量（新字段引入/升级）才 replay_full() 自愈一次。
 # 之后新增 TaskState 字段时递增本常量即可触发一次全量重建（字段漂移自愈）。
-_CHECKPOINT_SCHEMA_VERSION = 1
+# v2（2026-08-27）：review_claimed_session 引入（e7e70a8）时漏 bump，既有
+# checkpoint 缺该字段且自愈永不触发 → E030 持续告警；bump 至 2 触发一次自愈。
+_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -1266,11 +1268,16 @@ class Store:
                     ts.status = "completed"
                     ts.review_phase = None
                     ts.review_claimed_by = None
+                    ts.review_claimed_session = None
                     # B1（2026-08-13 full-audit-v2）：与 _apply_events 保持一致——
                     # merge 降级标记随事件持久化。全量重建（RETRACT / check_integrity
                     # 前缀重放）若不设置，merge_warning 将丢失：既让 audit-merge
                     # 对漏 merge 失明，又会与含 merge_warning 的 checkpoint 快照
                     # 不一致而误报 E030 篡改告警。
+                    # review-unify-r2 附加（2026-08-27）：review_claimed_session 同样须
+                    # 对齐活跃路径（_apply_events）在 APPROVED→completed 时清空；缺失
+                    # 会令全量重建保留 completed 任务的历史审查会话指纹，与活跃路径
+                    # 写入的 checkpoint 快照不一致 → E030 反复告警。
                     ts.merge_warning = event.get("merge_warning")
                 elif verdict == "CHANGES_REQUESTED":
                     # 不重置 attempt_count（与 _apply_events 一致）：打回次数累计，
