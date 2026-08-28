@@ -38,6 +38,33 @@ from typing import Any
 # 集中为模块级常量：入口变更时只改此处，避免 20+ 处命令/hint 字符串漂移。
 _ENTRY_CMD = "python .orchd/__main__.py"
 
+# ---------------------------------------------------------------------------
+# W-1 guidance 分级：T0/T1/T2（task-guide-tiering）
+# ---------------------------------------------------------------------------
+# 信息瘦身口径（owner 已确认）：单视角 + 5 键 / 红线上限 1 条 / hint 单行。
+# 全命令分三级注入，避免"每条命令灌全量、三层重复"的信息超载。
+_T0_CMDS = frozenset({"status", "doctor", "help", "version", "session-status",
+                      "session-current", "session", "pool", "validate"})
+_T1_CMDS = frozenset({"retract", "force-status"})
+
+
+def guidance_tier(command: str) -> int:
+    """命令 → 引导分级（纯函数，W-1）。
+
+    T0  读/健康命令：guidance 置空（仅保留退出态一行）。
+    T1  轻写/恢复命令：只给 step + command + hint + 1 条红线 + branch_ctx。
+    T2  决策写命令：完整但精简（step/command/hint/read/branch_ctx 5 键）。
+    未列出的命令（含子命令首 token，如 "session"）默认 T2。
+    """
+    if not command:
+        return 2
+    base = command.strip()
+    if base in _T0_CMDS:
+        return 0
+    if base in _T1_CMDS:
+        return 1
+    return 2
+
 
 def _resolve_paths(
     paths: list[str],
@@ -538,6 +565,71 @@ def context_guidance(
     return out
 
 
+def slim_guidance(
+    guidance: dict[str, Any],
+    ctx: dict[str, Any] | None,
+    tier: int,
+    max_read: int = 2,
+) -> dict[str, Any]:
+    """把全量 guidance + 转换上下文收敛为分级精简结构（纯函数，W-1）。
+
+    W-1 信息瘦身口径（owner 已确认）：单视角 + 5 键 / 红线上限 1 条 /
+    hint 单行。本函数在命令响应层做最终收敛，纯函数层（next_guidance 等）
+    保持可测且不推倒重写。
+
+    Args:
+        guidance: ``next_guidance`` 产出的全量引导（含 agent_view/project_view、
+            template、rules 等将被裁剪的字段）。
+        ctx: ``context_guidance`` 产出的转换上下文（branch_ctx / transition）。
+        tier: ``guidance_tier(cmd)`` 的分级值。
+        max_read: read[] 条数上限（默认 2，指向文件按需读）。
+
+    Returns:
+        - tier=0 → ``{}``（读/健康命令：guidance 置空）。
+        - tier=1 → ``{step, command, hint, branch_ctx?}``（轻写/恢复：不带 read）。
+        - tier=2 → ``{step, command, hint, read[], branch_ctx?}``（决策写：5 键）。
+
+    收敛规则：
+        去 agent_view / project_view / template（template 并入 read 前缀）；
+        transition 语义与红线 ≤1 条一并并入 hint（一行）；
+        rules 不再作为顶层独立键（防信息超载），read≤max_read 兜底。
+    """
+    if tier == 0:
+        return {}
+    out: dict[str, Any] = {
+        "step": guidance.get("step", "check_status"),
+        "command": guidance.get("command", ""),
+    }
+    # 顶层键收敛（W-1）
+    hint_bits: list[str] = []
+    base_hint = guidance.get("hint")
+    if base_hint:
+        hint_bits.append(base_hint)
+    ctx = ctx or {}
+    transition = ctx.get("transition")
+    if isinstance(transition, dict) and transition.get("hint"):
+        hint_bits.append(transition["hint"])
+    rules = guidance.get("rules") or []
+    if rules:
+        hint_bits.append(_REDLINE_PREFIX + rules[0])
+    hint = "；".join(dict.fromkeys(hint_bits))  # 去重保序，单行
+    out["hint"] = hint
+    bc = ctx.get("branch_ctx")
+    if isinstance(bc, dict) and bc.get("hint") and tier >= 1:
+        out["branch_ctx"] = bc
+    if tier >= 2:
+        read = list(guidance.get("read") or [])
+        for t in guidance.get("template") or []:
+            if t not in read:
+                read.append(t)  # template 并入 read 前缀
+        out["read"] = read[:max_read]
+    return out
+
+
+# 红线并入 hint 的前缀（task-guide-tiering：只留 ≤1 条最强红线）
+_REDLINE_PREFIX: str = "红线："
+
+
 def next_guidance(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
@@ -646,6 +738,7 @@ def _summarize_rules(
 def attach_rule_summaries(
     guidance: dict[str, Any],
     base_dir: str | os.PathLike[str] | None,
+    max_rules: int = 1,
 ) -> dict[str, Any]:
     """对 guidance 的 read 数组生成 rules 键（加法式，纯函数）。
 
@@ -654,17 +747,21 @@ def attach_rule_summaries(
     本函数返回**新增 ``rules`` 键**的 guidance 副本，内容为 read 数组对应
     规则文件的 TL;DR 摘要（``<文件名>: <TL;DR>``），无 TL;DR 段跳过。
 
+    W-1 红线上限（task-guide-tiering）：仅保留前缀 ``max_rules`` 条摘要
+    （默认 1 条），其余规则交由 ``read[]`` 指向文件按需读——避免"红线列表"
+    信息超载同时保留关键约束提示。
+
     - 顶层新增 rules 键；agent_view / project_view 递归处理（与
       resolve_read_paths 同构），保证双视角与顶层 rules 一致。
     - 不碰 step/read/template/command/hint 既有字段（加法式）。
     - read 为空 / base_dir None 时返回 rules=[]（无害降级）。
     """
     out = dict(guidance)
-    out["rules"] = _summarize_rules(guidance.get("read") or [], base_dir)
+    out["rules"] = _summarize_rules(guidance.get("read") or [], base_dir)[:max_rules]
     for key in ("agent_view", "project_view"):
         sub = guidance.get(key)
         if isinstance(sub, dict):
-            out[key] = attach_rule_summaries(sub, base_dir)
+            out[key] = attach_rule_summaries(sub, base_dir, max_rules=max_rules)
     return out
 
 
@@ -810,6 +907,15 @@ def attach_error_guidance(
         return out
     g = error_guidance(code)
     guidance = attach_rule_summaries(resolve_read_paths(g, base_dir), base_dir)
+    # 场景化 hint 优先（2026-08-28 bug1 修复）：错误详情含 hint（如 done 越界 →
+    # amend 补声明、锁冲突 → watchdog）时，用它覆盖通用 recovery，使恢复指引贴近
+    # 具体原因而非泛化描述。取首个含 hint 的 detail，缺失则保持通用 recovery。
+    error_details = (resp.get("error") or {}).get("details") or []
+    for detail in error_details:
+        if isinstance(detail, dict) and detail.get("hint"):
+            guidance["hint"] = detail["hint"]
+            guidance["recovery"] = detail["hint"]
+            break
     # 经验回灌触发注入（设计 §8.4）：错误码命中的 lesson cases 挂到 guidance.cases。
     # best-effort：任何异常静默跳过，绝不阻塞错误响应主流程。
     try:

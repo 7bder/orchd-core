@@ -46,6 +46,10 @@ from orchd.ledger import (
     is_fingerprint_agent_id as _is_fingerprint_agent_id,
     resolve_review_mode,
     resolve_store_dir,
+    # W-2 僵尸审查认领：request 巡检/status/doctor 共用同一派生判定
+    review_claim_age_s,
+    review_stale_timeout_s,
+    stale_review_claims,
 )
 from orchd.pool import (
     _build_claimed_files,
@@ -1605,16 +1609,18 @@ def _done_impl(
     # 锁外执行（约 35s），避免长时间持锁；锁内二次校验仍兜底 TOCTOU。
     full_regression: dict[str, Any] | None = None
     files_to_edit = task_def.get("files_to_edit", [])
-    # P1-17：config.full_regression 开关——false 时用定向测试替代全量回归。
-    # 默认 True（向后兼容，全量回归不变）；设为 false 后仅跑 files_to_edit 对应
-    # 的 test 文件（orchd/foo.py → tests/test_foo.py），大幅缩短 done 耗时。
-    _full_reg_enabled = True
+    # task-full-regression-gate-r2：done 默认不跑全量冒烟（发版前由
+    # orchd full-regression 命令 + sync_orchd_core.sh 覆盖检查兜底）。
+    # config.full_regression_on_done 显式 true 时恢复原全量冒烟行为（失败仅附加
+    # full_regression warning，不阻断 done、不改任务状态）；缺省/显式 false 时
+    # 跳过回归段，响应无 full_regression 字段。
+    _full_reg_enabled = False
     try:
         _mp = store.orchd_dir / "_master.json"
         if _mp.exists():
             import json as _json17
             _master_cfg = _json17.loads(_mp.read_text(encoding="utf-8"))
-            _fr_val = (_master_cfg.get("config") or {}).get("full_regression")
+            _fr_val = (_master_cfg.get("config") or {}).get("full_regression_on_done")
             if _fr_val is not None:
                 _full_reg_enabled = bool(_fr_val)
     except (OSError, ValueError):
@@ -1624,36 +1630,15 @@ def _done_impl(
         (f.startswith("orchd/") or f.startswith(".orchd/orchd/")) and f.endswith(".py")
         for f in files_to_edit
     )
-    if project_root and _has_engine_files:
-        # 定向测试文件推导（P1-17）：orchd/foo.py → tests/test_foo.py
-        _targeted_tests: list[str] = []
-        if not _full_reg_enabled:
-            for f in files_to_edit:
-                # 归一化路径前缀
-                stem = f
-                if stem.startswith(".orchd/"):
-                    stem = stem[len(".orchd/"):]
-                if stem.startswith("orchd/") and stem.endswith(".py"):
-                    mod_name = stem[len("orchd/"):-len(".py")]
-                    test_path = f"tests/test_{mod_name}.py"
-                    if (project_root / test_path).exists():
-                        _targeted_tests.append(test_path)
-
+    if project_root and _has_engine_files and _full_reg_enabled:
         reg_started = time.monotonic()
         try:
             # P2-1（2026-08-19 审查）：回归子进程继承当前解释器（sys.executable），
             # 避免裸 `python` 命中 PATH 上未装依赖的解释器导致误报。
-            if _full_reg_enabled or not _targeted_tests:
-                reg_cmd = (
-                    f'"{sys.executable}" -m pytest tests/ -q '
-                    f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
-                )
-            else:
-                _test_args = " ".join(_targeted_tests)
-                reg_cmd = (
-                    f'"{sys.executable}" -m pytest {_test_args} -q '
-                    f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
-                )
+            reg_cmd = (
+                f'"{sys.executable}" -m pytest tests/ -q '
+                f'--basetemp="${{TMPDIR:-/tmp}}/orchd-vf-$$"'
+            )
             reg_result = run_shell(reg_cmd, str(project_root), _FULL_REGRESSION_TIMEOUT)
             reg_elapsed = round(time.monotonic() - reg_started, 1)
             if reg_result.returncode == 0:
@@ -1916,15 +1901,25 @@ def retract(
         # 其「无认证」属 P2-11，根治需 1.6 Registry 认证机制，暂不在此移除。
         target_author = target_event.get("agent_id")
         if target_author is not None and target_author != agent_id and agent_id != "admin":
-            raise OrchdError(
-                ErrorCode.E034,
-                f"retract_not_authorized: event '{target_event_id}' owned by "
-                f"'{target_author}', caller '{agent_id}' cannot retract",
-                [{"event_id": target_event_id, "owner": target_author,
-                  "caller": agent_id,
-                  "hint": "跨 agent 撤认需事件作者本人或 admin 操作；"
-                          "如确须纠正，请事件作者撤回或管理员 force-status"}],
-            )
+            # W-2 僵尸审查认领接管：跨 agent 撤认他人 REVIEW_CLAIMED 仅在目标
+            # 认领已超时（stale，押注作者/会话失联）时放行——这正是"接管僵死审查"
+            # 的必要路径；未超时仍受 E034 保护，防实现者借撤认绕过独立审查。
+            stale_release = False
+            if target_event.get("type") == "REVIEW_CLAIMED":
+                _age = review_claim_age_s(target_event.get("timestamp"))
+                if _age is not None and _age >= review_stale_timeout_s():
+                    stale_release = True
+            if not stale_release:
+                raise OrchdError(
+                    ErrorCode.E034,
+                    f"retract_not_authorized: event '{target_event_id}' owned by "
+                    f"'{target_author}', caller '{agent_id}' cannot retract",
+                    [{"event_id": target_event_id, "owner": target_author,
+                      "caller": agent_id,
+                      "hint": "跨 agent 撤认需事件作者本人或 admin 操作，或目标为超时（僵尸）"
+                              "审查认领（W-2，引擎按时间判定放行）；如确须纠正，请事件作者撤回"
+                              "或管理员 force-status"}],
+                )
 
         # 找级联事件（同 task_id，在 target 之后的事件）
         task_id = target_event.get("task_id", "")
@@ -2204,6 +2199,25 @@ def force_status(
                       "allowed_from": sorted(allowed)}],
                 )
 
+        # W-5 逃生舱语义一致性：completed 终态 = 状态终态 + 代码落 main，二者由引擎一并
+        # 保证。任务分支领先 main 时自动 --ff-only 快进落码后再置终态；与 main 分叉则拒绝
+        # 自动合并（仅接受快进，防止静默并入错误代码）并返回冲突指引交人工。
+        merge_state: dict[str, Any] | None = None
+        if target_status == "completed" and project_root:
+            from orchd.gitops_ops import try_ff_merge_to_main
+
+            merge_state = try_ff_merge_to_main(project_root, task_id)
+            if merge_state and merge_state.get("state") == "diverged":
+                raise OrchdError(
+                    ErrorCode.E007,
+                    f"force_complete_diverged: 任务分支 {merge_state.get('branch')} 与 main "
+                    "已分叉，无法自动快进合并（逃生舱仅接受 --ff-only）。请先手工解决分叉"
+                    "（合并/rebase）使任务分支可快进到 main，再重新 force-status completed，"
+                    "防止静默并入错误代码。",
+                    [{"task_id": task_id, "branch": merge_state.get("branch"),
+                      "guidance": "resolve_divergence_then_retry"}],
+                )
+
         event = _make_event(
             task_id, agent_id, "FORCE_STATUS",
             target_status=target_status,
@@ -2231,6 +2245,9 @@ def force_status(
         "new_status": target_status,
         "reason": reason,
     }
+    # W-5：completed 逃生隐含的落码结果透出（merged / already_in_main / None）。
+    if target_status == "completed" and merge_state is not None:
+        result["merge"] = merge_state
     # task-14-worktree-lifecycle（AC3）：终态（completed/cancelled）自动回收任务
     # worktree（git worktree remove + 删分支 + 解绑，best-effort）。
     if target_status in ("completed", "cancelled") and project_root:

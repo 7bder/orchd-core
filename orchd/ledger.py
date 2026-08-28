@@ -42,7 +42,9 @@ from orchd.lockfile import ExclusiveFileLock, read_locked_text
 # 之后新增 TaskState 字段时递增本常量即可触发一次全量重建（字段漂移自愈）。
 # v2（2026-08-27）：review_claimed_session 引入（e7e70a8）时漏 bump，既有
 # checkpoint 缺该字段且自愈永不触发 → E030 持续告警；bump 至 2 触发一次自愈。
-_CHECKPOINT_SCHEMA_VERSION = 2
+# v3（2026-08-28，W-2）：新增 review_claimed_at（僵尸审查认领判定）后 bump，
+# 触发一次 replay_full 自愈，避免旧 checkpoint 缺该字段自我传播 → E030。
+_CHECKPOINT_SCHEMA_VERSION = 3
 
 
 @dataclass
@@ -63,6 +65,9 @@ class TaskState:
         attempt_count:      累计尝试次数，每次 DONE 事件递增；FORCE_STATUS(pending) 时重置为 0。
         review_phase:       当前审核阶段类型（如 ``"spec"`` 或 ``"code"``），无审核时为 None。
         review_claimed_by:  认领该审核的 reviewer agent ID，未认领时为 None。
+        review_claimed_at:  审查认领发生的 ISO 时间戳（源自 REVIEW_CLAIMED 事件的
+                             timestamp）。用于僵尸审查认领判定（W-2）：in_review 且
+                            认领超时未见提交 → 可接管。未认领/已提交时为 None。
         merge_warning:      代码审查通过后 git merge 未执行（环境异常/best-effort 降级），
                             标记完成但 merge 未落地，audit-merge 需告警。仅 completed 有值。
     """
@@ -74,6 +79,7 @@ class TaskState:
     review_phase: str | None = None
     review_claimed_by: str | None = None
     review_claimed_session: str | None = None
+    review_claimed_at: str | None = None
     merge_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,6 +100,8 @@ class TaskState:
             d["review_claimed_by"] = self.review_claimed_by
         if self.review_claimed_session:
             d["review_claimed_session"] = self.review_claimed_session
+        if self.review_claimed_at:
+            d["review_claimed_at"] = self.review_claimed_at
         if self.merge_warning:
             d["merge_warning"] = self.merge_warning
         return d
@@ -113,8 +121,69 @@ class TaskState:
             review_phase=d.get("review_phase"),
             review_claimed_by=d.get("review_claimed_by"),
             review_claimed_session=d.get("review_claimed_session"),
+            review_claimed_at=d.get("review_claimed_at"),
             merge_warning=d.get("merge_warning"),
         )
+
+
+# 僵尸审查认领（W-2）：审查认领超过该时长且未见提交，即由 request / status /
+# doctor 浮出、可供接管。默认 10 分钟（复用本次实测校准值）。
+_REVIEW_STALE_DEFAULT_S = 600
+
+
+def review_stale_timeout_s() -> float:
+    """返回审查认领超时秒数；环境变量 ``ORCHD_REVIEW_STALE_SECS`` 可覆盖（测试用）。"""
+    env = os.environ.get("ORCHD_REVIEW_STALE_SECS")
+    if env is not None:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _REVIEW_STALE_DEFAULT_S
+
+
+def review_claim_age_s(claimed_at: str | None, now: str | None = None) -> float | None:
+    """审查认领距今秒数。时间戳缺失/不可解析 → None（不判 stale，避免误伤）。"""
+    if not claimed_at:
+        return None
+    try:
+        t = datetime.fromisoformat(claimed_at)
+        base = datetime.fromisoformat(now) if now else datetime.now(t.tzinfo)
+        return (base - t).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def stale_review_claims(
+    state: dict[str, TaskState],
+    timeout_s: float | None = None,
+    now: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """从派生状态找出「僵尸审查认领」：in_review 且有认领、认领超时未见提交。
+
+    仅依据派生状态（status / review_claimed_by / review_claimed_at）判定，不加
+    ledger 扫描、不引入独立标志位（与 replay 同源，判定即派生）。``timeout_s`` /
+    ``now`` 缺省取常量/环境覆盖与当前时刻，便于测试注入。
+
+    返回 ``{task_id: {claimed_by, claimed_session, review_phase, age_s, timeout_s}}``。
+    """
+    tmo = review_stale_timeout_s() if timeout_s is None else timeout_s
+    stale: dict[str, dict[str, Any]] = {}
+    for tid, ts in state.items():
+        if not (ts.status == "in_review" and ts.review_claimed_by and ts.review_claimed_at):
+            continue
+        age = review_claim_age_s(ts.review_claimed_at, now)
+        if age is not None and age >= tmo:
+            stale[tid] = {
+                "claimed_by": ts.review_claimed_by,
+                "claimed_session": ts.review_claimed_session,
+                "review_phase": ts.review_phase or "spec",
+                "age_s": round(age),
+                "timeout_s": tmo,
+            }
+    return stale
 
 
 def generate_event_id() -> str:
@@ -469,8 +538,34 @@ def resolve_workspace_root(project_root: Path) -> Path:
 # claim/done（账本锁）不被一次 amend 阻塞。
 
 _INTAKE_LOCK_FILENAME = ".intake.lock"
-# 准入写最长持有锁的超时（秒）。超过视为僵死锁，可强制接管/清理。
+# 准入写最长持有锁的超时（秒）。超过视为僵死锁，watchdog 可巡检/告警（task-admission-lock-engine）。
 _INTAKE_LOCK_TIMEOUT = 120
+# 准入写获取锁的阻塞等待上限（秒）。超过即抛 E012 并给出明确处置指引，不无限等待。
+# 可用环境变量 ORCHD_INTAKE_LOCK_WAIT_SECS 覆盖（task-admission-lock-engine：A 项）。
+_INTAKE_LOCK_WAIT_SECS = 60
+
+# 进程内准入锁注册表（task-admission-lock-engine 修复）：按规范锁路径持有
+# (ExclusiveFileLock, refcount)，实现同一进程内嵌套获取的可重入，避免
+# init → bootstrap_container 对同一 .intake.lock 的自死锁；跨进程仍依赖底层
+# flock 真实互斥（并发 agent 阻塞等待）。
+_intake_lock_registry: dict = {}
+
+
+def _intake_lock_wait_secs() -> float:
+    """准入写获取锁的阻塞等待上限（秒）。
+
+    默认 :data:`_INTAKE_LOCK_WAIT_SECS`（60s）；环境变量
+    ``ORCHD_INTAKE_LOCK_WAIT_SECS`` 可覆盖（须为正数）。
+    """
+    env = os.environ.get("ORCHD_INTAKE_LOCK_WAIT_SECS")
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return float(_INTAKE_LOCK_WAIT_SECS)
 
 
 def intake_lock_path(orchd_dir: Path) -> Path:
@@ -530,62 +625,106 @@ def intake_lock_check(
 
 
 def intake_lock_acquire(
-    orchd_dir: Path, agent_id: str, timeout_s: float = _INTAKE_LOCK_TIMEOUT
+    orchd_dir: Path, agent_id: str, timeout_s: float | None = None
 ) -> dict[str, Any]:
     """获取准入写锁（ExclusiveFileLock 原语，flock 为唯一互斥权威，无强夺接管）。
 
     与账本 Store 锁解耦：这里锁 ``.intake.lock``，不阻塞并行 claim/done。
-    多进程尝试准入写时，后到者非阻塞获取失败即抛 E012——**无**旧实现的
-    "blocking-flock→释放→读JSON超时→覆盖" 强夺路径（flock 崩溃自动释放，
-    无需时间戳接管）。
+    多进程尝试准入写时，后到者**阻塞等待** ``timeout_s``（默认 60s，可经
+    ``ORCHD_INTAKE_LOCK_WAIT_SECS`` 覆盖）——正常并发的持有者释放后即自动成功，
+    **不再**"无声卡死"；仅当真正僵死（持锁进程挂起/未退出）超过等待上限才抛 E012。
 
     Args:
         orchd_dir: .orchd 目录。
         agent_id: 当前 agent（仅写入诊断标记，不参与互斥）。
-        timeout_s: 保留形参（原超时接管语义已移除），与旧签名兼容。
+        timeout_s: 阻塞等待上限（秒）；``None`` → :func:`_intake_lock_wait_secs`
+            （默认 60s，env 可覆盖）。
 
     Returns:
         锁句柄 dict（传给 :func:`intake_lock_release`）。
 
     Raises:
-        OrchdError: E012 获取失败（被其他进程持有）。
+        OrchdError: E012 等待 ``timeout_s`` 内仍未拿到锁（持有者僵死）。
     """
-    lock = ExclusiveFileLock(intake_lock_path(orchd_dir))
+    wait = _intake_lock_wait_secs() if timeout_s is None else timeout_s
+    canonical = intake_lock_path(orchd_dir).resolve()
+    # 进程内可重入（task-admission-lock-engine 修复）：同一进程对同一锁路径，
+    # 仅引用计数 +1，不重复 flock——避免 init → bootstrap_container 的嵌套自死锁，
+    # 同时保留跨进程真实 flock 互斥（并发 agent 仍阻塞等待）。
+    entry = _intake_lock_registry.get(canonical)
+    if entry is not None:
+        entry["refcount"] += 1
+        return {
+            "acquired": True,
+            "agent_id": agent_id,
+            "path": str(canonical),
+            "_lock": entry["lock"],
+            "reentrant": True,
+        }
+    lock = ExclusiveFileLock(canonical)
     try:
-        lock.acquire(blocking=False)
+        lock.acquire(blocking=True, timeout_s=wait)
     except OrchdError as exc:
-        # 注入 intake 语义，保留 E012
+        # 注入 intake 语义，保留 E012；hint 明确化（task-admission-lock-engine：C 项）
         raise OrchdError(
             ErrorCode.E012,
             "lock_timeout: failed to acquire .intake.lock (准入写被并发 agent 持有)",
-            [{"path": str(lock.lock_path.resolve()),
-              "hint": "另一 agent 正在执行 intake/amend。稍后重试，或对其僵死锁执行 watchdog 接管。"}],
+            [{
+                "path": str(canonical),
+                "timeout_s": wait,
+                "hint": (
+                    "另一 agent 正在执行准入写（intake / amend / roadmap-land / idea *）。"
+                    f"已阻塞等待 {round(wait)}s 仍未拿到锁。若长时间无进展，可能是其进程僵死"
+                    "（卡在子进程 / 等待交互）：请检查其进程，或等待其退出"
+                    "（flock 将在进程退出时由内核自动释放），不要无上限重试。"
+                ),
+            }],
         ) from exc
+    _intake_lock_registry[canonical] = {"lock": lock, "refcount": 1}
     # 诊断标记（best-effort，非互斥依据）：供 intake_lock_check 报障
     try:
         lock.write_text(
             json.dumps({"agent_id": agent_id, "timestamp": str(time.time()),
-                        "path": str(lock.lock_path.resolve())}, ensure_ascii=False) + "\n"
+                        "path": str(canonical)}, ensure_ascii=False) + "\n"
         )
     except OSError:
         pass
     return {"acquired": True, "agent_id": agent_id,
-            "path": str(lock.lock_path.resolve()), "_lock": lock}
+            "path": str(canonical), "_lock": lock}
 
 
 def intake_lock_release(lock: dict[str, Any]) -> None:
     """释放准入锁（ExclusiveFileLock 原语释放）。
 
-    lock 为 intake_lock_acquire 返回值。**不 unlink 锁文件**：文件永久保留，
-    flock 释放后由 :func:`intake_lock_check` 判为未持有——避免"unlink 后新进程
-    建新 inode"导致的 flock 失效（unlink-alias），及"文件被删却仍认为持锁"。
+    进程内可重入：仅当引用计数归零才真正 flock 释放（与 :func:`intake_lock_acquire`
+    的嵌套获取配对）。**不 unlink 锁文件**：文件永久保留，flock 释放后由
+    :func:`intake_lock_check` 判为未持有——避免 unlink-alias / 删后误判持锁。
     """
     lk = lock.get("_lock")
-    if lk is not None:
+    if lk is None:
+        return
+    canonical = None
+    p = lock.get("path")
+    if p:
+        try:
+            canonical = Path(p).resolve()
+        except (OSError, ValueError):
+            canonical = None
+    entry = _intake_lock_registry.get(canonical) if canonical else None
+    if entry is None:
+        # 不在注册表（跨进程持锁句柄 / 异常路径）→ 直接释放底层锁，不碰注册表
         try:
             lk.release()
         except (OSError, IOError):
             pass
+        return
+    entry["refcount"] -= 1
+    if entry["refcount"] <= 0:
+        try:
+            lk.release()
+        except (OSError, IOError):
+            pass
+        _intake_lock_registry.pop(canonical, None)
 
 
 def intake_lock_clear(orchd_dir: Path) -> dict[str, Any]:
@@ -1086,6 +1225,7 @@ class Store:
                 ts.review_phase = None
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
+                ts.review_claimed_at = None
 
             elif etype == "DONE":
                 ts.status = "done"
@@ -1096,10 +1236,12 @@ class Store:
                 ts.review_phase = event.get("review_type")
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
+                ts.review_claimed_at = None
 
             elif etype == "REVIEW_CLAIMED":
                 ts.review_claimed_by = event.get("agent_id")
                 ts.review_claimed_session = event.get("session_id")
+                ts.review_claimed_at = event.get("timestamp")
 
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
@@ -1114,6 +1256,7 @@ class Store:
                         ts.review_phase = None
                         ts.review_claimed_by = None
                         ts.review_claimed_session = None
+                        ts.review_claimed_at = None
                         # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
                         # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
                         ts.merge_warning = event.get("merge_warning")
@@ -1132,6 +1275,7 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
 
             elif etype == "FORCE_STATUS":
                 # 强制状态覆盖：根据 target_status 重置关联字段，
@@ -1144,6 +1288,7 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
                     ts.claimed_by = None
                     ts.claimed_session = None
                 elif target == "claimed":
@@ -1157,12 +1302,14 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
                 elif target == "completed":
                     # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
                     # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
 
             elif etype == "RETRACT":
                 target_eid = event.get("target_event_id", "")
@@ -1248,6 +1395,7 @@ class Store:
                 ts.review_phase = None
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
+                ts.review_claimed_at = None
             elif etype == "DONE":
                 ts.status = "done"
                 ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
@@ -1256,9 +1404,11 @@ class Store:
                 ts.review_phase = event.get("review_type")
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
+                ts.review_claimed_at = None
             elif etype == "REVIEW_CLAIMED":
                 ts.review_claimed_by = event.get("agent_id")
                 ts.review_claimed_session = event.get("session_id")
+                ts.review_claimed_at = event.get("timestamp")
             elif etype == "REVIEW_SUBMITTED":
                 verdict = event.get("verdict", "")
                 review_type = event.get("review_type")
@@ -1269,6 +1419,7 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
                     # B1（2026-08-13 full-audit-v2）：与 _apply_events 保持一致——
                     # merge 降级标记随事件持久化。全量重建（RETRACT / check_integrity
                     # 前缀重放）若不设置，merge_warning 将丢失：既让 audit-merge
@@ -1288,6 +1439,7 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
             elif etype == "FORCE_STATUS":
                 # 强制状态覆盖：与 _apply_events 中逻辑一致
                 target = event.get("target_status", "pending")
@@ -1297,6 +1449,7 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
                     ts.claimed_by = None
                     ts.claimed_session = None
                 elif target == "claimed":
@@ -1308,11 +1461,13 @@ class Store:
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
                 elif target == "completed":
                     # 与 _apply_events 一致：强制完成仅清空审查字段
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
+                    ts.review_claimed_at = None
 
     # ------------------------------------------------------------------
     # Checkpoint

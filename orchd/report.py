@@ -905,8 +905,32 @@ def watchdog(
         except Exception:
             pass
 
+    # 准入写锁巡检（task-admission-lock-engine：B 项）：.intake.lock 僵死结构化告警，
+    # 不自动强夺——flock 在持锁进程退出时由内核自动释放，无需接管。
+    intake_lock_alert: dict[str, Any] | None = None
+    try:
+        from orchd.ledger import intake_lock_check
+
+        ic = intake_lock_check(store.orchd_dir)
+        if ic.get("locked") or ic.get("reason") == "timeout":
+            intake_lock_alert = {
+                "status": "alert" if ic.get("locked") else "stale_marker",
+                "locked": ic.get("locked", False),
+                "agent_id": ic.get("agent_id"),
+                "age_s": ic.get("age_s"),
+                "reason": ic.get("reason"),
+                "hint": (
+                    "准入写锁 .intake.lock 被持有或残留超时标记。flock 在持锁进程退出时"
+                    "自动释放，请勿强行强夺；若持锁进程已僵死，请等待其退出或人工接管后再重试。"
+                ),
+            }
+    except Exception:
+        # best-effort：准入锁巡检失败不影响既有 watchdog 行为
+        pass
+
     result = {
         "stuck_tasks": stuck,
+        "intake_lock": intake_lock_alert,
         "summary": f"{len(stuck)} 个任务可能僵死",
         # 扩展字段（便于脚本集成）
         "stuck_count": len(stuck),

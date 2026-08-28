@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
 
+    command = _command_name(args)
     try:
         result = args.func(args)
         if result is None:
@@ -49,11 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         # 支持命令返回 (dict, exit_code) 元组
         if isinstance(result, tuple):
             data, code = result
-            data = _attach_guidance(data)
+            data = _attach_guidance(data, command)
             _output(data)
             _emit_guidance(data)
             return code
-        data = _attach_guidance(result)
+        data = _attach_guidance(result, command)
         _output(data)
         _emit_guidance(data)
         return 0
@@ -80,7 +81,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _attach_guidance(data: Any) -> Any:
+def _command_name(args: Any) -> str:
+    """从已解析 args 反推当前命令名（子命令首 token，如 status / force-status / session）。
+
+    引擎侧无感引导分级（task-guide-tiering）需要知道所属命令；argparse 不直接暴露
+    命令名，这里从 func 名（``_cmd_xxx``）映射回连字符风格命令名。子命令
+    （如 ``_cmd_session_current`` → ``session-current``）按 func 名派生。
+    """
+    func = getattr(args, "func", None)
+    if func is None:
+        return ""
+    name = getattr(func, "__name__", "")
+    if name.startswith("_cmd_"):
+        return name[len("_cmd_"):].replace("_", "-")
+    return name
+
+
+def _attach_guidance(data: Any, command: str = "") -> Any:
     """为命令 JSON 响应统一附加 guidance 字段（task-guide-seamless-guidance）。
 
     无感引导契约：
@@ -100,6 +117,16 @@ def _attach_guidance(data: Any) -> Any:
     """
     if not isinstance(data, dict):
         return data
+    # W-1 分级（task-guide-tiering）：T0 读/健康命令 guidance 置空，直接返回，
+    # 不进入状态推导（避免读/健康命令也被灌入引导信息）。
+    try:
+        from orchd.guide import guidance_tier
+        tier = guidance_tier(command)
+        if tier == 0:
+            data["guidance"] = ""
+            return data
+    except Exception:
+        tier = 2
     try:
         from orchd.ledger import Store
         from orchd.spec import load_master
@@ -114,7 +141,7 @@ def _attach_guidance(data: Any) -> Any:
 
         from orchd.guide import (
             next_guidance, resolve_read_paths, attach_rule_summaries,
-            context_guidance,
+            context_guidance, slim_guidance, _classify,
         )
         # task-guidance-dual-view-engine：传 agent_id（_resolve_agent_id 解析）与
         # has_master（master_path.exists()），支撑双视角与未初始化/空项目区分。
@@ -124,9 +151,23 @@ def _attach_guidance(data: Any) -> Any:
         agent_id = _resolve_agent_id(orchd_dir)
         has_master = master_path.exists()
         review_mode = resolve_review_mode(orchd_dir)
-        # 分支以命令实际所在 worktree 为准（容器布局下 agent 在独立 task worktree
-        # 跑命令），避免 ORCHD_HOME 指向 canonical 主工作树时误判成主分支。
-        branch = get_current_branch(Path.cwd()) or get_current_branch(orchd_dir.parent)
+        # W-4 登记表权威分支：cwd 仅作最后一次兜底，不再优先。先算聚焦任务，再从
+        # session-worktrees.json 登记表取该任务 worktree 的真实分支；无绑定才回退
+        # 调用进程 cwd 分支。保证 branch_ctx 描述的是引擎即将操作的 worktree，
+        # 而非工具进程 cwd（复盘 P1：主 worktree cwd 误判成"当前在 task 分支"）。
+        cls = _classify(state, tasks, agent_id, has_master, review_mode)
+        focus_tid = cls.get("focus_tid")
+        cwd_branch = get_current_branch(Path.cwd()) or get_current_branch(orchd_dir.parent)
+        branch = cwd_branch
+        if focus_tid:
+            try:
+                from orchd.ledger import resolve_store_dir
+                from orchd.worktree import resolve_task_branch
+                task_branch = resolve_task_branch(resolve_store_dir(orchd_dir), focus_tid)
+                if task_branch:
+                    branch = task_branch
+            except Exception:
+                pass  # best-effort：登记表解析失败回退 cwd
 
         guidance = data.get("guidance")
         if not isinstance(guidance, dict):
@@ -137,7 +178,6 @@ def _attach_guidance(data: Any) -> Any:
             )
             # task-guidance-rule-summary：read 过滤后追加 rules 键（TL;DR 摘要）
             guidance = attach_rule_summaries(guidance, orchd_dir)
-            data["guidance"] = guidance
 
         # task-guide-transition-aware：分支纪律 + 聚焦任务状态由来（加法式新键，
         # 已有 guidance 的既有字段保持不变）
@@ -157,7 +197,10 @@ def _attach_guidance(data: Any) -> Any:
                         view.update(vctx)
             guidance = resolve_read_paths(guidance, orchd_dir)
             guidance = attach_rule_summaries(guidance, orchd_dir)
-            data["guidance"] = guidance
+
+        # W-1 精简（task-guide-tiering）：最终收敛为分级精简结构（单视角 5 键、
+        # 去 agent_view/project_view/template、hint 单行、read≤2）。
+        data["guidance"] = slim_guidance(guidance, ctx, tier)
     except Exception:
         # best-effort：引导失败静默跳过，绝不阻塞命令主流程
         pass
@@ -186,7 +229,8 @@ def _emit_guidance(data: Any) -> None:
     if not _guidance_stderr_enabled():
         return
     command = g.get("command") or "<无命令>"
-    rules = g.get("rules") or []
+    read = g.get("read") or []
+    branch_ctx = g.get("branch_ctx")
     sep = "─" * 40
     lines = [
         "",
@@ -194,16 +238,13 @@ def _emit_guidance(data: Any) -> None:
         f"orchd ▸ {hint}",
         f"建议执行：{command}",
     ]
-    # task-guide-transition-aware：转换感知上下文块（分支纪律 + 状态由来）
-    transition = g.get("transition")
-    if isinstance(transition, dict) and transition.get("hint"):
-        lines.append(f"orchd ▸ [转换] {transition['hint']}")
-    branch_ctx = g.get("branch_ctx")
+    # W-1 精简（task-guide-tiering）：transition/红线已并入 hint，顶层只保留
+    # branch_ctx 作一块；read[] 指向需按需读取的文件清单（不展开规则内容）。
     if isinstance(branch_ctx, dict) and branch_ctx.get("hint"):
         lines.append(f"orchd ▸ [分支] {branch_ctx['hint']}")
-    if rules:
-        lines.append("关键红线：")
-        lines.extend(f"  · {r}" for r in rules)
+    if read:
+        lines.append("按需读取：")
+        lines.extend(f"  · {r}" for r in read)
     # 经验回灌注入（设计 §8.4）：错误响应命中 lesson cases 时打印历史经验参考。
     cases = g.get("cases")
     if cases:
@@ -215,7 +256,12 @@ def _emit_guidance(data: Any) -> None:
             lines.append(f"  · [{c.get('id')}] {c.get('symptom')}{tag}{drift_text}")
             lines.append(f"    解法：{c.get('solution')}")
     lines.extend([sep, ""])
-    print("\n".join(lines), file=sys.stderr)
+    block = "\n".join(lines)
+    # W-1 文本上限：stderr 提示块 ≤ ~200 字符（超出省略，避免刷屏）。
+    if len(block) > 200:
+        block = block[:197] + "..."
+        block += "\n" + sep + "\n"
+    print(block, file=sys.stderr)
 
 
 def resolve_guidance_paths(
@@ -562,6 +608,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--path", default=".", help="flat 主工作树根，默认当前目录")
     p.set_defaults(func=_cmd_layout_migrate)
+
+    # full-regression（task-full-regression-gate-r2）：全量回归并记录 last_pass_commit
+    p = sub.add_parser(
+        "full-regression",
+        help="跑全量 pytest 并通过后写 .orchd/_full_regression.json（last_pass_commit）；失败不写通过标记",
+    )
+    p.add_argument("--path", default=None, help="项目根目录，默认当前目录")
+    p.set_defaults(func=_cmd_full_regression)
 
     # intake（2026-08-14 intake-commit-enforcement）
     p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md；ROADMAP.md 不纳入 git，自动跳过）并校验状态合法性")
@@ -1069,13 +1123,25 @@ def _cmd_init(args) -> dict:
     from orchd.spec import load_master
     from orchd.split import init
     from orchd.worktree import bootstrap_container, read_layout, write_layout
+    from orchd.ledger import (
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
 
     master_path = Path(args.master).resolve()
     orchd_dir = master_path.parent
     project_root = orchd_dir.parent
 
-    # 新项目（无 master）→ 默认 container（AC3）
+    # 初始化串行化（task-admission-lock-engine：E 项）—— 并发 orchd init 竞态防护。
+    # 关键约束：锁必须加在「稳定、不会被 shutil.move 搬动」的路径上，否则 Windows
+    # 会因锁文件被持有时无法 rename 目录而报 WinError 5/33（E999）。
+    # - 新项目（无 master）→ 串行化交由 bootstrap_container：它锁最终稳定的
+    #   main/.orchd/.intake.lock（该目录在 git init / move 之后才存在，move 前尚无）；
+    # - 既有项目（master 已存在）→ 对稳定存在的 orchd_dir 加 .intake.lock。
+    # 两路径不同、互不嵌套，既避免自死锁，也避免锁文件被 move 搬动。
     if not master_path.exists():
+        # 新项目（无 master）→ 默认 container（AC3）；串行化交予 bootstrap_container。
         boot = bootstrap_container(project_root, master_path)
         orchd_dir = Path(boot["main_worktree"]) / ".orchd"
         master = load_master(orchd_dir / "_master.json")
@@ -1087,11 +1153,18 @@ def _cmd_init(args) -> dict:
         result["created_files"] = boot["created"] + result.get("created_files", [])
         return result
 
-    # 既有项目（master 已存在）→ flat（AC5 零回归）；标记缺失时补写 flat 标记（AC2）
-    if read_layout(orchd_dir) is None:
-        write_layout(orchd_dir, "flat", project_root)
-    master = load_master(master_path)
-    return init(orchd_dir, master)
+    # 既有项目（master 已存在）→ flat（AC5 零回归）；标记缺失时补写 flat 标记（AC2）。
+    # 串行化：对稳定存在的 orchd_dir 加 .intake.lock（不会被移动）。
+    lk = None
+    try:
+        lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+        if read_layout(orchd_dir) is None:
+            write_layout(orchd_dir, "flat", project_root)
+        master = load_master(master_path)
+        return init(orchd_dir, master)
+    finally:
+        if lk is not None:
+            intake_lock_release(lk)
 
 
 def _cmd_amend(args) -> dict:
@@ -1269,7 +1342,7 @@ def _cmd_request(args) -> dict:
     不再有 --agent/--role。
     返回: 匹配的任务信息或空结果。--auto-claim 时附加 claim 结果（或错误）。
     """
-    from orchd.ledger import Store
+    from orchd.ledger import Store, stale_review_claims
     from orchd.onboard import claim, request
 
     tasks, orchd_dir, master = _load_tasks()
@@ -1290,6 +1363,32 @@ def _cmd_request(args) -> dict:
         ),
         enforce_self_review_block=enforce_self_review_block,
     )
+
+    # W-2 僵尸审查认领巡检：request 响应恒附 stale_reviews，无候选时把
+    # next_action 抬为 review_takeover 并给接管命令，避免 agent 卡在死锁里
+    # （判定复用 ledger 派生，与 status/doctor 一致）。
+    stale_reviews: dict[str, dict[str, object]] = {}
+    try:
+        stale_reviews = stale_review_claims(store.replay())
+    except Exception:
+        pass
+    if stale_reviews:
+        ordered = sorted(stale_reviews.items(), key=lambda kv: kv[1]["age_s"], reverse=True)
+        result["stale_reviews"] = [
+            {"task_id": tid, **v} for tid, v in ordered
+        ]
+        takeover_msg = (
+            f"僵尸审查认领 {len(stale_reviews)} 个（认领超时未提交）："
+            + "、".join(f"{tid}({v['review_phase']},{v['claimed_by']},{v['age_s']}s)" for tid, v in ordered)
+            + "。可接管：先 python .orchd/__main__.py retract --task <id> --type "
+            "REVIEW_CLAIMED（引擎对超时认领放行跨 agent 回收），再重新认领审查。"
+        )
+        if result.get("message"):
+            result["message"] = f"{result['message']} {takeover_msg}"
+        else:
+            result["message"] = takeover_msg
+        if result.get("candidate") is None:
+            result["next_action"] = "review_takeover"
 
     # 无候选（candidate=None / next_action=exit|wait）：以引擎分配为准，
     # 附加 stop_wait 引导，明确"停止等待用户指令"，防止 agent 自行 claim/重试。
@@ -1517,11 +1616,17 @@ def _cmd_claim(args) -> dict:
     """
     from orchd.ledger import Store
     from orchd.onboard import claim
+    from orchd.worktree import resolve_canonical_project_root
 
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
     shared = master.shared if hasattr(master, "shared") else None
-    project_root = orchd_dir.parent
+    # canonical-project-root（2026-08-28 修复）：claim 的 project_root 与
+    # pool/status/done 等读一致统一走 canonical。否则在容器根（其下残留
+    # .orchd 时 _find_orchd_dir 会命中容器根）执行 claim，ensure_task_wt 的
+    # _propagate_container_marker 会把任务 worktree 布局标记的 main_worktree
+    # 写成容器根，导致任务 worktree 账本解析错位（done 报 not in claimed）。
+    project_root = resolve_canonical_project_root(orchd_dir.parent)
     agent_id = _require_agent_id(orchd_dir)
     role = _detect_claim_role(store, tasks, args.task)
     enforce_self_review_block = bool(
@@ -1778,6 +1883,66 @@ def _cmd_ideas_archive(args) -> dict:
     return _maybe_archive_ideas(orchd_dir)
 
 
+def _cmd_full_regression(args) -> tuple[dict, int]:
+    """跑全量 pytest 并通过后写 .orchd/_full_regression.json（task-full-regression-gate-r2）。
+
+    全量回归通过 → 记录 last_pass_commit=当前 HEAD + passed_at；失败不写通过标记、
+    返回非零退出码（供 sync_orchd_core.sh 发版前检查消费）。
+    """
+    import subprocess
+    import time
+    from datetime import datetime, timezone
+
+    from orchd.subproc import run_shell
+
+    project_root = Path(args.path).resolve() if args.path else Path.cwd()
+    orchd_dir = project_root / ".orchd"
+    reg_cmd = (
+        f'"{sys.executable}" -m pytest tests/ -q '
+        f'--basetemp="${{TMPDIR:-/tmp}}/orchd-fullreg-$$"'
+    )
+    reg_started = time.monotonic()
+    try:
+        reg_result = run_shell(reg_cmd, str(project_root), 600)
+    except subprocess.TimeoutExpired:
+        reg_elapsed = round(time.monotonic() - reg_started, 1)
+        return {
+            "ok": False,
+            "code": "full_regression_timeout",
+            "message": f"全量回归超时（600s）after {reg_elapsed}s",
+        }, 1
+    reg_elapsed = round(time.monotonic() - reg_started, 1)
+    if reg_result.returncode != 0:
+        return {
+            "ok": False,
+            "code": "full_regression_failed",
+            "message": f"exit code {reg_result.returncode} after {reg_elapsed}s",
+            "details": {
+                "returncode": reg_result.returncode,
+                "elapsed_seconds": reg_elapsed,
+            },
+        }, 1
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(project_root),
+        capture_output=True, text=True,
+    ).stdout.strip()
+    payload = {
+        "last_pass_commit": head,
+        "passed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "command": "python -m pytest tests/ -q",
+    }
+    orchd_dir.mkdir(exist_ok=True)
+    (orchd_dir / "_full_regression.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return {
+        "ok": True,
+        "last_pass_commit": head,
+        "elapsed_seconds": reg_elapsed,
+        "note": f"已写入 {orchd_dir / '_full_regression.json'}",
+    }, 0
+
+
 def _cmd_doctor(args):
     """检测 git 仓库完整性（只读，task-git-doctor-command）。
 
@@ -1906,7 +2071,7 @@ def _cmd_status(args) -> dict:
     args.audit_merge（--audit-merge，附加只读 merge 巡检）。
     返回: 全局状态字典或单任务详情字典；若 --text 模式则直接打印表格并返回 None。
     """
-    from orchd.ledger import Store
+    from orchd.ledger import Store, stale_review_claims
     from orchd.report import intake_audit, merge_audit, revive_audit, status, task_integrity_audit
 
     tasks, orchd_dir, master = _load_tasks()
@@ -1919,6 +2084,18 @@ def _cmd_status(args) -> dict:
         project_root=orchd_dir.parent,
         active_only=not getattr(args, "all", False),
     )
+    # W-2 僵尸审查认领：status 读路径浮现超时未提交的审查认领（同 request 判定），
+    # 让"任何一次状态查看"都能暴露僵局，不依赖后续再发 request。
+    if not args.text:
+        try:
+            _stale = stale_review_claims(store.replay())
+        except Exception:
+            _stale = {}
+        if _stale:
+            result["stale_reviews"] = [
+                {"task_id": tid, **v}
+                for tid, v in sorted(_stale.items(), key=lambda kv: kv[1]["age_s"], reverse=True)
+            ]
     # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
     if not args.text:
         exclude = args.task or _current_task_from_branch(orchd_dir.parent)

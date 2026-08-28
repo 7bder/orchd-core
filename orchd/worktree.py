@@ -335,52 +335,66 @@ def bootstrap_container(project_root: Path, master_path: Path) -> dict[str, Any]
     main_dir = project_root / _CONTAINER_MAIN_DIR
     created: list[str] = []
 
-    main_dir.mkdir(parents=True, exist_ok=True)
-    created.append(str(main_dir.relative_to(project_root)))
+    # 初始化串行化（task-admission-lock-engine：E 项）—— 并发 init 竞态防护。
+    # 直接把 master / 布局落盘到最终稳定的 main/.orchd（不再经「暂存目录 +
+    # shutil.move」搬运）：锁文件始终落在 main/.orchd/.intake.lock（稳定、永不被
+    # 搬动），避免 Windows 因持锁目录被 rename 而报 WinError 5/33（E999）。
+    # 进程内可重入（ledger 注册表），同进程同路径二次获取不重复阻塞。
+    from orchd.ledger import (
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
 
-    # 默认 master：先写容器根 .orchd/，随后整体移入 main/.orchd/
-    orchd_src = project_root / ".orchd"
-    orchd_src.mkdir(parents=True, exist_ok=True)
-    if not master_path.exists():
-        master_path.write_text(
-            json.dumps(_default_master(main_dir), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        created.append(str(master_path.relative_to(project_root)))
-
-    # git init（best-effort；已是 git 仓库则跳过）
-    if not (main_dir / ".git").exists():
-        subprocess.run(
-            ["git", "init", "-q"],
-            cwd=str(main_dir),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_GIT_TIMEOUT,
-        )
-
-    # 移入 main/.orchd/（若存在）
     orchd_dst = main_dir / ".orchd"
-    if orchd_src.exists() and not orchd_dst.exists():
-        shutil.move(str(orchd_src), str(orchd_dst))
-        created.append(str(orchd_dst.relative_to(project_root)))
+    lk = None
+    try:
+        # 先建最终 orchd 目录（锁文件落点），再获取稳定的 .intake.lock
+        orchd_dst.mkdir(parents=True, exist_ok=True)
+        lk = intake_lock_acquire(orchd_dst, resolve_agent_id(orchd_dst))
+        main_dir.mkdir(parents=True, exist_ok=True)
+        created.append(str(main_dir.relative_to(project_root)))
 
-    # 共享账本 runtime 根
-    runtime = project_root / _RUNTIME_DIR
-    runtime.mkdir(parents=True, exist_ok=True)
-    created.append(str(runtime.relative_to(project_root)))
+        # 默认 master 直接写入 main/.orchd/（无需暂存 + move）
+        master_file = orchd_dst / "_master.json"
+        if not master_file.exists():
+            master_file.write_text(
+                json.dumps(_default_master(main_dir), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            created.append(str(master_file.relative_to(project_root)))
 
-    # 布局标记
-    write_layout(orchd_dst, "container", main_dir)
-    created.append(str(marker_path(orchd_dst).relative_to(project_root)))
+        # git init（best-effort；已是 git 仓库则跳过）
+        if not (main_dir / ".git").exists():
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=str(main_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_GIT_TIMEOUT,
+            )
 
-    return {
-        "container": True,
-        "main_worktree": str(main_dir),
-        "runtime_root": str(runtime),
-        "marker": str(marker_path(orchd_dst)),
-        "created": created,
-    }
+        # 共享账本 runtime 根
+        runtime = project_root / _RUNTIME_DIR
+        runtime.mkdir(parents=True, exist_ok=True)
+        created.append(str(runtime.relative_to(project_root)))
+
+        # 布局标记
+        write_layout(orchd_dst, "container", main_dir)
+        created.append(str(marker_path(orchd_dst).relative_to(project_root)))
+
+        result = {
+            "container": True,
+            "main_worktree": str(main_dir),
+            "runtime_root": str(runtime),
+            "marker": str(marker_path(orchd_dst)),
+            "created": created,
+        }
+    finally:
+        if lk is not None:
+            intake_lock_release(lk)
+    return result
 
 
 def layout_migrate(project_root: Path) -> dict[str, Any]:
@@ -626,6 +640,25 @@ def resolve_task_root(store_root: Path, task_id: str) -> Path | None:
     return Path(entry["worktree"])
 
 
+def resolve_task_branch(store_root: Path, task_id: str) -> str | None:
+    """登记表权威分支（W-4）：任务绑定 worktree → 该 worktree 真实分支；无绑定 None。
+
+    分支判定以 `session-worktrees.json` 登记表为**权威来源**：guidance 的
+    ``branch_ctx`` 应描述引擎即将操作的 worktree，而非工具进程的 cwd。无绑定
+    （flat 兼容 / 未走 claim 绑定）返回 None，由调用方回退 cwd（最后一次兜底）。
+
+    best-effort：读取 / git 探测异常静默返回 None，不阻塞引导。
+    """
+    wt = resolve_task_root(store_root, task_id)
+    if not wt:
+        return None
+    try:
+        from orchd.gitops import get_current_branch
+        return get_current_branch(wt)
+    except Exception:
+        return None
+
+
 def guard_task_root(
     project_root: Path | None,
     store_root: Path,
@@ -721,9 +754,17 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             # 已存在且是 worktree → 幂等复用（补写布局标记）
             _propagate_container_marker(wt_path, project_root)
             return {"worktree": wt_path, "separate": True, "created": False}
-        # 先尝试 branch + worktree 一并创建（-b 建分支），分支已存在则回退
+        # 创建期不变量硬化（W-4，复盘 P1 孤儿分支修复）：任务分支必须从**主分支**
+        # fork（`git worktree add -b task/<id> <path> <main>`），杜绝因主工作树当
+        # 前检出的非 main 分支而生成孤儿/悬空分支。base 解析失败（无 main/master）
+        # 则回退当前 HEAD（best-effort），仍可创建但依赖探测结果。
+        from orchd.gitops import get_default_branch
+        base = get_default_branch(project_root)
+        add_cmd = ["git", "worktree", "add", "-b", branch, str(wt_path)]
+        if base:
+            add_cmd.append(base)
         proc = subprocess.run(
-            ["git", "worktree", "add", "-b", branch, str(wt_path)],
+            add_cmd,
             cwd=str(project_root),
             capture_output=True,
             encoding="utf-8",
@@ -740,6 +781,19 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
                 timeout=30,
             )
         if proc.returncode == 0 and (wt_path / ".git").exists():
+            # 创建后校验不变量（W-4）：任务 worktree 检出恰为 task/<id> 分支且 HEAD
+            # 解析正常。校验失败即使 add 成功也视为创建异常 → 走降级告警（禁止静默
+            # 绑错分支/跑错目录，落地"静默降级禁止"硬约束）。
+            verify = _verify_task_wt(wt_path, branch)
+            if not verify["ok"]:
+                _cleanup_stale_task_wt(project_root, wt_path)
+                return {
+                    "worktree": project_root,
+                    "separate": False,
+                    "created": False,
+                    "degraded": True,
+                    "reason": verify["reason"],
+                }
             # 任务 worktree 自识别容器布局（共享账本根），见 _propagate_container_marker
             _propagate_container_marker(wt_path, project_root)
             return {"worktree": wt_path, "separate": True, "created": True}
@@ -748,6 +802,10 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
         reason = (proc.stderr or "").strip()[:300] or (
             f"git worktree add {str(wt_path)} 失败（exit {proc.returncode}）"
         )
+        # 2026-08-28 bug4 修复：add 失败可能残留半成品 worktree 元数据（git 注册 /
+        # 残留目录）。降级前 best-effort 清理孤儿 worktree，避免污染 git worktree
+        # list / doctor / 后续终态回收；仅清理「无效 worktree」，绝不误删有效 worktree。
+        _cleanup_stale_task_wt(project_root, wt_path)
         return {
             "worktree": project_root,
             "separate": False,
@@ -763,6 +821,64 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             "degraded": True,
             "reason": f"worktree add 异常: {exc}",
         }
+
+
+def _cleanup_stale_task_wt(project_root: Path, wt_path: Path) -> None:
+    """best-effort 清理 worktree add 失败残留的半成品元数据（孤儿 worktree）。
+
+    - ``git worktree prune``：移除指向已消失目录的失效 git 注册（安全）。
+    - 残留目录仅在其**非有效 worktree**（无 ``.git`` 标记）时删除，有标记
+      视为有效 worktree 绝不误删（与 remove_task_wt 的 P0-19 残留清理同构）。
+    任何失败静默跳过，不阻断降级主流程。
+    """
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    if not wt_path.exists() or (wt_path / ".git").exists():
+        return
+    try:
+        wt_path.rmdir()
+    except OSError:
+        try:
+            shutil.rmtree(str(wt_path), ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _verify_task_wt(wt_path: Path, expected_branch: str) -> dict[str, Any]:
+    """创建期不变量校验（W-4）：任务 worktree 检出分支恰为 task/<id> 且 HEAD 可解析。
+
+    Returns:
+        ``{"ok": True}`` 或 ``{"ok": False, "reason": str}``（best-effort，绝不抛异常）。
+    """
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(wt_path), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        if head.returncode != 0 or not head.stdout.strip():
+            return {"ok": False, "reason": f"任务 worktree HEAD 无法解析（{wt_path}）"}
+        cur = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(wt_path), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        actual = cur.stdout.strip() if cur.returncode == 0 else ""
+        if actual != expected_branch:
+            return {"ok": False,
+                    "reason": f"任务 worktree 检出分支 {actual or '<null>'}，期望 {expected_branch}"}
+        return {"ok": True}
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "reason": f"worktree 校验异常: {exc}"}
 
 
 def remove_task_wt(

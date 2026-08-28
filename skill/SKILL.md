@@ -57,6 +57,7 @@ python .orchd/__main__.py bootstrap
 5. 任何异常（verify 失败、merge 冲突、状态不符）立即停止并报告，不自行猜测处置。
 6. session 结束时工作区必须干净（无未提交改动），或在报告中说明。
 7. completed 任务关闭前运行 `status --audit-task` 实证声明文件完整性告警清零。
+8. **准入/会话锁占住时不盲重试**：收到 E012（准入写锁被其他 agent 持有并已等待超时）或 E019（会话锁被其他 session 持有）时，**不无限重试**——先查看持有者：正常并发的持有者会在其释放后自动成功（E012 已阻塞等待到超时上限）；长时间无进展则可能是持锁进程僵死（卡在子进程/等待交互），等待其退出（flock 由内核在进程退出时自动释放）或对僵死进程接管后再重试。准入锁相关命令统一走 `.intake.lock`（intake / amend / roadmap-land / idea *），初始化即 `init` / `bootstrap_container` 同样串行化。
 
 ## 身份约定（会话级指纹）
 - 身份 = 宿主注入 `ORCHD_SESSION_ID` 派生的 12 位 hex 会话指纹；同一对话内指纹不变，不同对话不同指纹。

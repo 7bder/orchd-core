@@ -145,7 +145,12 @@ def intake_commit(
           "status_warnings": [...], 可选 "commit_warning": {...}}``
     """
     from orchd.gitops import ensure_committed
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import (
+        resolve_workspace_root,
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
 
     project_root = Path(project_root)
     # canonical 共享读（task-canonical-workspace-docs，2026-08-25）：container 布局
@@ -165,26 +170,32 @@ def intake_commit(
     workspace_root = resolve_workspace_root(project_root)
     status_warnings = check_idea_statuses(workspace_root)
 
-    # 3) 强制提交摄入产物（IDEAS.md + ROADMAP.md）
-    paths = [str(workspace_root / "IDEAS.md"), str(workspace_root / "ROADMAP.md")]
-    commit_message = message or "chore(intake): orchd intake — commit intake products"
-    commit = ensure_committed(project_root, paths, commit_message)
-    result: dict[str, Any] = {
-        "committed": commit.get("performed") is True,
-        "commit": commit,
-    }
-    if status_warnings:
-        result["status_warnings"] = status_warnings
-    # 提交未执行（非 no_changes）→ commit_warning（降级可审计化）
-    if commit.get("performed") is False and commit.get("reason") != "no_changes":
-        result["commit_warning"] = {
-            "reason": commit.get("reason"),
-            "message": (
-                f"摄入产物 commit 未执行（{commit.get('reason')}）：改动可能未入库，"
-                "请人工核对（可运行 orchd status --audit-intake 巡检）"
-            ),
+    # 3) 强制提交摄入产物（IDEAS.md + ROADMAP.md）—— 受准入写锁串行
+    # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
+    orchd_dir = workspace_root / ".orchd"
+    lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+    try:
+        paths = [str(workspace_root / "IDEAS.md"), str(workspace_root / "ROADMAP.md")]
+        commit_message = message or "chore(intake): orchd intake — commit intake products"
+        commit = ensure_committed(project_root, paths, commit_message)
+        result: dict[str, Any] = {
+            "committed": commit.get("performed") is True,
+            "commit": commit,
         }
-    return result
+        if status_warnings:
+            result["status_warnings"] = status_warnings
+        # 提交未执行（非 no_changes）→ commit_warning（降级可审计化）
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"摄入产物 commit 未执行（{commit.get('reason')}）：改动可能未入库，"
+                    "请人工核对（可运行 orchd status --audit-intake 巡检）"
+                ),
+            }
+        return result
+    finally:
+        intake_lock_release(lk)
 
 
 def _roadmap_land_entry(header: str, version: str, roadmap_rel: str) -> str:
@@ -230,6 +241,11 @@ def roadmap_land(
         list_tracked_changes,
     )
     from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import (
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
     from orchd.spec import _parse_roadmap_sections
 
     project_root = Path(project_root)
@@ -289,38 +305,44 @@ def roadmap_land(
             "hint": f"IDEAS.md 已有引用 ROADMAP §{version} 的落地条目",
         }
 
-    # 4) 生成 IDEAS pending 条目（追加到 IDEAS.md 末尾）
-    roadmap_rel = roadmap.relative_to(project_root).as_posix()
-    entry = _roadmap_land_entry(sec["header"], version, roadmap_rel)
-    if ideas.exists():
-        existing = ideas.read_text(encoding="utf-8")
-        if not existing.endswith("\n"):
-            existing += "\n"
-        _atomic_write_text(ideas, existing + "\n" + entry)
-    else:
-        _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
+    # 4) 生成 IDEAS pending 条目（追加到 IDEAS.md 末尾）—— 受准入写锁串行
+    # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
+    orchd_dir = ws / ".orchd"
+    lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+    try:
+        roadmap_rel = roadmap.relative_to(project_root).as_posix()
+        entry = _roadmap_land_entry(sec["header"], version, roadmap_rel)
+        if ideas.exists():
+            existing = ideas.read_text(encoding="utf-8")
+            if not existing.endswith("\n"):
+                existing += "\n"
+            _atomic_write_text(ideas, existing + "\n" + entry)
+        else:
+            _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
 
-    # 5) 强制提交摄入产物（IDEAS.md + ROADMAP.md）
-    commit = ensure_committed(
-        project_root,
-        [str(ws / "IDEAS.md"), str(ws / "ROADMAP.md")],
-        f"chore(intake): orchd roadmap-land — §{version}",
-    )
-    result: dict[str, Any] = {
-        "landed": True,
-        "version": version,
-        "section_id": sec["id"],
-        "commit": commit,
-    }
-    if commit.get("performed") is False and commit.get("reason") != "no_changes":
-        result["commit_warning"] = {
-            "reason": commit.get("reason"),
-            "message": (
-                f"roadmap-land 落地 commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
-                "可能未入库，请人工核对"
-            ),
+        # 5) 强制提交摄入产物（IDEAS.md + ROADMAP.md）
+        commit = ensure_committed(
+            project_root,
+            [str(ws / "IDEAS.md"), str(ws / "ROADMAP.md")],
+            f"chore(intake): orchd roadmap-land — §{version}",
+        )
+        result: dict[str, Any] = {
+            "landed": True,
+            "version": version,
+            "section_id": sec["id"],
+            "commit": commit,
         }
-    return result
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"roadmap-land 落地 commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                    "可能未入库，请人工核对"
+                ),
+            }
+        return result
+    finally:
+        intake_lock_release(lk)
 
 
 def _find_idea_entry(text: str, title: str) -> dict[str, Any] | None:
@@ -384,7 +406,12 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         - 成功: ``{"proposed": True, "title", "commit": {...}, 可选 "commit_warning"}``
     """
     from orchd.gitops import ensure_committed
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import (
+        resolve_workspace_root,
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
 
     project_root = Path(project_root)
     guard_err = _intake_guard(project_root)
@@ -405,36 +432,42 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
 
     import datetime
 
-    date = datetime.date.today().isoformat()
-    entry = (
-        f"## {date} {title}\n"
-        f"- status: study\n"
-        f"- 论证: {feasibility}\n"
-        f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 drop 丢弃。\n"
-    )
-    if ideas.exists():
-        existing = text
-        if not existing.endswith("\n"):
-            existing += "\n"
-        _atomic_write_text(ideas, existing + "\n" + entry)
-    else:
-        _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
+    # 写入 IDEAS.md —— 受准入写锁串行（task-admission-lock-engine：D 项）
+    orchd_dir = ws / ".orchd"
+    lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+    try:
+        date = datetime.date.today().isoformat()
+        entry = (
+            f"## {date} {title}\n"
+            f"- status: study\n"
+            f"- 论证: {feasibility}\n"
+            f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 drop 丢弃。\n"
+        )
+        if ideas.exists():
+            existing = text
+            if not existing.endswith("\n"):
+                existing += "\n"
+            _atomic_write_text(ideas, existing + "\n" + entry)
+        else:
+            _atomic_write_text(ideas, "# IDEAS\n" + "\n" + entry)
 
-    commit = ensure_committed(
-        project_root,
-        [str(ideas)],
-        f"chore(idea): orchd idea propose — {title}",
-    )
-    result: dict[str, Any] = {"proposed": True, "title": title, "commit": commit}
-    if commit.get("performed") is False and commit.get("reason") != "no_changes":
-        result["commit_warning"] = {
-            "reason": commit.get("reason"),
-            "message": (
-                f"idea propose commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
-                "可能未入库，请人工核对"
-            ),
-        }
-    return result
+        commit = ensure_committed(
+            project_root,
+            [str(ideas)],
+            f"chore(idea): orchd idea propose — {title}",
+        )
+        result: dict[str, Any] = {"proposed": True, "title": title, "commit": commit}
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"idea propose commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                    "可能未入库，请人工核对"
+                ),
+            }
+        return result
+    finally:
+        intake_lock_release(lk)
 
 
 def _idea_transition(
@@ -455,7 +488,12 @@ def _idea_transition(
         - 成功: ``{"{key}": True, "title", "new_status", "commit": {...}}``
     """
     from orchd.gitops import ensure_committed
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import (
+        resolve_workspace_root,
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
 
     # 动作 → 结果键（过去式）：confirm→confirmed，drop→dropped
     key = "dropped" if action == "drop" else "confirmed"
@@ -484,44 +522,50 @@ def _idea_transition(
         }
 
     lines = entry["lines"]
-    new_lines: list[str] = []
-    replaced = False
-    for ln in lines:
-        s = ln.strip()
-        if s.startswith("- status:") or s.startswith("status:"):
-            indent = ln[: len(ln) - len(ln.lstrip())]
-            new_lines.append(f"{indent}- status: {target_status}")
-            replaced = True
-        else:
-            new_lines.append(ln)
-    if not replaced:
-        # 理论上不会走到（_find_idea_entry 已确认含 status），防御性兜底
-        new_lines.append(f"- status: {target_status}")
+    # 改写状态 + 提交 —— 受准入写锁串行（task-admission-lock-engine：D 项）
+    orchd_dir = ws / ".orchd"
+    lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+    try:
+        new_lines: list[str] = []
+        replaced = False
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith("- status:") or s.startswith("status:"):
+                indent = ln[: len(ln) - len(ln.lstrip())]
+                new_lines.append(f"{indent}- status: {target_status}")
+                replaced = True
+            else:
+                new_lines.append(ln)
+        if not replaced:
+            # 理论上不会走到（_find_idea_entry 已确认含 status），防御性兜底
+            new_lines.append(f"- status: {target_status}")
 
-    all_lines = text.splitlines()
-    new_content_lines = all_lines[: entry["header_line"]] + new_lines + all_lines[entry["end"]:]
-    _atomic_write_text(ideas, "\n".join(new_content_lines) + "\n")
+        all_lines = text.splitlines()
+        new_content_lines = all_lines[: entry["header_line"]] + new_lines + all_lines[entry["end"]:]
+        _atomic_write_text(ideas, "\n".join(new_content_lines) + "\n")
 
-    commit = ensure_committed(
-        project_root,
-        [str(ideas)],
-        f"chore(idea): orchd idea {action} — {title}",
-    )
-    result: dict[str, Any] = {
-        key: True,
-        "title": title,
-        "new_status": target_status,
-        "commit": commit,
-    }
-    if commit.get("performed") is False and commit.get("reason") != "no_changes":
-        result["commit_warning"] = {
-            "reason": commit.get("reason"),
-            "message": (
-                f"idea {action} commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
-                "可能未入库，请人工核对"
-            ),
+        commit = ensure_committed(
+            project_root,
+            [str(ideas)],
+            f"chore(idea): orchd idea {action} — {title}",
+        )
+        result: dict[str, Any] = {
+            key: True,
+            "title": title,
+            "new_status": target_status,
+            "commit": commit,
         }
-    return result
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"idea {action} commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                    "可能未入库，请人工核对"
+                ),
+            }
+        return result
+    finally:
+        intake_lock_release(lk)
 
 
 def idea_confirm(project_root: Path, title: str) -> dict[str, Any]:

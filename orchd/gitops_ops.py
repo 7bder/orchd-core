@@ -238,6 +238,58 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
         return None
 
 
+def try_ff_merge_to_main(
+    project_root: Path, task_id: str
+) -> dict[str, Any] | None:
+    """W-5：仅当任务分支领先 main 时以 ``--ff-only`` 快速并入 main。
+
+    逃生舱（force-status completed）"完成 = 状态终态 + 代码落 main" 的落码环节。
+    与 ``try_git_merge``（普通 merge，可产生 merge commit/自动化解）不同：**仅接受
+    快进**——任务与 main 分叉时拒绝自动合并，返回 ``diverged`` 交人工处理，防止
+    静默并入错误代码。
+
+    Returns:
+        - ``{"state": "merged"}``：ff 合并成功，main 前进到任务分支。
+        - ``{"state": "already_in_main"}``：任务分支不领先 main（已并入 / 无独立分支）。
+        - ``{"state": "diverged", "branch": <task_branch>}``：与 main 分叉，拒绝自动合并。
+        - ``None``：环境异常，调用方按 best-effort 降级。
+    """
+    branch = f"task/{task_id}"
+
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
+        workdir = main_worktree_root(project_root)
+        return subprocess.run(
+            ["git", "-C", str(workdir), *args],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+
+    try:
+        _ = _git("rev-parse", "--git-dir")  # 非 git 仓库探测（返回 None 降级）
+        # 任务分支不存在 → 无待落码（无独立分支即视为已并入/无实现）
+        if _git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode != 0:
+            return {"state": "already_in_main"}
+        main_is_ancestor = _git("merge-base", "--is-ancestor", "main", branch).returncode == 0
+        task_is_ancestor = _git("merge-base", "--is-ancestor", branch, "main").returncode == 0
+        if main_is_ancestor and task_is_ancestor:
+            # main 与任务分支同 commit → 无待落码（已并入）
+            return {"state": "already_in_main"}
+        if main_is_ancestor:
+            # 任务领先 main → 可快进。先确认主工作树落到 main（flat 布局下主工作树
+            # 可能正 checkout 任务分支），再 --ff-only 快进。
+            if _git("checkout", "main").returncode != 0:
+                return {"state": "diverged", "branch": branch}
+            if _git("merge", "--ff-only", branch).returncode == 0:
+                return {"state": "merged"}
+            # 快进被拒（并发/脏工作区）→ 交人工，防止静默完成却不落码
+            return {"state": "diverged", "branch": branch}
+        if task_is_ancestor:
+            return {"state": "already_in_main"}
+        # 两者互为祖先均不成立 → 分叉，拒绝自动合并（仅接受快进，防止静默并入错误代码）
+        return {"state": "diverged", "branch": branch}
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
 def try_delete_task_branch(project_root: Path, task_id: str) -> bool:
     """best-effort 删除任务分支 task/{task_id}（merge 成功后调用）。
 
