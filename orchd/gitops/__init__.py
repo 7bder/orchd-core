@@ -1,0 +1,162 @@
+"""gitops 包兼容层：全量 re-export 原 orchd/gitops.py 的 68 个顶层符号。"""
+
+from orchd.gitops._const import _GIT_ENCODING, _GIT_ERRORS, _GIT_TIMEOUT, _T
+from orchd.gitops._run import _run_git, _shell_quote
+from orchd.gitops.query import (
+    branch_exists,
+    check_workspace_state,
+    get_current_branch,
+    get_default_branch,
+    get_head_commit,
+    is_task_worktree,
+    list_tracked_changes,
+    main_worktree_root,
+    _has_linked_worktrees,
+    _probe_git_repo_ready,
+)
+from orchd.gitops.cleanup import (
+    _cleanup_trash_residue,
+    _os_delete_file,
+    _os_delete_tree,
+    _safe_delete,
+    parse_conflicts,
+)
+from orchd.gitops.session_lock import (
+    _SESSION_GATE_FILENAME,
+    _SESSION_LOCK_FILENAME,
+    _SESSION_LOCK_FLOCK_MARKER,
+    _SESSION_LOCK_REGISTRY,
+    _SESSION_LOCK_TIMEOUT_MIN,
+    _acquire_and_write_session_lock,
+    _get_session_gate_path,
+    _get_session_lock_path,
+    _git_worktree_name,
+    _prepare_session_lock_payload,
+    _probe_session_lock_os_active,
+    _resolve_store_root,
+    ensure_session_lock,
+    reclaim_orphan_session_locks,
+    release_session_lock_if_owned,
+    session_lock_acquire,
+    session_lock_check,
+    session_lock_release,
+)
+from orchd.gitops.commit import (
+    _commit_filtered_paths,
+    _filter_committable_paths,
+    ensure_committed,
+    head_drift_check,
+)
+from orchd.gitops.hook import (
+    _e020_hook_escape_block,
+    _get_hook_path,
+    _HOOK_FILENAME,
+    hook_install,
+    hook_uninstall,
+)
+from orchd.gitops.guard import (
+    GUARD_FAIL_CLOSED,
+    GUARD_STATUS_FAILED,
+    GUARD_STATUS_NOT_APPLICABLE,
+    GUARD_WARN,
+    _build_wrong_branch_hint,
+    _enforce_branch_allowed,
+    _enforce_workspace_clean,
+    _guard_failed,
+    _probe_guard_workspace_state,
+    _record_git_unavailable_guard,
+    _resolve_claim_check_root,
+    _same_git_repo,
+    checkout_default_strict,
+    guard_claim,
+    guard_clean_workspace,
+    guard_done_branch,
+    guard_review_write,
+    guard_write_command,
+    record_degraded_guard,
+    run_guard,
+)
+
+__all__ = [
+    # _const.py（4）
+    "_GIT_ENCODING",
+    "_GIT_ERRORS",
+    "_GIT_TIMEOUT",
+    "_T",
+    # _run.py（2）
+    "_run_git",
+    "_shell_quote",
+    # query.py（10）
+    "get_current_branch",
+    "get_head_commit",
+    "get_default_branch",
+    "branch_exists",
+    "check_workspace_state",
+    "list_tracked_changes",
+    "_has_linked_worktrees",
+    "main_worktree_root",
+    "is_task_worktree",
+    "_probe_git_repo_ready",
+    # cleanup.py（5）
+    "_cleanup_trash_residue",
+    "_os_delete_file",
+    "_os_delete_tree",
+    "_safe_delete",
+    "parse_conflicts",
+    # session_lock.py（18）
+    "_SESSION_GATE_FILENAME",
+    "_SESSION_LOCK_FILENAME",
+    "_SESSION_LOCK_FLOCK_MARKER",
+    "_SESSION_LOCK_REGISTRY",
+    "_SESSION_LOCK_TIMEOUT_MIN",
+    "_acquire_and_write_session_lock",
+    "_get_session_gate_path",
+    "_get_session_lock_path",
+    "_git_worktree_name",
+    "_prepare_session_lock_payload",
+    "_probe_session_lock_os_active",
+    "_resolve_store_root",
+    "ensure_session_lock",
+    "reclaim_orphan_session_locks",
+    "release_session_lock_if_owned",
+    "session_lock_acquire",
+    "session_lock_check",
+    "session_lock_release",
+    # commit.py（4）
+    "_commit_filtered_paths",
+    "_filter_committable_paths",
+    "ensure_committed",
+    "head_drift_check",
+    # hook.py（4）
+    "_e020_hook_escape_block",
+    "_get_hook_path",
+    "_HOOK_FILENAME",
+    "hook_install",
+    "hook_uninstall",
+    # guard.py（20）
+    "GUARD_FAIL_CLOSED",
+    "GUARD_WARN",
+    "GUARD_STATUS_NOT_APPLICABLE",
+    "GUARD_STATUS_FAILED",
+    "record_degraded_guard",
+    "_guard_failed",
+    "run_guard",
+    "_probe_guard_workspace_state",
+    "_build_wrong_branch_hint",
+    "_enforce_branch_allowed",
+    "_enforce_workspace_clean",
+    "_record_git_unavailable_guard",
+    "guard_write_command",
+    "_resolve_claim_check_root",
+    "_same_git_repo",
+    "guard_claim",
+    "guard_done_branch",
+    "guard_clean_workspace",
+    "guard_review_write",
+    "checkout_default_strict",
+    # 兼容性别名（来自 errors 的 re-export）
+    "NotApplicableError",
+]
+
+# 兼容性别名：errors 类型原通过 orchd.gitops re-export
+from orchd.errors import NotApplicableError  # noqa: E402, F811  re-export for backward compat

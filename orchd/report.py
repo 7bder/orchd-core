@@ -739,11 +739,12 @@ def watchdog(
 
     # Session Identity Layer：僵死 session 检测（task-session-watchdog-stale）。
     # 对 claimed/done/in_review 任务，若实现者或审查者的 session runtime 已缺失、
-    # inactive 或过期，则计入 stale_claims。不自动释放有活跃 session 的任务锁。
+    # inactive 或过期（TTL 惰性过期：last_seen 超过 TTL 即判过期，判定即生效、
+    # 不依赖清理动作），则计入 stale_claims。不自动释放有活跃 session 的任务锁。
     stale_sessions: list[dict[str, Any]] = []
     stale_claims: list[dict[str, Any]] = []
     try:
-        from orchd.ledger import session_runtime_dir
+        from orchd.ledger import is_session_expired, session_runtime_dir
 
         session_dir = session_runtime_dir(store.orchd_dir)
         sessions_by_id: dict[str, dict[str, Any]] = {}
@@ -772,6 +773,11 @@ def watchdog(
                     reason = "missing_runtime"
                 elif not runtime.get("active", True):
                     reason = "inactive"
+                elif is_session_expired(runtime):
+                    # TTL 惰性过期：runtime 仍在且标称 active，但 last_seen 已超
+                    # TTL → 宿主会话早已中断（session end 未被调用）。判定即生效，
+                    # 过期文件即使仍在磁盘也不计入活跃，交接管流程处置。
+                    reason = "session_expired"
                 if reason:
                     stale_sessions.append({
                         "session_id": sid,

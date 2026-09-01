@@ -30,6 +30,17 @@ from orchd.spec import (
 _SAFE_MODULE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _annotate_if_needed(items: list[dict[str, Any]], orchd_dir: Path) -> list[dict[str, Any]]:
+    """批量校验结果附加 guidance（best-effort，异常时原样返回）。"""
+    if not items:
+        return items
+    try:
+        from orchd.guide import annotate_validation_items
+        return annotate_validation_items(items, orchd_dir)
+    except Exception:
+        return items
+
+
 def _validate_module_id(mod_id: str) -> str:
     """P2-3：module.id 仅允许 [A-Za-z0-9_-]，防止 ``../`` 或绝对路径越界写到 store 根之外。"""
     if not mod_id or not _SAFE_MODULE_ID_RE.fullmatch(mod_id):
@@ -310,11 +321,14 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
         # 防止仅经 amend 注入坏引用；shared 文件存在性仅在 .orchd/ 目录时检查（无副作用）。
         structure_errors = validate_structure(master) + validate_references(master)
         if structure_errors:
+            from orchd.guide import annotate_validation_items
+            raw_details = [{"code": e.code.name, "path": e.path, "message": e.message}
+                           for e in structure_errors]
+            annotated_details = annotate_validation_items(raw_details, orchd_dir)
             raise OrchdError(
                 ErrorCode.E003,
                 f"schema_validation_failed: {len(structure_errors)} error(s), amend aborted",
-                [{"code": e.code.name, "path": e.path, "message": e.message}
-                 for e in structure_errors],
+                annotated_details,
             )
 
         # 加载现有 snapshot 中的任务定义（用于 diff；扫描全部模块目录）。
@@ -502,7 +516,8 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
             raise OrchdError(
                 ErrorCode.E025,
                 f"source_validation_failed: {len(source_errors)} new task(s) "
-                "missing/invalid source, amend aborted",
+                "missing/invalid source, amend aborted。"
+                " 提示：外部来源任务可用 debug:manual 标记。",
                 source_errors,
             )
 
@@ -589,7 +604,7 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
         "attachable_sync": attachable_sync,
         "unchanged_tasks": unchanged_tasks,
         "removed_tasks": removed_tasks,
-        "quality_warnings": quality_warnings,
+        "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
         "conflict_warnings": conflict_warnings,
         "sources_missing": sources_missing,
         "sources_invalid": sources_invalid,
@@ -646,3 +661,5 @@ def classify_dry_run_failure(
 
     # 其余失败（测试断言失败、实现未完成等）→ 预期失败，不阻断
     return "expected_pending"
+
+# task-errexit-weak-polish-batch: E007 hint polish placeholder

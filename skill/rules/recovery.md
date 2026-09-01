@@ -62,3 +62,37 @@
 - 未深入解决 → `lesson stage`（记问题，标记"值得关注"）。
 
 > 来源可追溯：每条 lesson 记录 source（agent 指纹 / session / engine_version）；信任分级 `proposed`（未验证·参考）→ 人工 `resolve --approve` 后 `verified`（正式触发）；solution 只提示不代行。详见 `design/lesson-feedback-design-20260828.md`。
+
+## 错误出口分级处置（设计 §2.2 / §3.2）
+
+> 关联：`design/error-code-exit-guidance-design-20260830.md`、`orchd/guide.py` ERROR_CODE_CHANNELS。
+> 五类 exit_type 行动约定见 [SKILL.md](../SKILL.md)「按 exit_type 行动」。
+
+### 四条错误产生通道
+
+| 通道 | 产生方式 | 是否经 attach_error_guidance | 典型码 |
+|---|---|---|---|
+| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E014/E016-E019/E022/E025/E027/E033/E034/E036 |
+| **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | E004/E005/E006/E023/E024/E026/E028/E029 |
+| **C 手工 dict** | 代码里手拼 `{"code":"Exxx", ...}` 后 return | ❌ 否（需 structured_error 接线） | E021/E028/E030/E031/E032/E035 |
+| **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | E020 |
+
+**E015 (merge_conflict) 是死映射**：全包无 `raise OrchdError(E015)`，仅 review.py result reason。通道登记为空集。
+
+### 被占场景 SOP（E009 / E011）
+
+遇到以下错误时，**禁止重试原命令**（exit_type = await-external）：
+
+| 错误码 | 场景 | 正确处置 |
+|---|---|---|
+| **E009 already_claimed** | 任务已被他人 claimed | 用 `status --text` 查看 holder → 等待其完成或由其 `retract`；**禁止重复 claim** |
+| **E011 agent_busy** | 当前 agent 已持有其他任务 | 先完成或 retract 当前任务 → 再领新任务；**不要重试原命令** |
+
+### 锁超时场景 SOP（E012 / E019）
+
+遇到以下错误时，**禁止盲重试**（exit_type = await-external）：
+
+| 错误码 | 场景 | 正确处置 |
+|---|---|---|
+| **E012 lock_timeout** | 准入写锁持有超时 | 用 `watchdog` 查看锁持有者 → 正常并发释放后自动成功；僵死则等其退出（flock 进程退出自动释放）或按 watchdog 指引接管 |
+| **E019 workspace_busy** | 工作区被其他会话占用 | 用 `watchdog` 查看持有会话 → 等待其释放或按需接管；**不要重试原命令** |

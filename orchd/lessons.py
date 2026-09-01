@@ -701,3 +701,5 @@ def show_lesson(orchd_dir: Path | str, *, lesson_id: str) -> dict[str, Any] | No
     """查看完整条目（完整 solution，超出注入摘要，设计 §7/§8.5）。"""
     rows = _read_jsonl(_lib_path(orchd_dir))
     return next((r for r in rows if r.get("id") == lesson_id), None)
+
+# task-errexit-weak-polish-batch: E007 hint polish placeholder

@@ -18,6 +18,7 @@ IDEAS/ROADMAP、暂不注册任务」场景的提交。
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,25 @@ _INTAKE_PRODUCT_FILES = frozenset({
     "ROADMAP.md",
     ".orchd/ROADMAP.md",
 })
+
+# 条目标题中的显式 id 约定写法：`<标题>（id: <slug>）`
+# slug 仅允许字母、数字、连字符、下划线，且以字母或数字开头（与 source: idea:<id>
+# 的引用形态一致；中文标题无法可靠派生 ASCII slug，故 id 必须显式声明）。
+_TITLE_ID_RE = re.compile(r"id:\s*([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+
+def _parse_title_id(title: str) -> str | None:
+    """从灵感标题中解析显式 id（约定写法 ``...（id: <slug>）``）。
+
+    ``- id:`` 是 E025 溯源校验（``spec._check_idea_reference``）与自动归档
+    （``ideas._entry_is_resolved``）的权威锚点：缺 id 的条目既无法通过 source
+    引用校验，也永不自动归档。写入侧必须产出该字段，否则与读取侧契约断裂。
+
+    Returns:
+        解析到的 slug；标题未声明 id 时返回 None（调用方应 fail-closed 拒绝）。
+    """
+    m = _TITLE_ID_RE.search(title or "")
+    return m.group(1) if m else None
 
 
 def _parse_idea_statuses(text: str) -> list[tuple[int, str, str]]:
@@ -198,14 +218,21 @@ def intake_commit(
         intake_lock_release(lk)
 
 
-def _roadmap_land_entry(header: str, version: str, roadmap_rel: str) -> str:
-    """构造 ROADMAP 落地 IDEAS pending 条目（date 用运行日，标题取章节头）。"""
+def _roadmap_land_entry(header: str, version: str, roadmap_rel: str, section_id: str) -> str:
+    """构造 ROADMAP 落地 IDEAS pending 条目（date 用运行日，标题取章节头）。
+
+    ``section_id`` 来自 ROADMAP 章节的 ``id:`` 声明（``roadmap_land`` 已校验其
+    存在，缺失时以 ``no_section_id`` 拒绝）——**必须写入条目** ``- id:`` 字段：
+    它是 E025 溯源校验与自动归档的权威锚点，此前因漏传该参数导致落地条目缺 id，
+    既无法被 source 引用（amend 报 E025），也永不自动归档。
+    """
     import datetime
 
     date = datetime.date.today().isoformat()
     return (
         f"## {date} {header}\n"
         f"- status: pending\n"
+        f"- id: {section_id}\n"
         f"- goal: 把 ROADMAP §{version} 规划内容落地拆解为具体任务并注册到 _master.json。\n"
         f"- idea: ROADMAP §{version}（{header}）落地。\n"
         f"- detail: {roadmap_rel} §{version}\n"
@@ -311,7 +338,7 @@ def roadmap_land(
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
         roadmap_rel = roadmap.relative_to(project_root).as_posix()
-        entry = _roadmap_land_entry(sec["header"], version, roadmap_rel)
+        entry = _roadmap_land_entry(sec["header"], version, roadmap_rel, sec["id"])
         if ideas.exists():
             existing = ideas.read_text(encoding="utf-8")
             if not existing.endswith("\n"):
@@ -430,6 +457,24 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
             "hint": f"IDEAS.md 已存在标题为 '{title}' 的条目",
         }
 
+    # 显式 id 强校验（fail-closed）：- id: 是 E025 溯源校验与自动归档的权威锚点。
+    # 缺 id 的条目后续必然失败（amend 报 E025 source 引用不存在）且永不自动归档，
+    # 故在此早失败，而非让问题推迟到注册阶段才暴露（对齐引擎硬约束取向）。
+    idea_id = _parse_title_id(title)
+    if not idea_id:
+        return {
+            "proposed": False,
+            "reason": "missing_idea_id",
+            "title": title,
+            "hint": (
+                "标题须含显式 id，写法：`<标题>（id: <slug>）`；"
+                "slug 仅允许字母 / 数字 / 连字符 / 下划线，且以字母或数字开头。"
+                "例：`引擎硬化整改（id: audit-engine-hardening）`。"
+                "原因：- id: 是 E025 溯源校验与自动归档的权威锚点，缺 id 的条目"
+                "既无法被 source 引用（amend 必报 E025），也永不自动归档。"
+            ),
+        }
+
     import datetime
 
     # 写入 IDEAS.md —— 受准入写锁串行（task-admission-lock-engine：D 项）
@@ -440,6 +485,7 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         entry = (
             f"## {date} {title}\n"
             f"- status: study\n"
+            f"- id: {idea_id}\n"
             f"- 论证: {feasibility}\n"
             f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 drop 丢弃。\n"
         )
@@ -456,7 +502,12 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
             [str(ideas)],
             f"chore(idea): orchd idea propose — {title}",
         )
-        result: dict[str, Any] = {"proposed": True, "title": title, "commit": commit}
+        result: dict[str, Any] = {
+            "proposed": True,
+            "title": title,
+            "id": idea_id,
+            "commit": commit,
+        }
         if commit.get("performed") is False and commit.get("reason") != "no_changes":
             result["commit_warning"] = {
                 "reason": commit.get("reason"),

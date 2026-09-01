@@ -1,8 +1,8 @@
 """orchd/lockfile.py — 统一排他文件锁原语（ExclusiveFileLock）。
 
 提供进程级可重入的排他文件锁原语，封装跨平台 flock（POSIX）/ msvcrt（Windows）
-差异，并内嵌「同进程 depth 登记」语义：同一进程重复 acquire 同一锁返回成功
-（depth+1），release 到 0 才真正释放 flock；跨进程仍互斥。
+差异，并内嵌「同进程 depth 登记」语义：同一进程（含不同实例）重复 acquire 同一锁
+返回成功（depth+1），所有实例 release 到 0 才真正释放 flock；跨进程仍互斥。
 
 设计要点：
 - mode A（flock）：acquire 成功 ⇔ 本进程真持锁，无 check-then-act 窗口。
@@ -11,6 +11,9 @@
   输出明确告警，不伪装成有效锁。
 - probe_lock_support 在目标路径执行一次 flock 探测，判定本地文件系统是否支持
   可靠的排他 flock；不支持时调用方应降级使用或放弃。
+- _depth_registry 是路径级全局表：path -> (fd, total_depth)。
+  每个实例维护 self._depth（本实例引用计数），total_depth 是所有实例之和。
+  跨实例 acquire 共享同一 fd，跨实例 release 到 total_depth=0 才真正释放。
 
 依赖方向：lockfile.py → errors.py（不导入 ledger / spec / onboard）。
 """
@@ -26,9 +29,31 @@ from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
 
-# 进程级 depth 登记：路径 → (fd, depth)。
+# 进程级 depth 登记：路径 → (fd, total_depth)。
 # 同一进程内所有 ExclusiveFileLock 实例共享，保证跨实例重入语义与释放安全。
+# total_depth 是路径级总引用计数，实例各自维护 self._depth（本实例引用数）。
 _depth_registry: dict[str, tuple[int, int]] = {}
+
+
+def _flock_op(fd: int, op: str) -> None:
+    """跨平台 flock 操作单点（收敛 msvcrt/fcntl 重复分支）。
+
+    op:
+      - "lock_nb": 非阻塞排他锁
+      - "unlock": 解锁
+    """
+    if sys.platform == "win32":
+        import msvcrt
+        if op == "lock_nb":
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        elif op == "unlock":
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        if op == "lock_nb":
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif op == "unlock":
+            fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class ExclusiveFileLock:
@@ -38,9 +63,9 @@ class ExclusiveFileLock:
 
         lock = ExclusiveFileLock(path)
         lock.acquire()   # 首次：获取 flock，depth=1
-        lock.acquire()   # 同进程重入：depth=2，返回成功
+        lock.acquire()   # 同进程重入（同实例或跨实例）：depth=2，返回成功
         lock.release()   # depth=1，仍持锁
-        lock.release()     # depth=0，真正释放 flock
+        lock.release()   # depth=0，真正释放 flock
     """
 
     def __init__(self, lock_path: Path | str) -> None:
@@ -59,7 +84,7 @@ class ExclusiveFileLock:
     def acquire(self, *, blocking: bool = False, timeout_s: float = 10.0) -> bool:
         """获取排他锁。
 
-        - 同进程已持锁：depth+1，立即返回 True（可重入）。
+        - 同进程已持锁（任一实例）：共享 fd，本实例 depth+1，全局 depth+1，立即返回 True。
         - 跨进程竞争：
           - ``blocking=False``（默认）：非阻塞尝试，失败抛 E012。
           - ``blocking=True``：阻塞等待，超时抛 E012。
@@ -72,13 +97,13 @@ class ExclusiveFileLock:
         """
         key = str(self._lock_path.resolve())
 
-        # 同进程重入：已有 fd 且属于本实例/进程 → depth+1
-        if self._fd is not None and key in _depth_registry:
+        # 同进程跨实例重入：路径已在注册表 → 共享 fd，引用计数+1
+        if key in _depth_registry:
             fd, depth = _depth_registry[key]
-            if fd == self._fd:
-                _depth_registry[key] = (fd, depth + 1)
-                self._depth = depth + 1
-                return True
+            self._fd = fd
+            self._depth += 1
+            _depth_registry[key] = (fd, depth + 1)
+            return True
 
         # 新获取：打开 fd 并 flock
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,12 +122,7 @@ class ExclusiveFileLock:
     def _acquire_nonblocking(self, fd: int) -> None:
         """非阻塞获取 flock，失败抛 E012。"""
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock_op(fd, "lock_nb")
         except (OSError, IOError) as exc:
             os.close(fd)
             raise OrchdError(
@@ -116,12 +136,7 @@ class ExclusiveFileLock:
         deadline = time.monotonic() + timeout_s
         while True:
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _flock_op(fd, "lock_nb")
                 return
             except (OSError, IOError):
                 if time.monotonic() >= deadline:
@@ -138,11 +153,12 @@ class ExclusiveFileLock:
     def release(self) -> bool:
         """释放排他锁。
 
-        - depth > 1：depth-1，仍持锁，返回 False。
-        - depth == 1：真正释放 flock + close fd + 清理登记，返回 True。
+        - 本实例 depth > 1：本实例 depth-1，全局 depth-1，仍持锁，返回 False。
+        - 本实例 depth == 1 且全局 depth > 1：本实例释放引用，全局仍持锁，返回 False。
+        - 全局 depth == 1：真正释放 flock + close fd + 清理登记，返回 True。
 
         Returns:
-            True 表示已真正释放；False 表示仍持锁（depth > 1）。
+            True 表示全局锁已真正释放；False 表示仍持锁（全局 depth > 0）。
         """
         key = str(self._lock_path.resolve())
 
@@ -150,14 +166,20 @@ class ExclusiveFileLock:
             return True
 
         self._depth -= 1
-        if self._depth > 0:
-            _depth_registry[key] = (self._fd, self._depth)
-            return False
 
-        # depth == 0：真正释放
-        self._release_flock(self._fd)
-        _depth_registry.pop(key, None)
-        self._fd = None
+        if key in _depth_registry:
+            fd, depth = _depth_registry[key]
+            if depth > 1:
+                _depth_registry[key] = (fd, depth - 1)
+                if self._depth == 0:
+                    self._fd = None
+                return False
+            # 全局 depth == 1 → 释放后归零，真正释放
+            self._release_flock(fd)
+            _depth_registry.pop(key, None)
+
+        if self._depth == 0:
+            self._fd = None
         return True
 
     def write_text(self, content: str, encoding: str = "utf-8") -> None:
@@ -198,12 +220,7 @@ class ExclusiveFileLock:
     def _release_flock(self, fd: int) -> None:
         """释放 flock 并 close fd（best-effort）。"""
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            _flock_op(fd, "unlock")
         except (OSError, IOError):
             pass
         try:
@@ -216,14 +233,15 @@ class ExclusiveFileLock:
 
         Returns:
             ``{"held": True, "by_current_process": bool, "depth": int}``
-            当前进程持锁时 by_current_process=True。
+            当前进程任一实例持锁时 by_current_process=True。
             ``{"held": False}`` 未被持有。
         """
         key = str(self._lock_path.resolve())
 
-        if self._fd is not None and key in _depth_registry:
+        # 同进程任一实例持锁 → by_current_process=True
+        if key in _depth_registry:
             fd, depth = _depth_registry[key]
-            if fd == self._fd and depth > 0:
+            if depth > 0:
                 return {"held": True, "by_current_process": True, "depth": depth}
 
         # 尝试非阻塞获取：成功=未持有（我们刚拿到），失败=被其他进程持有
@@ -232,12 +250,7 @@ class ExclusiveFileLock:
         try:
             fd = os.open(str(self._lock_path), os.O_RDWR)
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _flock_op(fd, "lock_nb")
                 # 获取成功 → 原无持有者
                 self._release_flock(fd)
                 return {"held": False}
@@ -251,11 +264,13 @@ class ExclusiveFileLock:
         """强制清理（best-effort）：释放 flock、close fd、清理登记。
 
         用于 watchdog 接管僵死锁。不抛异常。
+        注意：clear 释放全局锁，不管理各实例引用计数；调用后所有实例的 fd 失效。
         """
         key = str(self._lock_path.resolve())
-        if self._fd is not None:
-            self._release_flock(self._fd)
-        _depth_registry.pop(key, None)
+        if key in _depth_registry:
+            fd, _ = _depth_registry[key]
+            self._release_flock(fd)
+            _depth_registry.pop(key, None)
         self._fd = None
         self._depth = 0
 
@@ -308,31 +323,16 @@ def probe_lock_support(target_dir: Path | str) -> dict[str, Any]:
     try:
         # fd1 获取排他 flock
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd1, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock_op(fd1, "lock_nb")
         except (OSError, IOError):
             return {"mode": "flock"}
 
         # fd2 尝试非阻塞获取：应失败（fd1 持有中）
         fd2 = os.open(str(tmp_path), os.O_RDWR)
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd2, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock_op(fd2, "lock_nb")
             # 获取成功 → flock 未真正互斥 → 降级
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd2, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd2, fcntl.LOCK_UN)
+            _flock_op(fd2, "unlock")
             os.close(fd2)
             return {
                 "mode": "degraded",
@@ -348,12 +348,7 @@ def probe_lock_support(target_dir: Path | str) -> dict[str, Any]:
         return {"mode": "degraded", "warning": f"flock 探测异常：{e}"}
     finally:
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(fd1, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd1, fcntl.LOCK_UN)
+            _flock_op(fd1, "unlock")
         except (OSError, IOError):
             pass
         try:

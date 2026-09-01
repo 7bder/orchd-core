@@ -18,6 +18,13 @@
 | `safety.md` | 引擎改动触碰 §9.1 停服边界 | 改引擎 |
 | `install.md` | 无感安装协议 + BOOTSTRAP | 新项目首次进入 |
 
+## 外置协议文件（自 SKILL.md 外置，SKILL 内留入口链接）
+
+| 文件 | 主题 | 何时读 |
+|------|------|--------|
+| `skill-bootstrap.md` | BOOTSTRAP 自启动安装全流程 | 宿主无 `.orchd/`、新项目首次进入 |
+| `skill-lesson.md` | 经验回灌（lesson）命令入口 | 执行中打点 / 收尾审核 |
+
 ## 方法表（templates + CLI）
 
 | 场景 | 模板 |

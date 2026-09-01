@@ -56,6 +56,16 @@ reasonix.toml
 # session 运行时凭据/锁（宿主接入层写入的本地会话 token 与锁文件，不入库）
 .session_token.txt
 .session-*.lock
+.session.lock
+.session.gate.lock
+
+# 引擎运行时锁（task-audit-lock-residue-reclaim）：运行时状态，一律不入库。
+# 实测教训：.session-task-p3-roadmap-ideas-map.lock 曾于 504e39c 被误提交入 git，
+# 之后虽补了 .session-*.lock 规则，但 gitignore 对已跟踪文件无效；该文件被清理后
+# 留下「已删除未提交」的脏状态，持续以 E017 dirty_workspace 阻塞 amend，且可复发。
+# 注意：新增规则只能防未跟踪文件；已误提交的须用 git rm --cached 显式移除。
+/.intake.lock
+/.lock
 
 # pytest 临时目录（误入跟踪，2026-08-05 恢复时清理）
 .pytest-tmp/

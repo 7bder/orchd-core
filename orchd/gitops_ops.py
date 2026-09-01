@@ -194,6 +194,30 @@ def sync_master_with_main(project_root: Path, branch: str) -> None:
     )
 
 
+def _clean_stale_index_lock(workdir: Path) -> bool:
+    """清理主工作树 .git/index.lock 残留锁文件。
+
+    当 git 进程异常中断时（如 shell 被强制关闭、超时被杀），index.lock 会残留，
+    阻塞后续所有 git 操作（checkout/merge/commit 等均报 ``Unable to create
+    '.../index.lock': File exists``）。通过文件年龄判断锁是否已过期：
+    - 存在时间 > 5 分钟 → 视为 stale，删除后返回 True。
+    - 不存在或 < 5 分钟 → 不动，返回 False（可能是活跃 git 操作，不应干预）。
+
+    best-effort：任何异常（路径不存在、权限不足等）静默降级，不阻断调用方。
+    """
+    try:
+        lock = workdir / ".git" / "index.lock"
+        if not lock.is_file():
+            return False
+        age = datetime.now(timezone.utc).timestamp() - lock.stat().st_mtime
+        if age > 300:  # 5 分钟
+            lock.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     """best-effort 将任务分支合并到主工作树的 main（task-14-merge-main-tree）。
 
@@ -206,6 +230,7 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     """
     try:
         workdir = main_worktree_root(project_root)
+        _clean_stale_index_lock(workdir)
         checkout = subprocess.run(
             ["git", "-C", str(workdir), "checkout", "main"],
             capture_output=True,

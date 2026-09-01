@@ -534,6 +534,23 @@ def _review_submit_impl(
                     result["reason"] = "merge_conflict"
                     result["conflict_files"] = conflict_files
                     result["task_status"] = "in_review"
+                    # 通道 D：E015 merge_conflict 指引挂载（structured_error 收敛）
+                    # 加法式：保留原 reason/conflict_files/action，新增 error 字段
+                    # 使 guide.py E015 静态表指引(recovery/command/exit_type=git-diagnose)可达
+                    try:
+                        from orchd.ledger import structured_error
+                        _cf_text = ", ".join(conflict_files) if conflict_files else "未知"
+                        _e015_resp = structured_error(
+                            "E015",
+                            f"merge 冲突：{_cf_text}（main 已恢复，需人工裁决）",
+                            [{"conflict_files": conflict_files, "hint": "进入任务 worktree 执行 git merge main，解决冲突后 commit，再由同一 reviewer 重试 code APPROVED"}],
+                            project_root,
+                        )
+                        result["error"] = _e015_resp.get("error")
+                        if "guidance" in _e015_resp:
+                            result["guidance"] = _e015_resp["guidance"]
+                    except Exception:
+                        pass  # best-effort：指引挂接失败不阻断冲突上报
                     # P0-18：增强冲突指引——worktree 位置、文件清单、重试路径、回退命令
                     _auto_action = (auto or {}).get("action")
                     if _auto_action:

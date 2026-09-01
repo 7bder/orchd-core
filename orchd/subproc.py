@@ -26,6 +26,24 @@ _GIT_BASH_CANDIDATES = (
 )
 
 
+def _is_git_for_windows_bash(bash_path: str) -> bool:
+    """校验 PATH 中的 bash 是否来自 Git for Windows（排除 WSL 等其它发行版）。
+
+    依据：Git for Windows 的 bash.exe 与 git.exe 同装——bash 所在目录
+    （Git\\bin）或 Git 根下的 bin/ 目录存在 git.exe。WSL 的 bash
+    （System32\\bash.exe）与独立 MSYS 均不满足该同现条件，无需再依赖
+    脆弱的 "system32" 字符串排除。
+    """
+    d = os.path.dirname(bash_path)
+    if not d:
+        return False
+    if os.path.isfile(os.path.join(d, "git.exe")):
+        return True
+    # Git\usr\bin\bash.exe → Git 根 = dirname(dirname(d))，检查 <root>\bin\git.exe
+    git_root = os.path.dirname(os.path.dirname(d))
+    return os.path.isfile(os.path.join(git_root, "bin", "git.exe"))
+
+
 def find_bash() -> str | None:
     """定位 Windows 上的 Git Bash；POSIX 平台返回 None（用 shell=True 即可）。"""
     if os.name != "nt":
@@ -34,7 +52,7 @@ def find_bash() -> str | None:
         if os.path.isfile(cand):
             return cand
     p = shutil.which("bash")
-    if p and "system32" not in p.lower():
+    if p and _is_git_for_windows_bash(p):
         return p
     return None
 

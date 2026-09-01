@@ -13,7 +13,7 @@ container 的主工作树是 ``<容器>/main/``，flat 是 ``<项目根>/``。�
 （``<主工作树>/.orchd/.layout.json``）在运行期决定，缺失时自动探测 + 告警
 （不静默跑错目录）。
 
-依赖方向：本模块只依赖标准库（json / os / pathlib / shutil / subprocess）+ orchd.errors，
+依赖方向：本模块只依赖标准库（json / os / pathlib / shutil / subprocess / sys）+ orchd.errors，
 不导入 onboard / review / ledger 状态机（叶子化，单一入口可审计）。
 """
 
@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -246,6 +247,33 @@ def detect_layout(project_root: Path) -> dict[str, Any]:
     return _build_layout(layout, git_root, warnings, "detected")
 
 
+def detect_container_root_cwd(cwd: Path, orchd_dir: Path) -> tuple[str | None, Path | None]:
+    """检测 cwd 是否为容器根（主工作树父目录），纪律护栏的判定核心。
+
+    容器根特征：其 ``.orchd`` 是 junction/符号链接（指向主工作树 .orchd），
+    ``_find_orchd_dir`` 会命中它，使 project_root 被解析成容器根而非主工作树，
+    进而污染任务 worktree 布局标记、引发 worktree/分支误删
+    （2026-08-30 task-audit-* 分支丢失复盘）。
+
+    Returns:
+        ``(reason, main_wt)``：
+        - cwd 为容器根 → ``("container_root", <main_worktree>)``；
+        - 否则 → ``(None, None)``。
+        标记缺失 / 非 container 布局 / 读取异常 → ``(None, None)``（best-effort）。
+    """
+    try:
+        cwd = Path(cwd).resolve()
+        marker = read_layout(Path(orchd_dir))
+        if marker is None or marker.get("layout") != "container":
+            return None, None
+        main_wt = Path(marker["main_worktree"]).resolve()
+        if cwd == main_wt.parent:
+            return "container_root", main_wt
+    except Exception:
+        return None, None
+    return None, None
+
+
 def resolve_canonical_project_root(project_root: Path) -> Path:
     """解析 canonical 项目根（统一共享读入口：主工作树根，task-canonical-project-root）。
 
@@ -270,7 +298,14 @@ def resolve_canonical_project_root(project_root: Path) -> Path:
     marker = read_layout(project_root / ".orchd")
     if marker is not None:
         if marker.get("layout") == "container":
-            return Path(marker["main_worktree"]).resolve()
+            try:
+                main_wt = Path(marker["main_worktree"]).resolve()
+                # 跨环境防御：标记中的绝对路径在当前环境可能无效（如沙箱→本机混合路径），校验 is_dir()，无效回退 project_root
+                if main_wt.is_dir():
+                    return main_wt
+                return project_root
+            except Exception:
+                return project_root
         return project_root  # flat：自身
 
     # 2) 标记缺失 → git 公共目录定位主工作树（flat 单 worktree 返回自身）
@@ -881,6 +916,50 @@ def _verify_task_wt(wt_path: Path, expected_branch: str) -> dict[str, Any]:
         return {"ok": False, "reason": f"worktree 校验异常: {exc}"}
 
 
+def _recycle_actor() -> str:
+    """删除/回收动作执行者标识（best-effort）：优先会话指纹，其次原始 session id。"""
+    try:
+        from orchd.ledger import resolve_agent_id
+
+        agent = resolve_agent_id()
+        if agent:
+            return agent
+    except Exception:
+        pass
+    return os.environ.get("ORCHD_SESSION_ID") or "<unknown>"
+
+
+def _log_recycle(records: list[dict[str, Any]]) -> None:
+    """把删除决策/动作记录打印到 stderr（``orchd ▸ [回收]`` 前缀，best-effort）。
+
+    审计契约（2026-08-30 task-audit-* 分支丢失复盘 §1）：任何 worktree /
+    分支 / 目录的删除动作与「拒绝删除」决策都必须留痕，杜绝 best-effort 静默
+    删除无法追溯。单条记录为结构化 dict（action / target / reason / evidence /
+    actor），JSON 序列化输出。失败静默跳过，不阻断主流程。
+    """
+    try:
+        for rec in records:
+            print(f"orchd ▸ [回收] {json.dumps(rec, ensure_ascii=False)}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _task_status_for_recycle(store_root: Path, task_id: str) -> str | None:
+    """best-effort 读取任务当前状态（删除保护断言与决策打点共用）。
+
+    经 ``orchd.ledger.Store.replay()`` 只读查询；store_root 不可用 / 读取异常
+    返回 None（best-effort，不阻断删除——in_review 保护仅在能**确认** in_review
+    时生效，避免账本异常导致回收被永久卡死）。
+    """
+    try:
+        from orchd.ledger import Store
+
+        ts = Store(store_root).replay().get(task_id)
+        return ts.status if ts else None
+    except Exception:
+        return None
+
+
 def remove_task_wt(
     project_root: Path, task_id: str, store_root: Path, *, lock_held: bool = False,
 ) -> dict[str, Any]:
@@ -889,8 +968,15 @@ def remove_task_wt(
     ``lock_held=True``：调用方已在同一共享账本根持有 ``.lock``（同进程），解绑时
     复用该锁、不再重复 flock（见 :func:`unbind_task_wt`），规避同进程双 fd E012 死锁。
 
+    in_review 保护断言（2026-08-30 复盘 §1）：任务状态为 in_review 时拒绝删除。
+    in_review 是审查等待期（任务可能 idle 数小时），恰是分支误删高危窗口；正常
+    回收流（review 通过 / force_status 终态）都在状态写入 completed/cancelled
+    **之后**才调用本函数，故出现 in_review 即视为异常请求。
+
     Returns:
         ``{"removed": True, "unbound": True}``；失败降级 ``{"removed": False, ...}``。
+        in_review 保护命中返回 ``{"removed": False, "reason": "in_review_protected",
+        "status": "in_review"}``；删除动作/决策记录于 ``recycle_log``。
     """
     layout = detect_layout(project_root)
     wt_path = layout["task_wt_root"] / _task_wt_name(task_id)
@@ -901,10 +987,35 @@ def remove_task_wt(
     from orchd.gitops import main_worktree_root
 
     stable_wt = main_worktree_root(project_root)
+    actor = _recycle_actor()
+    recycle_log: list[dict[str, Any]] = []
+
+    # in_review 保护断言（只读查询，确认命中才拒绝；查不到状态不阻断）
+    status = _task_status_for_recycle(store_root, task_id)
+    if status == "in_review":
+        record = {
+            "action": "blocked",
+            "reason": "in_review_protected",
+            "task_id": task_id,
+            "target": str(wt_path),
+            "status": status,
+            "actor": actor,
+        }
+        recycle_log.append(record)
+        _log_recycle(recycle_log)
+        return {
+            "removed": False,
+            "unbound": False,
+            "reason": "in_review_protected",
+            "status": status,
+            "recycle_log": recycle_log,
+        }
+
     removed = False
     discarded_uncommitted = False
+    wt_existed = (wt_path / ".git").exists()
     try:
-        if (wt_path / ".git").exists():
+        if wt_existed:
             # P2-9：先无 --force 移除（仅干净 worktree 可移，避免丢弃未提交改动）；
             # 脏 worktree 才回退 --force（终态回收 best-effort），并记 discarded 告警。
             proc = subprocess.run(
@@ -930,6 +1041,15 @@ def remove_task_wt(
             removed = True  # 独立 worktree 本就不存在 → 视为已回收
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         removed = False
+    recycle_log.append({
+        "action": "worktree_remove" if wt_existed else "worktree_absent",
+        "task_id": task_id,
+        "target": str(wt_path),
+        "removed": removed,
+        "discarded_uncommitted": discarded_uncommitted,
+        "status": status,
+        "actor": actor,
+    })
     # P0-19：Windows 下 git worktree remove 可能删除内容但残留空目录
     # （文件句柄 / .lock / 杀毒扫描导致目录删除不完整）。best-effort 清理残留。
     residual_cleaned = False
@@ -946,21 +1066,45 @@ def remove_task_wt(
                     residual_cleaned = True
             except Exception:
                 pass
+    if residual_cleaned:
+        recycle_log.append({
+            "action": "residual_clean",
+            "task_id": task_id,
+            "target": str(wt_path),
+            "actor": actor,
+        })
     # 删任务分支（best-effort，未合并时 -d/-D 失败不阻断）
     # 以主工作树为稳定 cwd（git -C）：worktree 已回收时 task/{id} 不再被占用可删除；
     # project_root（任务 worktree）可能已被 git worktree remove 删除，不能作为 cwd。
+    branch_deleted = False
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["git", "-C", str(stable_wt), "branch", "-D", f"task/{task_id}"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=_GIT_TIMEOUT,
         )
+        branch_deleted = proc.returncode == 0
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        pass
+        branch_deleted = False
+    recycle_log.append({
+        "action": "branch_delete",
+        "task_id": task_id,
+        "branch": f"task/{task_id}",
+        "deleted": branch_deleted,
+        "actor": actor,
+    })
     unbound = unbind_task_wt(store_root, task_id, lock_held=lock_held)
-    result = {"removed": removed, "unbound": unbound.get("unbound", False)}
+    recycle_log.append({
+        "action": "unbind",
+        "task_id": task_id,
+        "unbound": unbound.get("unbound", False),
+        "actor": actor,
+    })
+    _log_recycle(recycle_log)
+    result = {"removed": removed, "unbound": unbound.get("unbound", False),
+              "recycle_log": recycle_log}
     if discarded_uncommitted:
         result["discarded_uncommitted"] = True
     if residual_cleaned:
@@ -1020,20 +1164,9 @@ def _rmtree_force(path: Path) -> bool:
     Returns:
         ``True`` 目录已不存在（删除成功或本就不存在）。
     """
-    if not path.exists():
-        return True
-    try:
-        def _onerror(func: Any, p: str, exc: Any) -> None:
-            try:
-                os.chmod(p, 0o200)  # S_IWRITE：清只读后重试
-                func(p)
-            except OSError:
-                pass
+    from orchd.gitops import _os_delete_tree
 
-        shutil.rmtree(str(path), onerror=_onerror)
-    except OSError:
-        pass
-    return not path.exists()
+    return _os_delete_tree(path)
 
 
 def _cleanup_container_root_junk(task_wt_root: Path) -> list[str]:
@@ -1078,8 +1211,13 @@ def prune_orphans(
     - 绑定任务已不在 master / 无对应活跃任务 → remove + 解绑；
     - 文件系统残留 task-* 空目录（P0-19，Windows git worktree remove 不完整）→ 清理。
 
+    删除决策审计（2026-08-30 复盘 §1）：每次判定「可清理」前输出决策上下文
+    （task_id / status / has_active_binding / git 登记 / 判定依据），删除动作由
+    ``remove_task_wt`` 内部再记 recycle_log，杜绝 best-effort 静默删除无痕。
+
     Returns:
-        ``{"pruned": [<str>], "orphans_found": int, "residual_cleaned": [<str>]}``
+        ``{"pruned": [<str>], "orphans_found": int, "residual_cleaned": [<str>],
+        "decisions": [<dict>]}``；decisions 为本次全部删除/拒绝决策记录。
     """
     from orchd.gitops import _has_linked_worktrees
 
@@ -1087,6 +1225,8 @@ def prune_orphans(
     bindings = load_bindings(store_root)
     pruned: list[str] = []
     residual_cleaned: list[str] = []
+    decisions: list[dict[str, Any]] = []
+    actor = _recycle_actor()
 
     # 既有绑定任务清理（需要 git 层 linked worktrees 存在才执行 git worktree remove）
     if _has_linked_worktrees(project_root):
@@ -1094,7 +1234,16 @@ def prune_orphans(
             ts = state.get(task_id)
             status = ts.status if ts else "pending"
             if status in ("completed", "cancelled"):
-                # 终态：回收 worktree + 解绑
+                # 终态：回收 worktree + 解绑（删除动作由 remove_task_wt 记 recycle_log）
+                decisions.append({
+                    "action": "recycle",
+                    "task_id": task_id,
+                    "kind": "terminal_binding",
+                    "status": status,
+                    "bound_worktree": (entry or {}).get("worktree"),
+                    "actor": actor,
+                })
+                _log_recycle(decisions[-1:])
                 result = remove_task_wt(project_root, task_id, store_root)
                 if result.get("removed"):
                     pruned.append(task_id)
@@ -1125,6 +1274,15 @@ def prune_orphans(
                     continue
                 # 无活跃绑定 → 尝试清理残留目录
                 if not (entry / ".git").exists():
+                    decisions.append({
+                        "action": "clean",
+                        "target": entry.name,
+                        "kind": "residual_dir",
+                        "has_active_binding": False,
+                        "git_registered": False,
+                        "actor": actor,
+                    })
+                    _log_recycle(decisions[-1:])
                     try:
                         entry.rmdir()  # 仅空目录
                         residual_cleaned.append(entry.name)
@@ -1159,6 +1317,8 @@ def prune_orphans(
     result: dict[str, Any] = {"pruned": pruned, "orphans_found": len(pruned)}
     if residual_cleaned:
         result["residual_cleaned"] = residual_cleaned
+    if decisions:
+        result["decisions"] = decisions
     if stale_locks_cleaned:
         result["stale_locks_cleaned"] = stale_locks_cleaned
     if junk_cleaned:

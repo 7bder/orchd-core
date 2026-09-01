@@ -72,6 +72,16 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 并行：-n auto 按 CPU 核数起 worker；--dist=loadscope 按模块/类分组（session 级夹具
+# 每 worker 只执行一次，避免 test_packaging 同步脚本被多 worker 重复执行）；
+# --strict-markers 拦截未注册 marker；--durations=20 每次回归产出热点数据。
+#
+# 日常 pytest（多 agent 并发跑）保持 -n auto + numbered tmpdir，不动 basetemp。
+# 全量回归（独占通道，一次一人跑）应在调用方显式覆盖：
+#   --basetemp=C:/Temp/orchd-fr-baseline -n 8 --max-worker-restart=5
+# 详见 design/full-regression-parallel-crash-fix-20260830.md。固定 basetemp 仅
+# 适用于独占回归通道，日常多会话并发不要固定单一路径（会互相覆盖/删除）。
+addopts = "-n auto --dist=loadscope --strict-markers --durations=20"
 markers = [
     "slow: 慢速测试（长锁等待/真安装/构建），常规集默认忽略（-m 'not slow' 或 CI 烟测子集）",
 ]

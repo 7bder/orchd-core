@@ -366,8 +366,8 @@
           },
           "source": {
             "type": "string",
-            "pattern": "^(idea|roadmap):[a-z0-9-]+$",
-            "description": "任务来源（可选）。格式 ^(idea|roadmap):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id。缺省无 source 时校验通过（向后兼容存量任务）。"
+            "pattern": "^(idea|roadmap|debug):[a-z0-9-]+$",
+            "description": "任务来源（可选）。格式 ^(idea|roadmap|debug):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id；debug: 前缀标记外部来源手工注册的任务（无文件引用校验）。缺省无 source 时校验通过（向后兼容存量任务）。"
           },
           "verify_timeout_seconds": {
             "type": "integer",

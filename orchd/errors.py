@@ -1,8 +1,11 @@
 """Orchd 统一错误处理模块。
 
-本模块提供三个核心组件：
-- ErrorCode 枚举：定义 E001-E030 + E033-E034 共 32 个错误码（E031/E032/E035 为告警/拒绝码，不入枚举）。
+本模块提供四个核心组件：
+- ErrorCode 枚举：定义 E001-E036 共 36 个错误码（含 E031/E032/E035 三个
+  告警/拒绝码，统一纳入枚举以保证错误响应契约完整性）。
 - OrchdError 异常类：携带错误码、人类可读消息及结构化详情的业务异常基类。
+- NotApplicableError 异常类：门禁「环境不适用」信号，与 OrchdError（业务拒绝）
+  和普通 Exception（校验故障）共同构成门禁三分类。
 - to_json_response 格式化函数：将 OrchdError 转换为 CLI 统一 JSON 错误响应字典。
 
 依赖方向：errors.py 为最底层模块，不导入项目内其他模块。
@@ -15,7 +18,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """32 个错误码（E001-E030 + E033-E034）。"""
+    """35 个错误码（E001-E035，全码段统一纳入枚举）。"""
 
     E001 = "file_not_found"
     E002 = "invalid_json"
@@ -49,8 +52,12 @@ class ErrorCode(Enum):
     E028 = "dry_run_assertion_mismatch"
     E029 = "granularity_overflow"  # 任务拆解粒度越界（R4，warning 级）
     E030 = "runtime_file_integrity"  # 运行时文件完整性校验失败（红线 8 R3，warning 级）
+    E031 = "roadmap_landing_warning"  # validate 阶段 ROADMAP 规划章节未落地 IDEAS（warning 级，不判 invalid）
+    E032 = "auto_claim_disabled"  # 自动认领被拒（--auto-claim 默认禁用，需 config.allow_auto_claim）
     E033 = "session_identity_missing"  # 写命令需会话身份，但宿主未注入 ORCHD_SESSION_ID（session-id-fingerprint）
     E034 = "retract_not_authorized"  # 撤认归属守卫：仅事件作者本人或 admin 可撤回，跨 agent 撤认他人事件被拒（task-retract-ownership-guard）
+    E035 = "session_collision_warning"  # 会话冲突告警（同一工作区多会话碰撞，不阻断命令）
+    E036 = "container_root_cwd"  # 纪律护栏：在容器根执行引擎命令被拒（task-container-root-cwd-guard）
 
 
 # warning 级错误码（设计 §5）：不阻断操作，默认不触发 lesson 注入，仅 agent 主动打点。
@@ -60,6 +67,8 @@ WARNING_CODES = frozenset({
     "E028",  # dry_run_assertion_mismatch
     "E029",  # granularity_overflow
     "E030",  # runtime_file_integrity
+    "E031",  # roadmap_landing_warning
+    "E035",  # session_collision_warning
 })
 
 # 引擎预判「值得上报」的 warning 码（设计 §5.1 信号 A：suggest_report=true）。
@@ -105,6 +114,29 @@ class OrchdError(Exception):
         self.message = message
         self.details: list[dict[str, Any]] = details if details is not None else []
         super().__init__(f"[{code.name}] {message}")
+
+
+class NotApplicableError(Exception):
+    """门禁「环境不适用」——该门禁在本环境本就不该执行，属合法降级。
+
+    门禁异常的三分类之一（另见 :class:`OrchdError`）：
+
+    - ``OrchdError``：业务拒绝，携带错误码，原样向上抛、错误码不被改写。
+    - ``NotApplicableError``：**环境不适用**（非 git 仓库、非独立任务 worktree、
+      任务分支不存在等前提不成立），引擎允许降级跳过，但必须留痕。
+    - 其他 ``Exception``：**校验故障**（前提成立但门禁没能跑起来，如 git 超时、
+      IO 错误、模块导入失败），必须阻断或至少升级为 E030 告警，绝不静默。
+
+    与「校验故障」严格区分：不适用 = 前提不成立，故障 = 前提成立但门禁没能跑起来。
+    抛出后由 :func:`orchd.gitops.run_guard` 捕获并记入 ``degraded`` 列表（可审计），
+    不会像 ``except Exception: pass`` 那样静默消失。
+
+    Note:
+        为什么放 errors.py 而不是就近定义在 gitops.py：本类是**全引擎通用**的
+        门禁语义类型，属错误类型体系成员，而非 git 领域类型。依赖方向
+        ``gitops → errors`` 本就存在（``from orchd.errors import ErrorCode,
+        OrchdError``），本类归位不新增任何依赖边。
+    """
 
 
 def to_json_response(error: OrchdError) -> dict[str, Any]:

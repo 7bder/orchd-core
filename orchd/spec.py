@@ -533,7 +533,7 @@ def validate_source(
 ) -> list[ValidationError]:
     """source 字段溯源校验（E025，加法式：不改变 validate_structure/references 行为）。
 
-    task 可选 ``source`` 字段（``^(idea|roadmap):[a-z0-9-]+$``）声明任务来源：
+    task 可选 ``source`` 字段（``^(idea|roadmap|debug):[a-z0-9-]+$``）声明任务来源：
     - ``idea:<id>``：引用 IDEAS.md 中 ``- id: <id>`` **精确匹配**的条目，且该条目
       ``status: pending``（已 taskified/完成/dropped 的条目不可作为新任务来源；
       日期词/标题词 ref 因无对应条目 id 必然被拒）；
@@ -595,14 +595,14 @@ def validate_source(
 
         # 格式校验（正则已在 schema 层，但 validate_source 独立可调用时也要保证）
         import re as _re
-        if not _re.fullmatch(r"(idea|roadmap):[a-z0-9-]+", source):
+        if not _re.fullmatch(r"(idea|roadmap|debug):[a-z0-9-]+", source):
             errors.append(
                 ValidationError(
                     code=ErrorCode.E025,
                     path=f"$.tasks[{i}].source",
                     message=(
                         f"task '{tid}' source '{source}' 格式非法"
-                        "（须 ^(idea|roadmap):[a-z0-9-]+$）"
+                        "（须 ^(idea|roadmap|debug):[a-z0-9-]+$）"
                     ),
                 )
             )
@@ -632,6 +632,7 @@ def validate_source(
                 )
                 continue
             errors.extend(_check_roadmap_reference(tid, i, ref_id, roadmap_path))
+        # debug: 前缀标记外部来源手工注册的任务，不校验文件引用
 
     return errors
 
@@ -805,15 +806,51 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
             continue
         if f"§{sec['version']}" in ideas_text:
             continue
-        warnings.append({
+        warnings.append(_e031_warning(sec))
+    return warnings
+
+
+def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
+    """构造单条 E031 落地告警（通道 C：经 structured_error 挂 details+guidance）。
+
+    保留 ``{code, path, message}`` 既有键（消费方断言面不变），加法式附加
+    ``details``（list 契约）与 ``guidance``（按码指引，command 指向 roadmap-land）。
+    """
+    message = (
+        f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
+        "IDEAS.md 缺引用该章节的 detail；可运行 `orchd roadmap-land <版本>` 落地"
+    )
+    try:
+        from orchd.ledger import structured_error
+
+        resp = structured_error(
+            "E031",
+            message,
+            [{
+                "path": f"roadmap §{sec['version']}",
+                "hint": (
+                    f"运行 `orchd roadmap-land {sec['version']}` 为该规划章节生成 "
+                    "IDEAS pending 落地条目（摄入协议：先落地再注册任务）"
+                ),
+            }],
+            None,
+        )
+        err = resp.get("error", {})
+        return {
+            "code": err.get("code", "E031"),
+            "path": f"roadmap §{sec['version']}",
+            "message": message,
+            "details": err.get("details", []),
+            "severity": err.get("severity", "warning"),
+            "guidance": resp.get("guidance"),
+        }
+    except Exception:
+        # 通道 C best-effort：指引挂接失败不击穿 validate 告警链
+        return {
             "code": "E031",
             "path": f"roadmap §{sec['version']}",
-            "message": (
-                f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
-                "IDEAS.md 缺引用该章节的 detail；可运行 `orchd roadmap-land <版本>` 落地"
-            ),
-        })
-    return warnings
+            "message": message,
+        }
 
 
 def layout_marker_warnings(project_root: Path) -> list[dict[str, Any]]:

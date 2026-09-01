@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from orchd.ledger import Store, TaskState
@@ -19,18 +20,45 @@ from orchd.ledger import Store, TaskState
 # importance 权重映射
 _IMPORTANCE_WEIGHT = {"critical": 4, "high": 3, "normal": 2, "low": 1}
 
-# 共享核心文件集合（task-concurrency-hardening）：
-# 多 agent 并行改动这些引擎/测试基础设施文件时冲突最密集（onboard/gitops/cli/
-# errors/spec/pool/review/worktree/ledger + tests/*），且纯声明级 files_to_edit
-# 重叠未必能反映（常因越界改动未声明而同文件）。摄入/注册 tip 将其冲突从
-# warning 升级为强约束：非依赖的并行任务命中共享核心文件重叠即硬串行化
-# （靠 request 依赖感知过滤 + claim E010 兜底），不允许静默并行。
-SHARED_CORE_FILES = frozenset({
-    "orchd/onboard.py", "orchd/gitops.py", "orchd/gitops_ops.py",
-    "orchd/cli.py", "orchd/errors.py", "orchd/spec.py", "orchd/pool.py",
-    "orchd/review.py", "orchd/worktree.py", "orchd/ledger.py",
-    "orchd/split.py", "orchd/intake.py", "orchd/report.py",
+# 共享核心文件集合（task-concurrency-hardening + 拆包前置）：
+# 多 agent 并行改动这些引擎/测试基础设施文件时冲突最密集。改为递归扫描
+# 避免拆包后真空：_SHARED_CORE_PACKAGES 三子包递归 rglob + _SHARED_CORE_MODULES 硬编码散文件，
+# 迁移期双留旧路径保证兼容。
+_SHARED_CORE_PACKAGES = ("gitops", "onboard", "cli")
+_SHARED_CORE_MODULES = frozenset({
+    "orchd/gitops_ops.py", "orchd/errors.py", "orchd/spec.py", "orchd/pool.py",
+    "orchd/review.py", "orchd/worktree.py", "orchd/ledger.py", "orchd/split.py",
+    "orchd/intake.py", "orchd/report.py",
+    # 迁移期双留旧路径（拆包前 hard-coded 兼容）
+    "orchd/gitops.py", "orchd/onboard.py", "orchd/cli.py",
 })
+
+
+def _scan_core_files() -> frozenset[str]:
+    """扫描核心文件集合：子包递归 + 散文件，基于 __file__ 推导绝对路径，不依赖 CWD。"""
+    base = Path(__file__).resolve().parent
+    files: set[str] = set(_SHARED_CORE_MODULES)
+    for pkg in _SHARED_CORE_PACKAGES:
+        pkg_dir = base / pkg
+        if pkg_dir.is_dir():
+            for p in pkg_dir.rglob("*.py"):
+                if "__pycache__" in p.parts:
+                    continue
+                # 相对 orchd/ 父目录的路径，如 orchd/gitops/file.py
+                try:
+                    rel = p.relative_to(base.parent).as_posix()
+                    files.add(rel)
+                except ValueError:
+                    continue
+        else:
+            # 子包目录不存在（如拆包前），跳过，硬编码已覆盖
+            continue
+    if not files:
+        raise RuntimeError("SHARED_CORE_FILES 扫描结果为空（fail-closed）")
+    return frozenset(files)
+
+
+SHARED_CORE_FILES = _scan_core_files()
 
 
 def derive_importance(

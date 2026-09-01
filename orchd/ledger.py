@@ -29,12 +29,12 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.errors import ErrorCode, OrchdError
-from orchd.lockfile import ExclusiveFileLock, read_locked_text
+from orchd.errors import ErrorCode, OrchdError, to_json_response
+from orchd.lockfile import ExclusiveFileLock, _depth_registry, read_locked_text
 
 # checkpoint 字段 schema 版本（P2-10 / ROADMAP 1.4.1 引擎性能）：
 # update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
@@ -45,6 +45,102 @@ from orchd.lockfile import ExclusiveFileLock, read_locked_text
 # v3（2026-08-28，W-2）：新增 review_claimed_at（僵尸审查认领判定）后 bump，
 # 触发一次 replay_full 自愈，避免旧 checkpoint 缺该字段自我传播 → E030。
 _CHECKPOINT_SCHEMA_VERSION = 3
+
+
+# ------------------------------------------------------------------
+# 通道 C 结构化收敛（task-errexit-channel-c-structured）
+# ------------------------------------------------------------------
+# 手工 dict 错误（不冒泡到 cli 统一异常处理器的 {code,...} 裸 dict）拿不到
+# 按码指引。structured_error 内部统一 to_json_response 语义 +
+# attach_error_guidance，是通道 C 的唯一收敛入口（设计稿 §6.2）。
+#
+# 宿主位置选 ledger：cli / spec / gitops 均可按既有依赖方向引用
+# （cli→ledger 已文档化；spec→ledger 与 validate_source 同向；
+# gitops→ledger 无环），guide 依赖用函数内惰性导入保持 ledger→errors
+# 主干不膨胀。
+
+
+def structured_error(
+    code: str,
+    message: str,
+    details: Any = None,
+    base_dir: Path | None = None,
+) -> dict[str, Any]:
+    """通道 C 结构化错误：to_json_response + attach_error_guidance 一体化收敛。
+
+    保证两条契约（设计稿 §8.8 / §6.2）：
+
+    - ``error.details`` 恒为 ``list[dict]``——None/str/dict/list/其他一律归一，
+      消灭 E032 类 details 为字符串的契约违例；
+    - 响应恒带 ``guidance``（recovery/command/exit_type 等），按静态表挂接，
+      details 含 ``hint`` 时场景化覆盖通用 recovery（对齐异常通道行为）。
+
+    Args:
+        code: 错误码名（如 ``"E032"``）；未知码回退 E007（best-effort）。
+        message: 错误消息。
+        details: 任意形态，归一为 ``list[dict]``。
+        base_dir: guidance 路径解析用 ``.orchd`` 根（可 None）。
+
+    Returns:
+        ``{"error": {code, message, details, severity, suggest_report},
+           "guidance": {...}}``。
+    """
+    if details is None:
+        norm_details: list[dict[str, Any]] = []
+    elif isinstance(details, str):
+        norm_details = [{"message": details}]
+    elif isinstance(details, dict):
+        norm_details = [details]
+    elif isinstance(details, list):
+        norm_details = [
+            {"message": d} if isinstance(d, str)
+            else (d if isinstance(d, dict) else {"value": str(d)})
+            for d in details
+        ]
+    else:
+        norm_details = [{"value": str(details)}]
+    try:
+        code_enum = ErrorCode[code] if isinstance(code, str) else code
+    except KeyError:
+        code_enum = ErrorCode.E007
+    err = OrchdError(code_enum, message, norm_details)
+    resp = to_json_response(err)
+    try:
+        from orchd.guide import attach_error_guidance
+
+        resp = attach_error_guidance(resp, code_enum.name, base_dir)
+    except Exception:
+        # guidance 为加法式附加：挂接失败不得击穿错误主体输出（通道 C best-effort）
+        pass
+    return resp
+
+
+def _attach_structured_guidance(
+    entry: dict[str, Any], base_dir: Path | None = None
+) -> dict[str, Any]:
+    """给 E030 完整性/降级告警条目附加结构化 ``details`` + ``guidance``。
+
+    保留条目原有键（code/severity/message/path/guard/...）不改变既有消费方
+    断言面，仅加法式附加；任何异常静默降级（告警链不得因指引挂接失败）。
+
+    注意：details 必须用条目的**浅拷贝**——直接传条目自身会让归一后的
+    ``details[0]`` 与条目互指，回填 ``entry["details"]`` 后形成循环引用，
+    JSON 序列化即崩（实测 E999 Circular reference）。
+    """
+    try:
+        resp = structured_error(
+            entry.get("code", ErrorCode.E030.name),
+            entry.get("message", ""),
+            [dict(entry)],
+            base_dir,
+        )
+        entry["details"] = resp.get("error", {}).get("details", [])
+        guidance = resp.get("guidance")
+        if guidance:
+            entry["guidance"] = guidance
+    except Exception:
+        pass
+    return entry
 
 
 @dataclass
@@ -204,8 +300,8 @@ class TaskDerived:
       ``baseline_sha``（正序遍历后者覆盖 = 最近一次）。
 
     与 replay 同源（同一份 ledger、同一 :meth:`Store._read_ledger_lines`
-    容错语义：末行损坏跳过、中间行损坏 E002），保证「读到的辅助信息」与
-    「派生状态」一致。
+    容错语义：末行损坏跳过、中间行损坏降级跳过 + E030 warning），保证
+    「读到的辅助信息」与「派生状态」一致。
     """
 
     last_done: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -389,6 +485,103 @@ def _session_runtime_path(orchd_dir: Path, session_id: str) -> Path:
     return session_runtime_dir(orchd_dir) / f"{session_id}.json"
 
 
+# ------------------------------------------------------------------
+# Session TTL 与惰性过期（task-audit-session-ttl-lazy-expiry）
+# ------------------------------------------------------------------
+# 根因：session 依赖显式 end，而宿主会话中断（关对话 / IDE 崩 / agent 超时 /
+# context 满）时 session end 永不被调用，orchd 每次调用都是独立短进程、无法
+# 感知宿主存活 → 僵尸 runtime 文件累积（实测约 9 个/天）。
+#
+# 策略：不追求「删除」（清理是被动的，得有人跑命令才触发），而是读时按
+# ``last_seen + TTL`` 判定过期、**判定即生效**——过期文件即使仍在磁盘：
+#   - 不参与身份解析：session current / end → E033（reason=session_expired），
+#     附重新 start 指引（对齐 E033 现有语义）；
+#   - 不再计入活跃：watchdog stale_sessions → reason=session_expired
+#     （见 report.py，供接管流程发现）。
+
+
+_SESSION_TTL_MIN_ENV = "ORCHD_SESSION_TTL_MIN"
+_SESSION_TTL_DEFAULT_MIN = 24 * 60  # 默认 24h
+
+
+def session_ttl_minutes() -> int:
+    """返回 session TTL（分钟）：``ORCHD_SESSION_TTL_MIN`` 覆盖，默认 24h（1440）。
+
+    非法值（非整数 / <= 0 / 空串）静默回退默认——环境差异不得击穿身份路径。
+
+    Returns:
+        当前生效的 TTL 分钟数（正整数）。
+    """
+    raw = os.environ.get(_SESSION_TTL_MIN_ENV)
+    if raw is None or not raw.strip():
+        return _SESSION_TTL_DEFAULT_MIN
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        return _SESSION_TTL_DEFAULT_MIN
+    return val if val > 0 else _SESSION_TTL_DEFAULT_MIN
+
+
+def _parse_session_ts(value: Any) -> datetime | None:
+    """解析 ISO-8601 时间戳为 aware datetime；缺失 / 非法返回 None（naive 视为 UTC）。"""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        ts = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def is_session_expired(data: dict[str, Any], now: datetime | None = None) -> bool:
+    """TTL 判定：``last_seen + TTL <= now`` → 过期（惰性过期，判定即生效）。
+
+    纯只读计算，不触碰磁盘、不依赖任何清理动作：
+
+    - ``last_seen`` 缺失 / 非法 → 判**未过期**（兼容降级：旧式 runtime 文件
+      与测试夹具可能缺该字段；缺字段不构成过期依据，僵尸判定宁可保守，
+      与既有「无 last_seen 的 active runtime 不算僵死」行为零回归）；
+    - 否则按 :func:`session_ttl_minutes`（``ORCHD_SESSION_TTL_MIN`` 可覆盖）比较。
+
+    Args:
+        data: session runtime JSON 内容（含 ``last_seen``）。
+        now: 判定基准时刻；缺省取当前 UTC 时间。
+
+    Returns:
+        True：会话已过期；False：未过期或无法判定。
+    """
+    last_seen = _parse_session_ts(data.get("last_seen"))
+    if last_seen is None:
+        return False
+    moment = now or datetime.now(timezone.utc)
+    return last_seen + timedelta(minutes=session_ttl_minutes()) <= moment
+
+
+def _touch_session_last_seen(orchd_dir: Path) -> None:
+    """刷新当前会话 runtime 的 ``last_seen``（best-effort，任何异常静默降级）。
+
+    写命令路径事件追加成功后调用（另见 :func:`session_current` 的活跃刷新）：
+    仅当 runtime 文件存在且 active 时写入新时间戳。TTL 判定依赖该信号，
+    但活性刷新自身不得阻塞写路径——失败只影响判活精度，不影响账本正确性。
+    """
+    try:
+        identity = resolve_session_identity(orchd_dir)
+        if not identity["session_id"]:
+            return
+        path = _session_runtime_path(Path(orchd_dir), identity["session_id"])
+        if not path.exists():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not data.get("active"):
+            return
+        data["last_seen"] = datetime.now(timezone.utc).isoformat()
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError):
+        return
+
+
 def session_start(
     orchd_dir: Path,
     agent_name: str | None = None,
@@ -426,6 +619,11 @@ def session_current(orchd_dir: Path) -> dict[str, Any]:
 
     判定：取 ``resolve_session_identity()`` 的 session_id，再在 runtime 目录中
     定位同名 JSON。若 runtime 文件缺失或已 inactive，提示重新 session start。
+
+    TTL 惰性过期（task-audit-session-ttl-lazy-expiry）：runtime active 但
+    ``last_seen`` 超过 TTL（默认 24h，``ORCHD_SESSION_TTL_MIN`` 覆盖）→
+    E033（reason=session_expired）附重新 start 指引；判定即生效、不清理文件。
+    活跃会话每次查询刷新 ``last_seen``（活性信号）。
     """
     orchd_dir = Path(orchd_dir)
     identity = resolve_session_identity(orchd_dir)
@@ -458,14 +656,40 @@ def session_current(orchd_dir: Path) -> dict[str, Any]:
             "session_inactive: 当前 session 已结束，请重新 session start",
             [{"session_id": data.get("session_id"), "path": str(path)}],
         )
+    if is_session_expired(data):
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_expired: 当前 session 已超过 TTL 未活动，请重新 session start",
+            [{
+                "session_id": data.get("session_id"),
+                "reason": "session_expired",
+                "ttl_minutes": session_ttl_minutes(),
+                "last_seen": data.get("last_seen"),
+                "hint": (
+                    "会话已按 TTL 惰性过期（判定即生效，无需清理）：重新运行 "
+                    "'orchd session start' 开启新会话，并将返回的 session_token "
+                    "注入 ORCHD_SESSION_ID"
+                ),
+            }],
+        )
     now = datetime.now(timezone.utc).isoformat()
     data["last_seen"] = now
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {**data, "path": str(path), "current": True}
 
 
-def session_end(orchd_dir: Path) -> dict[str, Any]:
-    """结束当前会话：标记 runtime 文件 inactive（best-effort，不删除）。"""
+def session_end(
+    orchd_dir: Path,
+    *,
+    force_bypass: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """结束当前会话：标记 runtime 文件 inactive（best-effort，不删除）。
+
+    红线 #5 硬化（task-audit-session-end-clean-gate）：CLI 层在调用前已校验
+    工作区无已跟踪改动，脏且未 --force 时会被拒绝，不会到达本函数。当
+    ``--force`` 放行时，``force_bypass`` 携带放行原因与待提交文件清单，
+    原样写入 runtime 文件，保证审计可查。
+    """
     orchd_dir = Path(orchd_dir)
     identity = resolve_session_identity(orchd_dir)
     if not identity["session_id"]:
@@ -482,8 +706,31 @@ def session_end(orchd_dir: Path) -> dict[str, Any]:
             [{"session_id": identity["session_id"], "hint": "先 session start 再 session end"}],
         )
     data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("active") and is_session_expired(data):
+        # TTL 惰性过期：会话早已无人活动，无需「结束」一个已过期会话——
+        # 与 session_current 同样报 E033（reason=session_expired），指引重新 start。
+        raise OrchdError(
+            ErrorCode.E033,
+            "session_expired: 当前 session 已超过 TTL 未活动，无需结束，请重新 session start",
+            [{
+                "session_id": data.get("session_id"),
+                "reason": "session_expired",
+                "ttl_minutes": session_ttl_minutes(),
+                "last_seen": data.get("last_seen"),
+                "hint": (
+                    "会话已按 TTL 惰性过期（判定即生效，无需清理）：重新运行 "
+                    "'orchd session start' 开启新会话，并将返回的 session_token "
+                    "注入 ORCHD_SESSION_ID"
+                ),
+            }],
+        )
     data["active"] = False
     data["ended_at"] = datetime.now(timezone.utc).isoformat()
+    if force_bypass:
+        data["force_bypass"] = {
+            **force_bypass,
+            "at": data["ended_at"],
+        }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {**data, "path": str(path), "ended": True}
 
@@ -529,6 +776,14 @@ def resolve_workspace_root(project_root: Path) -> Path:
 
 # ------------------------------------------------------------------
 # 准入/公共文件锁（task-intake-file-lock）
+# 锁维度盘点（task-audit-lock-residue-reclaim AC1）：intake 准入写锁
+# ``.intake.lock`` 落于共享账本根（resolve_store_dir，container/flat 兼容）。
+# 路径解析：ORCHD_HOME 重定向 > container 布局 ``<容器>/.orchd-runtime/`` > flat
+# 回退 ``orchd_dir``（intake_lock_path）。生命周期：acquire（阻塞+超时 flock + 写
+# 诊断标记）→ release（引用计数归零释放 flock，**不 unlink**，文件保留）→ 无 live
+# flock 时由 intake_lock_check 判未持有；长时间未用的超时残留标记由
+# intake_lock_check 自动清除（AC3）。迁移孤儿：flat→container 后旧路径
+# ``<main>/.orchd/.intake.lock`` 由 reclaim_orphan_intake_locks 在 intake 路径回收（AC2）。
 # ------------------------------------------------------------------
 # 背景：_master.json / IDEAS.md / ROADMAP.md 是 git 跟踪的全局文件、无进程级锁，
 # 与账本文件（被 Store.acquire_lock()) 的 flock 串行不对等。两个 agent 并行准入
@@ -579,12 +834,15 @@ def intake_lock_check(
     """检查准入锁状态（不阻塞），供 watchdog / caller 判定是否僵死。
 
     以 :class:`ExclusiveFileLock` 的 flock 探测为权威：无 live flock 持有即未锁；
-    被持有则尽量读诊断标记（agent_id/timestamp）。为兼容旧调用方/测试，未持有但
-    存在**超时残留标记**时亦返回 ``reason="timeout"``（可续获取）。
+    被持有则尽量读诊断标记（agent_id/timestamp）。task-audit-lock-residue-reclaim
+    （AC3）：未持有但存在**超时残留标记**（无 live flock 的陈旧标记）时**自动清除**
+    陈旧标记并返回 ``reason="timeout_cleaned"``——陈旧标记不再产生
+    ``reason="timeout"`` 误导（watchdog 曾据此误报 stale_marker），返回未锁可续获取。
 
     Returns:
         ``{"locked": False}`` 未被持有（无 live flock，可获取）。
-        ``{"locked": False, "reason": "timeout", "age_s"}`` 未被持有但残留标记超时。
+        ``{"locked": False, "reason": "timeout_cleaned", "age_s",
+        "cleanup_result"}`` 未被持有且残留超时标记已被自动清除。
         ``{"locked": True, "agent_id", "timestamp", "age_s"}`` 被持有，诊断标记可读。
         ``{"locked": True, "reason": "no_marker"}`` 被持有但标记不可读。
     """
@@ -611,14 +869,29 @@ def intake_lock_check(
             }
         except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
             return {"locked": True, "reason": "no_marker"}
-    # 未被持有：兼容旧"残留标记超时"判定（flock 是权威，此项仅诊断，不参与互斥）
+    # 未被持有：无 live flock → 残留标记不再参与互斥。若残留标记已超时
+    # （task-audit-lock-residue-reclaim AC3），**自动清除**陈旧标记并返回未锁，
+    # 不再让陈旧标记产生 reason="timeout" 误导（watchdog 曾据此误报 stale_marker）。
+    # 删除前已由上面的 ExclusiveFileLock.check() 确认无 live flock 持有；与
+    # intake_lock_clear 一致，仅当无持有才 unlink（防 unlink-alias 竞态）。
     try:
         if lock_path.exists():
             data = json.loads(lock_path.read_text(encoding="utf-8"))
             ts = float(data.get("timestamp", 0))
             age = time.time() - ts
             if age >= timeout_s and data.get("agent_id"):
-                return {"locked": False, "reason": "timeout", "age_s": round(age, 1)}
+                cleared = False
+                try:
+                    lock_path.unlink()
+                    cleared = not lock_path.exists()
+                except OSError:
+                    cleared = False
+                return {
+                    "locked": False,
+                    "reason": "timeout_cleaned",
+                    "age_s": round(age, 1),
+                    "cleanup_result": {"cleared": cleared, "path": str(lock_path)},
+                }
     except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
         pass
     return {"locked": False}
@@ -689,6 +962,13 @@ def intake_lock_acquire(
         )
     except OSError:
         pass
+    # 迁移孤儿回收（task-audit-lock-residue-reclaim AC2）：账本根重定向
+    # （container / ORCHD_HOME）时清理 flat→container 迁移后旧路径
+    # ``<main>/.orchd/.intake.lock`` 残留，best-effort 不阻断准入。
+    try:
+        reclaim_orphan_intake_locks(orchd_dir)
+    except Exception:
+        pass
     return {"acquired": True, "agent_id": agent_id,
             "path": str(canonical), "_lock": lock}
 
@@ -725,6 +1005,45 @@ def intake_lock_release(lock: dict[str, Any]) -> None:
         except (OSError, IOError):
             pass
         _intake_lock_registry.pop(canonical, None)
+
+
+def reclaim_orphan_intake_locks(orchd_dir: Path) -> dict[str, Any]:
+    """回收迁移后旧路径下的 ``.intake.lock`` 孤儿（task-audit-lock-residue-reclaim AC2）。
+
+    flat→container 迁移后账本根从 ``<main>/.orchd/`` 变为 ``<runtime>/.orchd-runtime/``，
+    flat 时代落在 ``<main>/.orchd/.intake.lock`` 的准入锁文件成为**迁移孤儿**（新路径
+    在 runtime 根，旧路径不再被读写）。本函数在账本根重定向生效
+    （``resolve_store_dir != orchd_dir``，container / ORCHD_HOME 重定向）时识别并清理
+    旧路径残留：仅当无 live flock 持有才删除（与 :func:`intake_lock_clear` 同语义，
+    防 unlink-alias 竞态）。
+
+    Args:
+        orchd_dir: 主工作树的 .orchd 目录。
+
+    Returns:
+        ``{"scanned": bool, "cleaned": [<str>], "reason": <str|None>}``：
+        - ``scanned=False``：账本根未重定向（flat 未迁移），无迁移孤儿路径，零操作；
+        - ``scanned=True``：已检查旧路径；``cleaned`` 列出已删除的孤儿文件路径
+          （无 live flock 且旧路径存在时删除）；``reason="held"`` 表示旧路径仍被
+          live flock 持有（不删除，保守跳过）。
+    """
+    canonical = resolve_store_dir(orchd_dir)
+    old_path = Path(orchd_dir) / _INTAKE_LOCK_FILENAME
+    if Path(canonical).resolve() == Path(orchd_dir).resolve():
+        # 账本根未重定向（flat 未迁移）→ 不存在"旧路径"概念，零操作
+        return {"scanned": False, "cleaned": []}
+    if not old_path.exists():
+        return {"scanned": True, "cleaned": []}
+    if ExclusiveFileLock(old_path).check().get("held"):
+        return {"scanned": True, "cleaned": [], "reason": "held"}
+    try:
+        old_path.unlink()
+        return {
+            "scanned": True,
+            "cleaned": [str(old_path)] if not old_path.exists() else [],
+        }
+    except OSError:
+        return {"scanned": True, "cleaned": []}
 
 
 def intake_lock_clear(orchd_dir: Path) -> dict[str, Any]:
@@ -764,7 +1083,8 @@ class StorageBackend(ABC):
     def read_events(self, from_line: int = 1) -> list[dict[str, Any]]:
         """读取 ledger 事件（从 ``from_line`` 起，1-based 行号）。
 
-        容错语义与既有实现一致：末行损坏跳过 + warning，中间行损坏抛 E002。
+        容错语义：末行损坏跳过 + warning，中间行损坏降级跳过 + E030 warning
+        （task-audit-ledger-write-atomicity AC4，不再抛 E002 中断引擎）。
         ``from_line`` 必须在文件层先跳过前 ``from_line-1`` 行再解析——保证
         checkpoint 之前（已被快照覆盖）的损坏行不会被解析（B-1 修复，
         恢复增量 replay 的容错语义）。
@@ -806,17 +1126,27 @@ class FilesystemBackend(StorageBackend):
         self.lock_path = orchd_dir / ".lock"
         self._file_lock = ExclusiveFileLock(self.lock_path)
 
-    @property
-    def _lock_fd(self) -> int | None:
-        """当前持有的 fd（兼容 Store._lock_fd 转发）；未持锁返回 None。"""
-        return self._file_lock._fd
-
-    @_lock_fd.setter
-    def _lock_fd(self, value: int | None) -> None:
-        """兼容旧接口（不应被外部直接设置；no-op）。"""
-        pass
-
     def append_event(self, event: dict[str, Any]) -> None:
+        """以 append 模式写一条事件到 ledger（持锁断言 + 追加 + fsync）。
+
+        持锁断言（task-audit-ledger-write-atomicity AC1）：写路径必须持锁——
+        单次 O_APPEND 在 Windows 下不保证原子，长事件行并发会撕裂 ledger。
+        绕过持锁直接写入视为引擎纪律违反，抛 E007。同进程其他 Store 实例
+        （如 review 合并流 merge_lock）已持同路径锁时视为持锁（_depth_registry
+        进程级登记），避免容器布局下复用锁场景误报。
+        """
+        if (
+            self._file_lock._fd is None
+            and str(self.lock_path.resolve()) not in _depth_registry
+        ):
+            raise OrchdError(
+                ErrorCode.E007,
+                "append_event 必须在持锁状态下调用（acquire_lock 之后）",
+                [{
+                    "path": str(self.ledger_path),
+                    "hint": "写路径须先 store.acquire_lock() 再 append_event，确保并发 append 串行原子",
+                }],
+            )
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
         fd = os.open(str(self.ledger_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
@@ -834,9 +1164,10 @@ class FilesystemBackend(StorageBackend):
         恢复增量 replay 的容错语义（重构前 ``_read_ledger_lines`` 直接在文件层
         跳过，不解析被跳过的行）。
 
-        容错规则：
+        容错规则（task-audit-ledger-write-atomicity AC4）：
         - 最后一行 JSON 解析失败 → 跳过 + warning（可能写入未完成）
-        - 中间行解析失败 → E002
+        - 中间行解析失败 → warning（E030 语义）+ 跳过，不再硬抛 E002 中断引擎；
+          撕裂行（并发 append 被中断）因此降级为可读，数据可继续恢复
         """
         if not self.ledger_path.exists():
             return []
@@ -854,7 +1185,8 @@ class FilesystemBackend(StorageBackend):
                 events.append(json.loads(stripped))
             except json.JSONDecodeError:
                 # 末行（含末尾空行）损坏 → 可能写入未完成，仅 warning 跳过；
-                # 中间行损坏 → 数据损坏，抛 E002 中断。
+                # 中间行损坏 → E030 warning + 跳过（数据可能撕裂，引擎降级继续，
+                # 不再抛 E002 中断——AC4）。
                 is_last = i == len(raw_lines) - 1 or all(
                     not raw_lines[j].strip() for j in range(i + 1, len(raw_lines))
                 )
@@ -864,10 +1196,10 @@ class FilesystemBackend(StorageBackend):
                         stacklevel=2,
                     )
                 else:
-                    raise OrchdError(
-                        ErrorCode.E002,
-                        f"ledger 中间行 JSON 解析失败（第 {i + 1} 行），数据可能损坏",
-                        [{"line": i + 1, "content": stripped[:200]}],
+                    warnings.warn(
+                        f"[E030] ledger 中间行 JSON 解析失败（第 {i + 1} 行），"
+                        f"已跳过（可能为并发写入撕裂行，引擎降级继续）: {stripped[:80]}",
+                        stacklevel=2,
                     )
         return events
 
@@ -891,11 +1223,21 @@ class FilesystemBackend(StorageBackend):
     def save_checkpoint(self, data: dict[str, Any]) -> None:
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.checkpoint_path.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(str(tmp_path), str(self.checkpoint_path))
+        # fsync 父目录，确保持久化目录项（与 append_event 对齐；Windows 下
+        # 目录 fsync 不可用，best-effort 忽略）
+        try:
+            dir_fd = os.open(str(self.checkpoint_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     def acquire_lock(self) -> None:
         """获取排他文件锁（ExclusiveFileLock 原语，阻塞等待 + 超时）。
@@ -916,6 +1258,78 @@ class FilesystemBackend(StorageBackend):
     def release_lock(self) -> None:
         """释放文件锁（ExclusiveFileLock 原语，depth 到 0 才真正释放）。"""
         self._file_lock.release()
+
+
+# 跃迁白矩阵（task-audit-ledger-state-machine-dedup）：事件类型 → 允许的当前状态
+# 集合。仅约束「会改变状态」的事件；目标状态 == 当前状态（幂等 self-transition，
+# 如两阶段审查 spec APPROVED 后任务仍 in_review、REVIEW_READY(code) 再次到来）
+# 永远合法。FORCE_STATUS（强制逃生口，支持 cancelled→pending 复活 / claimed→
+# completed）、RETRACT（回滚）、REVIEW_CLAIMED（非状态跃迁）不受矩阵约束。
+_TRANSITION_WHITELIST: dict[str, frozenset[str]] = {
+    "CLAIMED": frozenset({"pending"}),
+    "DONE": frozenset({"claimed"}),
+    "REVIEW_READY": frozenset({"done", "in_review"}),
+    "REVIEW_SUBMITTED": frozenset({"in_review"}),
+}
+# 不受白矩阵约束的事件类型（引擎逃生口 / 回滚 / 非状态跃迁）
+_UNGATED_TRANSITIONS = frozenset({"FORCE_STATUS", "RETRACT", "REVIEW_CLAIMED"})
+
+
+def _event_target_status(event: dict[str, Any]) -> str | None:
+    """推导事件将设置的目标状态；不改变状态或不受约束的事件返回 None（跳过校验）。"""
+    etype = event.get("type", "")
+    if etype in _UNGATED_TRANSITIONS:
+        return None
+    if etype == "CLAIMED":
+        return "claimed"
+    if etype == "DONE":
+        return "done"
+    if etype == "REVIEW_READY":
+        return "in_review"
+    if etype == "REVIEW_SUBMITTED":
+        verdict = event.get("verdict", "")
+        rt = event.get("review_type")
+        if verdict == "CHANGES_REQUESTED":
+            return "pending"
+        if verdict == "APPROVED" and (rt == "code" or rt is None):
+            return "completed"
+        if verdict == "APPROVED" and rt == "spec":
+            return "in_review"  # self-transition，放行
+    return None
+
+
+def validate_transition(
+    event_type: str,
+    current_status: str,
+    target_status: str,
+) -> None:
+    """跃迁白矩阵校验（引擎硬约束）：非法状态跃迁抛 E007（含当前/目标状态）。
+
+    - 不受约束的事件（FORCE_STATUS / RETRACT / REVIEW_CLAIMED）直接放行；
+    - 目标 == 当前（幂等 self-transition，状态不变）放行；
+    - 否则要求 ``current_status`` 属于白矩阵中该事件允许的来源集合。
+    未知事件类型保守放行（不阻塞未来事件扩展）。
+    """
+    if event_type in _UNGATED_TRANSITIONS:
+        return
+    allowed = _TRANSITION_WHITELIST.get(event_type)
+    if allowed is None:
+        return
+    if target_status == current_status:
+        return
+    if current_status not in allowed:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"invalid_transition: {current_status} --{event_type}--> {target_status} "
+            "不在跃迁白矩阵",
+            [{
+                "event_type": event_type,
+                "current_status": current_status,
+                "target_status": target_status,
+                "hint": f"{event_type} 仅允许从 {sorted(allowed)} 状态跃迁到 "
+                        f"{target_status}",
+            }],
+        )
 
 
 class Store:
@@ -966,13 +1380,24 @@ class Store:
         return self.backend.lock_path
 
     @property
-    def _lock_fd(self) -> int | None:
-        """转发到 backend 的 ExclusiveFileLock fd（测试/审查兼容）。"""
-        return self.backend._lock_fd
+    def _lock_fd(self) -> Any | None:
+        """兼容属性：转发到 backend._file_lock._fd，保证既有测试与调用方兼容。
+
+        FilesystemBackend docstring 明文承诺'Store 的 _lock_fd 属性转发到本后端'，
+        未持锁时为 None，持锁时为 fd 真值。
+        """
+        try:
+            return self.backend._file_lock._fd  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
 
     @_lock_fd.setter
-    def _lock_fd(self, value: int | None) -> None:
-        self.backend._lock_fd = value
+    def _lock_fd(self, value: Any | None) -> None:
+        """no-op setter，兼容直接赋值测试（不实际改变锁状态）。"""
+        try:
+            self.backend._file_lock._fd = value  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
     # ------------------------------------------------------------------
     # 文件锁
@@ -991,11 +1416,47 @@ class Store:
     # ------------------------------------------------------------------
 
     def append_event(self, event: dict[str, Any]) -> None:
-        """以 append 模式写入 JSONL，写入后 flush + fsync。"""
-        self.backend.append_event(event)
+        """以 append 模式写入 JSONL，写入后 flush + fsync。
+
+        写前校验跃迁白矩阵（引擎硬约束，2026-08-29）：受约束事件若引起非法状态
+        跃迁（如 pending 直接 DONE）抛 E007、事件不落盘；self-transition /
+        FORCE_STATUS / RETRACT / REVIEW_CLAIMED 放行。各写命令自身仍保留前置
+        校验，此处为底层硬约束兜底，防调用方绕过状态机。
+
+        持锁兜底（task-audit-ledger-write-atomicity AC1）：写命令在命令级
+        ``acquire_lock`` 内调用（backend 持锁 → 直接写）；未持锁时（单测 /
+        单次 append）自动加锁写一次保证原子，backed 层持锁断言因此恒满足。
+        自动加锁前先查进程级锁登记（_depth_registry）：同进程其他 Store 实例
+        （如 container 布局 review 合并流 merge_lock）已持同路径锁时不重复
+        flock——同一进程双 fd 对同一区域加锁会自锁死（E012），须复用已持锁。
+        """
+        task_id = event.get("task_id", "")
+        target = _event_target_status(event)
+        if task_id and target:
+            current = self.replay().get(task_id)
+            validate_transition(
+                event.get("type", ""),
+                current.status if current else "pending",
+                target,
+            )
+        held = (
+            self.backend._file_lock._fd is not None
+            or str(self.lock_path.resolve()) in _depth_registry
+        )
+        if not held:
+            self.acquire_lock()
+        try:
+            self.backend.append_event(event)
+        finally:
+            if not held:
+                self.release_lock()
         # H4：已校准时追加 1 行（写入成功才递增；未校准则保持 None 惰性校准）
         if self._line_count is not None:
             self._line_count += 1
+        # Session TTL（task-audit-session-ttl-lazy-expiry）：写命令路径事件追加
+        # 成功后刷新当前会话 last_seen——写事件是宿主活动的最强信号，惰性过期
+        # 据此判活。best-effort，任何异常不反向影响已成功的账本写入。
+        _touch_session_last_seen(self.orchd_dir)
 
     # ------------------------------------------------------------------
     # Replay
@@ -1010,7 +1471,7 @@ class Store:
         容错规则：
         - checkpoint 解析失败 → 回退全量 replay
         - 最后一行 JSON 解析失败 → 跳过 + warning
-        - 中间行解析失败 → E002
+        - 中间行解析失败 → 降级跳过 + E030 warning（AC4，不再抛 E002）
         """
         checkpoint_line, tasks, retracted = self._load_checkpoint()
         events = self._read_ledger_lines(from_line=checkpoint_line + 1)
@@ -1070,9 +1531,10 @@ class Store:
         为界，重放该前缀事件并与 checkpoint 的 ``tasks`` 快照比对，检测运行时
         文件（ledger / checkpoint）被手改的篡改。
 
-        注意：停用 RETRACT 递归（改用 :meth:`_apply_events_no_retract`）——
-        前缀重放只关心前 ``n`` 条事件的派生结果，若 RETRACT 触发全量重建会越过
-        前缀边界读到 ``n`` 之后的事件，破坏前缀语义。
+        注意：停用 RETRACT 递归（``handle_retract=False``，task-audit-ledger-
+        state-machine-dedup 合并去重后统一走 :meth:`_apply_events`）——前缀重放只
+        关心前 ``n`` 条事件的派生结果，若 RETRACT 触发全量重建会越过前缀边界读到
+        ``n`` 之后的事件，破坏前缀语义。
         """
         events = self.backend.read_events()[:n]
         tasks: dict[str, TaskState] = {}
@@ -1084,7 +1546,7 @@ class Store:
                 te = ev.get("target_event_id", "")
                 if te:
                     retracted.add(te)
-        self._apply_events_no_retract(events, tasks, retracted)
+        self._apply_events(events, tasks, retracted, handle_retract=False)
         return tasks
 
     def check_integrity(self) -> list[dict[str, Any]]:
@@ -1107,7 +1569,7 @@ class Store:
 
         ledger_line = checkpoint.get("ledger_line")
         if not isinstance(ledger_line, int) or ledger_line < 0:
-            warnings_list.append({
+            warnings_list.append(_attach_structured_guidance({
                 "code": ErrorCode.E030.name,
                 "severity": "warning",
                 "message": (
@@ -1115,12 +1577,12 @@ class Store:
                     "运行时文件疑似被篡改（不自动修复）"
                 ),
                 "path": str(self.checkpoint_path),
-            })
+            }, self.orchd_dir))
             return warnings_list
 
         actual = self._count_ledger_lines()
         if ledger_line > actual:
-            warnings_list.append({
+            warnings_list.append(_attach_structured_guidance({
                 "code": ErrorCode.E030.name,
                 "severity": "warning",
                 "message": (
@@ -1128,19 +1590,26 @@ class Store:
                     f"{actual}，运行时文件疑似被篡改；建议人工核对（不自动修复）"
                 ),
                 "path": str(self.checkpoint_path),
-            })
+            }, self.orchd_dir))
+            return warnings_list
+
+        # 兼容层清理：schema 升级后 checkpoint 快照与重放结果不一致属预期
+        # 版本落后时跳过快照一致性比较，消除升级后误报 E030
+        ckpt_version = checkpoint.get("schema_version")
+        if isinstance(ckpt_version, int) and ckpt_version != _CHECKPOINT_SCHEMA_VERSION:
             return warnings_list
 
         try:
             derived = self._replay_prefix(ledger_line)
         except OrchdError:
-            # ledger 中间行损坏（E002）——replay 处已抛，此处仅附加告警
-            warnings_list.append({
+            # 防御性兜底：replay 异常（如校验故障）时附加 E030 告警。
+            # 注：AC4 起中间行损坏已降级跳过，此处不再因 E002 触发。
+            warnings_list.append(_attach_structured_guidance({
                 "code": ErrorCode.E030.name,
                 "severity": "warning",
-                "message": "ledger 中间行 JSON 解析失败，运行时文件疑似被篡改（不自动修复）",
+                "message": "ledger 重放异常，运行时文件疑似被篡改（不自动修复）",
                 "path": str(self.ledger_path),
-            })
+            }, self.orchd_dir))
             return warnings_list
 
         derived_dict = {tid: ts.to_dict() for tid, ts in derived.items()}
@@ -1177,7 +1646,8 @@ class Store:
         ``from_line - 1`` 行，从而定位到起始行（B-1 修复：被跳过的早期损坏行
         不参与解析，恢复 checkpoint 增量 replay 的容错语义）。
 
-        容错：最后一行解析失败跳过+warning；中间行失败抛 E002。
+        容错：末行解析失败跳过 + warning；中间行失败降级跳过 + E030 warning
+        （AC4，不再抛 E002 中断引擎）。
         """
         return self.backend.read_events(from_line=from_line)
 
@@ -1186,20 +1656,22 @@ class Store:
         events: list[dict[str, Any]],
         tasks: dict[str, TaskState],
         retracted: set[str],
+        *,
+        handle_retract: bool = True,
     ) -> None:
         """事件驱动的状态机：逐条应用事件列表，原地修改 ``tasks`` 和 ``retracted``。
 
-        支持的事件类型及其效果：
-            - ``CLAIMED``          : 任务被 agent 认领，状态 → ``claimed``，清空审核字段。
-            - ``DONE``             : agent 提交完成，状态 → ``done``，递增 ``attempt_count``。
-            - ``REVIEW_READY``     : 进入审核，状态 → ``in_review``，设置 ``review_phase``。
-            - ``REVIEW_CLAIMED``   : reviewer 认领审核，设置 ``review_claimed_by``。
-            - ``REVIEW_SUBMITTED`` : 审核结果提交。``APPROVED``(code) → ``completed``；
-                                    ``CHANGES_REQUESTED`` → 回退 ``pending``。
-            - ``FORCE_STATUS``     : 强制覆盖状态到指定值，附带相关字段重置逻辑。
-            - ``RETRACT``          : 撤回指定事件，触发全量重建（参见 :meth:`_rebuild_after_retract`）。
+        已被撤回（``retracted`` 集合中）的事件会被跳过；没有 ``task_id`` 的事件
+        也会被忽略。单个事件的跃迁逻辑收敛到 :meth:`_apply_event`（去重后单一实现）。
 
-        已被撤回（``retracted`` 集合中）的事件会被跳过。没有 ``task_id`` 的事件也会被忽略。
+        ``handle_retract``（合并去重的唯一分歧点，2026-08-29）：
+        - ``True``（活跃路径 replay / replay_full）：遇到 RETRACT 时把目标事件标记
+          撤回并触发 :meth:`_rebuild_after_retract` 全量重建，随后 **return**——
+          重建已从头重放全部事件（含本 RETRACT 之后的事件），``tasks`` 已是最终
+          状态，继续循环会重复应用；且可避免 K 个 RETRACT 触发 K 次 O(L) 级联重建
+          （O(K·L) → 单次重建后即 O(L)）。
+        - ``False``（_rebuild_after_retract / _replay_prefix 内部）：仅记录
+          ``target_event_id`` 到 ``retracted``，不递归重建，避免无限递归 / 越过前缀边界。
         """
         for event in events:
             eid = event.get("event_id", "")
@@ -1207,124 +1679,29 @@ class Store:
                 # 跳过已被 RETRACT 撤回的事件，不纳入状态计算
                 continue
 
-            etype = event.get("type", "")
             task_id = event.get("task_id", "")
             if not task_id:
                 # 没有 task_id 的事件（如系统级事件）不影响任务状态，直接跳过
                 continue
 
-            if task_id not in tasks:
-                # 首次出现的 task_id，初始化默认状态（pending）
-                tasks[task_id] = TaskState()
-            ts = tasks[task_id]
-
-            if etype == "CLAIMED":
-                ts.status = "claimed"
-                ts.claimed_by = event.get("agent_id")
-                ts.claimed_session = event.get("session_id")
-                ts.review_phase = None
-                ts.review_claimed_by = None
-                ts.review_claimed_session = None
-                ts.review_claimed_at = None
-
-            elif etype == "DONE":
-                ts.status = "done"
-                ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
-
-            elif etype == "REVIEW_READY":
-                ts.status = "in_review"
-                ts.review_phase = event.get("review_type")
-                ts.review_claimed_by = None
-                ts.review_claimed_session = None
-                ts.review_claimed_at = None
-
-            elif etype == "REVIEW_CLAIMED":
-                ts.review_claimed_by = event.get("agent_id")
-                ts.review_claimed_session = event.get("session_id")
-                ts.review_claimed_at = event.get("timestamp")
-
-            elif etype == "REVIEW_SUBMITTED":
-                verdict = event.get("verdict", "")
-                review_type = event.get("review_type")
-                if verdict == "APPROVED":
-                    if review_type == "code" or review_type is None:
-                        # review-unify-r2：code review 通过，或 unified 单阶段
-                        # （事件无 review_type 字段）APPROVED → 任务彻底完成；
-                        # 老事件含 review_type: spec 仍按两阶段语义（仅 spec 通过，
-                        # 等待 code），保持 checkpoint 与历史一致。
-                        ts.status = "completed"
-                        ts.review_phase = None
-                        ts.review_claimed_by = None
-                        ts.review_claimed_session = None
-                        ts.review_claimed_at = None
-                        # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
-                        # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
-                        ts.merge_warning = event.get("merge_warning")
-                    else:
-                        # spec review 通过但 code review 尚未开始，
-                        # CLI 层会自动生成 REVIEW_READY(code) 事件，此处无需处理
-                        pass
-                elif verdict == "CHANGES_REQUESTED":
-                    # 审核被驳回 → 任务回退到 pending，清空认领和审核信息。
-                    # 注意：不重置 attempt_count——attempt_count 累计「打回次数」，
-                    # 供 request 的 max_attempts 上限警告（exceeded_max_attempts）；
-                    # 仅 force-status pending 才重置计数（人工恢复手段）。
-                    ts.status = "pending"
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-
-            elif etype == "FORCE_STATUS":
-                # 强制状态覆盖：根据 target_status 重置关联字段，
-                # 确保派生状态与被强制设置的状态保持一致
-                target = event.get("target_status", "pending")
-                ts.status = target
-                if target == "pending":
-                    # 回退到待认领：清空所有执行和审核相关字段
-                    ts.attempt_count = 0
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                elif target == "claimed":
-                    # 强制认领：设置指派的 agent
-                    ts.claimed_by = event.get("assignee")
-                    ts.claimed_session = event.get("session_id")
-                elif target == "cancelled":
-                    # 强制取消：清空所有执行和审核相关字段
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-                elif target == "completed":
-                    # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
-                    # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-
-            elif etype == "RETRACT":
+            if event.get("type") == "RETRACT":
+                # RETRACT 在任务初始化之前处理：它是系统级回滚事件，不应为某任务
+                # 凭空创建状态条目（活跃路径与重建路径一致，见 _apply_event 注释）。
                 target_eid = event.get("target_event_id", "")
                 if target_eid:
                     retracted.add(target_eid)
+                if handle_retract:
                     # RETRACT 具有级联效应：撤回某事件后，后续依赖该事件的状态变化
-                    # 都需要重新计算，因此必须从头全量重建
+                    # 都需要重新计算，因此必须从头全量重建（_rebuild_after_retract
+                    # 已重放全部事件，tasks 已是最终状态，此处必须 return）
                     self._rebuild_after_retract(tasks, retracted)
-                    # 性能（H1，2026-08-13）：_rebuild_after_retract 已从第 1 行
-                    # 全量重放全部事件（含本 RETRACT 之后的事件），tasks 已是最终
-                    # 状态。此处必须 return，避免：
-                    #   ① 后续事件被重复应用（重建已应用过一遍）；
-                    #   ② 后续 RETRACT 再次触发全量重建——K 个 RETRACT 原实现触发
-                    #      K 次 O(L) 重建（O(K·L)），单次重建后即 O(L)。
                     return
+                continue
+
+            if task_id not in tasks:
+                # 首次出现的 task_id，初始化默认状态（pending）
+                tasks[task_id] = TaskState()
+            self._apply_event(event, tasks[task_id])
 
     def _rebuild_after_retract(
         self, tasks: dict[str, TaskState], retracted: set[str]
@@ -1351,123 +1728,118 @@ class Store:
                 target_eid = event.get("target_event_id", "")
                 if target_eid:
                     retracted.add(target_eid)
-        self._apply_events_no_retract(all_events, tasks, retracted)
+        self._apply_events(all_events, tasks, retracted, handle_retract=False)
 
-    def _apply_events_no_retract(
-        self,
-        events: list[dict[str, Any]],
-        tasks: dict[str, TaskState],
-        retracted: set[str],
-    ) -> None:
-        """全量应用事件（跳过 retracted），不再递归处理 RETRACT。
+    def _apply_event(self, event: dict[str, Any], ts: TaskState) -> None:
+        """应用单个非 RETRACT 事件到任务状态（原地修改 ``ts``）。
 
-        与 :meth:`_apply_events` 的区别：
-            - 本方法在遇到 RETRACT 事件时仅记录 ``target_event_id`` 到 ``retracted``
-              集合，**不会**再触发 ``_rebuild_after_retract``，避免无限递归。
-            - 仅在 ``_rebuild_after_retract`` 内部调用，用于全量重建场景。
-            - 逻辑与 ``_apply_events`` 基本一致，但去掉了递归 RETRACT 分支。
+        支持的事件类型及其效果（task-audit-ledger-state-machine-dedup 合并去重后
+        的单一实现，活跃路径与全量重建路径共用，根除「改一处漏一处」缺陷类别）：
+            - ``CLAIMED``          : 任务被 agent 认领，状态 → ``claimed``，清空审核字段。
+            - ``DONE``             : agent 提交完成，状态 → ``done``，递增 ``attempt_count``。
+            - ``REVIEW_READY``     : 进入审核，状态 → ``in_review``，设置 ``review_phase``。
+            - ``REVIEW_CLAIMED``   : reviewer 认领审核，设置 ``review_claimed_by``。
+            - ``REVIEW_SUBMITTED`` : 审核结果提交。``APPROVED``(code) → ``completed``；
+                                    ``CHANGES_REQUESTED`` → 回退 ``pending``。
+            - ``FORCE_STATUS``     : 强制覆盖状态到指定值，附带相关字段重置逻辑。
+
+        RETRACT 由调用方 :meth:`_apply_events` 在进入本方法前拦截（活跃路径触发
+        全量重建、重建路径仅记录），此处只处理状态跃迁事件。跃迁合法性由白矩阵
+        （:func:`validate_transition`）在写入时校验。
         """
-        for event in events:
-            eid = event.get("event_id", "")
-            if eid in retracted:
-                continue
+        etype = event.get("type", "")
+        if etype == "CLAIMED":
+            ts.status = "claimed"
+            ts.claimed_by = event.get("agent_id")
+            ts.claimed_session = event.get("session_id")
+            ts.review_phase = None
+            ts.review_claimed_by = None
+            ts.review_claimed_session = None
+            ts.review_claimed_at = None
 
-            etype = event.get("type", "")
-            task_id = event.get("task_id", "")
-            if not task_id:
-                continue
+        elif etype == "DONE":
+            ts.status = "done"
+            ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
 
-            if etype == "RETRACT":
-                # 仅记录被撤回的事件 ID，不触发全量重建（避免递归）
-                target_eid = event.get("target_event_id", "")
-                if target_eid:
-                    retracted.add(target_eid)
-                continue
+        elif etype == "REVIEW_READY":
+            ts.status = "in_review"
+            ts.review_phase = event.get("review_type")
+            ts.review_claimed_by = None
+            ts.review_claimed_session = None
+            ts.review_claimed_at = None
 
-            if task_id not in tasks:
-                tasks[task_id] = TaskState()
-            ts = tasks[task_id]
+        elif etype == "REVIEW_CLAIMED":
+            ts.review_claimed_by = event.get("agent_id")
+            ts.review_claimed_session = event.get("session_id")
+            ts.review_claimed_at = event.get("timestamp")
 
-            if etype == "CLAIMED":
-                ts.status = "claimed"
-                ts.claimed_by = event.get("agent_id")
-                ts.claimed_session = event.get("session_id")
-                ts.review_phase = None
-                ts.review_claimed_by = None
-                ts.review_claimed_session = None
-                ts.review_claimed_at = None
-            elif etype == "DONE":
-                ts.status = "done"
-                ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
-            elif etype == "REVIEW_READY":
-                ts.status = "in_review"
-                ts.review_phase = event.get("review_type")
-                ts.review_claimed_by = None
-                ts.review_claimed_session = None
-                ts.review_claimed_at = None
-            elif etype == "REVIEW_CLAIMED":
-                ts.review_claimed_by = event.get("agent_id")
-                ts.review_claimed_session = event.get("session_id")
-                ts.review_claimed_at = event.get("timestamp")
-            elif etype == "REVIEW_SUBMITTED":
-                verdict = event.get("verdict", "")
-                review_type = event.get("review_type")
-                if verdict == "APPROVED" and (review_type == "code" or review_type is None):
-                    # review-unify-r2：unified 单阶段（无 review_type）或 code
-                    # APPROVED → completed；老事件含 review_type: spec 保持两阶段语义。
+        elif etype == "REVIEW_SUBMITTED":
+            verdict = event.get("verdict", "")
+            review_type = event.get("review_type")
+            if verdict == "APPROVED":
+                if review_type == "code" or review_type is None:
+                    # review-unify-r2：code review 通过，或 unified 单阶段
+                    # （事件无 review_type 字段）APPROVED → 任务彻底完成；
+                    # 老事件含 review_type: spec 仍按两阶段语义（仅 spec 通过，
+                    # 等待 code），保持 checkpoint 与历史一致。
                     ts.status = "completed"
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
                     ts.review_claimed_at = None
-                    # B1（2026-08-13 full-audit-v2）：与 _apply_events 保持一致——
-                    # merge 降级标记随事件持久化。全量重建（RETRACT / check_integrity
-                    # 前缀重放）若不设置，merge_warning 将丢失：既让 audit-merge
-                    # 对漏 merge 失明，又会与含 merge_warning 的 checkpoint 快照
-                    # 不一致而误报 E030 篡改告警。
-                    # review-unify-r2 附加（2026-08-27）：review_claimed_session 同样须
-                    # 对齐活跃路径（_apply_events）在 APPROVED→completed 时清空；缺失
-                    # 会令全量重建保留 completed 任务的历史审查会话指纹，与活跃路径
-                    # 写入的 checkpoint 快照不一致 → E030 反复告警。
+                    # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
+                    # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
                     ts.merge_warning = event.get("merge_warning")
-                elif verdict == "CHANGES_REQUESTED":
-                    # 不重置 attempt_count（与 _apply_events 一致）：打回次数累计，
-                    # 供 request 的 max_attempts 上限警告；仅 force-status pending 重置。
-                    ts.status = "pending"
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-            elif etype == "FORCE_STATUS":
-                # 强制状态覆盖：与 _apply_events 中逻辑一致
-                target = event.get("target_status", "pending")
-                ts.status = target
-                if target == "pending":
-                    ts.attempt_count = 0
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                elif target == "claimed":
-                    ts.claimed_by = event.get("assignee")
-                    ts.claimed_session = event.get("session_id")
-                elif target == "cancelled":
-                    ts.claimed_by = None
-                    ts.claimed_session = None
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
-                elif target == "completed":
-                    # 与 _apply_events 一致：强制完成仅清空审查字段
-                    ts.review_phase = None
-                    ts.review_claimed_by = None
-                    ts.review_claimed_session = None
-                    ts.review_claimed_at = None
+                else:
+                    # spec review 通过但 code review 尚未开始，
+                    # CLI 层会自动生成 REVIEW_READY(code) 事件，此处无需处理
+                    pass
+            elif verdict == "CHANGES_REQUESTED":
+                # 审核被驳回 → 任务回退到 pending，清空认领和审核信息。
+                # 注意：不重置 attempt_count——attempt_count 累计「打回次数」，
+                # 供 request 的 max_attempts 上限警告（exceeded_max_attempts）；
+                # 仅 force-status pending 才重置计数（人工恢复手段）。
+                ts.status = "pending"
+                ts.claimed_by = None
+                ts.claimed_session = None
+                ts.review_phase = None
+                ts.review_claimed_by = None
+                ts.review_claimed_session = None
+                ts.review_claimed_at = None
+
+        elif etype == "FORCE_STATUS":
+            # 强制状态覆盖：根据 target_status 重置关联字段，
+            # 确保派生状态与被强制设置的状态保持一致
+            target = event.get("target_status", "pending")
+            ts.status = target
+            if target == "pending":
+                # 回退到待认领：清空所有执行和审核相关字段
+                ts.attempt_count = 0
+                ts.review_phase = None
+                ts.review_claimed_by = None
+                ts.review_claimed_session = None
+                ts.review_claimed_at = None
+                ts.claimed_by = None
+                ts.claimed_session = None
+            elif target == "claimed":
+                # 强制认领：设置指派的 agent
+                ts.claimed_by = event.get("assignee")
+                ts.claimed_session = event.get("session_id")
+            elif target == "cancelled":
+                # 强制取消：清空所有执行和审核相关字段
+                ts.claimed_by = None
+                ts.claimed_session = None
+                ts.review_phase = None
+                ts.review_claimed_by = None
+                ts.review_claimed_session = None
+                ts.review_claimed_at = None
+            elif target == "completed":
+                # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
+                # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
+                ts.review_phase = None
+                ts.review_claimed_by = None
+                ts.review_claimed_session = None
+                ts.review_claimed_at = None
 
     # ------------------------------------------------------------------
     # Checkpoint
@@ -1507,8 +1879,8 @@ class Store:
             try:
                 full_state = self.replay_full()
                 tasks = {tid: ts.to_dict() for tid, ts in full_state.items()}
-            except Exception:
-                # 全量重放异常：回退到调用方传入的增量状态（best-effort，不静默丢写）
+            except (OrchdError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as _exc:
+                # 收窄：仅捕获可预期的重放/序列化异常，不吞全部 Exception
                 tasks = {tid: ts.to_dict() for tid, ts in state.items()}
         else:
             tasks = {tid: ts.to_dict() for tid, ts in state.items()}
@@ -1550,12 +1922,15 @@ class Store:
         info = TaskDerived()
         if not self.ledger_exists():
             return info
-        # M-1（2026-08-12）：与 replay() 同源——先收集完整撤回集合，跳过被
-        # RETRACT 撤回的事件，保证派生缓存与派生状态一致（否则被撤回的 DONE /
-        # REVIEW_SUBMITTED / REVIEW_CLAIMED 仍会污染 last_done / review_comments /
-        # review_baselines）。两遍扫描与 _rebuild_after_retract 语义一致。
-        retracted = self._collect_retracted_event_ids()
-        for event in self._read_ledger_lines(from_line=1):
+        # M-1 合并扫描：单次读取后同时收集撤回集合与派生信息（3→1）
+        all_events = self._read_ledger_lines(from_line=1)
+        retracted: set[str] = set()
+        for ev in all_events:
+            if ev.get("type") == "RETRACT":
+                te = ev.get("target_event_id", "")
+                if te:
+                    retracted.add(te)
+        for event in all_events:
             if event.get("event_id", "") in retracted:
                 continue
             etype = event.get("type", "")
