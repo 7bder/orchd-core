@@ -54,10 +54,16 @@ line-length = 100
 
 [tool.ruff.lint]
 # 规则集：E4/E7/E9（语法+风格核心）+ F（pyflakes 正确性）。
-# 既有代码基线（task-release-pipeline 记录，2026-08-08）：
-# - E402：__init__.py/ledger.py 模块级 import 不在文件顶部（有意的惰性加载）→ 忽略
-# - F401：ledger/pool/report/spec/onboard 遗留未使用 import（基线）→ 忽略
-# - F541：onboard 遗留无占位 f-string（基线）→ 忽略
+# 既有代码基线（task-release-pipeline 记录，2026-08-08；task-lint-ruff-green 校准，2026-09-10）：
+# - E402（13 处）：模块级 import 不在文件顶部——orchd/onboard/__init__.py（6 处，子包聚合
+#   入口的延迟 re-export）、orchd/__init__.py（1）、tests/test_cli.py（2）与
+#   tests/test_doctor.py（4，sys.path 引导之后的 import）→ 忽略
+# - F401（248 处）：子包聚合入口 re-export 与遗留未使用 import，集中在
+#   orchd/onboard/__init__.py（62）、orchd/cli/__init__.py（54）及各 cli/commands/*、
+#   tests/*（基线）→ 忽略
+# - F541（3 处）：orchd/review.py:653-654、orchd/onboard/lifecycle/core.py:469 无占位
+#   f-string（基线）→ 忽略
+# 以上三类为唯一豁免范围；orchd/ scripts/ 与 tests 现已零告警（CI lint job 绿）。
 select = [
     "E4",
     "E7",

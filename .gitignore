@@ -81,3 +81,14 @@ orchd-dashboard/
 
 # orchd-core 自动同步运行日志（scripts/sync_orchd_core.sh 生成）
 .orchd-core-sync.log
+
+# 运行卫生防复发（task-runtime-hygiene-and-workspace-cleanup，2026-09-11）
+# 清理任务识别的过程产物/工具目录；新增规则只防未跟踪文件再入，
+# 已误提交的须 git rm --cached 显式移除。
+.ruff_cache/
+.codeartsdoer/
+.merkle-snapshot.json
+.sandbox-test-dir/
+.orchd-runtime-backup-*/
+_e020_tests_extract.txt
+$null

@@ -28,7 +28,6 @@ from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import (
     checkout_default_strict,
     check_workspace_state,
-    ensure_committed,
     ensure_session_lock,
     get_default_branch,
     guard_write_command,
@@ -114,15 +113,42 @@ def verify_output_summary(stdout: bytes, stderr: bytes, limit: int = 400) -> str
 # ------------------------------------------------------------------
 
 
-def try_git_branch(project_root: Path, task_id: str) -> None:
-    """best-effort 切换到任务分支 task/{task_id}。
+def _git_error_summary(proc: "subprocess.CompletedProcess[str]") -> str:
+    """从 git checkout 子进程提取可读错误摘要：stderr 优先，回退 stdout，截断 200 字符。"""
+    text = (proc.stderr or proc.stdout or "").strip()
+    return text[:200] + ("…" if len(text) > 200 else "")
 
-    返工场景分支已存在则 checkout 复用，并同步 master 与 main 的差异。
+
+def try_git_branch(project_root: Path, task_id: str) -> dict[str, Any] | None:
+    """best-effort 切换到任务分支 task/{task_id}，并显式上报 git 命令失败。
+
+    返工场景分支已存在则 checkout 复用（task-master-single-copy：不再同步分支
+    worktree 的 .orchd/_master.json 与 main——container 副本已由 sparse-checkout
+    抑制、flat 布局单副本无需同步）。
     首次 claim 才 checkout -b 新建——**显式从默认分支(main/master) fork**，
-    避免游离 HEAD / 孤儿分支（2026-08-28 仓库损坏根因修复）。异常静默降级。
+    避免游离 HEAD / 孤儿分支（2026-08-28 仓库损坏根因修复）。
+
+    返回值契约（task-git-branch-fail-report，替代原先的静默吞错）：
+      - 成功创建/切换：``{"state": "ok"}``；
+      - git 命令失败（真实仓库内 checkout / checkout -b 返回非零）：
+        ``{"state": "failed", "step": "create" | "checkout", "error": <stderr 摘要>}``；
+      - 环境异常（非 git 仓库 / git 不可用 / 子进程超时）：``None``
+        ——静默降级、不抛异常（既有契约 test_non_git_dir_no_error 锁定）。
     """
     branch = f"task/{task_id}"
     try:
+        # 环境探测：区分「非 git 仓库等环境异常」（返回 None）与
+        # 「真实仓库内 git 命令失败」（返回 failed 状态字典）。
+        env = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if env.returncode != 0:
+            return None
         check = subprocess.run(
             ["git", "rev-parse", "--verify", branch],
             cwd=str(project_root),
@@ -141,57 +167,30 @@ def try_git_branch(project_root: Path, task_id: str) -> None:
                 timeout=10,
             )
             if checkout.returncode == 0:
-                sync_master_with_main(project_root, branch)
-        else:
-            default = get_default_branch(project_root) or "main"
-            subprocess.run(
-                ["git", "checkout", "-b", branch, default],
-                cwd=str(project_root),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-            )
+                return {"state": "ok"}
+            return {
+                "state": "failed",
+                "step": "checkout",
+                "error": _git_error_summary(checkout),
+            }
+        default = get_default_branch(project_root) or "main"
+        create = subprocess.run(
+            ["git", "checkout", "-b", branch, default],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if create.returncode == 0:
+            return {"state": "ok"}
+        return {
+            "state": "failed",
+            "step": "create",
+            "error": _git_error_summary(create),
+        }
     except (subprocess.SubprocessError, FileNotFoundError):
-        pass
-
-
-def sync_master_with_main(project_root: Path, branch: str) -> None:
-    """分支工作区 .orchd/_master.json 落后 main 时同步为 main 版本（best-effort）。"""
-    master_rel = str(Path(".orchd") / "_master.json")
-    has_main = subprocess.run(
-        ["git", "rev-parse", "--verify", "main"],
-        cwd=str(project_root),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    ).returncode == 0
-    if not has_main:
-        return
-    diff = subprocess.run(
-        ["git", "diff", "--quiet", "main", "--", master_rel],
-        cwd=str(project_root),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    if diff.returncode == 0:
-        return
-    subprocess.run(
-        ["git", "checkout", "main", "--", master_rel],
-        cwd=str(project_root),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    ensure_committed(
-        project_root,
-        [master_rel],
-        f"chore(claim): sync {branch} master with main",
-    )
+        return None
 
 
 def _clean_stale_index_lock(workdir: Path) -> bool:

@@ -92,6 +92,23 @@ def _task_branch_tip(project_root: Path, task_id: str) -> str | None:
     return None
 
 
+def _wt_dir_name(task_id: str) -> str:
+    """任务 worktree 目录名（单一来源：``orchd.worktree.worktree_hint``）。
+
+    AC4（task-review-diagnostics-hardening）：与 ``orchd/gitops/guard.py`` 的
+    E018 hint 同源，均经 ``worktree_hint(task_id)``（内部使用 ``_task_wt_name``）
+    输出真实目录名，杜绝各处自行拼 ``task-{task_id}`` 产生 ``task-task-<id>``
+    双前缀。引擎不可用时回退等价实现（best-effort）。
+    """
+    try:
+        from orchd.worktree import worktree_hint
+
+        return worktree_hint(task_id)
+    except Exception:
+        short = task_id[5:] if task_id.startswith("task-") else task_id
+        return f"task-{short}"
+
+
 def request_reviewer(
     store: Store,
     state: dict[str, TaskState],
@@ -403,7 +420,12 @@ def _review_submit_impl(
             )
 
         baseline_sha = extract_review_baseline(store, task_id, agent_id, derived)
-        current_sha = get_head_commit(project_root) if project_root else None
+        # AC1（task-review-baseline-and-worktree-recycle-fix）：current_sha 与
+        # REVIEW_CLAIMED 的 baseline_sha 必须同源。原取 get_head_commit(project_root)
+        # （主工作树 HEAD），与基线（任务分支 tip）比对必然不等 → 恒误报漂移。
+        current_sha = (
+            _task_branch_tip(project_root, task_id) or get_head_commit(project_root)
+        ) if project_root else None
         baseline_drift = bool(baseline_sha and current_sha and baseline_sha != current_sha)
 
         event = make_event(
@@ -428,11 +450,21 @@ def _review_submit_impl(
             result["integrity_warnings"] = integrity_warnings
 
         if baseline_drift:
-            result["baseline_warning"] = (
-                f"baseline drift detected: task branch HEAD changed during review "
-                f"(claimed at {baseline_sha[:7]}, now {current_sha[:7]}). "
-                f"Review may be based on outdated code."
-            )
+            # AC1（task-review-diagnostics-hardening）：baseline_warning 结构化，
+            # 以稳定契约对象承载漂移信息（code / baseline_sha / current_sha /
+            # severity / message），字段级可断言，避免 container 布局下告警长期
+            # 被当作裸字符串噪音忽略。无漂移时不产出该字段。
+            result["baseline_warning"] = {
+                "code": "baseline_drift",
+                "baseline_sha": baseline_sha,
+                "current_sha": current_sha,
+                "severity": "warning",
+                "message": (
+                    f"task branch HEAD changed during review "
+                    f"(claimed at {baseline_sha[:7]}, now {current_sha[:7]}). "
+                    f"Review may be based on outdated code."
+                ),
+            }
 
         pending_code_event: dict[str, Any] | None = None
 
@@ -480,15 +512,19 @@ def _review_submit_impl(
     if pending_code_event is not None:
         # task-engine-review-merge-diff-gate：code APPROVED 前校验声明文件已全部
         # 进入任务分支 diff；缺失则拒绝 merge，避免“实现/测试未进分支”被终审放行。
+        # task-master-single-copy：与 done 门禁同源改用 diagnose_missing_branch_files
+        # （区分“漏提交”与“声明但未改动”），声明未改动的冗余文件不再误拦 merge。
         if project_root:
             try:
                 task_map = {t.get("id", ""): t for t in tasks}
                 task_def = task_map.get(task_id) or {}
-                from orchd.worktree import missing_declared_branch_files
+                from orchd.worktree import diagnose_missing_branch_files
 
-                missing = missing_declared_branch_files(
-                    project_root, task_id, task_def.get("files_to_edit", [])
-                )
+                missing = [
+                    d["file"] for d in diagnose_missing_branch_files(
+                        project_root, task_id, task_def.get("files_to_edit", [])
+                    )
+                ]
                 if missing:
                     raise OrchdError(
                         ErrorCode.E010,
@@ -560,7 +596,7 @@ def _review_submit_impl(
                         result["action"] = (
                             f"merge 冲突（main 已恢复）。冲突文件：{_cf_list}。\n"
                             f"【解决步骤】\n"
-                            f"  1. 进入任务 worktree 目录：cd ../task-{task_id}/\n"
+                            f"  1. 进入任务 worktree 目录：cd ../{_wt_dir_name(task_id)}/\n"
                             f"     （container 布局下主工作树内无法 checkout task/{task_id} 分支）\n"
                             f"  2. 执行 git merge main，解决冲突后 git commit\n"
                             f"  3. 由同一 reviewer 重试 code APPROVED\n"

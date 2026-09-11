@@ -235,6 +235,21 @@ verify_command 必须执行**覆盖该任务全部 acceptance_criteria 的测试
 | 编译 + lint | `cargo build && cargo clippy -- -D warnings` |
 | 多步组合 | `dotnet build && dotnet test --filter "RingBuffer"` |
 
+#### 验收分级：定向 / 门禁两档（2026-09-11 新增）
+
+背景：全量套件已达 1444 例（单进程约 6.5 分钟），若各任务验收写"全量 pytest 通过"，每个任务 done 会烧 2~3 遍全量（实现自检 + verify + 审查复核），时间成本随套件规模线性恶化。因此验收分两档，选用规则如下：
+
+| 档位 | 范围 | 触发点 | 书写规则 |
+|------|------|--------|---------|
+| **定向档**（日常验收） | files_to_edit 映射的定向测试文件（`orchd/x.py` ↔ `tests/test_x.py` + 显式列出的 tests/ 文件） | 每个任务的 verify_command（done 时自动执行） | verify_command **一律定向档**，秒级完成，满足 120s 预算 |
+| **门禁档**（全量守门） | 全量 pytest | 发版前 `orchd full-regression` 手动触发；或 `config.full_regression_on_done: true` 时 done 后冒烟（失败仅 warning 不阻断） | **禁写入任何任务的 verify_command**（超 120s 必卡死） |
+
+选用规则：
+
+1. 分解者写新任务时，verify_command 按定向档书写（映射规则见 `.orchd/rules/verify.md`）；验收标准不再写"全量 pytest 通过"。
+2. 全量守门是引擎/发版层职责，不属于单任务验收——门禁点由 full-regression 命令与发版脚本承担（详见 verify.md）。
+3. **存量任务定义不动**；仅新任务草案与重写/拆分的任务按本节规范书写。
+
 #### 测试与 acceptance_criteria 的对应关系
 
 分解任务时，应为每条 acceptance_criteria 预想对应的测试策略：

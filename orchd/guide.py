@@ -39,6 +39,36 @@ from typing import Any
 # 集中为模块级常量：入口变更时只改此处，避免 20+ 处命令/hint 字符串漂移。
 _ENTRY_CMD = "python .orchd/__main__.py"
 
+
+def amend_patch_cmd(task, files=None, exempt=None, verify=None, entry=_ENTRY_CMD):
+    """amend 声明域补登命令的单一事实源（task-amend-decl-patch-channel）。
+
+    guide.py 逃生文案、hook.py 逃生 echo、测试断言皆由此派生，禁止手写
+    ``amend --task/--files-to-edit/--exempt-files/--verify-command`` 字符串。
+    占位符（``<id>``/``{task_id}``/``<cmd>``）按原文透传，调用方负责替换。
+    """
+    parts = [entry, "amend", "--task", str(task)]
+    for f in files or []:
+        parts += ["--files-to-edit", str(f)]
+    for f in exempt or []:
+        parts += ["--exempt-files", str(f)]
+    if verify is not None:
+        parts += ["--verify-command", str(verify)]
+    return " ".join(parts)
+
+
+def amend_mainwt_command(task, main_wt, files=None, exempt=None, verify=None,
+                         entry=_ENTRY_CMD):
+    """带主工作树绝对路径的 amend 补登命令（task-amend-guidance-mainwt）。
+
+    在 amend_patch_cmd 基础上前缀 cd "<main_wt>";，使持任务 agent
+    可直接复制执行——任务 worktree 内无 _master.json，amend 必须回主工作树。
+    跨平台用分号分隔（PowerShell / bash / cmd 均兼容）；main_wt 含空格时
+    双引号包裹。占位符按原文透传，调用方负责替换。
+    """
+    cmd = amend_patch_cmd(task, files=files, exempt=exempt, verify=verify, entry=entry)
+    return f'cd "{main_wt}"; {cmd}'
+
 # ---------------------------------------------------------------------------
 # W-1 guidance 分级：T0/T1/T2（task-guide-tiering）
 # ---------------------------------------------------------------------------
@@ -983,13 +1013,13 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     ("E019", "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
     ("E020", "范围外提交：只改 files_to_edit 声明文件", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
     ("E021", "身份不匹配：确认 ORCHD_SESSION_ID 与认领者一致，必要时重连", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
-    ("E022", "缺少 verify_command：任务 {task_id} 缺少 verify_command，请运行 python .orchd/__main__.py amend --task {task_id} --verify-command \"<cmd --basetemp=...>\" 补充后重试", ("rules/verify.md",), f"{_ENTRY_CMD} amend --task <id> --verify-command \"<cmd>\"", "suggest", "exec-command"),
+    ("E022", f"缺少 verify_command：任务 {{task_id}} 缺少 verify_command，请运行 {amend_patch_cmd('{task_id}', verify='<cmd --basetemp=...>')} 补充后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd>"), "suggest", "exec-command"),
     ("E023", "验收标准模糊（警告不阻断）：建议用可量化标准，可 amend 修订", ("rules/intake.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
-    ("E024", "verify_command 缺 --basetemp：用 amend 补充跨平台 basetemp", ("rules/verify.md",), f"{_ENTRY_CMD} amend --task <id> --verify-command \"<cmd --basetemp=...>\"", "suggest", "exec-command"),
+    ("E024", "verify_command 缺 --basetemp：用 amend 补充跨平台 basetemp", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd --basetemp=...>"), "suggest", "exec-command"),
     ("E025", "source 引用缺失：任务 {task_id} 需关联 IDEAS.md/ROADMAP.md 条目 {source}，请补齐 source 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
     ("E026", "测试连带未声明（警告不阻断）：用 amend 声明测试或加入 exempt_files", ("rules/verify.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
-    ("E027", "verify_command 含不安全/不兼容段：用 amend 改为跨平台安全命令", ("rules/verify.md",), f"{_ENTRY_CMD} amend --task <id> --verify-command \"<安全命令>\"", "suggest", "exec-command"),
-    ("E028", "dry-run 断言不匹配：任务 {task_id} 的 verify_command 断言失败，请核对断言或运行 python .orchd/__main__.py amend --task {task_id} --verify-command \"<修正命令>\" 调整", ("rules/verify.md",), f"{_ENTRY_CMD} amend --task <id> --verify-command \"<修正命令>\"", "suggest", "continue"),
+    ("E027", "verify_command 含不安全/不兼容段：用 amend 改为跨平台安全命令", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<安全命令>"), "suggest", "exec-command"),
+    ("E028", f"dry-run 断言不匹配：任务 {{task_id}} 的 verify_command 断言失败，请核对断言或运行 {amend_patch_cmd('{task_id}', verify='<修正命令>')} 调整", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<修正命令>"), "suggest", "continue"),
     ("E029", "任务拆解粒度越界：任务 {task_id} 按 R4 文件≤5/行≤60/小时≤8 拆分为更小任务，参考 docs/decomposition-guide.md", ("rules/intake.md",), f"{_ENTRY_CMD} status --text", "suggest", "continue"),
     ("E030", "运行时文件完整性校验失败（警告不阻断）：用 doctor 诊断并修复引擎文件", ("rules/recovery.md",), f"{_ENTRY_CMD} doctor", "manual", "continue"),
     ("E031", "ROADMAP 规划章节未落地 IDEAS：章节 {chapter} 需先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS pending 后再 intake", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
@@ -1005,7 +1035,7 @@ ALLOWED_WEAK: frozenset[str] = frozenset()
 E007_INTERNAL_DEFENSE: frozenset[str] = frozenset({
     "orchd/lessons.py",  # 8 处字段校验，内部防御
     "orchd/split.py",  # 4 处结构校验
-    "orchd/cli.py:lesson",  # lesson 字段校验
+    "orchd/cli/commands/lessons.py:lesson",  # lesson 字段校验（cli 拆包后路径）
 })
 
 # ── 码→通道登记表（设计 §2.2 / §8.5）───────────────────────────────────────

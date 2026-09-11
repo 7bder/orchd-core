@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
-from orchd.gitops._run import _shell_quote
+from orchd.gitops._run import _run_git, _shell_quote
 from orchd.gitops.cleanup import _safe_delete
 
 
@@ -20,15 +21,19 @@ def _e020_hook_escape_block() -> str:
     逃生步骤覆盖：查看被拦文件、移出暂存区、amend 补声明、红线命令警告。
     """
     try:
-        from orchd.guide import ERROR_GUIDANCE
+        from orchd.guide import ERROR_GUIDANCE, amend_patch_cmd
         e020 = ERROR_GUIDANCE.get("E020", {})
         recovery = e020.get("recovery", "范围外提交：只改 files_to_edit 声明文件")
         command = e020.get("command", "git status")
         exit_type = e020.get("exit_type", "git-diagnose")
+        amend_files = amend_patch_cmd("<id>", files=["<file>"], entry="orchd")
+        amend_exempt = amend_patch_cmd("<id>", exempt=["<file>"], entry="orchd")
     except Exception:
         recovery = "范围外提交：只改 files_to_edit 声明文件"
         command = "git status"
         exit_type = "git-diagnose"
+        amend_files = "orchd amend --task <id> --files-to-edit <file>"
+        amend_exempt = "orchd amend --task <id> --exempt-files <file>"
 
     lines = [
         f'    echo "E020 recovery: {recovery}"',
@@ -38,8 +43,8 @@ def _e020_hook_escape_block() -> str:
         '    echo "=== 合规逃生步骤 ==="',
         '    echo "1. 查看被拦文件: git diff --cached --name-only"',
         '    echo "2. 移出暂存区(保留工作区): git restore --staged <file>"',
-        '    echo "3. 确属本任务: orchd amend --task <id> --files-to-edit <file>"',
-        '    echo "4. 豁免类(测试/文档): orchd amend --task <id> --exempt-files <file>"',
+        f'    echo "3. 确属本任务: {amend_files}"',
+        f'    echo "4. 豁免类(测试/文档): {amend_exempt}"',
         '    echo "5. 重新提交: git commit -m \"...\""',
         '    echo ""',
         '    echo "=== 红线命令(禁止,会丢失未提交工作) ==="',
@@ -51,9 +56,42 @@ def _e020_hook_escape_block() -> str:
     return "\n".join(lines)
 
 
+def _is_absolute_hooks_path(value: str) -> bool:
+    """判断 core.hooksPath 配置值是否为绝对路径（跨平台）。
+
+    POSIX 上无法用 Path.is_absolute() 识别 Windows 盘符形态（C:/...、C:\\...），
+    单独用盘符正则兜底；保证在任意平台解析 hooksPath 均一致。
+    """
+    return Path(value).is_absolute() or bool(re.match(r"^[A-Za-z]:[/\\]", value))
+
+
+def _get_hooks_dir(project_root: Path) -> Path:
+    """解析实际 hooks 目录：git config core.hooksPath，缺省回退 .git/hooks。
+
+    core.hooksPath 语义（git-config 文档）：
+    - 未设置 / 设置为空 → 默认 .git/hooks
+    - 相对路径 → 相对仓库根目录
+    - 绝对路径 → 原样使用
+    git 不可用或 config 读取失败 → 保守回退 .git/hooks（与旧版行为一致）。
+    """
+    try:
+        proc = _run_git(project_root, ["config", "--get", "core.hooksPath"])
+    except Exception:
+        return project_root / ".git" / "hooks"
+    if proc.returncode != 0:
+        return project_root / ".git" / "hooks"
+    value = proc.stdout.strip()
+    if not value:
+        return project_root / ".git" / "hooks"
+    hooks = Path(value)
+    if _is_absolute_hooks_path(value):
+        return hooks
+    return project_root / hooks
+
+
 def _get_hook_path(project_root: Path) -> Path:
-    """返回 .git/hooks/pre-commit 路径。"""
-    return project_root / ".git" / "hooks" / _HOOK_FILENAME
+    """返回实际 hooks 目录下的 pre-commit 路径（适配 core.hooksPath）。"""
+    return _get_hooks_dir(project_root) / _HOOK_FILENAME
 
 
 def hook_install(
@@ -100,8 +138,8 @@ def hook_install(
             "error": "task_id 含非 [A-Za-z0-9_-] 字符，拒绝写入 pre-commit hook（防 shell 注入）",
         }
 
-    hooks_dir = project_root / ".git" / "hooks"
-    if not hooks_dir.parent.exists():
+    hooks_dir = _get_hooks_dir(project_root)
+    if not (project_root / ".git").exists():
         return {"installed": False, "reason": "not_a_git_repo"}
 
     exempt = exempt_files or []

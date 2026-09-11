@@ -30,6 +30,11 @@ from orchd.spec import (
 _SAFE_MODULE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+def _collapse(s: str) -> str:
+    """折叠连续斜杠为单个（用于 Windows 转义路径与声明路径的归一化对齐）。"""
+    return re.sub(r"/{2,}", "/", s)
+
+
 def _annotate_if_needed(items: list[dict[str, Any]], orchd_dir: Path) -> list[dict[str, Any]]:
     """批量校验结果附加 guidance（best-effort，异常时原样返回）。"""
     if not items:
@@ -233,16 +238,29 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     tasks = master.tasks
     modules = master.modules
 
-    # 红线 7：非 main 分支拒绝 amend 注册（best-effort 降级已移除）
+    # 红线 7：amend 只在 default（main）分支（= canonical 主工作树）执行。
+    # task-master-single-copy：废除 task 分支 amend 例外——container 下任务
+    # worktree 不再保留 .orchd/_master.json（sparse-checkout 抑制），唯一权威 =
+    # 主工作树；任务分支上补声明改由"认领后、动手前在主工作树补 files_to_edit"
+    # 流程承接。任务分支调用 amend 一律拒绝注册（E007，含 task/xxx），而非降级
+    # 为"仅不提交"，避免污染 master 注册来源。分支判定仅在 amend 阶段强制：
+    # init / validate / status 等只读或冷启动命令不受限。
     project_root = orchd_dir.parent
     current_branch = get_current_branch(project_root)
     default_branch = get_default_branch(project_root) or "main"
     if current_branch is not None and current_branch != default_branch:
         raise OrchdError(
             ErrorCode.E007,
-            "invalid_branch: amend 仅在 default（main）分支执行，"
+            f"invalid_branch: amend 仅在 default（{default_branch}）分支执行（主工作树），"
             f"当前分支 {current_branch} 拒绝注册（红线 7）",
-            [{"branch": current_branch, "default": default_branch}],
+            [{
+                "branch": current_branch,
+                "default": default_branch,
+                "hint": (
+                    f"任务分支不再允许 amend；请在主工作树 {project_root} 上补充/注册 "
+                    "files_to_edit 等声明后再执行"
+                ),
+            }],
         )
 
     # intake-commit-enforcement（2026-08-14）：amend 前置"非摄入产物干净"守卫。
@@ -278,13 +296,13 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     sources_invalid: list[str] = []
     source_errors: list[dict[str, Any]] = []
     attachable_sync: list[dict[str, Any]] = []
+    terminal_decl_sync: list[dict[str, Any]] = []
 
     # task-intake-file-lock（AC1/AC3）：准入写锁 + 提交前 HEAD 推进检测。
     # 准入写（改 _master.json / IDEAS.md / ROADMAP.md）受独立 .intake.lock 串行，
     # 不复用账本锁（避免一次 amend 阻塞并行 claim/done）；HEAD 漂移检测发现
     # base 被并行推进则拒绝注册（git 层 TOCTOU）。两者 best-effort。
     intake_lock: dict[str, Any] | None = None
-    drift_checked = False
     try:
         from orchd.gitops import head_drift_check
         from orchd.ledger import intake_lock_acquire, intake_lock_release
@@ -305,12 +323,11 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                 " 与本地 HEAD 分叉），拒绝注册——请先更新工作区 main 后重试",
                 [{"base_sha": drift.get("base_sha"), "head_sha": drift.get("head_sha")}],
             )
-        drift_checked = True
     except OrchdError:
         raise
     except Exception:
         # 准入锁/HEAD 检测属 best-effort：失败不阻断 amend 本身
-        drift_checked = False
+        pass
 
     store.acquire_lock()
     try:
@@ -410,6 +427,23 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                     if task.get(key) != old_task.get(key)
                 }
                 if changed_fields <= set(_CLAIMED_WHITELIST_FIELDS):
+                    # task-amend-scope-add：claimed 任务 files_to_edit 只增不删
+                    # 添加遗漏连带文件允许，删除已声明文件拒绝（E007）
+                    if "files_to_edit" in changed_fields:
+                        old_files = set(old_task.get("files_to_edit", []))
+                        new_files = set(task.get("files_to_edit", []))
+                        removed = old_files - new_files
+                        if removed:
+                            errors.append({
+                                "task_id": tid,
+                                "status": status,
+                                "message": (
+                                    "claimed task files_to_edit 只增不删："
+                                    f"禁止删除已声明文件 {sorted(removed)}，"
+                                    "仅允许添加遗漏连带文件"
+                                ),
+                            })
+                            continue
                     updated_tasks.append(tid)
                     whitelisted_updates.append({
                         "task_id": tid,
@@ -434,13 +468,54 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                     for key in set(task) | set(old_task)
                     if task.get(key) != old_task.get(key)
                 }
-                if changed_fields and changed_fields <= _TERMINAL_ATTACHABLE_FIELDS:
+                if not changed_fields:
+                    # 值级无差异（e.g. master 以 null 占位、快照缺键）→ 视为未变更，
+                    # 避免 key 存在性差异把空 diff 误判为"终态不可修改"（假阳性 E007）。
+                    unchanged_tasks.append(tid)
+                elif changed_fields <= _TERMINAL_ATTACHABLE_FIELDS:
                     updated_tasks.append(tid)
                     attachable_sync.append({
                         "task_id": tid,
                         "status": status,
                         "fields": sorted(changed_fields),
                     })
+                elif changed_fields <= {"files_to_edit", "exempt_files"}:
+                    # task-terminal-decl-drift-channel：终态声明路径规范化通道。
+                    # 仅当删的全不存在、增的全存在（相对 project_root）时放行并
+                    # 同步 snapshot；否则仍 E007。防"借规范化之名篡改声明"。
+                    sync_entries: list[dict[str, Any]] = []
+                    normalized_ok = True
+                    for field in ("files_to_edit", "exempt_files"):
+                        if field not in changed_fields:
+                            continue
+                        old_files = old_task.get(field, []) or []
+                        new_files = task.get(field, []) or []
+                        removed = [p for p in old_files if p not in new_files]
+                        added = [p for p in new_files if p not in old_files]
+                        if any((project_root / p).exists() for p in removed):
+                            normalized_ok = False
+                            break
+                        if any(not (project_root / p).exists() for p in added):
+                            normalized_ok = False
+                            break
+                        sync_entries.append({
+                            "task_id": tid,
+                            "field": field,
+                            "removed": sorted(removed),
+                            "added": sorted(added),
+                        })
+                    if normalized_ok:
+                        updated_tasks.append(tid)
+                        terminal_decl_sync.extend(sync_entries)
+                    else:
+                        errors.append({
+                            "task_id": tid,
+                            "status": status,
+                            "message": (
+                                f"{status} 为终态，声明路径变更非规范化"
+                                "（删的须不存在、增的须存在），不可修改"
+                            ),
+                        })
                 else:
                     errors.append({
                         "task_id": tid,
@@ -602,6 +677,7 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
         "updated_tasks": updated_tasks,
         "whitelisted_updates": whitelisted_updates,
         "attachable_sync": attachable_sync,
+        "terminal_decl_sync": terminal_decl_sync,
         "unchanged_tasks": unchanged_tasks,
         "removed_tasks": removed_tasks,
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
@@ -616,6 +692,7 @@ def classify_dry_run_failure(
     exit_code: int,
     stderr: str,
     stdout: str = "",
+    to_be_created: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """dry-run 失败分类（L3：注册通道校验，2026-08-08）。
 
@@ -630,7 +707,8 @@ def classify_dry_run_failure(
     - exit_code == 4（pytest usage error，cmd 语法错误）→ assertion_mismatch
     - stderr 含 "ERROR"/"error:" 指向现有文件（tests/ 下的收集错误）→ assertion_mismatch
     - stderr 含 "file not found"/"No such file"/"ModuleNotFoundError"
-      （引用不存在文件/模块）→ 若为 pytest 收集错误 → assertion_mismatch
+      （引用不存在文件/模块）→ 缺失路径 ∈ to_be_created（本任务即将创建的
+      files_to_edit）→ expected_pending；否则 → assertion_mismatch
     - 其余（如测试运行但断言失败、实现未完成）→ expected_pending
 
     Args:
@@ -638,21 +716,64 @@ def classify_dry_run_failure(
         exit_code: dry-run 子进程退出码。
         stderr: 子进程 stderr。
         stdout: 子进程 stdout（可空）。
+        to_be_created: 本任务 files_to_edit 声明（即将创建的路径集合，可空；
+            为空时保持存量行为，向后兼容）。
 
     Returns:
         "assertion_mismatch" 或 "expected_pending"。
     """
     stderr_l = (stderr or "").lower()
 
-    # pytest usage error（cmd 语法错误）——定义本身有问题，阻断
+    # 缺失路径/模块信号（pytest 收集错误）。pytest 引用不存在测试文件时真实
+    # 输出为 "ERROR: file or directory not found"（且 exit_code==4），"file not
+    # found" 子串不匹配它，须单独列出（task-e028-dryrun-exit4-priority）。
+    _MISSING_REF_SIGNALS = (
+        "filenotfounderror", "nosuchfile", "no such file",
+        "file not found", "file or directory not found",
+        "can't open file", "modulenotfounderror", "cannot import",
+    )
+
+    def _missing_ref() -> bool:
+        return any(k in stderr_l for k in _MISSING_REF_SIGNALS)
+
+    def _hit_to_be_created() -> bool:
+        """缺失路径 ∈ to_be_created（本任务即将创建的 files_to_edit）判定。
+
+        与旧缺失信号分支共用同一套归一化对齐：小写、反斜杠→斜杠、折叠连续
+        分隔符 + 模块名变体（tests/test_x.py ↔ tests.test_x）。
+        """
+        if not to_be_created:
+            return False
+        declared: set[str] = {
+            _collapse(re.sub(r"/{2,}", "/", str(p).lower().replace("\\", "/")))
+            for p in to_be_created
+        }
+        variants = set(declared)
+        for p in list(declared):
+            if p.endswith(".py"):
+                variants.add(p[:-3].replace("/", "."))
+            elif "." in p and "/" not in p:
+                variants.add(p.replace(".", "/") + ".py")
+        hay = _collapse(
+            (stderr_l + " " + (stdout or "").lower()).replace("\\", "/")
+        )
+        return any(v in hay for v in variants)
+
+    # pytest usage error（cmd 语法错误）——先做 to_be_created 豁免：
+    # pytest 引用『本任务将创建的测试文件』时恒返回 exit 4（ERROR: file or
+    # directory not found: tests/test_x.py），属预期失败（expected_pending）
+    # 而非断言不匹配；纯语法错误或缺失路径不属待创建时仍阻断（assertion_mismatch）。
     if exit_code == 4:
+        if _missing_ref() and _hit_to_be_created():
+            return "expected_pending"
         return "assertion_mismatch"
 
-    # 引用不存在文件/模块（收集错误）——定义引用了不存在的路径
-    if any(k in stderr_l for k in (
-        "filenotfounderror", "nosuchfile", "no such file",
-        "file not found", "modulenotfounderror", "cannot import",
-    )):
+    # 引用不存在文件/模块（收集错误）——缺失路径若属于本任务即将创建的
+    # files_to_edit，则为 expected_pending（新增测试文件 + verify 引用它），
+    # 否则维持 assertion_mismatch（定义引用了本不该缺失的路径）
+    if _missing_ref():
+        if _hit_to_be_created():
+            return "expected_pending"
         return "assertion_mismatch"
 
     # pytest 收集阶段错误（ERROR at setup/collection，指向现有测试文件）

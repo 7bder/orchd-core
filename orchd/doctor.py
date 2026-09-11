@@ -365,7 +365,69 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
     # 任一 in_review 任务分支/worktree 缺失即 fail，附重建命令模板（只读不修）。
     checks.extend(_check_in_review_worktree_integrity(project_root))
 
+    # 7) container 任务 worktree 不变量：._master.json 单副本（唯一权威 = 主工作树）
+    checks.extend(_check_master_single_copy(project_root))
+
     return checks
+
+
+def _check_master_single_copy(project_root: Path) -> list[dict[str, str]]:
+    """container 任务 worktree 残留 ``.orchd/_master.json`` 巡检（task-master-single-copy）。
+
+    唯一权威 = 主工作树的 ``.orchd/_master.json``；container 布局下任务 worktree
+    由 sparse-checkout/skip-worktree 抑制副本。若某任务 worktree 仍存在
+    ``.orchd/_master.json`` → 不变量被破坏（副本漂移风险），报 fail 并附修复 hint。
+    flat 布局本就不建任务 worktree（单 worktree，副本在主工作树）→ 直接 ok。
+    只读检测；无容器标记 / 布局解析失败 → best-effort ok（不误报）。
+    """
+    try:
+        from orchd.worktree import detect_layout
+    except Exception:
+        return []
+    try:
+        layout = detect_layout(project_root)
+        if layout.get("layout") != "container":
+            return [_make_check("master_single_copy", "ok", "flat 布局：无任务 worktree，无需单副本巡检")]
+        task_root = Path(layout["task_wt_root"])
+        canonical = Path(layout["main_worktree"]).resolve()
+    except Exception:
+        return [_make_check("master_single_copy", "ok", "container 标记缺失/解析失败，跳过单副本巡检")]
+    if not task_root.is_dir():
+        return [_make_check("master_single_copy", "ok", "无任务 worktree 目录，单副本不变量成立")]
+    residual: list[str] = []
+    try:
+        for child in task_root.iterdir():
+            if not child.is_dir():
+                continue
+            # 唯一权威 = 主工作树，其自身的 .orchd/_master.json 必在，不算残留
+            if child.resolve() == canonical:
+                continue
+            wt_master = child / ".orchd" / "_master.json"
+            if wt_master.exists():
+                residual.append(str(child))
+    except OSError:
+        return [_make_check("master_single_copy", "ok", "任务 worktree 目录扫描异常，跳过")]
+    if not residual:
+        return [_make_check("master_single_copy", "ok", "container 任务 worktree 无 .orchd/_master.json 副本（单副本不变量成立）")]
+    return [_make_check(
+        "master_single_copy", "fail",
+        f"{len(residual)} 个任务 worktree 残留 .orchd/_master.json（唯一权威 = 主工作树 "
+        f"{canonical}/.orchd/_master.json）：{'；'.join(residual)}。"
+        "修复：cd <任务worktree> && git sparse-checkout init --no-cone && "
+        "git sparse-checkout set '/*' '!/.orchd/' '/.orchd/*' '!/.orchd/_master.json'；"
+        "或在主工作树手工清理残留副本后重跑 claim",
+    )]
+
+
+def _load_master_task_ids(orchd_dir: Path) -> set[str] | None:
+    """读取 ``_master.json`` 登记的任务 id 集合；不可读返回 None（不做过滤）。"""
+    try:
+        from orchd.spec import load_master
+
+        master = load_master(Path(orchd_dir) / "_master.json")
+        return {t.get("id") for t in master.tasks if t.get("id")}
+    except Exception:
+        return None
 
 
 def _check_in_review_worktree_integrity(project_root: Path) -> list[dict[str, str]]:
@@ -394,10 +456,21 @@ def _check_in_review_worktree_integrity(project_root: Path) -> list[dict[str, st
     except Exception:
         return []
     main_wt = Path(layout["main_worktree"]).resolve()
+    # 仅巡检**引擎登记任务**：账本中残留的非登记 id（测试夹具 task-1/task-2 等
+    # 写入共享账本的噪音、或已从 master 移除的任务）本就没有分支与 worktree，
+    # 纳入会把健康仓库误判为 fail。master 不可读时不做过滤（保持 best-effort，
+    # 兼容无 _master.json 的最小场景）。
+    master_ids = _load_master_task_ids(orchd_dir)
     reviewed = 0
     problems_by_task: dict[str, list[str]] = {}
     for tid, ts in state.items():
-        if ts.status != "in_review":
+        if master_ids is not None and tid not in master_ids:
+            continue
+        # AC5（task-review-baseline-and-worktree-recycle-fix）：巡检面由 in_review
+        # 扩展到 claimed。claimed 是「实现中」长时窗（可跨数小时 / 数天），与
+        # in_review 同为分支误删高危期；2026-09-10 事故即发生在 claimed 期
+        # （refs/heads/task/ 目录被删、三支分支丢失）。
+        if ts.status not in ("in_review", "claimed"):
             continue
         reviewed += 1
         entry = bindings.get(tid)
@@ -408,6 +481,18 @@ def _check_in_review_worktree_integrity(project_root: Path) -> list[dict[str, st
         rev = _run_git(project_root, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"])
         if rev.returncode != 0 or not rev.stdout.strip():
             problems.append(f"分支 {branch} 缺失/不可解析")
+        # 4) 任务 worktree HEAD 指向的 ref 存在（AC5）
+        if wt is not None and (wt / ".git").exists():
+            head = _run_git(wt, ["symbolic-ref", "-q", "HEAD"])
+            head_ref = head.stdout.strip() if head.returncode == 0 else ""
+            if not head_ref:
+                problems.append(f"worktree HEAD 不可解析（{wt}）")
+            else:
+                ref_rev = _run_git(
+                    project_root, ["rev-parse", "--verify", "--quiet", head_ref]
+                )
+                if ref_rev.returncode != 0 or not ref_rev.stdout.strip():
+                    problems.append(f"worktree HEAD 指向的 ref 不存在（{head_ref}）")
         # 2) 绑定 worktree 目录有效
         if wt is None:
             problems.append("账本绑定缺失 worktree 路径")
@@ -427,17 +512,44 @@ def _check_in_review_worktree_integrity(project_root: Path) -> list[dict[str, st
     if not problems_by_task:
         if reviewed == 0:
             return [_make_check(
-                "in_review_integrity", "ok", "无 in_review 任务（或无账本，跳过）")]
+                "in_review_integrity", "ok", "无 in_review/claimed 任务（或无账本，跳过）")]
         return [_make_check(
-            "in_review_integrity", "ok", f"{reviewed} 个 in_review 任务 worktree/分支完整")]
+            "in_review_integrity", "ok",
+            f"{reviewed} 个 in_review/claimed 任务 worktree/分支完整")]
+    # 惰性导入：doctor 为叶子模块（零顶层 orchd 依赖），依赖一律函数内导入。
+    try:
+        from orchd.worktree import branch_reflog_tip
+    except Exception:
+        def branch_reflog_tip(_root, _branch):  # type: ignore[misc]
+            return None
+
     hints = []
     for tid, problems in sorted(problems_by_task.items()):
         entry = bindings.get(tid)
-        wt = Path(entry["worktree"]) if (entry and entry.get("worktree")) else (
-            Path(project_root).parent / f"task-{tid[5:] if tid.startswith('task-') else tid}")
+        try:
+            from orchd.worktree import _task_wt_name
+
+            default_wt = Path(project_root).parent / _task_wt_name(tid)
+        except Exception:
+            default_wt = Path(project_root).parent / (
+                f"task-{tid[5:] if tid.startswith('task-') else tid}")
+        wt = Path(entry["worktree"]) if (entry and entry.get("worktree")) else default_wt
+        # AC5：引用自愈模板——refs 被删但 reflog 存活时（2026-08-08 / 2026-09-10
+        # 两次同型事故），reflog 末行 tip 即分支最后落点，可直接用于重建。
+        tip = branch_reflog_tip(Path(project_root), f"task/{tid}")
+        if tip:
+            rebuild = (
+                f"git branch task/{tid} {tip}（reflog tip 自愈："
+                f"git reflog show --format=%H task/{tid} 末行）"
+            )
+        else:
+            rebuild = (
+                f"git branch task/{tid} <悬空sha>"
+                "（git fsck --lost-found 找回；无 reflog 时用此兜底）"
+            )
         hints.append(
-            f"{tid}：{'；'.join(problems)}。重建：git branch task/{tid} <悬空sha>（git fsck "
-            f"--lost-found 找回）; git worktree add {wt} task/{tid}; "
+            f"{tid}：{'；'.join(problems)}。重建：{rebuild}; "
+            f"git worktree add {wt} task/{tid}; "
             "并补回任务 worktree 的 .orchd/.layout.json（_propagate_container_marker 语义）"
         )
     return [_make_check("in_review_integrity", "fail", "；".join(hints))]
@@ -447,35 +559,66 @@ def _check_in_review_worktree_integrity(project_root: Path) -> list[dict[str, st
 # 残留检测（task-audit-doctor-fix）
 # ---------------------------------------------------------------------------
 
+def _resolve_runtime_dir(orchd_dir: Path) -> Path:
+    """解析运行时残留根目录（与 Store 同根）。
+
+    container 布局 → ``resolve_store_dir`` 返回 ``<容器>/.orchd-runtime/``
+    （锁 / session / intake 标记均落于此）；flat 或解析失败 →
+    回退 ``orchd_dir``（``<project_root>/.orchd``），零回归。
+
+    task-runtime-hygiene 路径盲区修复：此前 detect_residues 一律用
+    ``<project_root>/.orchd``，container 布局下扫不到 .orchd-runtime 内的
+    运行时残留（doctor --fix 恒报 0 项、僵尸 session 持续堆积）。
+    """
+    try:
+        from orchd.ledger import resolve_store_dir
+
+        return Path(resolve_store_dir(orchd_dir))
+    except Exception:
+        return orchd_dir
+
+
 def detect_residues(project_root: Path) -> list[dict[str, Any]]:
     """扫描 orchd 运行时残留，返回待清理项列表。
 
-    检测四类残留：
+    检测五类残留：
     1. 孤儿 session 锁文件（对应 worktree 已不存在）
     2. 僵尸 session runtime 文件（超 TTL 未更新的 session 记录）
     3. 残留 intake 标记（.intake.lock 文件，无 live flock 持锁）
     4. 已误提交入 git 的锁文件（.git 目录外的 .lock 文件出现在 git ls-files 中）
+    5. 幽灵任务（账本/checkpoint 派生存在但不在 ``_master.json``）
+
+    运行时残留（1/2/3）以**共享账本根**为扫描根（与 Store 同根，见
+    :func:`_resolve_runtime_dir`）：container 布局扫 ``<容器>/.orchd-runtime/``，
+    flat 扫 ``<project_root>/.orchd``。
 
     所有检测均为只读，不执行任何写操作。返回的每项包含：
     - path: 残留文件绝对路径
-    - type: 残留类型（orphan_session_lock / zombie_session / intake_lock / git_tracked_lock）
+    - type: 残留类型（orphan_session_lock / zombie_session / intake_lock /
+      git_tracked_lock / ghost_task）
     - reason: 判定依据
-    - action: 建议动作（目前固定为 "delete"）
+    - action: 建议动作（delete / git_rm_cached_then_delete / retract_ghost /
+      ghost_task_manual）
     """
     residues: list[dict[str, Any]] = []
     orchd_dir = Path(project_root) / ".orchd"
+    # 运行时残留根 = 共享账本根（container → <容器>/.orchd-runtime；flat → .orchd）
+    runtime_dir = _resolve_runtime_dir(orchd_dir)
 
     # 1) 孤儿 session 锁文件：session-gate-*.lock 无对应活跃 worktree
-    residues.extend(_detect_orphan_session_locks(project_root, orchd_dir))
+    residues.extend(_detect_orphan_session_locks(project_root, runtime_dir))
 
     # 2) Zombie session runtime files: sessions/*.json 超 TTL
-    residues.extend(_detect_zombie_sessions(orchd_dir))
+    residues.extend(_detect_zombie_sessions(runtime_dir))
 
     # 3) Residual intake locks: .intake.lock 无 live flock
-    residues.extend(_detect_residual_intake_locks(orchd_dir))
+    residues.extend(_detect_residual_intake_locks(runtime_dir))
 
     # 4) Git-tracked lock files: .lock files committed to git
     residues.extend(_detect_git_tracked_locks(project_root))
+
+    # 5) 幽灵任务：账本/checkpoint 派生存在、但不在 _master.json（task-runtime-hygiene AC1）
+    residues.extend(_detect_ghost_tasks(project_root))
 
     return residues
 
@@ -614,6 +757,93 @@ def _detect_git_tracked_locks(project_root: Path) -> list[dict[str, Any]]:
     return residues
 
 
+def _detect_ghost_tasks(project_root: Path) -> list[dict[str, Any]]:
+    """检测幽灵任务：账本/checkpoint 派生存在、但不在 ``_master.json`` 的任务。
+
+    成因（2026-09-10 附录 D 补录）：测试夹具（如 pytest 泄漏的 ``task-2``）的
+    CLAIMED 事件落进共享账本根，但任务从未注册进 ``_master.json``；于是
+    ``status`` 不可见，``watchdog`` 却按僵死判定返回 exit 1，而
+    ``force-status`` / ``retract`` 的常规通道对"不在 master 的 id"不可用
+    （retract 另有跨 agent 归属守卫 E034）。
+
+    本检测为**只读**；清理走 ``doctor --fix`` 的 ``retract_ghost`` 分支——
+    以引擎保留的 ``admin`` 控制面撤回该任务的孤儿事件，使 replay 与 master 一致。
+
+    兼容性：仅当 ``<project_root>/.orchd/_master.json`` 存在且可读时才检测；
+    ledger / master 任一不可用时静默返回空（保持 doctor 叶子模块的 best-effort 语义）。
+    """
+    residues: list[dict[str, Any]] = []
+    orchd_dir = Path(project_root) / ".orchd"
+    master_path = orchd_dir / "_master.json"
+    if not master_path.is_file():
+        return residues
+    try:
+        from orchd.ledger import Store, resolve_store_dir
+        from orchd.spec import load_master
+
+        master = load_master(master_path)
+        master_ids = {t["id"] for t in master.tasks}
+        store = Store(resolve_store_dir(orchd_dir))
+        state = store.replay()
+        events = store.backend.read_events()
+    except Exception:
+        return residues
+
+    # 按任务归集事件，用于定位可撤回的起点事件
+    events_by_task: dict[str, list[dict[str, Any]]] = {}
+    for ev in events:
+        _tid = ev.get("task_id")
+        if _tid:
+            events_by_task.setdefault(_tid, []).append(ev)
+
+    for task_id in sorted(state):
+        if task_id in master_ids:
+            continue
+        target_event_id = _ghost_retract_target(events_by_task.get(task_id, []))
+        if target_event_id is None:
+            # 仅含 FORCE_STATUS（防篡改不可撤）→ 无法自动清理，单列需人工处置
+            residues.append({
+                "path": f"ledger#{task_id}",
+                "task_id": task_id,
+                "type": "ghost_task",
+                "reason": (
+                    f"任务 {task_id} 存在于账本但不属于 _master.json，且其事件"
+                    f"均为不可撤的 FORCE_STATUS（防篡改保护）——需人工/admin 专案处置"
+                ),
+                "action": "ghost_task_manual",
+            })
+            continue
+        residues.append({
+            "path": f"ledger#{task_id}",
+            "task_id": task_id,
+            "type": "ghost_task",
+            "reason": (
+                f"任务 {task_id} 存在于账本/checkpoint 但不在 _master.json"
+                f"（幽灵任务，watchdog 会误判僵死）"
+            ),
+            "action": "retract_ghost",
+            "event_id": target_event_id,
+        })
+
+    return residues
+
+
+def _ghost_retract_target(events: list[dict[str, Any]]) -> str | None:
+    """为幽灵任务挑选可撤回的起点事件 id。
+
+    优先 ``CLAIMED``（retract 级联撤回其后续事件）；否则取首个非
+    ``FORCE_STATUS`` 事件。``FORCE_STATUS`` 受引擎防篡改保护（retract 恒拒
+    E007），故事件全为 FORCE_STATUS 时返回 None，调用方降级为需人工处置。
+    """
+    for ev in events:
+        if ev.get("type") == "CLAIMED":
+            return ev.get("event_id")
+    for ev in events:
+        if ev.get("type") != "FORCE_STATUS":
+            return ev.get("event_id")
+    return None
+
+
 def _is_protected_path(path: Path, project_root: Path) -> bool:
     """检查路径是否在保护白名单中（--fix 绝不触碰）。
 
@@ -671,6 +901,7 @@ def doctor_fix(
             "backup_dir": str | None,
             "detected": [...],   # detect_residues 原始输出
             "skipped_protected": [...],  # 被白名单保护的路径
+            "skipped_manual": [...],     # 无自动清理通道、需人工处置的项
             "cleaned": [...],    # 已清理的项（dry_run=True 时为 []）
             "errors": [...],     # 清理失败的项
             "summary": str,
@@ -691,6 +922,13 @@ def doctor_fix(
         else:
             to_clean.append(item)
 
+    # 不可自动处置项单列（如事件全为 FORCE_STATUS 的幽灵任务），避免 --fix 报伪失败
+    skipped_manual: list[dict[str, Any]] = [
+        i for i in to_clean if i.get("action") == "ghost_task_manual"
+    ]
+    if skipped_manual:
+        to_clean = [i for i in to_clean if i.get("action") != "ghost_task_manual"]
+
     # dry-run 模式：只报告不执行
     if dry_run:
         return {
@@ -698,11 +936,13 @@ def doctor_fix(
             "backup_dir": None,
             "detected": detected,
             "skipped_protected": skipped_protected,
+            "skipped_manual": skipped_manual,
             "cleaned": [],
             "errors": [],
             "summary": (
                 f"[dry-run] 发现 {len(detected)} 项残留"
                 f"（{len(skipped_protected)} 项被白名单保护跳过，"
+                f"{len(skipped_manual)} 项需人工处置，"
                 f"{len(to_clean)} 项可清理）。"
                 f"使用 --fix 执行实际清理。"
             ),
@@ -721,6 +961,38 @@ def doctor_fix(
     for item in to_clean:
         path = Path(item["path"])
         action = item.get("action", "delete")
+
+        # 幽灵任务清理（task-runtime-hygiene AC1/AC5）：不走文件删除路径，改用
+        # 引擎保留的 admin 控制面撤回其在账本中的孤儿事件，使 replay 与 master
+        # 一致（force-status / retract 常规通道对不在 _master.json 的 id 不可用，
+        # 故此处是该类残留的专用处置通道）。
+        if action == "retract_ghost":
+            try:
+                from orchd.ledger import Store, resolve_store_dir
+                from orchd.onboard import retract as _retract
+
+                ghost_store = Store(resolve_store_dir(Path(project_root) / ".orchd"))
+                ghost_res = _retract(
+                    ghost_store,
+                    "admin",
+                    target_event_id=item.get("event_id"),
+                    reason=(
+                        f"幽灵任务清理（doctor --fix）："
+                        f"{item.get('task_id')} 不在 _master.json"
+                    ),
+                    project_root=Path(project_root),
+                )
+                cleaned.append({
+                    **item,
+                    "retracted": bool(ghost_res.get("retracted")),
+                    "backup": None,
+                })
+            except Exception as exc:  # 清理失败不中断其余项
+                errors.append({
+                    **item,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            continue
 
         try:
             if action == "git_rm_cached_then_delete":
@@ -764,6 +1036,7 @@ def doctor_fix(
         "backup_dir": str(backup_path) if backup_path else None,
         "detected": detected,
         "skipped_protected": skipped_protected,
+        "skipped_manual": skipped_manual,
         "cleaned": cleaned,
         "errors": errors,
         "summary": (

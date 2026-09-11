@@ -603,7 +603,7 @@ def review_task(
                         "solution": len(s.get("solution", ""))},
         }
         # 入库后从 staged 移除
-        all_staged = [x for x in all_staged if not (x is s)]
+        all_staged = [x for x in all_staged if x is not s]
         _append_jsonl(_lib_path(orchd_dir), entry, _lock_path(orchd_dir))
         promoted.append({
             "id": lesson_id,

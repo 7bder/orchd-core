@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from functools import wraps
 from typing import Any, Callable
@@ -28,7 +29,7 @@ def _cli_skeleton(
     def wrapper(args: Any) -> Any:
         # 业务函数签名：func(args, tasks, orchd_dir, master, store, agent_id)
         from orchd.cli import _load_tasks
-        from orchd.cli._legacy import _resolve_agent_id
+        from orchd.cli.identity import _resolve_agent_id
         tasks, orchd_dir, master = _load_tasks()
         from orchd.ledger import Store
 
@@ -39,12 +40,28 @@ def _cli_skeleton(
     return wrapper
 
 
-def _output(data: Any) -> None:
-    """将数据序列化为 JSON 并打印到 stdout。
+# 在 ensure_ascii=False 直写下会破坏「严格 json.loads 解析」或「UTF-8 编码」的字符：
+#  - U+007F DEL 与 U+0080–U+009F C1 控制符（JSON 允许原样但部分消费方不容 / 可读性差）
+#  - 孤立代理码位 U+D800–U+DFFF（无法 UTF-8 编码，直接触发 GBK/乱码或流写入失败）
+#  - 私用区 PUA：U+E000–U+F8FF、U+F0000–U+FFFFD、U+100000–U+10FFFD（多为脏数据/图标字体残留）
+# C0 控制字符由 json.dumps 自行转义为 \u00XX，无需在此处理；\t\n\r 与结构字符保持不动。
+_UNSAFE_JSON_CHARS = re.compile(
+    "[\x7f-\x9f\ud800-\udfff\ue000-\uf8ff"
+    "\U000f0000-\U000ffffd\U00100000-\U0010fffd]"
+)
 
-    使用 indent=2 美化输出，ensure_ascii=False 以保留中文等非 ASCII 字符。
+
+def _output(data: Any) -> None:
+    """将数据序列化为 JSON 并打印到 stdout（stdout 恒为严格可解析 JSON）。
+
+    使用 indent=2 美化、ensure_ascii=False 保留中文直写；序列化后把「不安全字符」
+    （孤立代理 / DEL / C1 控制符 / 私用区 PUA，见 ``_UNSAFE_JSON_CHARS``）统一替换为
+    U+FFFD，确保管道/脚本消费方对 stdout 一次 ``json.loads``（strict）即可解析，
+    且不因脏字符在 Windows 控制台触发 GBK/编码错误。
     """
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    text = _UNSAFE_JSON_CHARS.sub("\ufffd", text)
+    print(text)
 
 
 def _fix_windows_console_encoding() -> None:

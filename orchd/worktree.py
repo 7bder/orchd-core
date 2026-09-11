@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -582,6 +583,106 @@ def _task_wt_name(task_id: str) -> str:
     return f"{_TASK_WT_PREFIX}{short}"
 
 
+def worktree_hint(task_id: str) -> str:
+    """任务 worktree 目录名提示（单一来源，task-review-diagnostics-hardening AC4）。
+
+    内部使用 ``_task_wt_name`` 输出真实目录名，供 guard.py / review.py / doctor.py
+    等多处调用方统一引用，消除 ``task-task-<id>`` 双前缀漏网（task_id 已含
+    ``task-`` 前缀时再拼 ``task-`` 即产出双前缀）。
+
+    例：``task-14-worktree-lifecycle`` → ``task-14-worktree-lifecycle``；
+    ``t1`` → ``task-t1``。
+    """
+    return _task_wt_name(task_id)
+
+
+def task_branch_head(project_root: Path, task_id: str) -> str | None:
+    """best-effort 取 ``task/{task_id}`` 分支 tip SHA（审查基线单一事实源）。
+
+    task-review-baseline-and-worktree-recycle-fix AC1：REVIEW_CLAIMED 的
+    ``baseline_sha`` 与 review 提交期的 ``current_sha`` 必须取自**同一来源**
+    ——任务分支 tip。修复前两处分别取「主工作树 HEAD」（认领期 project_root
+    解析为主工作树，恒为 main HEAD）与「任务 worktree HEAD」（任务分支 tip），
+    container 布局下二者必然不同，导致漂移检测恒误报（每次审查都输出
+    ``baseline_warning``，实质审查基线校验失效）。
+
+    git 不可用 / 分支不存在 / 异常 → None（调用方回退旧行为，best-effort）。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", f"task/{task_id}"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip() or None
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
+def branch_reflog_tip(project_root: Path, branch: str) -> str | None:
+    """best-effort 取分支 reflog 中最新一条记录的 tip SHA。
+
+    refs 目录被删但 reflog 存活时（``.git/logs/refs/heads/<branch>``，
+    2026-08-08 / 2026-09-10 两次同型事故形态），reflog 末行即分支最后的落点，
+    可作为 ``git branch <branch> <tip>`` 的重建依据。无 reflog / 解析失败 → None。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "reflog", "show", "--format=%H", branch],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+        if proc.returncode == 0:
+            lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+            # git reflog show 为倒序输出（最新在前）
+            if lines:
+                return lines[0]
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+    # ref 无法解析时（refs 被删）git reflog 失效 → 直读 reflog 文件（正序，末行最新）
+    return _reflog_file_tip(project_root, branch)
+
+
+def _reflog_file_tip(project_root: Path, branch: str) -> str | None:
+    """直读 ``.git/logs/refs/heads/<branch>`` 末行的 new sha（ref 缺失兜底）。"""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        git_dir = Path(proc.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = (Path(project_root) / git_dir).resolve()
+        log = git_dir / "logs" / "refs" / "heads" / branch
+        if not log.is_file():
+            return None
+        lines = [
+            ln for ln in log.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip()
+        ]
+        if not lines:
+            return None
+        # reflog 行格式：<old> <new> <who> <ts> <tz>\t<message>
+        fields = lines[-1].split()
+        return fields[1] if len(fields) >= 2 else None
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+
 def bindings_path(store_root: Path) -> Path:
     """返回任务↔worktree 绑定文件路径（位于共享账本根）。"""
     return Path(store_root) / _BINDINGS_FILENAME
@@ -759,6 +860,111 @@ def _propagate_container_marker(task_wt: Path, main_wt: Path) -> None:
         pass
 
 
+# _master.json 副本抑制（task-master-single-copy）：container 任务 worktree 不再
+# 保留 .orchd/_master.json，唯一权威 = 主工作树。用 git sparse-checkout --no-cone
+# 仅排除该文件（.orchd/ 其余文件与全仓库仍正常检出）。4 条 pattern 已实证：
+# worktree 内文件不存在、git status 干净、git add -A/commit 不记录删除、主工作树
+# 前进后 merge 不复活（skip-worktree 方案 merge 时会复活，故为主方案）。
+_MASTER_IGNORE_PATTERNS = ["/*", "!/.orchd/", "/.orchd/*", "!/.orchd/_master.json"]
+
+
+def _git_minor_version() -> int:
+    """解析 git 次版本号（如 2.25 → 25）；解析失败返回 0（按不可用处理）。"""
+    try:
+        out = subprocess.run(
+            ["git", "--version"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        ).stdout or ""
+        m = re.search(r"(\d+)\.(\d+)", out)
+        return int(m.group(2)) if m else 0
+    except Exception:
+        return 0
+
+
+def _suppress_task_master_copy(wt_path: Path) -> dict[str, Any]:
+    """抑制任务 worktree 内 ``.orchd/_master.json`` 副本（best-effort，降级可审计）。
+
+    必须经 Python ``subprocess.run`` 以参数列表直传（``shell=False``），避免
+    Git for Windows 的 MSYS 路径转换改写 ``!/...`` pattern（``!/.orchd/`` 等
+    会被当作参数做路径归一化，导致 pattern 失效）。
+
+    Returns:
+        ``{"ok": bool, "method": str, "reason": str|None}``；``method`` ∈
+        ``sparse-checkout`` / ``skip-worktree`` / ``none``。sparse 不可用
+        （git < 2.25 或失败）→ 降级 skip-worktree；再失败 → 保留副本 + 告警
+        （``ok=False, method="none"``，由调用方以 degraded 透出）。
+    """
+    version = _git_minor_version()
+    if version >= 25:
+        init = subprocess.run(
+            ["git", "sparse-checkout", "init", "--no-cone", str(wt_path)],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            cwd=str(wt_path),
+        )
+        # 陈旧 sparse 状态：残余 in-cone 标记/禁用；先 reset（--no-cone 下不保留
+        # 先前 pattern），保证 set 前为纯 no-cone 基线。
+        if init.returncode == 0:
+            setp = subprocess.run(
+                ["git", "sparse-checkout", "set", *_MASTER_IGNORE_PATTERNS],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                cwd=str(wt_path),
+            )
+            if setp.returncode == 0:
+                # 收敛校验：明确的抑制目标文件应已从 worktree 消失。
+                if not (wt_path / ".orchd" / "_master.json").exists():
+                    return {"ok": True, "method": "sparse-checkout", "reason": None}
+                return {
+                    "ok": False, "method": "none",
+                    "reason": "sparse-checkout set 成功但 .orchd/_master.json 仍存在",
+                }
+            reason = (setp.stderr or "").strip()[:200]
+            return {
+                "ok": False, "method": "none",
+                "reason": f"sparse-checkout set 失败: {reason or 'exit' + str(setp.returncode)}",
+            }
+    # 降级：skip-worktree（merge 时副本可能复活，仍优于保留双副本）
+    sw = subprocess.run(
+        ["git", "update-index", "--skip-worktree", ".orchd/_master.json"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        cwd=str(wt_path),
+    )
+    if sw.returncode == 0:
+        return {
+            "ok": True, "method": "skip-worktree",
+            "reason": "sparse-checkout 不可用，回退 skip-worktree（merge 时副本可能复活）",
+        }
+    return {
+        "ok": False, "method": "none",
+        "reason": "sparse-checkout / skip-worktree 均不可用，保留副本（双副本漂移风险）",
+    }
+
+
+def _master_suppression_entry(wt_path: Path) -> dict[str, Any]:
+    """生成 ``ensure_task_wt`` 返回字典中的 ``master_suppression`` 段。"""
+    supp = _suppress_task_master_copy(wt_path)
+    # 抑制失败 → 副本残留，随 claim 透出 degraded 供 agent 可见（禁止静默）
+    return {
+        "master_suppression": supp,
+        "degraded": supp.get("ok") is False,
+        "degraded_reason": (
+            f"master 副本抑制失败（{supp.get('method')}）：{supp.get('reason')}"
+            if supp.get("ok") is False else None
+        ),
+    }
+
+
 def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
     """创建/复用任务 worktree（best-effort，幂等）。
 
@@ -784,17 +990,37 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
 
     branch = f"task/{task_id}"
     wt_path = layout["task_wt_root"] / _task_wt_name(task_id)
+    # AC4（task-review-baseline-and-worktree-recycle-fix）：目录名单一来源与不变量。
+    # 禁止用含 / 的分支名（task/<id>）拼路径——否则容器根出现 task/task-<id>
+    # 嵌套路径（2026-09-10 事故实测形态：task/task-release-docs-version-sync）。
+    if wt_path.name != _task_wt_name(task_id) or "/" in wt_path.name or "\\" in wt_path.name:
+        return {
+            "worktree": project_root,
+            "separate": False,
+            "created": False,
+            "degraded": True,
+            "reason": (
+                f"worktree 目录名非法（{wt_path.name}）：须由 _task_wt_name(task_id) "
+                "生成，禁止使用含分隔符的分支名拼路径"
+            ),
+        }
     try:
         if (wt_path / ".git").exists():
-            # 已存在且是 worktree → 幂等复用（补写布局标记）
+            # 已存在且是 worktree → 幂等复用（补写布局标记 + 抑制副本）
             _propagate_container_marker(wt_path, project_root)
-            return {"worktree": wt_path, "separate": True, "created": False}
+            result = {"worktree": wt_path, "separate": True, "created": False}
+            result.update(_master_suppression_entry(wt_path))
+            return result
         # 创建期不变量硬化（W-4，复盘 P1 孤儿分支修复）：任务分支必须从**主分支**
         # fork（`git worktree add -b task/<id> <path> <main>`），杜绝因主工作树当
         # 前检出的非 main 分支而生成孤儿/悬空分支。base 解析失败（无 main/master）
         # 则回退当前 HEAD（best-effort），仍可创建但依赖探测结果。
         from orchd.gitops import get_default_branch
         base = get_default_branch(project_root)
+        # AC4：建/认领 worktree 只写 .git/worktrees/<name>/HEAD，绝不改写主工作树
+        # .git/HEAD（事故形态：主工作树 HEAD 被写成 ref: refs/heads/task/... →
+        # 主工作树 unborn、git status 整树 staged、done 被 E017 误拦）。
+        main_head_before = _read_main_worktree_head(project_root)
         add_cmd = ["git", "worktree", "add", "-b", branch, str(wt_path)]
         if base:
             add_cmd.append(base)
@@ -816,6 +1042,18 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
                 timeout=30,
             )
         if proc.returncode == 0 and (wt_path / ".git").exists():
+            # AC4：HEAD 落点不变量校验（对照组为上面采集的 main_head_before）。
+            head_drift = _check_main_head_unchanged(project_root, main_head_before)
+            if head_drift:
+                _cleanup_stale_task_wt(project_root, wt_path)
+                return {
+                    "worktree": project_root,
+                    "separate": False,
+                    "created": False,
+                    "degraded": True,
+                    "reason": head_drift,
+                    "head_restored": _restore_main_head(project_root, main_head_before),
+                }
             # 创建后校验不变量（W-4）：任务 worktree 检出恰为 task/<id> 分支且 HEAD
             # 解析正常。校验失败即使 add 成功也视为创建异常 → 走降级告警（禁止静默
             # 绑错分支/跑错目录，落地"静默降级禁止"硬约束）。
@@ -831,7 +1069,9 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
                 }
             # 任务 worktree 自识别容器布局（共享账本根），见 _propagate_container_marker
             _propagate_container_marker(wt_path, project_root)
-            return {"worktree": wt_path, "separate": True, "created": True}
+            result = {"worktree": wt_path, "separate": True, "created": True}
+            result.update(_master_suppression_entry(wt_path))
+            return result
         # worktree add 失败（如分支已在别处 checkout）→ best-effort 降级主工作树，
         # 但降级原因显式记录（供 claim 告警 / 后续排查，禁止静默降级）。
         reason = (proc.stderr or "").strip()[:300] or (
@@ -856,6 +1096,55 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             "degraded": True,
             "reason": f"worktree add 异常: {exc}",
         }
+
+
+def _read_main_worktree_head(project_root: Path) -> str | None:
+    """读取主工作树 ``.git/HEAD`` 原文（best-effort）。
+
+    AC4（HEAD 落点加固）的对照组采集：仅当 project_root 确为主工作树
+    （``.git`` 是目录且含 HEAD 文件）时返回内容；linked worktree（``.git`` 为
+    gitfile）/ 读取异常 → None（守卫自动失效，不误报）。
+    """
+    try:
+        head = Path(project_root) / ".git" / "HEAD"
+        if head.is_file():
+            return head.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def _check_main_head_unchanged(project_root: Path, before: str | None) -> str | None:
+    """比对主工作树 HEAD 是否被改写；未漂移返回 None，漂移返回原因串。"""
+    if not before:
+        return None
+    after = _read_main_worktree_head(project_root)
+    if after is None or after == before:
+        return None
+    return (
+        "HEAD 落点异常：git worktree add 改写了主工作树 .git/HEAD"
+        f"（{before.strip()} → {after.strip()}）；已回滚本次 worktree 创建"
+        "（任务 worktree 只写 .git/worktrees/<name>/HEAD）"
+    )
+
+
+def _restore_main_head(project_root: Path, before: str) -> bool:
+    """best-effort 还原主工作树 HEAD（原文须为 symbolic ref，否则不动作）。"""
+    ref = before.strip()
+    if not ref.startswith("ref: "):
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "symbolic-ref", "HEAD", ref[len("ref: "):]],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+        return proc.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
 
 
 def _cleanup_stale_task_wt(project_root: Path, wt_path: Path) -> None:
@@ -1109,6 +1398,28 @@ def remove_task_wt(
         result["discarded_uncommitted"] = True
     if residual_cleaned:
         result["residual_cleaned"] = True
+    # AC6（task-review-baseline-and-worktree-recycle-fix）：回收失败可解释。
+    # 修复前 removed=false 时仅静默返回（unbind + 删分支照旧），磁盘残留空壳目录
+    # 无人知晓（实测 task-check-test-dedup-utf8/ 残留，仅 doctor 可检出）。现显式
+    # 返回 residual 标记并指向 worktree_residual 处置入口（禁止静默失败）。
+    residual_dir = str(wt_path) if wt_path.exists() else None
+    if not removed or residual_dir:
+        result["residual"] = {
+            "path": residual_dir or str(wt_path),
+            "removed": removed,
+            "residual_cleaned": residual_cleaned,
+            "reason": (
+                "git worktree remove 未成功（常见于调用方 cwd 位于该 worktree 内，"
+                "或 Windows 文件句柄占用）"
+                if not removed
+                else "worktree 已注销但目录仍存在（残留空壳，Windows 句柄/杀毒扫描常见）"
+            ),
+            "hint": (
+                "退出该目录后重试回收；或运行 python .orchd/__main__.py doctor "
+                "查看 worktree_residual 项并执行 --fix 清理"
+            ),
+            "doctor_check": "worktree_residual",
+        }
     return result
 
 
@@ -1459,11 +1770,28 @@ def diagnose_missing_branch_files(
                     continue
             except (subprocess.SubprocessError, FileNotFoundError, OSError):
                 pass
-            results.append({
-                "file": fp,
-                "reason": "not_committed",
-                "detail": "文件存在且未被 .gitignore 忽略，但未出现在任务分支 diff 中",
-            })
+            # task-master-single-copy：区分"漏提交"与"声明未改动"。未进分支
+            # diff 的文件若在工作树/暂存区有改动 → 真漏提交（not_committed，
+            # 阻断）；完全无改动 → 声明冗余（E020 预防性声明），不阻断。
+            try:
+                st = subprocess.run(
+                    ["git", "status", "--short", "--", fp],
+                    cwd=str(pr),
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                has_changes = st.returncode == 0 and bool(st.stdout.strip())
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                has_changes = True  # 无法判定时保持 fail-closed 语义
+            if has_changes:
+                results.append({
+                    "file": fp,
+                    "reason": "not_committed",
+                    "detail": "文件存在且未被 .gitignore 忽略，但未出现在任务分支 diff 中"
+                              "（工作树/暂存区有改动未提交）",
+                })
         return results
     except Exception:
         return []

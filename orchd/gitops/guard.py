@@ -285,21 +285,28 @@ def _build_wrong_branch_hint(
     hint_parts = []
     for tb in task_branches:
         task_id = tb[len("task/"):]
+        # AC4（task-review-diagnostics-hardening）：worktree 目录名单一来源 =
+        # worktree_hint(task_id)（内部使用 _task_wt_name），消除双前缀 fallback。
+        # task_id 由分支名 task/<id> 截出后已含 task- 前缀，再拼 "task-" 会产出
+        # task-task-<id> 双前缀（实测：提示 cd ../task-task-check-test-dedup-utf8/）。
         wt_exists = False
         try:
-            from orchd.worktree import _task_wt_name, detect_layout
+            from orchd.worktree import worktree_hint, detect_layout
 
+            wt_name = worktree_hint(task_id)
             _layout = detect_layout(project_root)
             if _layout.get("layout") == "container":
                 wt_exists = (
-                    _layout["task_wt_root"] / _task_wt_name(task_id) / ".git"
+                    _layout["task_wt_root"] / wt_name / ".git"
                 ).exists()
         except Exception:
-            pass
+            # Fallback: engine unavailable, use equivalent logic (no double prefix)
+            short = task_id[5:] if task_id.startswith("task-") else task_id
+            wt_name = f"task-{short}"
         if wt_exists:
             hint_parts.append(
-                f"container 布局下请进入任务 worktree 目录 task-{task_id}/ "
-                f"（或 cd ../task-{task_id}）"
+                f"container 布局下请进入任务 worktree 目录 {wt_name}/ "
+                f"（或 cd ../{wt_name}）"
             )
         else:
             hint_parts.append(
@@ -344,12 +351,19 @@ def _enforce_workspace_clean(
 ) -> None:
     """判定工作区干净度；require_clean 且有已跟踪改动时抛 E017。"""
     if require_clean and not state.get("clean"):
+        try:
+            from orchd.guide import amend_patch_cmd as _amend_cmd
+            _patch_hint = ("；若脏改动系本任务需新增的声明外文件，先在主工作树补声明："
+                           + _amend_cmd("<id>", files=["<file>"], entry="orchd"))
+        except Exception:
+            _patch_hint = ""
         raise OrchdError(
             ErrorCode.E017,
             f"dirty_workspace: {command} 要求工作区干净（无已跟踪文件改动）",
             [{
                 "command": command,
-                "hint": "请先提交或还原已跟踪文件改动（untracked 工具/配置文件不阻塞）",
+                "hint": ("请先提交或还原已跟踪文件改动（untracked 工具/配置文件不阻塞）"
+                         + _patch_hint),
             }],
         )
 
@@ -625,11 +639,18 @@ def checkout_default_strict(
     if cur == default:
         return {"checked_out_to": default}
     if not state.get("clean"):
+        try:
+            from orchd.guide import amend_patch_cmd as _amend_cmd2
+            _patch_hint2 = ("；若脏改动系本任务需新增的声明外文件，先在主工作树补声明："
+                            + _amend_cmd2("<id>", files=["<file>"], entry="orchd"))
+        except Exception:
+            _patch_hint2 = ""
         raise OrchdError(
             ErrorCode.E017,
             f"{command}_switch_branch: 工作区非干净，拒绝强制切换(避免把未提交改动带离"
             "任务分支)，请先提交或还原已跟踪改动后重试",
-            [{"command": command, "hint": "请先提交或还原已跟踪文件改动后重试"}],
+            [{"command": command,
+              "hint": ("请先提交或还原已跟踪文件改动后重试" + _patch_hint2)}],
         )
     try:
         result = subprocess.run(

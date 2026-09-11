@@ -23,6 +23,7 @@ from orchd.gitops import (
     get_default_branch as _get_default_branch,
     is_task_worktree,
     list_tracked_changes,
+    main_worktree_root,
     run_guard,
 )
 
@@ -261,6 +262,15 @@ def _guard_out_of_scope(
     ) or []
     if not out_of_scope:
         return
+    # task-amend-guidance-mainwt：定位主工作树，生成带绝对路径的可执行 amend 命令
+    try:
+        main_wt = str(main_worktree_root(project_root))
+        from orchd.guide import amend_mainwt_command
+        patch_cmd = amend_mainwt_command(
+            task_id, main_wt, files=out_of_scope[:3])
+    except Exception:
+        main_wt = "<主工作树路径>"
+        patch_cmd = f'cd "{main_wt}"; python .orchd/__main__.py amend --task {task_id} --files-to-edit <file>'
     raise OrchdError(
         ErrorCode.E010,
         "file_conflict: 实现改动超出任务 files_to_edit∪exempt_files 声明范围",
@@ -268,9 +278,13 @@ def _guard_out_of_scope(
             "task_id": task_id,
             "out_of_scope_files": sorted(out_of_scope),
             "declared_files": sorted(allowed),
+            "main_worktree": main_wt,
             "hint": (
                 "实现只允许改动 files_to_edit/exempt_files 声明内的文件。"
-                "若确有必要连带修改，请先用 amend 把该文件纳入声明后重试。"
+                "若确有必要连带修改，请回到主工作树补 files_to_edit 声明并执行 amend"
+                "（任务 worktree 不保留 _master.json，唯一权威 = 主工作树；"
+                "claimed 状态任务允许 files_to_edit 只增不删，需记录原因，不重置 attempt_count）。"
+                f"可执行命令：{patch_cmd}"
             ),
         }],
     )

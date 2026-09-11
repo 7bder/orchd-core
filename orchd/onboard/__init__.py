@@ -27,7 +27,6 @@ from orchd.gitops_ops import (  # noqa: E402  re-exports (backward compat)
     decode_subprocess_output as _decode_subprocess_output,
     make_event as _make_event,
     now_iso as _now_iso,
-    sync_master_with_main as _sync_master_with_main,
     try_auto_resolve_conflict as _try_auto_resolve_conflict,
     try_delete_task_branch as _try_delete_task_branch,
     try_git_branch as _try_git_branch,
