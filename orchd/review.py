@@ -11,6 +11,7 @@ done / retract / force_status）。
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from orchd.gitops_ops import (
     try_delete_task_branch,
     try_git_merge,
 )
+from orchd.guide import NEXT_ACTION_EXIT
 from orchd.ledger import (
     Store,
     TaskDerived,
@@ -175,7 +177,7 @@ def request_reviewer(
             return {
                 "candidate": None,
                 "message": f"有 {len(not_in_list)} 个待审查任务但你不在名单内",
-                "next_action": "exit",
+                "next_action": NEXT_ACTION_EXIT,
                 "pool_size": 0,
                 "reason": "not_in_reviewer_list",
                 "tasks": not_in_list,
@@ -183,7 +185,7 @@ def request_reviewer(
         return {
             "candidate": None,
             "message": "当前无待审查任务",
-            "next_action": "exit",
+            "next_action": NEXT_ACTION_EXIT,
             "pool_size": 0,
         }
     best = review_candidates[0]
@@ -232,12 +234,18 @@ def extract_review_comments(
         return comments
     events = store._read_ledger_lines(from_line=1)
     for ev in events:
-        if (
-            ev.get("task_id") == task_id
-            and ev.get("type") == "REVIEW_SUBMITTED"
-            and ev.get("comments")
-        ):
+        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+            continue
+        if ev.get("comments"):
             comments.append(ev["comments"])
+        # task-review-comments-gate-and-stale-timeout（B）：历史空打回事件
+        # （CHANGES_REQUESTED 但无 comments）注入占位，避免返工时 review_comments=[]
+        # 导致实现者看不到任何意见。A 的强制门已阻止新空打回，此处仅兜底历史数据。
+        elif ev.get("verdict") == "CHANGES_REQUESTED":
+            comments.append(
+                "[该次打回未附审查意见（历史数据），请联系审查者补充；"
+                "当前版本已强制要求 CHANGES_REQUESTED 必须附意见]"
+            )
     return comments
 
 
@@ -314,6 +322,7 @@ def review_submit(
     verdict: str,
     comments: str | None = None,
     project_root: Path | None = None,
+    authorize_reviewer_resolve: bool = False,
 ) -> dict[str, Any]:
     """提交审查结果（task-session-lock-lifecycle：异常路径也保证释放会话锁）。
 
@@ -326,11 +335,80 @@ def review_submit(
     """
     try:
         return _review_submit_impl(
-            store, tasks, agent_id, task_id, review_type, verdict, comments, project_root
+            store, tasks, agent_id, task_id, review_type, verdict, comments,
+            project_root, authorize_reviewer_resolve=authorize_reviewer_resolve,
         )
     finally:
         if project_root:
             release_session_lock_if_owned(project_root / ".orchd", agent_id)
+
+
+def _resolve_review_resolve_markers(workdir: Path, conflict_files: list[str]) -> bool:
+    """[fallback] 审查者授权解冲突：只解 REVIEW-RESOLVE 标记段，保留双方内容。
+
+    task-merge-tests-union-and-reviewer-fallback：仅在显式
+    authorize_reviewer_resolve=True 时由调用方触发。逐文件扫描
+    ``<<<<<<< REVIEW-RESOLVE`` 标记段，去掉标记符、保留双方内容（Both sides
+    preserved），不改业务逻辑。只 git add 冲突文件并提交，不触碰其他文件。
+
+    Returns:
+        True 表示全部标记段已解并提交；False 表示失败（调用方回退 E015）。
+    """
+    import re as _re
+
+    marker_start = _re.compile(r"^<<<<<<< REVIEW-RESOLVE\s*$", _re.MULTILINE)
+    marker_sep = _re.compile(r"^=======\s*$", _re.MULTILINE)
+    marker_end = _re.compile(r"^>>>>>>>.*$", _re.MULTILINE)
+
+    for rel in conflict_files:
+        target = workdir / rel
+        if not target.exists():
+            return False
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
+        # 逐段替换 REVIEW-RESOLVE 标记
+        pos = 0
+        result_parts: list[str] = []
+        while True:
+            m_start = marker_start.search(text, pos)
+            if not m_start:
+                result_parts.append(text[pos:])
+                break
+            result_parts.append(text[pos:m_start.start()])
+            m_sep = marker_sep.search(text, m_start.end())
+            if not m_sep:
+                return False  # 标记不完整，拒绝
+            m_end = marker_end.search(text, m_sep.end())
+            if not m_end:
+                return False
+            # 保留双方内容（去掉标记符），中间加空行分隔
+            left = text[m_start.end():m_sep.start()].strip("\n")
+            right = text[m_sep.end():m_end.start()].strip("\n")
+            result_parts.append(f"{left}\n\n{right}\n")
+            pos = m_end.end()
+        merged = "".join(result_parts)
+        # 确认无残留冲突标记
+        if "<<<<<<<" in merged or ">>>>>>>" in merged:
+            return False
+        target.write_text(merged, encoding="utf-8")
+        add = subprocess.run(
+            ["git", "-C", str(workdir), "add", rel],
+            capture_output=True,
+        )
+        if add.returncode != 0:
+            return False
+    # 只提交冲突文件
+    commit = subprocess.run(
+        ["git", "-C", str(workdir), "commit", "-q",
+         "-m", "chore(merge): reviewer-authorized resolve — Both sides preserved"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    return commit.returncode == 0
 
 
 def _review_submit_impl(
@@ -342,6 +420,8 @@ def _review_submit_impl(
     verdict: str,
     comments: str | None = None,
     project_root: Path | None = None,
+    *,
+    authorize_reviewer_resolve: bool = False,
 ) -> dict[str, Any]:
     """提交审查结果（APPROVED 或 CHANGES_REQUESTED）。
 
@@ -427,6 +507,18 @@ def _review_submit_impl(
             _task_branch_tip(project_root, task_id) or get_head_commit(project_root)
         ) if project_root else None
         baseline_drift = bool(baseline_sha and current_sha and baseline_sha != current_sha)
+
+        # task-review-comments-gate-and-stale-timeout（A）：CHANGES_REQUESTED
+        # 必须附意见，否则返工任务取到 review_comments=[]，实现者看不到打回原因。
+        # APPROVED / REVIEW_READY 不受影响（通过无需意见）。空白字符串视同空。
+        if verdict == "CHANGES_REQUESTED" and not (comments or "").strip():
+            raise OrchdError(
+                ErrorCode.E007,
+                "invalid_state: CHANGES_REQUESTED requires non-empty review comments",
+                [{"task_id": task_id, "verdict": verdict,
+                  "hint": "打回审查必须附上具体修改意见（comments 不能为空或仅空白），"
+                          "否则实现者返工后无法获知需要修复什么"}],
+            )
 
         event = make_event(
             task_id, agent_id, "REVIEW_SUBMITTED",
@@ -566,10 +658,34 @@ def _review_submit_impl(
                     auto_resolved = True
                 else:
                     conflict_files = (auto or {}).get("conflict_files") or merge_result.get("files", [])
-                    result["merged"] = False
-                    result["reason"] = "merge_conflict"
-                    result["conflict_files"] = conflict_files
-                    result["task_status"] = "in_review"
+                    # task-merge-tests-union-and-reviewer-fallback [fallback]：
+                    # 审查者显式授权解冲突兜底。仅在 authorize_reviewer_resolve=True
+                    # 时尝试解 REVIEW-RESOLVE 标记段，保留双方内容；只提交冲突文件。
+                    # 无授权或解冲突失败 → 回退 E015（默认仍要求实现者解）。
+                    reviewer_resolved = False
+                    if authorize_reviewer_resolve and project_root and conflict_files:
+                        _rr_workdir = main_worktree_root(project_root)
+                        # 重新触发 merge 以获得冲突工作树状态（try_git_merge 已 abort）
+                        subprocess.run(["git", "-C", str(_rr_workdir), "merge", "--abort"],
+                                       capture_output=True, timeout=10)
+                        subprocess.run(["git", "-C", str(_rr_workdir), "checkout", "main"],
+                                       capture_output=True, timeout=10)
+                        _rr_merge = subprocess.run(
+                            ["git", "-C", str(_rr_workdir), "merge", f"task/{task_id}"],
+                            capture_output=True, timeout=30,
+                        )
+                        if _rr_merge.returncode != 0:
+                            reviewer_resolved = _resolve_review_resolve_markers(
+                                _rr_workdir, conflict_files
+                            )
+                    if reviewer_resolved:
+                        auto_resolved = True
+                        result["reviewer_resolve"] = "Both sides preserved"
+                    else:
+                        result["merged"] = False
+                        result["reason"] = "merge_conflict"
+                        result["conflict_files"] = conflict_files
+                        result["task_status"] = "in_review"
                     # 通道 D：E015 merge_conflict 指引挂载（structured_error 收敛）
                     # 加法式：保留原 reason/conflict_files/action，新增 error 字段
                     # 使 guide.py E015 静态表指引(recovery/command/exit_type=git-diagnose)可达
@@ -727,4 +843,64 @@ def _review_submit_impl(
             release = session_lock_release(orchd_dir)
             result["session_lock_released"] = release.get("released", False)
 
+    # task-review-completion-guidance（AC1/AC2）：code APPROVED 且 merge 成功
+    # （任务 completed）的响应附 guidance，明确下一步在主工作树执行
+    # status --audit-merge；回收未成功时额外给出处置指引。
+    if result.get("task_status") == "completed" and result.get("merged") is True:
+        result["guidance"] = _build_completion_guidance(
+            task_id, result.get("worktree_recycled")
+        )
+
     return result
+
+
+def _build_completion_guidance(
+    task_id: str, worktree_recycled: dict[str, Any] | None
+) -> dict[str, Any]:
+    """构造 code APPROVED + merge 成功后的完成态 guidance（AC1/AC2）。
+
+    AC1：明确下一步在主工作树执行 status --audit-merge（rules/review.md 硬要求）。
+    AC2：回收未成功（worktree_recycled.removed=false）时额外给出处置指引，
+    文案与 residual 实际结局一致、不承诺已清理。
+    """
+    from orchd.guide import _ENTRY_CMD
+
+    hint = (
+        f"任务 {task_id} 已审查通过并合并（completed）。请在**主工作树**执行 "
+        f"{_ENTRY_CMD} status --audit-merge 确认 merge_audit.warnings 为空"
+        "（rules/review.md 硬要求）。"
+    )
+    wr = worktree_recycled or {}
+    if wr.get("removed") is False:
+        residual = wr.get("residual") or {}
+        reason = residual.get("reason") or "worktree 回收未成功"
+        hint += (
+            f" 注意：任务 worktree 回收未成功（{reason}），"
+            "请先切出该目录后重试回收，或运行 doctor --fix 清理残留；"
+            "不要在已失效的 worktree 目录内执行命令。"
+        )
+    return {
+        "step": "audit_merge",
+        "command": f"{_ENTRY_CMD} status --audit-merge",
+        "hint": hint,
+        "read": ["rules/review.md"],
+    }
+
+
+def build_reviewer_rerun_command(task_def: dict[str, Any]) -> str | None:
+    """从任务 verify_command 提取 reviewer 可粘贴的定向重跑命令（AC3，单一事实源）。
+
+    解析 verify_command（``ruff && pytest && validate`` 链式），提取含 ``pytest``
+    的命令段作为 reviewer 定向重跑模板——reviewer 只需重跑测试，不需重跑 ruff
+    或 validate。跨平台 --basetemp 形式直接继承 verify_command 中的写法
+    （``${TMPDIR:-/tmp}/orchd-vf-$$``），不手写字符串。verify_command 无
+    pytest 段时返回 None（不编造命令）。
+    """
+    verify_cmd = task_def.get("verify_command")
+    if not isinstance(verify_cmd, str) or not verify_cmd.strip():
+        return None
+    for segment in verify_cmd.split("&&"):
+        seg = segment.strip()
+        if "pytest" in seg:
+            return seg
+    return None

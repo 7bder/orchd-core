@@ -1,6 +1,6 @@
 # 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
 
-> TL;DR: ① 审查者不得自审（E016）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract
+> TL;DR: ① 审查者不得自审（E016）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
 
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
@@ -25,3 +25,20 @@
 
 ## 文档类单阶段（Q2 分级，2026-08-06；白名单收紧 2026-08-13）
 - files_to_edit 全为**真文档**（`.md` / `.mdx` / `.markdown` / `.rst` / `.txt` 后缀——`docs/`、`doc/` 目录下文件同样须命中后缀白名单，示例代码/JSON/脚本等一律双阶段）且**不碰** SKILL.md / conventions.md / .orchd/_master.json（约定与状态文件）的任务，done 时直接进入 code review（跳过 spec，code 即终审）——文档修改不涉及引擎运行与约定改变；碰引擎代码 / 约定 / 状态文件 / 构建配置（`pyproject.toml`）/ CI / schema JSON 等非文档文件的任务保持 spec + code 双阶段。
+
+## 审查检查项：引擎语义变更同步（引导层三查，task-guidance-sync-convention，2026-09-13）
+
+diff 命中以下任一触发条件时，审查者必须逐项核对 `shared/conventions.md` 的同名检查项（「错误出口同步」向引擎语义域的扩面）：
+
+- 新增 / 修改状态机分支，或新增 / 修改 guidance `step`、`next_action` 取值；
+- 新增 / 删除规则文件（`rules/*.md`）或规则章节；
+- 新增命令、hint 文案或建议命令。
+
+三查（每条须引用证据，任一不满足即 CHANGES_REQUESTED）：
+
+1. **step 词表登记**——实际返回的 `step` / `next_action` 取值与 guide 词表逐项对齐：无漏登记、无死词汇、无双词表并行且无映射断言；
+2. **read / template 路由完备**——新增规则文件 / 模板 / 规则章节已接入 `guidance.read` 与 `template` 路由，`max_read` 等上限未把关键必读（如 `rules/verify.md`）挤出；
+3. **hint 文案与实际命令一致**——hint / 建议命令参数完整（两段式含 `--confirm`）、执行位置正确（任务分支 / worktree 而非 main），且与 rules/ 同语义条款一致、硬要求（如 `status --audit-merge`）不漏。
+4. **人类可见窗口（stderr 提示块）预算自洽**——`_emit_guidance` 渲染层不做硬编码总数裁剪（无 200/197 字面量），预算由 `guide.py` 的 `_BLOCK_MAX` 求和不等式单一真源管理（布局开销 + hint + command + read + cases ≤ _BLOCK_MAX），红线用语义截断（按点分割只装整点，装不下退化为「红线 N 条（见路径）」），渲染体包 try/except；命令逐字完整不被腰斩。
+
+**spec 与 code 两阶段均适用**：spec 阶段核对「新增语义是否已在词表 / 路由 / 文档中登记」的规格完备性；code 阶段核对代码与文案的实际一致（含 `--confirm`、执行位置、硬要求链路）。unified 单阶段审查同样适用。

@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+from orchd.guide import (
+    NEXT_ACTION_EXIT,
+    NEXT_ACTION_REVIEW_TAKEOVER,
+    NEXT_ACTION_WAIT,
+)
 from orchd.cli._util import (
     _command_name,
     _find_orchd_dir,
@@ -65,7 +70,20 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             or None
         ),
         enforce_self_review_block=enforce_self_review_block,
+        conflict_policy=(
+            (master.config.get("conflict_policy") if hasattr(master, "config") else None)
+            or None
+        ),
     )
+
+    # task-review-comments-gate-and-stale-timeout（D）：request 候选只透出
+    # review_comments_count（条数），不摆意见正文，避免逐候选 token 浪费；
+    # 完整意见仅在 claim --confirm 时由 review_comments 字段给出。
+    if result.get("candidate"):
+        _rc = result["candidate"].pop("review_comments", None)
+        result["candidate"]["review_comments_count"] = (
+            len(_rc) if isinstance(_rc, list) else 0
+        )
 
     # W-2 僵尸审查认领巡检：request 响应恒附 stale_reviews，无候选时把
     # next_action 抬为 review_takeover 并给接管命令，避免 agent 卡在死锁里
@@ -91,12 +109,14 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         else:
             result["message"] = takeover_msg
         if result.get("candidate") is None:
-            result["next_action"] = "review_takeover"
+            result["next_action"] = NEXT_ACTION_REVIEW_TAKEOVER
 
     # 无候选（candidate=None / next_action=exit|wait）：以引擎分配为准，
     # 附加 stop_wait 引导，明确"停止等待用户指令"，防止 agent 自行 claim/重试。
     # _attach_guidance 幂等（已有 guidance 不覆盖），此处预置即生效。
-    if result.get("candidate") is None and result.get("next_action") in ("exit", "wait"):
+    if result.get("candidate") is None and result.get("next_action") in (
+        NEXT_ACTION_EXIT, NEXT_ACTION_WAIT
+    ):
         from orchd.guide import stop_wait_guidance
 
         result["guidance"] = stop_wait_guidance()
@@ -197,7 +217,18 @@ def claim_preview(
         "reviewers": task_def.get("reviewers", []),
         "current_status": status,
         "review_phase": current_phase,
+        # task-claim-preview-and-scope-triage：声明范围与校验命令前置展示
+        "files_to_edit": task_def.get("files_to_edit", []),
+        "exempt_files": task_def.get("exempt_files", []),
+        "verify_command": task_def.get("verify_command", ""),
+        # cwd 预期：实现 claim 须在 main，审查 claim 须在 task 分支（两者规则相反）
+        "cwd_expected": "main（主工作树）" if role == "implementer" else f"task/{task_id}（任务 worktree）",
     }
+    # task-review-comments-gate-and-stale-timeout（D）：预览阶段只透出意见条数，
+    # 不摆正文（token 克制）；完整意见仅在 claim --confirm 返回体的 review_comments
+    # 字段一次给出。初次实现任务无意见 → 0；返工任务 → 实际条数。
+    from orchd.review import extract_review_comments as _ecr
+    preview["review_comments_count"] = len(_ecr(store, task_id, derived))
 
     # git 状况（best-effort，非 git 环境降级为 available:false）
     if project_root is not None:
@@ -225,7 +256,8 @@ def claim_preview(
             {"check": "任务处于 in_review（可认领审查）",
              "expected_pass": status == "in_review"},
             {"check": "agent 在任务 reviewers 名单内",
-             "expected_pass": agent_id in task_def.get("reviewers", [])},
+             "expected_pass": agent_id in task_def.get("reviewers", []),
+             "note": "指纹身份（12位hex）默认豁免此名单校验（ledger.is_fingerprint_agent_id），expected_pass=false 不阻断认领；具名 agent 身份才需在 reviewers 名单内"},
             {"check": "审查阶段与当前 review_phase 匹配",
              "expected_pass": (not review_type) or review_type == current_phase},
         ]
@@ -320,6 +352,7 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         review_type=getattr(args, "review_type", None),
         with_context=getattr(args, "with_context", False),
         enforce_self_review_block=enforce_self_review_block,
+        force=getattr(args, "force", False),
     )
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
@@ -425,6 +458,8 @@ def register(sub) -> None:
                    help="确认执行认领（无 --confirm 时仅输出预览，不写事件、不建分支）")
     p.add_argument("--with-context", action="store_true",
                    help="显式附加全部共享上下文（architecture + conventions），默认按需")
+    p.add_argument("--force", action="store_true",
+                   help="绕过 retract 认领冷却期（task-retract-bind-cooloff）")
     p.set_defaults(func=_cmd_claim)
 
     # done

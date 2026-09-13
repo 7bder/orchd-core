@@ -15,7 +15,7 @@
 ## 工作流程
 
 1. **认领审查**：`python .orchd/__main__.py request` 获取候选（有 in_review 任务时引擎优先返回审查候选 / `review_priority` 提示）→ `python .orchd/__main__.py claim --task {id}`（审查角色由引擎按任务状态自动分流，无需指定 --agent/--role）
-2. **阅读材料**：任务的 acceptance_criteria、deliverables（若有）、实现者的 changes_description、DONE 事件（ledger）、shared/conventions.md（必读）、shared/architecture.md（参考）、实现者变更的文件（git diff）
+2. **阅读材料（响应+diff 优先，2026-09-13 读取纪律 A4）**：优先消费 claim 响应已附带的 `files_to_review`（path+priority）、`verify` 摘要与 `rerun_command`，不再读 master.json 任务定义；变更用 `git diff` 定向查看，不重读实现文件全文；任务的 acceptance_criteria、deliverables（若有）、实现者的 changes_description 仅在响应未附带时按需查看，shared/conventions.md（必读，按读取纪律 A1 判断：会话内已读且版本未变不重读）、shared/architecture.md（参考）
 3. **收集验证证据（分层，默认不重跑）**：① 引擎保证——任务 in_review = verify_command 已通过（done 成功前提）；② 实现者 changes_description 中的自检声明；③ 仅在上述不可信或需确认特定行为时，重跑**定向**测试（`pytest tests/test_<相关>.py -q --basetemp="${TMPDIR:-/tmp}/orchd-vf-$$"`），禁止全量 pytest
 4. **逐条判定**：对照验收标准逐条勾选三态清单（规格维度）+ 分组核验（代码维度，见下）
 5. **提交审查**：`python .orchd/__main__.py review --task {id} --verdict APPROVED|CHANGES_REQUESTED [--comments "..."]`（unified 模式不传 --type）

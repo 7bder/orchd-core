@@ -1,4 +1,4 @@
-"""gitops 包兼容层：全量 re-export 原 orchd/gitops.py 的 68 个顶层符号。"""
+"""gitops 包兼容层：全量 re-export 原 orchd/gitops.py 的 70 个顶层符号。"""
 
 from orchd.gitops._const import _GIT_ENCODING, _GIT_ERRORS, _GIT_TIMEOUT, _T
 from orchd.gitops._run import _run_git, _shell_quote
@@ -20,6 +20,7 @@ from orchd.gitops.cleanup import (
     _os_delete_tree,
     _safe_delete,
     parse_conflicts,
+    unmerged_paths,
 )
 from orchd.gitops.session_lock import (
     _SESSION_GATE_FILENAME,
@@ -97,12 +98,13 @@ __all__ = [
     "main_worktree_root",
     "is_task_worktree",
     "_probe_git_repo_ready",
-    # cleanup.py（5）
+    # cleanup.py（6）
     "_cleanup_trash_residue",
     "_os_delete_file",
     "_os_delete_tree",
     "_safe_delete",
     "parse_conflicts",
+    "unmerged_paths",
     # session_lock.py（18）
     "_SESSION_GATE_FILENAME",
     "_SESSION_LOCK_FILENAME",
@@ -127,7 +129,7 @@ __all__ = [
     "_filter_committable_paths",
     "ensure_committed",
     "head_drift_check",
-    # hook.py（4）
+    # hook.py（5）
     "_e020_hook_escape_block",
     "_get_hook_path",
     "_HOOK_FILENAME",

@@ -28,3 +28,13 @@ orchd 协议文本（`AGENTS.md`、`SKILL.md`、`rules/*.md`、`templates/*.md`�
 - **管道消费 orchd JSON 须按 UTF-8 解码**：`python .orchd/__main__.py pool --all | python -c "json.load(sys.stdin)"` 在中文 Windows 会 JSONDecodeError/乱码（消费方 stdin 按 GBK 解码 UTF-8 字节流）。
 - 规避方式：设 `PYTHONIOENCODING=utf-8` 或 `python -X utf8`、或显式 `encoding='utf-8'` 解码。
 - 此为 CLI 写 stdout 给管道消费方的编码契约，与 task-encoding-hardening 的引擎读子进程输出解码不同向，详见 README「Windows 管道编码」。
+
+## PowerShell 管道传参编码陷阱（取证 / 复核）
+
+PowerShell 5.1 把内容经管道喂给原生进程时，默认以 **UTF-16LE（带 BOM）** 形态写 stdin；按 UTF-8 解析的原生进程会整体误判——实测 `git show <rev>:<path> | python -m ruff check --stdin-filename <path> -` 时 6 个文件全部报 `invalid-syntax`，**与代码本身无关**（纯环境编码陷阱，复查基线时极易误判为"代码有问题"）。
+
+正确做法（任选其一）：
+
+- **推荐**：改用临时文件 + 显式路径复核（`git show <rev>:<path> > "$TMP/x.py"` 后由 Python 读文件），绕开管道形态转换；
+- 或先显式设置 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`（必要时连同 `[Console]::OutputEncoding`）再管道；
+- 或直接用 Git Bash（`bash -lc`）执行同一命令（见上节「Windows shell 命令执行规则」）。

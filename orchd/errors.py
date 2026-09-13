@@ -18,7 +18,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """35 个错误码（E001-E035，全码段统一纳入枚举）。"""
+    """36 个错误码（E001-E036，全码段统一纳入枚举）。"""
 
     E001 = "file_not_found"
     E002 = "invalid_json"

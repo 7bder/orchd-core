@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
@@ -46,6 +47,7 @@ dev = [
     "setuptools-scm>=8.0",
     "build>=1.0",
     "ruff>=0.6",
+    "mypy>=1.10",
 ]
 
 [tool.ruff]
@@ -54,16 +56,19 @@ line-length = 100
 
 [tool.ruff.lint]
 # 规则集：E4/E7/E9（语法+风格核心）+ F（pyflakes 正确性）。
-# 既有代码基线（task-release-pipeline 记录，2026-08-08；task-lint-ruff-green 校准，2026-09-10）：
-# - E402（13 处）：模块级 import 不在文件顶部——orchd/onboard/__init__.py（6 处，子包聚合
-#   入口的延迟 re-export）、orchd/__init__.py（1）、tests/test_cli.py（2）与
-#   tests/test_doctor.py（4，sys.path 引导之后的 import）→ 忽略
-# - F401（248 处）：子包聚合入口 re-export 与遗留未使用 import，集中在
-#   orchd/onboard/__init__.py（62）、orchd/cli/__init__.py（54）及各 cli/commands/*、
-#   tests/*（基线）→ 忽略
-# - F541（3 处）：orchd/review.py:653-654、orchd/onboard/lifecycle/core.py:469 无占位
-#   f-string（基线）→ 忽略
-# 以上三类为唯一豁免范围；orchd/ scripts/ 与 tests 现已零告警（CI lint job 绿）。
+#
+# 豁免范围（唯一三类，与下方 ignore 一一对应；不放宽任何其他规则）：
+# - E402：模块级 import 不在文件顶部——子包聚合入口的延迟 re-export，以及引导 sys.path
+#   之后才 import 的测试文件
+# - F401：子包聚合入口 re-export 与遗留未使用 import（引擎与测试均可能命中）
+# - F541：无占位 f-string
+# 不采用 per-file-ignores 基线化——那等于放弃对应目录的 lint 门禁，与本仓库目的相反。
+# 上述三类豁免（E402 / F401 / F541）对强制范围的三处（orchd/ + scripts/ + tests/）
+# 同等生效，不按目录区分强度。
+#
+# 强制范围 = CI lint job 实测执行的 ruff 范围：orchd/ + scripts/ + tests/ 三处，零告警由
+# CI 强制（本地 verify 预算 120s 硬上限，重活留在 CI，见 .orchd/rules/verify.md）。
+# 本注释不承诺具体处数：数字随代码漂移，实测以 CI 为准。
 select = [
     "E4",
     "E7",
@@ -91,3 +96,124 @@ addopts = "-n auto --dist=loadscope --strict-markers --durations=20"
 markers = [
     "slow: 慢速测试（长锁等待/真安装/构建），常规集默认忽略（-m 'not slow' 或 CI 烟测子集）",
 ]
+
+# =====================================================================
+# 类型检查（task-decl-ci-contract-verification，审查报告 T-1）
+# =====================================================================
+# 首轮宽松策略：让 ``python -m mypy orchd/`` 以退出码 0 通过，把存量类型错误按
+# 子包收敛到下方 overrides（``ignore_errors = true``）。意图不是掩盖——而是把
+# "已声明契约缺少对应强度验证"先补上（CI mypy job 见 .github/workflows/ci.yml），
+# 再按"收紧路线"逐个子包移除 overrides，使该子包进入强类型检查。
+#
+# 存量错误基线（mypy 1.10.0，--ignore-missing-imports，55 源文件）：59 errors / 20 files。
+# 各子包分布（按文件计，含概览）：
+#   orchd.ledger ............. 5  (StorageBackend 缺 ledger_path/checkpoint_path/lock_path/_file_lock attr)
+#   orchd.guide .............. 11 (本应是 int 的变量被赋 list/str/None；union-attr)
+#   orchd.split .............. 5  (Any|None 不可索引 / 与 set[Any] 不兼容)
+#   orchd.review ............. 4  (str|None 不可索引；remove_task_wt 收到 Path|None)
+#   orchd.cli.commands ....... 12 (workflow/query/control 大量 untyped 回调与 _cli_skeleton 签名不符)
+#   orchd.onboard ............ 7  (make_event 收 str|None；union-attr review_phase/attempt_count)
+#   orchd.worktree ........... 2  (str|None / no-redef)
+#   orchd.lessons ............ 3  (set[int] vs list[int]|None；in 操作数)
+#   orchd.pool ............... 1  (TaskState|None 赋值)
+#   orchd.doctor ............. 1  (Set comprehension 含 Any|None)
+#   orchd.report ............. 2  (Collection 与 dict 不兼容)
+#   orchd.cli.skeleton ....... 1  (call-arg)
+#   orchd.cli._util .......... 1  (Path|None 赋值)
+#   orchd.ledger_sync ........ 1  (StorageBackend 缺 orchd_dir attr)
+#   orchd.cli.commands.init .. 2  (__iadd__ 类型不符)
+#
+# 收紧路线（按模块移除 overrides 的顺序，由易到难）：
+#   ① orchd.ledger_sync → ② orchd.doctor → ③ orchd.pool → ④ orchd.cli._util
+#   → ⑤ orchd.cli.skeleton → ⑥ orchd.report → ⑦ orchd.split → ⑧ orchd.review
+#   → ⑨ orchd.ledger → ⑩ orchd.worktree → ⑪ orchd.lessons → ⑫ orchd.guide
+#   → ⑬ orchd.onboard.*（最后，union-attr 多）→ ⑭ orchd.cli.commands.*
+#   （cli 层大量 untyped 回调 + 动态类型，留到最后；收紧时同步给 _cli_skeleton
+#    补 Callable 泛型或 # type: ignore 局部标注）
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = false
+warn_redundant_casts = false
+# 仅对 orchd/ 做类型检查；scripts/ 与 tests/ 由 lint 门禁覆盖且 untyped 较多。
+
+[[tool.mypy.overrides]]
+module = "orchd.ledger"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.ledger_sync"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.guide"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.split"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.review"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.pool"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.lessons"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.worktree"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.doctor"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.report"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli._util"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli.skeleton"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.onboard"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.onboard.claim"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.onboard.control"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.onboard.lifecycle.core"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli.commands.init"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli.commands.control"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli.commands.query"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "orchd.cli.commands.workflow"
+ignore_errors = true

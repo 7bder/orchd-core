@@ -136,6 +136,13 @@ class Conflict:
     is_shared_core: bool = False
 
 
+# 在途任务（task-inflight-conflict-visibility）在冲突检测输入中的 claimed_by 标记。
+# 语义：「分支上已有改动、尚未落 main」——含 done / in_review / force-status 悬空态，
+# 与状态字段无关（真源 = git 事实）。实际改动文件由调用方（onboard/request.py）
+# 以 git 提供，本模块保持零 git 依赖；上层据此按 config.conflict_policy 分流。
+INFLIGHT_MARKER = "inflight"
+
+
 def build_pool(
     tasks: list[dict[str, Any]],
     state: dict[str, TaskState],
@@ -230,18 +237,61 @@ def sort_candidates(
     elif sort_key == "hours":
         return sorted(candidates, key=lambda c: c.task.get("estimated_hours", 0))
     else:
-        # 默认复合排序：importance desc → rework（返工优先）→ blocked_downstream desc
-        # → estimated_hours asc。rework 仅作同级内 tie-break，不跨 importance 层。
+        # 默认复合排序：rework（返工全局优先，与 guide.py rework_first 对齐）
+        # → importance desc → blocked_downstream desc → estimated_hours asc。
+        # rework 跨 importance 层全局优先：返工任务不论 importance 高低均排在新任务前，
+        # 避免低 importance 返工任务被高 importance 新任务长期饿死（与引导层 hint 一致）。
         return sorted(
             candidates,
             key=lambda c: (
-                _importance_key(c, importance_thresholds),
                 c.rework,
+                _importance_key(c, importance_thresholds),
                 c.blocked_downstream_count,
                 -c.task.get("estimated_hours", 0),
             ),
             reverse=True,
         )
+
+
+def _is_path_covered(declared: str, target: str) -> bool:
+    """目录式声明覆盖判定（内联自 task-decl-dir-notation-guard，避免跨任务依赖）。
+
+    目录式声明（orchd/cli/）覆盖其下所有文件（orchd/cli/foo.py），
+    但不误覆盖同前缀兄弟目录（orchd/cli/ 不覆盖 orchd/cli_extra.py）。
+    """
+    if not isinstance(declared, str) or not isinstance(target, str):
+        return False
+    d = declared.rstrip("/")
+    t = target.rstrip("/")
+    if d == t:
+        return True
+    if declared.endswith("/") and t.startswith(d + "/"):
+        return True
+    return False
+
+
+def _prefix_overlap(files_a: list[str] | set[str], files_b: list[str] | set[str]) -> list[str]:
+    """目录式声明感知的文件重叠计算（task-decl-dir-match-conflict）。
+
+    精确集合交集对目录式声明（orchd/cli/）永不命中（目录名 ≠ 文件名）。
+    本函数双向应用 _is_path_covered，优先返回具体文件（非目录式声明）。
+    """
+    a_list = list(files_a)
+    b_list = list(files_b)
+    overlap_files: set[str] = set()
+    overlap_dirs: set[str] = set()
+    for a in a_list:
+        for b in b_list:
+            if _is_path_covered(a, b) or _is_path_covered(b, a):
+                if not a.endswith("/"):
+                    overlap_files.add(a)
+                elif not b.endswith("/"):
+                    overlap_files.add(b)
+                else:
+                    overlap_dirs.add(a)
+                    overlap_dirs.add(b)
+    result = overlap_files if overlap_files else overlap_dirs
+    return sorted(result)
 
 
 def detect_file_conflict(
@@ -279,14 +329,14 @@ def detect_file_conflict(
     for tid, (files, claimed_by) in claimed_files.items():
         if tid == target_id:
             continue
-        overlap = target_files & set(files)
+        overlap = _prefix_overlap(target_files, files)
         if overlap:
             conflicts.append(
                 Conflict(
                     task_id=tid,
-                    files=sorted(overlap),
+                    files=overlap,
                     claimed_by=claimed_by,
-                    is_shared_core=bool(overlap & SHARED_CORE_FILES),
+                    is_shared_core=bool(set(overlap) & SHARED_CORE_FILES),
                 )
             )
     return conflicts
@@ -374,6 +424,7 @@ def _build_claimed_files(
     state: dict[str, TaskState],
     tasks: list[dict[str, Any]],
     include_pending: bool = False,
+    inflight_files: dict[str, list[str]] | None = None,
 ) -> dict[str, tuple[list[str], str]]:
     """从当前状态和任务定义推导活跃任务的文件映射。
 
@@ -381,14 +432,22 @@ def _build_claimed_files(
     include_pending=True 时额外纳入 pending 任务（claimed_by 标记为
     "pending"），供 request 预检 / 摄入冲突规划使用。
 
+    inflight_files（task-inflight-conflict-visibility）：{task_id: 实际改动文件}
+    ——「在途」任务（分支上已有改动、尚未落 main：done / in_review /
+    force-status 悬空态）由调用方以 **git 事实**提供其实际改动文件，此处仅做
+    映射登记、不触碰 git（保持本模块零 git 依赖）。在途条目的 claimed_by 标记为
+    ``INFLIGHT_MARKER``，供上层按 config.conflict_policy 分流。已在 claimed /
+    pending 中的任务不重复登记（claimed 的声明语义优先）。
+
     Args:
         state: Store.replay() 返回的任务状态字典。
         tasks: _master.json 中的 tasks[] 定义列表。
         include_pending: 是否纳入 pending 任务。
+        inflight_files: 在途任务 → 实际改动文件（git 事实，由调用方提供）。
 
     Returns:
-        {task_id: (files_to_edit 列表, claimed_by agent 标识)} 的映射字典。
-        其中 pending 任务的 claimed_by 为 "pending"。
+        {task_id: (files 列表, claimed_by 标识)} 的映射字典。
+        claimed_by ∈ {agent 标识, "pending", "inflight"}。
     """
     task_map = {t.get("id", ""): t for t in tasks}
     result: dict[str, tuple[list[str], str]] = {}
@@ -398,6 +457,15 @@ def _build_claimed_files(
             task_def = task_map.get(tid, {})
             files = task_def.get("files_to_edit", [])
             result[tid] = (files, ts.claimed_by)
+    # 在途任务（真源 = git 事实，由调用方提供；本层不做 git 调用）。
+    # 位置在 claimed 之后、pending 之前：claimed 的声明语义最强；在途任务用
+    # **实际改动文件**（比声明更准），故优先于 pending 的声明登记；pending 随后
+    # 只补空缺。覆盖状态盲区：done / in_review / force-status 悬空态的改动尚未
+    # 落 main，必须计入冲突检测输入，否则后来者只能在 merge 期才撞上（实测 43 秒盲区）。
+    for tid, files in (inflight_files or {}).items():
+        if tid in result or not files:
+            continue
+        result[tid] = (list(files), INFLIGHT_MARKER)
     # pending 任务（state 无记录或 status=pending）——pending 无 ledger 事件，
     # 必须遍历 tasks 定义补齐，否则空 ledger 下收集不到
     if include_pending:

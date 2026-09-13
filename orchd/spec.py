@@ -38,6 +38,139 @@ _SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
 _DEFAULT_SCHEMA_PATH = _SCHEMA_DIR / "_master.schema.json"
 
 
+# ------------------------------------------------------------------
+# 连带文件自动登记（task-decl-concession-autoregister）：白名单单一来源
+# ------------------------------------------------------------------
+# E026 推导（engine → 对应测试）与 done 越界分诊（guards.py）共用本函数——
+# 禁止在 guards.py 另写一份推导，防止双写漂移。白名单必须窄且单一来源
+# （红线 #3「禁改范围外文件」护栏不下降）：仅两类自动登记——
+#   ① 同名测试：tests/test_<stem>.py（对应 files_to_edit 中 orchd/<stem>.py）
+#   ② docs/*.md（文档类连带）
+# 其余越界文件一律高风险类，仍 E010 拒绝、需显式确认。
+
+
+def derive_related_test_file(fe: str, tests_root: str | Path | None = None) -> str | None:
+    """从引擎源码文件推导对应测试文件（单一来源，E026 与 done 分诊共用）。
+
+    ``orchd/<stem>.py`` → ``tests/test_<stem>.py``；嵌套路径（``orchd/a/b/x.py``）
+    按仓库实际命名约定拍平推导——候选为 ``tests/test_<一级目录>_<stem>.py`` 与
+    ``tests/test_<stem>.py``（如 ``orchd/cli/commands/session.py`` →
+    ``tests/test_cli_session.py``，``orchd/onboard/claim.py`` → ``tests/test_claim.py``）。
+    非 orchd/ 源码或无对应测试返回 ``None``。传入 ``tests_root`` 时做 **tests/
+    实际存在性兜底**：候选文件在 tests/ 下实际存在才返回，全部不存在返回
+    ``None``（E026 对不存在的派生测试文件不产生无法满足的预警）；未传时保持
+    纯字符串推导（guards.py 的 done 越界分诊以字符串比较复用本函数）。
+    E026 预警与 guards.py 的 done 越界分诊**必须**调用本函数取得同名测试路径，
+    禁止各自实现推导（双写漂移检测见 tests）。
+    """
+    if not (fe.startswith("orchd/") and fe.endswith(".py")):
+        return None
+    rel = fe[len("orchd/"):-3]  # 如 "errors" / "cli/commands/session"
+    parts = rel.split("/")
+    stem = parts[-1]
+    if len(parts) == 1:
+        rel_candidates = [f"test_{stem}.py"]
+    else:
+        rel_candidates = [
+            f"test_{parts[0]}_{stem}.py",
+            f"test_{stem}.py",
+        ]
+    if tests_root is None:
+        return f"tests/{rel_candidates[0]}"
+    root = Path(tests_root)
+    for rel_cand in rel_candidates:
+        if (root / rel_cand).is_file():
+            return f"tests/{rel_cand}"
+    return None
+
+
+def is_concession_file(file: str, files_to_edit: list[str]) -> bool:
+    """done 越界分诊白名单判定（单一来源，task-decl-concession-autoregister）。
+
+    返回 ``True`` = 连带类（同名测试 / docs/*.md）→ 引擎自动登记、done 不阻断；
+    ``False`` = 高风险类 → 仍 E010 拒绝并需显式确认。白名单判定规则：
+      - 同名测试：``tests/test_<stem>.py`` 且 ``orchd/<stem>.py`` 在 files_to_edit
+        中（经 :func:`derive_related_test_file`，与 E026 同一推导）；
+      - 文档：``docs/*.md``。
+    引擎核心 ``orchd/`` 既有文件、约定文件（``.orchd/SKILL.md`` /
+    ``.orchd/shared/conventions.md``）、``.orchd/_master.json``、他人声明或
+    在途文件一律不在此列（高风险类）。
+    """
+    if file.startswith("docs/") and file.endswith(".md"):
+        return True
+    for fe in files_to_edit:
+        if derive_related_test_file(fe) == file:
+            return True
+    return False
+
+
+def is_path_covered(declared: str, target: str) -> bool:
+    """目录式声明覆盖判定（task-decl-dir-notation-guard AC2/AC5）。
+
+    目录式声明（``orchd/cli/``）覆盖其下所有文件（``orchd/cli/foo.py``），
+    但**不误覆盖同前缀兄弟目录**（``orchd/cli/`` 不覆盖 ``orchd/cli_extra.py``）。
+
+    判定逻辑：尾斜杠归一后，精确相等直接命中；目录式声明要求 target 以
+    ``declared + "/"`` 为前缀（归一后的 declared 不含尾斜杠，加 ``/`` 确保
+    目录边界，避免 ``orchd/cli`` 前缀误命中 ``orchd/cli_extra.py``）。
+    非目录式声明仅精确相等命中。
+
+    Args:
+        declared: 声明路径（如 ``orchd/cli/`` / ``orchd/spec.py``）。
+        target: 待判定的目标文件路径（如 ``orchd/cli/foo.py``）。
+
+    Returns:
+        True 表示 target 被 declared 覆盖。
+    """
+    if not isinstance(declared, str) or not isinstance(target, str):
+        return False
+    d = declared.rstrip("/")
+    t = target.rstrip("/")
+    if d == t:
+        return True
+    # 目录式声明：declared 原本以 / 结尾，或归一后 target 以 declared/ 开头
+    if declared.endswith("/") and t.startswith(d + "/"):
+        return True
+    return False
+
+
+def detect_dir_or_glob_declarations(task: dict[str, Any]) -> list[dict[str, str]]:
+    """检出任务声明中的目录式/通配符路径（task-decl-dir-notation-guard AC1/AC3）。
+
+    扫描 ``files_to_edit`` 与 ``exempt_files``，返回命中清单。判定：
+    - **目录式**：路径以 ``/`` 结尾，或对应路径在项目中实际为目录（``Path.is_dir()``）；
+    - **通配符**：路径含 ``*`` 或 ``?``。
+
+    与 :func:`validate_quality` 同源不双写——本函数是唯一检出原语，amend 注册
+    门禁与消费点前缀匹配均须复用，禁止各自实现判定。
+
+    Args:
+        task: 任务定义 dict。
+
+    Returns:
+        ``[{"field", "path", "kind"}]``，kind 为 ``"directory"`` 或 ``"glob"``；
+        无命中返回空列表。
+    """
+    hits: list[dict[str, str]] = []
+    for decl_field in ("files_to_edit", "exempt_files"):
+        for fp in task.get(decl_field, []) or []:
+            if not isinstance(fp, str):
+                continue
+            if "*" in fp or "?" in fp:
+                hits.append({"field": decl_field, "path": fp, "kind": "glob"})
+                continue
+            if fp.endswith("/"):
+                hits.append({"field": decl_field, "path": fp, "kind": "directory"})
+                continue
+            # 实际为目录（如 orchd/cli 无尾斜杠但对应目录存在）
+            try:
+                if Path(fp).is_dir():
+                    hits.append({"field": decl_field, "path": fp, "kind": "directory"})
+            except OSError:
+                pass
+    return hits
+
+
 def _resolve_schema_path(version: int) -> Path:
     """根据版本号加载对应版本的 schema 文件。
 
@@ -359,6 +492,21 @@ def is_code_task(t: dict) -> bool:
     return not _is_doc_task(t)
 
 
+def _tests_root_from_master(master: Master) -> Path | None:
+    """从 _master.json 所在位置推导 tests/ 目录，不存在返回 None（E026 存在性兜底）。
+
+    .orchd/ 布局（``<root>/.orchd/_master.json``）→ 项目根为 source_path.parent.parent；
+    根布局（``<root>/_master.json``）→ 项目根为 source_path.parent。
+    """
+    src = master.source_path
+    if src.parent.name == ".orchd":
+        project_root = src.parent.parent
+    else:
+        project_root = src.parent
+    tests = project_root / "tests"
+    return tests if tests.is_dir() else None
+
+
 def validate_quality(master: Master) -> list[ValidationError]:
     """任务定义质量校验（弱 LLM 兜底）。
 
@@ -500,29 +648,33 @@ def validate_quality(master: Master) -> list[ValidationError]:
         # E026: 引擎源码变更但对应测试未声明（warning，intake 期预警）
         # 2026-08-08 实踩：errors.py 新增错误码必然连带 tests/test_errors.py 计数断言，
         # 但该文件不在 files_to_edit 被 E020 拦截——声明 exempt_files 或加入 files_to_edit 即消除。
+        # task-decl-concession-autoregister：同名测试推导收敛到单一来源
+        # derive_related_test_file（与 done 越界分诊 is_concession_file 共用，防双写漂移）。
+        # task-roadmap-section-parse-fix（AC6）：存在性兜底——tests/ 下实际不存在的
+        # 派生测试文件（如 orchd/gitops_ops.py → tests/test_gitops_ops.py 不存在）不产生
+        # 无法满足的预警（E026 跳过）；tests/ 目录缺失时同样跳过（无从验证即不预警）。
         files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
         exempts = [f for f in (t.get("exempt_files") or []) if isinstance(f, str)]
+        tests_root = _tests_root_from_master(master)
         for fe in files_edit:
-            # 匹配 orchd/X.py → 对应 tests/test_X.py
-            if fe.startswith("orchd/") and fe.endswith(".py"):
-                stem = fe[len("orchd/"):-3]
-                expect_test = f"tests/test_{stem}.py"
-                if (
-                    expect_test not in files_edit
-                    and expect_test not in exempts
-                    and any(f.startswith("tests/") for f in files_edit)
-                ):
-                    errors.append(
-                        ValidationError(
-                            code=ErrorCode.E026,
-                            path=f"$.tasks[{i}].exempt_files",
-                            message=(
-                                f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
-                                "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
-                                "否则 E020 hook 会拦截）"
-                            ),
-                        )
+            expect_test = derive_related_test_file(fe, tests_root)
+            if (
+                expect_test is not None
+                and expect_test not in files_edit
+                and expect_test not in exempts
+                and any(f.startswith("tests/") for f in files_edit)
+            ):
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E026,
+                        path=f"$.tasks[{i}].exempt_files",
+                        message=(
+                            f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
+                            "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
+                            "否则 E020 hook 会拦截）"
+                        ),
                     )
+                )
 
     return errors
 
@@ -726,17 +878,31 @@ def _check_idea_reference(
     return errors
 
 
+def _roadmap_section_headers(text: str) -> list[str]:
+    """提取 ROADMAP.md 章节头（单一来源，roadmap-ref 校验与 roadmap-land 定位共用）。
+
+    识别 ``## `` 与 ``### `` 两级标题（ROADMAP 自结构重构后版本章节位于
+    ``## 近期规划`` / ``## 远期规划`` / ``## 派生分支`` 之下、改用 ``### `` 层级，
+    如 ``### 1.4.5 · 架构演进（id: arch-evolution-145）``）；header 剥掉全部
+    前导 ``#`` 与空格。两份 ROADMAP 解析（_check_roadmap_reference /
+    _parse_roadmap_sections）必须都经本函数取 header，禁止各自实现解析
+    （对齐 shared/conventions.md:118「同一事实禁止两份解析」教训）。
+    """
+    headers: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## ") or stripped.startswith("### "):
+            headers.append(stripped.lstrip("#").strip())
+    return headers
+
+
 def _check_roadmap_reference(
     tid: str, task_idx: int, ref_id: str, roadmap_path: Path
 ) -> list[ValidationError]:
-    """核对 ROADMAP.md：存在 ``## 版本`` 章节头且包含引用 id。"""
+    """核对 ROADMAP.md：存在 ``## / ### 版本`` 章节头且包含引用 id。"""
     errors: list[ValidationError] = []
     text = roadmap_path.read_text(encoding="utf-8")
-    section_headers = [
-        line.strip()[3:].strip()
-        for line in text.splitlines()
-        if line.strip().startswith("## ")
-    ]
+    section_headers = _roadmap_section_headers(text)
     # P3（2026-08-13 full-audit-v2）：精确匹配（完整词），避免前缀误命中
     matched = any(_exact_ref_match(ref_id, header) for header in section_headers)
     if not matched:
@@ -746,7 +912,7 @@ def _check_roadmap_reference(
                 path=f"$.tasks[{task_idx}].source",
                 message=(
                     f"task '{tid}' 引用 roadmap '{ref_id}' 但 ROADMAP.md 的"
-                    "## 版本 章节头均不包含该 id"
+                    "## / ### 版本 章节头均不包含该 id"
                 ),
             )
         )
@@ -754,7 +920,7 @@ def _check_roadmap_reference(
 
 
 def _parse_roadmap_sections(text: str) -> list[dict[str, Any]]:
-    """解析 ROADMAP.md 的 ``## 版本 · 标题（id: xxx）`` 章节头（roadmap-land / validate 兜底复用）。
+    """解析 ROADMAP.md 的 ``## / ### 版本 · 标题（id: xxx）`` 章节头（roadmap-land / validate 兜底复用）。
 
     Returns:
         [{version, header, id, historical}]：version 为章节头首个词（如 ``1.3``）；
@@ -763,11 +929,7 @@ def _parse_roadmap_sections(text: str) -> list[dict[str, Any]]:
     import re as _re
 
     sections: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("## "):
-            continue
-        header = stripped[3:].strip()
+    for header in _roadmap_section_headers(text):
         tokens = header.split()
         version = tokens[0] if tokens else ""
         id_m = _re.search(r"id:\s*([\w-]+)", header)
@@ -792,7 +954,8 @@ def _find_workspace_file(orchd_dir: Path, name: str) -> Path | None:
 def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
     """validate 落地兜底（intake-dual-path）：带 id 且非历史的规划章节须有 IDEAS 落地条目。
 
-    IDEAS 落地判据：IDEAS.md 存在引用该章节的条目（detail 含 ``§版本``）。缺失 → warning
+    IDEAS 落地判据：IDEAS.md **或 IDEAS-archive.md** 存在引用该章节的条目
+    （detail 含 ``§版本``）——规划章节必须曾进入执行层，或被显式标记历史；否则提醒。缺失 → warning
     （不判 invalid，对齐 E022/E023/E024 质量告警语义）。ROADMAP.md 缺失时返回空（跳过）。
     """
     roadmap = _find_workspace_file(orchd_dir, "ROADMAP.md")
@@ -800,11 +963,16 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
         return []
     ideas = _find_workspace_file(orchd_dir, "IDEAS.md")
     ideas_text = ideas.read_text(encoding="utf-8") if ideas is not None else ""
+    # 判据扩展（task-roadmap-section-parse-fix）：IDEAS.md 或 IDEAS-archive.md 含 §版本
+    # 均视为「已落地」——archive_resolved_ideas 会在条目全部终态后把条目移入
+    # IDEAS-archive.md（先写归档、再删主文件），已落地且已实现的章节不得「回弹告警」。
+    archive = _find_workspace_file(orchd_dir, "IDEAS-archive.md")
+    archive_text = archive.read_text(encoding="utf-8") if archive is not None else ""
     warnings: list[dict[str, Any]] = []
     for sec in _parse_roadmap_sections(roadmap.read_text(encoding="utf-8")):
         if sec["historical"] or not sec["id"]:
             continue
-        if f"§{sec['version']}" in ideas_text:
+        if f"§{sec['version']}" in ideas_text or f"§{sec['version']}" in archive_text:
             continue
         warnings.append(_e031_warning(sec))
     return warnings
@@ -818,7 +986,9 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
     """
     message = (
         f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
-        "IDEAS.md 缺引用该章节的 detail；可运行 `orchd roadmap-land <版本>` 落地"
+        "IDEAS.md 与 IDEAS-archive.md 均缺引用该章节的 detail；处置二选一——"
+        "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS pending；"
+        "② 若该版本已发布或已放弃，标记历史或移出 ROADMAP"
     )
     try:
         from orchd.ledger import structured_error
@@ -829,8 +999,9 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
             [{
                 "path": f"roadmap §{sec['version']}",
                 "hint": (
-                    f"运行 `orchd roadmap-land {sec['version']}` 为该规划章节生成 "
-                    "IDEAS pending 落地条目（摄入协议：先落地再注册任务）"
+                    f"处置二选一：① 运行 `orchd roadmap-land {sec['version']}` 为该规划章节"
+                    "生成 IDEAS pending 落地条目（摄入协议：先落地再注册任务）；"
+                    "② 若该版本已发布或已放弃，在 ROADMAP.md 将章节标题标记「历史」或移出"
                 ),
             }],
             None,

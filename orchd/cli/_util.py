@@ -171,6 +171,36 @@ def _load_tasks(master_path: str | None = None) -> tuple[list, Path, Any]:
     return master.tasks, orchd_dir, master
 
 
+
+def _resolve_canonical_orchd_dir(task_orchd_dir: Path) -> Path | None:
+    """从已失效的任务 worktree .orchd 路径推断 canonical 主工作树 .orchd。
+
+    容器布局约定：``<容器>/task-<id>/.orchd`` → ``<容器>/main/.orchd``。
+    仅在任务 worktree 已被回收（目录不存在）时由 ``_maybe_archive_ideas``
+    调用，作为归档回退路径。flat 布局下 task_orchd_dir.parent 即项目根，
+    其自身就是 canonical，直接返回 ``task_orchd_dir``（调用方会再判存在性）。
+
+    Returns:
+        主工作树 .orchd 路径（不保证存在）；无法推断时返回 None。
+    """
+    try:
+        task_wt_root = task_orchd_dir.parent
+        container_root = task_wt_root.parent
+        candidate = container_root / "main" / ".orchd"
+        if candidate.exists():
+            return candidate
+        # flat 布局回退：任务 worktree 与主工作树同级，主工作树名不固定，
+        # 尝试用 resolve_canonical_project_root 解析（best-effort）。
+        from orchd.worktree import resolve_canonical_project_root
+
+        canonical = resolve_canonical_project_root(task_wt_root)
+        if canonical.is_dir():
+            return canonical / ".orchd"
+        return None
+    except Exception:
+        return None
+
+
 def _maybe_archive_ideas(orchd_dir: Path) -> dict:
     """best-effort：任务进入终态后触发 IDEAS 归档并自动提交。
 
@@ -190,10 +220,16 @@ def _maybe_archive_ideas(orchd_dir: Path) -> dict:
     Returns:
         归档结果；若无可归档条目或异常，返回 ``{"archived": [], ...}``。
     """
-    # 前置守卫：worktree 已终态回收 → orchd_dir（含 orchd/ 源码）消失，
-    # 必须在懒加载之前降级，避免 ModuleNotFoundError 阻断调用方。
+    # 前置守卫：worktree 已终态回收 → orchd_dir（含 orchd/ 源码）消失。
+    # task-worktree-recycle-cwd-selfheal（AC2）：不再直接跳过，而是回退到
+    # canonical 主工作树的 .orchd 继续归档——IDEAS.md / IDEAS-archive.md
+    # 位于主工作树，回收任务 worktree 不应连带阻断归档。仅当主工作树也
+    # 无法定位时才显式报告 skip 原因（不静默）。
     if not orchd_dir.exists():
-        return {"archived": [], "kept": 0, "skipped": "worktree_recycled"}
+        orchd_dir = _resolve_canonical_orchd_dir(orchd_dir)
+        if orchd_dir is None or not orchd_dir.exists():
+            return {"archived": [], "kept": 0,
+                    "skipped": "worktree_recycled_no_canonical"}
     master_path = orchd_dir / "_master.json"
     if not master_path.exists():
         # task-master-single-copy：container 任务 worktree 已抑制副本，本地无可读

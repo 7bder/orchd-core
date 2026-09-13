@@ -32,12 +32,26 @@
 3. 三者皆空 → **立即停止并报告**，不自行重试 `request`、不自行 `claim`、不 `--auto-claim`；等待用户下一条指令（引擎分配为准，无候选即停）
 - **摄入（intake）为手动触发**：仅在用户明确指定处理某条/某批 pending 时执行摄入协议 v2（见 rules/intake.md）；**agent 不得主动摄入 IDEAS.md 的 pending 条目**（2026-08-05 用户裁定：摄入需主动指定，不作为领取任务处理）
 
+## 在途冲突与候选可见性（2026-09-12）
+
+- **`conflict_with` 可能含"在途"条目**（`source=inflight`，含 `files` / `other_status` / `policy`）：
+  在途 = 分支有未落 main 的改动（done / in_review / force-status 悬空态），**真源是 git 事实**，与状态字段无关。
+- **`config.conflict_policy` 缺省 `warn`**：warn 下在途重叠**仅提示 + 降权排序，不阻断领取**——收到
+  `file_conflict_inflight` 警告时**不得据此跳过 `claim --confirm` 确认闸门**，也不得自行串行化或放弃候选；
+  改 `serialize` / `block` 后候选才会被硬排除（此时该候选不出现在可领取集合，按"request 无候选即停止"处理）。
+  `claimed` 任务的硬排除与 policy 无关。
+- **冲突文件清单以引擎返回的真实路径为准**（真源 = git 未合并路径）。若见到 `tree.` / `HEAD.` / `main.`
+  之类路径，那是旧 `CONFLICT` 行末词启发式的产物（已降级为诊断 fallback），**立即停止并按异常报告**，
+  不要按该路径执行 git 操作。
+
 ## claim 细节（claim 两段式 / 共享上下文 / 失败处理 / 审查冻结）
 - **确认闸门（task-claim-confirm-gate，2026-08-14）**：无 `--confirm` 时 claim 仅输出预览（`confirm_required: true` + 任务基本信息 / 当前状态 / git 状况 / 将执行动作 / 预期校验），**不写事件、不建分支**——防误领/误执行；核对无误后加 `--confirm` 真正执行（写 CLAIMED 事件 + 建分支）。
 - **auto-claim 默认禁用（2026-08-16）**：`request --auto-claim` 无人值守自动认领**默认拒绝**（E032 `auto_claim_disabled`），仅当 `_master.json` 顶层 `config.allow_auto_claim` 显式为 `true`（用户明确授权）时 agent 才可调用。agent **不得**擅自用 `--auto-claim` 连续领任务绕过人工确认。
 - **共享上下文按需（1.1，2026-08-07）**：claim 默认不附加 shared 上下文——仅高风险领域任务（mod-core 或 files_to_edit 含 orchd/ 引擎文件 / .orchd/_master.json）自动附 conventions.md；architecture.md 仅任务 files_to_read 显式引用时提供。需要完整上下文时显式 `--with-context` 附加全部。
+- **返工增量读（A5，2026-09-13，读取纪律）**：rework（被 CHANGES_REQUESTED 打回）后重领实现时，**优先消费 claim 响应已附带的 `review_comments` 与变更文件（git diff），不重读全部 `files_to_read`**——claim 响应已含上轮审查意见与实现基线，重读全文既耗时又偏离返工焦点；仅在 `review_comments` / `previous_changes` 缺失或需确认具体上下文时，才按 `files_to_read` 定向补读。
 - **失败处理**：claim 失败 CLI exits non-zero with `{"error": {code: E008-E011, ...}}`；**停止并报告失败原因，不自行重试**（不把 task id 加 `--exclude` 后回 request 重试——引擎分配为准，无候选/失败即停，等待用户下一条指令）。
 - **审查期实现者冻结（R1-b，2026-08-07）**：任务进入 review（REVIEW_CLAIMED）后，任务分支上的 commit 被 L3 hook 拒绝（E017）——审查基线保护；需补提交时先让 reviewer retract 审查。
+- **`claim --type` 取值域**（task-session-start-token-handoff）：审查认领时 `--type` 实际取值为 `review` / `spec` / `code`。`spec` = 规格审查阶段（验收标准/边界/设计），`code` = 代码审查阶段（实现质量/测试/越界），`review` = 统一审查（两阶段合并为一次，缺省）。guide.py 生成 `claim --task X --type {phase}` 时 phase 取自任务 `review_phase` 字段，缺省 `unified` → 对应 `--type review`。实现任务认领不传 `--type`（默认识别为实现）。
 
 ## 身份约定（会话级指纹）
 

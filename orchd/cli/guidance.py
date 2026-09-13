@@ -66,6 +66,7 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
         from orchd.guide import (
             next_guidance, resolve_read_paths, attach_rule_summaries,
             context_guidance, slim_guidance, apply_guidance_mode, _classify,
+            attach_read_versions,
         )
         # task-guidance-dual-view-engine：传 agent_id（_resolve_agent_id 解析）与
         # has_master（master_path.exists()），支撑双视角与未初始化/空项目区分。
@@ -100,6 +101,9 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
                               review_mode=review_mode),
                 orchd_dir,
             )
+            # task-guidance-read-versions：read[] 附加 {mtime,size} 版本标注
+            # （加法式新键 read_versions，read[] 契约不变），best-effort。
+            guidance = attach_read_versions(guidance, orchd_dir)
             # task-guidance-rule-summary：read 过滤后追加 rules 键（TL;DR 摘要）
             guidance = attach_rule_summaries(guidance, orchd_dir)
 
@@ -123,6 +127,7 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
                     if vctx:
                         view.update(vctx)
             guidance = resolve_read_paths(guidance, orchd_dir)
+            guidance = attach_read_versions(guidance, orchd_dir)
             guidance = attach_rule_summaries(guidance, orchd_dir)
 
         # W-1 精简（task-guide-tiering）：最终收敛为分级精简结构（单视角 5 键、
@@ -130,6 +135,35 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
         # 契约（task-audit-guidance-contract-unify）：slim 为空 dict 时省略
         # guidance 键（不用空串/空对象模拟缺失）。
         slim = apply_guidance_mode(guidance, ctx, tier, mode=guidance_mode)
+        # task-engine-cli-friction-fix：done 成功后 guidance 追加 cwd_switch 命令，
+        # 指引 agent 回主工作树，缓解任务 worktree 被回收后 cwd 失效。
+        if slim and command == "done" and data.get("done") is True:
+            post_cwd = data.get("post_done_cwd", "")
+            if post_cwd:
+                # task-done-cwd-hook-hygiene AC2：cwd_switch.hint 条件化。
+                # done 响应时任务通常处于 in_review（worktree 仍保留、待 review/merge
+                # 后回收），不得声称「已回收」；仅当任务真正到达终态
+                # （completed/cancelled，worktree 已回收）才称已回收。
+                _recycled = False
+                try:
+                    _ts = state.get(focus_tid) if focus_tid else None
+                    _recycled = _ts is not None and _ts.status in ("completed", "cancelled")
+                except Exception:
+                    _recycled = False
+                if _recycled:
+                    _hint = (
+                        "done 已回收任务 worktree，请切回主工作树后再执行后续命令"
+                        "（避免 cwd does not exist）"
+                    )
+                else:
+                    _hint = (
+                        "done 完成，请回主工作树（任务 worktree 仍保留至 review/merge 后回收，"
+                        "避免 cwd 指向已回收 worktree 失效）"
+                    )
+                slim["cwd_switch"] = {
+                    "command": f"Set-Location -Path {post_cwd}",
+                    "hint": _hint,
+                }
         if slim:
             data["guidance"] = slim
         else:
@@ -190,11 +224,14 @@ def _emit_guidance(data: Any) -> None:
             lines.append(f"    解法：{c.get('solution')}")
     lines.extend([sep, ""])
     block = "\n".join(lines)
-    # W-1 文本上限：stderr 提示块 ≤ ~200 字符（超出省略，避免刷屏）。
-    if len(block) > 200:
-        block = block[:197] + "..."
-        block += "\n" + sep + "\n"
-    print(block, file=sys.stderr)
+    # task-guidance-block-budget-root-fix：渲染层只做拼接与打印，不丢弃任何
+    # 已由数据层交付的行。预算由 guide.py 的 _BLOCK_MAX 求和不等式管理。
+    # 渲染体包 try/except（真 best-effort）：本函数由 __init__.py 在 except
+    # OrchdError 处理器内部调用，渲染异常不得冒泡成 traceback。
+    try:
+        print(block, file=sys.stderr)
+    except Exception:
+        pass
 
 
 def resolve_guidance_paths(

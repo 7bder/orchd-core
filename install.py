@@ -5,7 +5,7 @@
 把 orchd-core 的引擎与资源"安装"到自身 .orchd/，形成自包含工作空间。
 
 设计约束：
-- 纯 Python 标准库（os / shutil / subprocess / argparse / json），无任何第三方依赖；
+- 纯 Python 标准库（os / re / shutil / subprocess / argparse / json），无任何第三方依赖；
 - 资源根 = 本脚本所在目录的父目录（orchd-core 源码根）；
 - 安装器自身不依赖 orchd 引擎，也不依赖 .orchd/，可跨平台（Windows/macOS/Linux）运行；
 - 首次安装：完整组装 .orchd/（vendored 引擎 + schema/templates/rules/docs + SKILL +
@@ -25,8 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -165,6 +167,7 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         mode = "install"
 
     agents_entry = _ensure_agents_entry(host)
+    hooks_path = _ensure_repo_hooks(host)
 
     return {
         "installed": True,
@@ -172,6 +175,7 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "host": str(host),
         "orchd_dir": str(orchd),
         "agents_entry": agents_entry,
+        "hooks_path": hooks_path,
         "next": "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用（与 guidance first_time 卡片 steps 顺序一致）",
     }
 
@@ -201,6 +205,88 @@ def _ensure_agents_entry(host: Path) -> str:
         return "appended"
     agents.write_text(_AGENTS_POINTER, encoding="utf-8")
     return "created"
+
+
+# ------------------------------------------------------------------
+# 仓库自带 hooks 的启用（task-decl-hooks-autoset）
+# ------------------------------------------------------------------
+# core.hooksPath 是**本地仓库配置**，不随 git clone 传播：新 clone 检出后仓库内
+# .githooks/（pre-push 发版同步保护等）不生效，质量门禁形同虚设。安装流程据此
+# 自动把它打开。决策表与 orchd/gitops/hook._ensure_hooks_path **同语义**（该函数是
+# 引擎侧实现，供 claim 期 hook 安装复用）——安装器为纯标准库且不依赖 orchd 引擎
+# （设计约束），故此处独立实现；两处若调整须同步。
+_REPO_HOOKS_DIR = ".githooks"
+
+
+def _git_config_get(host: Path, key: str) -> str | None:
+    """读取 host 仓库的 git 配置值（未设置 / git 不可用 → None）。"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(host), "config", "--get", key],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() or None
+
+
+def _is_absolute_hooks_path(value: str) -> bool:
+    """hooksPath 是否为绝对路径（跨平台：POSIX 绝对或 Windows 盘符形态）。"""
+    return Path(value).is_absolute() or bool(re.match(r"^[A-Za-z]:[/\\]", value))
+
+
+def _ensure_repo_hooks(host: Path) -> dict:
+    """确保宿主仓库自带的 ``.githooks/`` 被启用（幂等；不覆盖用户自定义 hooksPath）。
+
+    决策表（与 ``orchd/gitops/hook._ensure_hooks_path`` 同语义，永不抛异常）：
+
+    - 非 git 仓库 → ``reason="not_a_git_repo"``，不动；
+    - 仓库内无 ``.githooks/`` → ``reason="hooks_dir_missing"``，不动；
+    - ``core.hooksPath`` 未设置 / 空 → 设为 ``.githooks``（相对仓库根），``reason="set"``；
+    - 已指向同一目录（相对或等价绝对路径）→ 幂等不写，``reason="already_set"``；
+    - 指向其他路径（用户显式自定义）→ **不改写**，``reason="custom_hooks_path"``
+      并附 ``hint`` 提示手动改法。
+    """
+    try:
+        if not (host / ".git").exists():
+            return {"configured": False, "reason": "not_a_git_repo"}
+        target = host / _REPO_HOOKS_DIR
+        if not target.is_dir():
+            return {"configured": False, "reason": "hooks_dir_missing",
+                    "hooks_dir": _REPO_HOOKS_DIR}
+        current = _git_config_get(host, "core.hooksPath")
+        if current is None:
+            proc = subprocess.run(
+                ["git", "-C", str(host), "config", "core.hooksPath", _REPO_HOOKS_DIR],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if proc.returncode != 0:
+                return {"configured": False, "reason": "config_failed",
+                        "error": (proc.stderr or "").strip()}
+            return {"configured": True, "reason": "set", "hooks_path": _REPO_HOOKS_DIR}
+        resolved = (Path(current) if _is_absolute_hooks_path(current)
+                    else host / current)
+        try:
+            same = resolved.resolve() == target.resolve()
+        except OSError:
+            same = False
+        if same:
+            return {"configured": False, "reason": "already_set", "hooks_path": current}
+        return {
+            "configured": False,
+            "reason": "custom_hooks_path",
+            "hooks_path": current,
+            "expected": _REPO_HOOKS_DIR,
+            "hint": (
+                f"core.hooksPath 已自定义为 {current}（非仓库自带 {_REPO_HOOKS_DIR}）："
+                f"保持不动、未改写；如需改为仓库自带 hooks，执行 "
+                f"git config core.hooksPath {_REPO_HOOKS_DIR}"
+            ),
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"configured": False, "reason": "error", "error": str(exc)}
 
 
 def _force_rmtree(path: Path) -> None:
@@ -268,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         label = _MODE_LABEL[result["mode"]]
         print(f"[OK] orchd 已{label}到 {result['orchd_dir']}")
+        hooks = result.get("hooks_path") or {}
+        if hooks.get("reason") == "set":
+            print(f"    已启用仓库自带 hooks：core.hooksPath={hooks.get('hooks_path')}")
+        elif hooks.get("reason") == "custom_hooks_path":
+            print(f"    提示：{hooks.get('hint')}")
         print(f"    下一步：{result['next']}")
     return 0
 

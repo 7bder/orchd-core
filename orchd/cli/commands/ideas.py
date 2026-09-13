@@ -48,11 +48,11 @@ def register(sub):
     _p.set_defaults(func=_cmd_idea_propose)
 
     _p = idea_sub.add_parser("confirm", help="将 status: study 条目升为 pending（仅用户执行）")
-    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
     _p.set_defaults(func=_cmd_idea_confirm)
 
     _p = idea_sub.add_parser("drop", help="将 status: study 条目降为 dropped（仅用户执行）")
-    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
     _p.set_defaults(func=_cmd_idea_drop)
 
 

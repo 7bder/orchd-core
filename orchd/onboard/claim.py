@@ -32,6 +32,7 @@ from orchd.gitops_ops import make_event as _make_event, try_git_branch as _try_g
 from orchd.ledger import (
     Store,
     TaskDerived,
+    TaskState,
     is_fingerprint_agent_id as _is_fingerprint_agent_id,
     resolve_session_identity,
     resolve_store_dir,
@@ -55,6 +56,10 @@ from orchd.worktree import (
 
 # 同包辅助（bootstrap 域迁移后 _is_high_risk 应在 claim 域，因为仅 claim 调用）
 # 注：_is_high_risk 和 _extract_previous_changes 随 claim 域整体迁移
+
+# retract 认领冷却期（秒）：与 control._RETRACT_COOLDOWN_S 保持一致（task-retract-bind-cooloff）。
+# 任务被 retract（disposition=abandon）后默认 300s 内拒绝重新认领，--force 可绕过。
+_RETRACT_COOLDOWN_S = 300
 
 
 def _is_high_risk(task_def: dict[str, Any]) -> bool:
@@ -119,15 +124,21 @@ def build_scope_warning(task_def: dict[str, Any], project_root: Path | None = No
     ``claim_preview`` 共用本函数，消除原先两份重复实现。best-effort——任何异常一律
     返回 ``None``，不阻断认领/预览。
 
+    真伪分诊（task-claim-preview-and-scope-triage）：
+    - 纯词法扫描会把 brief/AC 中**引用**的文件（如 _master.json、rules/*.md）误报为
+      "需改但未声明"，其中还可能包含**不存在的幽灵文件**。
+    - 修复：① 加磁盘存在性校验，不存在的文件归入 ``ghost_files`` 仅提示不预警；
+      ② 存在但未声明的文件标注为 ``referenced_files``（引用，非必然需改），
+      hint 改为保守提示"确认是否真的需要修改"，不再直接生成 amend 命令诱导污染声明。
+
     Args:
         task_def: ``_master.json`` tasks[] 中的单个任务定义。
-        project_root: 可选项目根路径，传入时定位主工作树并生成带绝对路径的
-            amend 可执行命令（task-amend-guidance-mainwt）；为 None 时回退
-            到无绝对路径的简短命令（向后兼容测试直调场景）。
+        project_root: 可选项目根路径，用于存在性校验的基准目录；为 None 时跳过
+            存在性校验（向后兼容测试直调场景），所有提及未声明文件均归入 referenced。
 
     Returns:
-        存在遗漏文件时返回含 ``type`` / ``message`` / ``missing_files`` / ``hint``
-        的 scope_warning 字典；无遗漏或扫描失败时返回 ``None``。
+        存在需关注文件时返回含 ``type`` / ``message`` / ``referenced_files`` /
+        ``ghost_files`` / ``hint`` 的 scope_warning 字典；无遗漏或扫描失败时返回 ``None``。
     """
     try:
         declared_files = set(task_def.get("files_to_edit", []))
@@ -135,39 +146,42 @@ def build_scope_warning(task_def: dict[str, Any], project_root: Path | None = No
             task_def.get("acceptance_criteria", []) or []
         )
         mentioned = set(_SCOPE_FILE_RE.findall(text_to_scan))
-        missing = sorted(mentioned - declared_files)
-        if not missing:
+        # 目录式声明感知差集（task-decl-dir-match-guards）：mentioned 文件若被
+        # declared_files 中任一路径覆盖（精确相等或目录式前缀匹配），则视为已声明。
+        from orchd.pool import _is_path_covered
+        undeclared = [
+            m for m in mentioned
+            if not any(_is_path_covered(d, m) for d in declared_files)
+        ]
+        if not undeclared:
             return None
-        task_id = task_def.get("id", "<id>")
-        # task-amend-guidance-mainwt：定位主工作树，生成带绝对路径的可执行命令
-        main_wt = None
-        try:
-            if project_root is not None:
-                from orchd.gitops import main_worktree_root
-                main_wt = str(main_worktree_root(project_root))
-        except Exception:
-            main_wt = None
-        try:
-            from orchd.guide import amend_mainwt_command, amend_patch_cmd
-            if main_wt:
-                patch_cmd = amend_mainwt_command(task_id, main_wt, files=missing[:3])
+        # 存在性分诊：磁盘存在 → referenced（引用，需确认是否真改）；不存在 → ghost（幽灵文件，仅提示）
+        referenced: list[str] = []
+        ghost: list[str] = []
+        for f in sorted(undeclared):
+            if project_root is not None and (project_root / f).exists():
+                referenced.append(f)
+            elif project_root is None:
+                referenced.append(f)  # 无 project_root 时不做存在性校验，保守归入 referenced
             else:
-                patch_cmd = amend_patch_cmd(task_id, files=missing[:3], entry="orchd")
-        except Exception:
-            patch_cmd = "orchd amend --task <id> --files-to-edit <file>"
-        verify_note = (
-            "verify_command 变更走同一通道（--verify-command 覆写，白名单内不阻断）；"
-            if main_wt else ""
-        )
+                ghost.append(f)
+        if not referenced and not ghost:
+            return None
         return {
-            "type": "files_to_edit_missing",
-            "message": f"brief/acceptance 中提到 {len(missing)} 个文件未在 files_to_edit 中声明，实现时可能触发 E010",
-            "missing_files": missing,
-            "main_worktree": main_wt,
-            "hint": ("若确需修改这些文件，认领后、动手前请回到主工作树补 "
-                     "files_to_edit 声明并执行 amend（任务 worktree 不保留 "
-                     "_master.json，唯一权威 = 主工作树）；"
-                     f"{verify_note}可执行命令：{patch_cmd}"),
+            "type": "files_to_edit_referenced",
+            "message": (
+                f"brief/acceptance 中提到 {len(referenced) + len(ghost)} 个文件未在 files_to_edit 中声明"
+                + (f"（其中 {len(ghost)} 个磁盘不存在，可能是失效引用）" if ghost else "")
+                + "；这些是**引用**文件，不必然需要修改"
+            ),
+            "referenced_files": referenced,
+            "ghost_files": ghost,
+            "hint": (
+                "上述文件是 brief/acceptance 中**引用**的路径（如规则文档、配置、测试入口），"
+                "不代表实现时必须修改。若确认某文件确需改动，请在认领后回到主工作树执行 "
+                "amend --files-to-edit 补声明；若仅是引用则无需处理。幽灵文件（磁盘不存在）"
+                "通常是 brief 中的失效引用，建议修正 brief 而非补声明。"
+            ),
         }
     except Exception:
         return None  # best-effort，预警失败不阻断认领/预览
@@ -178,7 +192,16 @@ def build_scope_warning(task_def: dict[str, Any], project_root: Path | None = No
 # ------------------------------------------------------------------
 
 
-def _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block):
+def _claim_precheck(
+    store: Store,
+    tasks: list[dict[str, Any]],
+    agent_id: str,
+    task_id: str,
+    role: str | None,
+    project_root: Path | None,
+    review_type: str | None,
+    enforce_self_review_block: bool,
+) -> tuple[dict[str, Any], str, str | None, list[dict[str, Any]]]:
     task_map = {t.get("id", ""): t for t in tasks}
     task_def = task_map.get(task_id)
     if task_def is None:
@@ -202,7 +225,13 @@ def _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_
     return task_def, role, session_id, degraded_guards
 
 
-def _claim_setup_worktree(project_root, task_id, task_def, store, degraded_guards):
+def _claim_setup_worktree(
+    project_root: Path | None,
+    task_id: str,
+    task_def: dict[str, Any],
+    store: Store,
+    degraded_guards: list[dict[str, Any]],
+) -> tuple[str | None, str | None]:
     worktree_path = None
     degraded_warning = None
     if project_root:
@@ -241,7 +270,94 @@ def _claim_setup_worktree(project_root, task_id, task_def, store, degraded_guard
     return worktree_path, degraded_warning
 
 
-def _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_id, review_type, enforce_self_review_block, project_root):
+def _check_master_uncommitted(project_root: Path | None) -> dict[str, Any] | None:
+    """task-engine-cli-friction-fix：检测主工作树 _master.json 是否有未提交改动。
+
+    有则返回 intake_warning（hint 输出 orchd intake，而非人工 git commit）；
+    无或检测失败返回 None。best-effort，不阻断认领。
+    """
+    if project_root is None:
+        return None
+    try:
+        from orchd.gitops import list_tracked_changes
+        dirty = list_tracked_changes(project_root)
+        if dirty is None:
+            return None
+        master_dirty = [f for f in dirty if f.endswith("_master.json")]
+        if not master_dirty:
+            return None
+        return {
+            "type": "master_uncommitted",
+            "files": master_dirty,
+            "hint": (
+                "_master.json 有未提交的摄入/注册产物，请运行 "
+                "python .orchd/__main__.py intake 自动提交（勿人工 git commit）"
+            ),
+            "command": "python .orchd/__main__.py intake",
+        }
+    except Exception:
+        return None
+
+
+def _check_retract_cooldown(store: Store, task_id: str) -> dict[str, Any] | None:
+    """检查任务是否在 retract 认领冷却期内（task-retract-bind-cooloff）。"""
+    from datetime import datetime
+    all_events = store._read_ledger_lines(from_line=1)
+    last_retract = None
+    last_claimed_ts = None
+    for ev in all_events:
+        if ev.get("task_id") != task_id:
+            continue
+        etype = ev.get("type")
+        if etype == "RETRACT" and not ev.get("retracted"):
+            last_retract = ev
+        elif etype == "CLAIMED" and not ev.get("retracted"):
+            last_claimed_ts = ev.get("timestamp")
+    if last_retract is None:
+        return None
+    if last_claimed_ts:
+        try:
+            rt = datetime.fromisoformat(last_retract["timestamp"])
+            ct = datetime.fromisoformat(last_claimed_ts)
+            if ct > rt:
+                return None
+        except (ValueError, KeyError):
+            pass
+    disposition = last_retract.get("disposition", "abandon")
+    if disposition != "abandon":
+        return None
+    # admin 执行的 retract 视为系统/管理员操作，不触发认领冷却（避免破坏既有测试
+    # 中 admin 撤回后立即重新认领的场景；用户主动放弃由非 admin 操作者触发）。
+    if last_retract.get("agent_id") == "admin":
+        return None
+    try:
+        rt = datetime.fromisoformat(last_retract["timestamp"])
+        now = datetime.now(rt.tzinfo) if rt.tzinfo else datetime.now()
+        seconds_ago = (now - rt).total_seconds()
+    except (ValueError, KeyError):
+        return None
+    if seconds_ago < _RETRACT_COOLDOWN_S:
+        return {
+            "retracted_at": last_retract["timestamp"],
+            "seconds_ago": seconds_ago,
+            "disposition": disposition,
+        }
+    return None
+
+
+def _claim_write_event(
+    store: Store,
+    tasks: list[dict[str, Any]],
+    agent_id: str,
+    task_id: str,
+    task_def: dict[str, Any],
+    role: str,
+    session_id: str | None,
+    review_type: str | None,
+    enforce_self_review_block: bool,
+    project_root: Path | None,
+    force: bool = False,
+) -> tuple[dict[str, Any], dict[str, TaskState], TaskDerived, list[dict[str, Any]], bool]:
     store.acquire_lock()
     try:
         integrity_warnings = store.check_integrity()
@@ -278,6 +394,20 @@ def _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_
                     raise OrchdError(ErrorCode.E009, f"already_claimed by {ts.claimed_by}", [{"task_id": task_id, "claimed_by": ts.claimed_by, "claimed_session": ts.claimed_session, "hint": f"任务已被 {ts.claimed_by} 认领，等待其完成或由其 retract 后重试，禁止重复 claim"}])
             if status != "pending":
                 raise OrchdError(ErrorCode.E008, f"task_not_pending: '{task_id}' status={status}", [{"task_id": task_id, "current_status": status, "hint": f"任务未就绪（当前 {status}），需 pending 再 claim；若被他人 claimed 已在上一步 E009 中提示"}])
+            # task-retract-bind-cooloff：认领冷却保护
+            if not force:
+                _cooldown = _check_retract_cooldown(store, task_id)
+                if _cooldown is not None:
+                    raise OrchdError(
+                        ErrorCode.E007,
+                        f"retract_cooldown: task '{task_id}' was retracted "
+                        f"{_cooldown['seconds_ago']:.0f}s ago (disposition={_cooldown['disposition']}), "
+                        f"cooldown {_RETRACT_COOLDOWN_S}s not elapsed",
+                        [{"task_id": task_id, "retracted_at": _cooldown["retracted_at"],
+                          "seconds_ago": _cooldown["seconds_ago"],
+                          "disposition": _cooldown["disposition"],
+                          "hint": "任务刚被撤回，疑似主动放弃；等待冷却或使用 --force 显式绕过"}],
+                    )
             for dep_id in task_def.get("depends_on", []):
                 dep_ts = state.get(dep_id)
                 if (dep_ts.status if dep_ts else "pending") not in ("completed", "cancelled"):
@@ -311,7 +441,7 @@ def _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_
                                  f"{_patch_ac}"),
                     }])
         for tid, t_state in state.items():
-            def _owns(h, hs):
+            def _owns(h: str | None, hs: str | None) -> bool:
                 return (hs == session_id and h == agent_id) if hs and session_id else bool(h and h == agent_id)
 
             if t_state.status in ("claimed", "done", "in_review") and _owns(t_state.claimed_by, t_state.claimed_session) and (tid != task_id or enforce_self_review_block):
@@ -342,7 +472,7 @@ def _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_
     finally:
         store.release_lock()
 
-def _resolve_review_worktree(project_root, task_id):
+def _resolve_review_worktree(project_root: Path | None, task_id: str) -> Path | None:
     """审查分支 diff 诊断的作用域根（AC2）：按布局解析到任务 worktree。
 
     container 布局下审查认领由主工作树发起，``project_root`` 即主工作树 →
@@ -350,25 +480,65 @@ def _resolve_review_worktree(project_root, task_id):
     作用域解析到 ``<task_wt_root>/task-<id>``；本身就是任务 worktree 则原样
     返回；解析不到（flat / 无独立 worktree）回退 ``project_root``，维持既有
     降级语义（best-effort，绝不抛异常）。
+
+    实现委托 :func:`orchd.gitops_ops.resolve_task_worktree`（单源，
+    task-done-reconcile-main）：对账与诊断必须解析到同一 worktree，两处各写
+    一份必然漂移。
+    """
+    from orchd.gitops_ops import resolve_task_worktree
+
+    return resolve_task_worktree(project_root, task_id)
+
+
+def _reconcile_mergeability(
+    project_root: Path | None, task_id: str
+) -> dict[str, Any] | None:
+    """reviewer 认领前置对账（task-done-reconcile-main 挂载点 ②）。
+
+    与 done 挂载点**共用同一函数与同一触发条件**
+    （:func:`orchd.gitops_ops.reconcile_with_main`，防双写漂移），区别仅在
+    ``apply=False``：纯探测、不落地、不留 ``MERGE_HEAD``——审查期不触碰工作区
+    （E017 审查期冻结不受影响）。
+
+    覆盖「done 之后、merge 之前」残余窗口（实测事故：main 于 done 后 84 秒推进，
+    两轮审查后才在 merge 撞冲突）。仅在**对账真正触发**（``checked``）时返回，
+    未触发（main 未推进 / 无文件交集）返回 ``None``，使无风险场景的认领响应与
+    现状逐字段一致（零噪音、零回归）。不改变可领取性、不新增阻断——reviewer
+    仍可选择继续审并记录风险。
+
+    best-effort：任何异常一律 ``None``，绝不阻断认领。
     """
     if project_root is None:
-        return project_root
+        return None
     try:
-        if is_task_worktree(project_root):
-            return project_root
-        from orchd.worktree import _task_wt_name, detect_layout
+        from orchd.gitops_ops import reconcile_with_main
 
-        layout = detect_layout(Path(project_root))
-        if layout.get("layout") == "container":
-            cand = Path(layout["task_wt_root"]) / _task_wt_name(task_id)
-            if (cand / ".git").exists():
-                return cand
+        rec = reconcile_with_main(project_root, task_id, apply=False)
     except Exception:
-        return project_root
-    return project_root
+        return None
+    if not rec.get("checked"):
+        return None
+    return {
+        "clean": rec.get("clean"),
+        "files": rec.get("files", []),
+        "reason": rec.get("reason"),
+        "action": rec.get("action"),
+    }
 
 
-def _claim_review_branch(store, task_id, task_def, project_root, role, derived, review_phase, is_self_review, event, degraded_guards, shared=None):
+def _claim_review_branch(
+    store: Store,
+    task_id: str,
+    task_def: dict[str, Any],
+    project_root: Path | None,
+    role: str,
+    derived: TaskDerived,
+    review_phase: str | None,
+    is_self_review: bool,
+    event: dict[str, Any],
+    degraded_guards: list[dict[str, Any]],
+    shared: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     if role != "reviewer":
         return None
     files_to_review = [{"path": p, "priority": "must_read"} for p in task_def.get("files_to_edit", [])]
@@ -396,9 +566,20 @@ def _claim_review_branch(store, task_id, task_def, project_root, role, derived, 
         result["self_review_notice"] = {"message": "self_review", "hint": "enforce flag", "done_by": _done_by, "enforce_self_review_block": False}
     if done_event and done_event.get("verify"):
         result["verify"] = done_event["verify"]
+    # task-review-completion-guidance（AC3）：reviewer 可粘贴的定向重跑命令模板，
+    # 由 build_reviewer_rerun_command 从 verify_command 单一事实源提取 pytest 段，
+    # 不手写字符串；含跨平台 --basetemp 形式。verify_command 无 pytest 段时不附加。
+    try:
+        from orchd.review import build_reviewer_rerun_command
+
+        rerun = build_reviewer_rerun_command(task_def)
+        if rerun:
+            result["rerun_command"] = rerun
+    except Exception:
+        pass  # best-effort：重跑模板生成失败不阻断认领
     review_degraded = []
 
-    def _diag():
+    def _diag() -> dict[str, Any]:
         if project_root is None:
             raise NotApplicableError("no root")
         exists = branch_exists(project_root, f"task/{task_id}")
@@ -424,6 +605,11 @@ def _claim_review_branch(store, task_id, task_def, project_root, role, derived, 
         result["missing_declared_files"] = diag["missing_declared_files"]
     if review_degraded or degraded_guards:
         result["degraded_guards"] = degraded_guards + review_degraded
+    # task-done-reconcile-main 挂载点 ②：reviewer 认领前置对账（纯探测、零副作用、
+    # 不阻断）。把冲突从「审查之后」挪到「审查之前」——避免白审两轮。
+    mergeability = _reconcile_mergeability(project_root, task_id)
+    if mergeability is not None:
+        result["mergeability"] = mergeability
     return result
 
 
@@ -438,9 +624,10 @@ def claim(
     review_type: str | None = None,
     with_context: bool = False,
     enforce_self_review_block: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     task_def, role, session_id, degraded_guards = _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block)
-    event, state, derived, integrity_warnings, is_self_review = _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_id, review_type, enforce_self_review_block, project_root)
+    event, state, derived, integrity_warnings, is_self_review = _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_id, review_type, enforce_self_review_block, project_root, force=force)
     worktree_path = None
     degraded_warning = None
     if role == "implementer" and project_root:
@@ -481,4 +668,8 @@ def claim(
         layout = detect_layout(project_root)
         if layout.get("layout") == "container":
             result["session_lock_released"] = release_session_lock_if_owned(project_root / ".orchd", agent_id).get("released", False)
+    # task-engine-cli-friction-fix：检测主工作树 _master.json 未提交，提示 orchd intake
+    master_warning = _check_master_uncommitted(project_root)
+    if master_warning is not None:
+        result["master_uncommitted_warning"] = master_warning
     return result

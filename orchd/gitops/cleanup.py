@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -147,11 +148,51 @@ def _cleanup_trash_residue(tmp_root: Path | None = None) -> list[str]:
     return cleaned
 
 
-def parse_conflicts(output: str) -> list[str]:
-    """从 git merge 输出中提取冲突文件路径列表（merge 冲突判定，task-14-git-policy-layer）。
+def unmerged_paths(workdir: Path) -> list[str] | None:
+    """权威真源：返回 git 索引中未合并（冲突）的路径清单（三态，task-conflict-true-source-fix）。
 
-    遍历输出行，命中 ``CONFLICT`` 的行取其最后一个词作为冲突文件路径。
-    无冲突返回空列表。
+    以 ``git diff --name-only -z --diff-filter=U`` 取未合并条目，取代
+    :func:`parse_conflicts` 的"取 CONFLICT 行末词"启发式——该启发式仅在 content
+    冲突上碰巧正确：modify/delete 行尾是 ``... left in tree.`` → 假名 ``tree.``；
+    rename/delete 行尾随分支名漂移 → ``HEAD.`` / ``main.``；含空格路径被截断到末段。
+
+    ``-z`` 不可省略：不加时 ``core.quotePath``（默认 true）会把非 ASCII 路径转义为
+    八进制引号串（如 ``"\\346\\226\\207.py"``），得到的不是原始路径（本机实测）。
+
+    **取值必须先于 ``git merge --abort``**：abort 会丢弃索引中的未合并态，之后再查只
+    会得到空列表（调用方 gitops_ops 已按此排序）。
+
+    Args:
+        workdir: git 工作树目录（通常是主工作树）。
+
+    Returns:
+        - ``list[str]``：未合并路径；空列表表示**无冲突**（merge 也可能因非冲突原因
+          失败，如本地脏写被拒）；
+        - ``None``：查询**测不到**（git 不可用 / 非 git 仓库 / 超时 / 解码异常）——
+          调用方须保守按"冲突"处理，不得当作无冲突放行。
+    """
+    try:
+        proc = _gitops_pkg._run_git(
+            workdir, ["diff", "--name-only", "-z", "--diff-filter=U"]
+        )
+        if proc.returncode != 0:
+            return None
+        return [p for p in proc.stdout.split("\0") if p]
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
+def parse_conflicts(output: str) -> list[str]:
+    """【诊断用，非权威】从 git merge 输出文本粗糙提取疑似冲突路径。
+
+    ⚠️ 禁止用于程序判定或 ``conflict_files`` 上报。本函数取 ``CONFLICT`` 行的
+    **末词**当路径，仅在 content 冲突上碰巧正确；modify/delete 会得到 ``tree.``、
+    rename/delete 随分支名漂移得到 ``HEAD.`` / ``main.``、含空格路径被截断（
+    task-conflict-true-source-fix 实测根因）。冲突清单的**权威真源**见
+    :func:`unmerged_paths`。
+
+    保留本函数仅供**人读**原始 merge 输出时快速浏览疑似冲突行（task-14-git-policy-layer
+    历史实现），不参与任何引擎判定与上报。无冲突返回空列表。
     """
     files: list[str] = []
     for line in (output or "").split("\n"):

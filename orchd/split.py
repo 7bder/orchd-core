@@ -20,6 +20,7 @@ from orchd.gitops import get_current_branch, get_default_branch, list_tracked_ch
 from orchd.ledger import Store, resolve_store_dir
 from orchd.spec import (
     Master,
+    detect_dir_or_glob_declarations,
     is_code_task,
     validate_quality,
     validate_references,
@@ -129,6 +130,29 @@ _TASK_SCHEMA_FIELDS = _derive_task_schema_fields()
 # 核心字段 = 全部字段 - 附加字段（含任一核心字段变更 → E007）
 _TERMINAL_CORE_FIELDS = _TASK_SCHEMA_FIELDS - _TERMINAL_ATTACHABLE_FIELDS
 
+# ── task-terminal-spec-revision-channel（2026-09-14）────────────────────────
+# 终态任务的**纯文本规格修订**通道：``amend --revise-terminal <task_id> --reason <文本>``。
+#
+# 动机（2026-09-13 实踩 df44a94）：终态任务的实际规格文本需对齐"已裁定 / 已实现的
+# 现实"（如 AC 表述漂移）时，引擎无合规入口——常规 amend 一律 E007、手改
+# mod-*/spec.json 是红线 #9、init 重建快照要求空账本，只能绕过引擎；且漂移一旦
+# 成立，此后任何 amend 都因该任务的一条错误整体 abort。
+#
+# 放行字段（用户 2026-09-13 裁定四者均放行）：
+# - ``name`` / ``brief``：展示类（无引擎消费者依赖其可执行语义）；
+# - ``acceptance_criteria``：引擎消费者仅 E023（模糊词）/ E029（条数）两条 warning；
+# - ``deliverables``：``orchd/`` 内零消费者。
+# 其余字段一律不因本通道放行——护栏不靠"字段名枚举的自觉"，而是结构性断言：剥离
+# 上述文本字段后，其余变更仍须逐项落入既有通道（terminal attachable / 声明路径
+# 规范化），否则 E007。以此挡住"用文本字段夹带执行字段"的组合式规避。
+_TERMINAL_TEXT_REVISABLE_FIELDS = frozenset({
+    "acceptance_criteria", "brief", "name", "deliverables",
+})
+
+# 终态规格文本修订的审计事件 reason（复用既有 AMEND 事件类型，不新增事件类型、
+# 不改 ledger._apply_event 语义）
+_TERMINAL_REVISION_EVENT_REASON = "terminal_spec_revision"
+
 
 def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
     """从 _master.json 生成 mod-*/spec.json + 空 ledger + 初始 checkpoint。
@@ -210,14 +234,97 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
     return {"initialized": True, "created_files": created_files}
 
 
-def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
+def validate_terminal_revision(reason: str | None) -> str:
+    """校验并归一化 ``--revise-terminal`` 的 ``--reason``（非空、非纯空白）。
+
+    对齐"CHANGES_REQUESTED 必须附意见"的既有取向：修订理由会写入 AMEND 审计事件，
+    缺失即无法回答"谁在何时以何理由改了什么"，故硬拒绝（E007）。CLI 与 amend 共用
+    本函数（单一事实源，避免两处文案漂移）。
+
+    Args:
+        reason: 命令行 ``--reason`` 原文（可 None）。
+
+    Returns:
+        归一化后的理由（strip 后）。
+
+    Raises:
+        OrchdError(E007): 缺失 / 纯空白——不写事件、不改快照、不落任何副作用。
+    """
+    cleaned = reason.strip() if isinstance(reason, str) else ""
+    if not cleaned:
+        raise OrchdError(
+            ErrorCode.E007,
+            "invalid_state: --revise-terminal 需附带非空 --reason（终态规格修订理由）",
+            [{
+                "option": "--revise-terminal",
+                "hint": (
+                    "修订理由会写入 AMEND 审计事件（reason="
+                    f"{_TERMINAL_REVISION_EVENT_REASON}）供事后回查，纯空白视为缺失。"
+                    "示例：amend --revise-terminal <task_id> --reason \"AC 文本对齐用户裁定\""
+                ),
+            }],
+        )
+    return cleaned
+
+
+def is_text_only_spec_revision(
+    old_task: dict[str, Any], new_task: dict[str, Any]
+) -> bool:
+    """变更是否仅落在终态规格文本字段（供调用方跳过与之无关的 verify dry-run）。
+
+    文本修订不改变可执行验收面（``verify_command`` 未变），重跑其 dry-run 无信息量；
+    且会让本通道被目标的**存量** E024/E027（缺 --basetemp / 不安全段）误伤——终态
+    任务多为历史定义，往往命中存量告警，一旦计入阻断集合通道即不可用。
+
+    Args:
+        old_task: 快照（mod-*/spec.json）中的任务定义。
+        new_task: master 中的任务定义。
+
+    Returns:
+        存在变更且变更字段全部落在 :data:`_TERMINAL_TEXT_REVISABLE_FIELDS`。
+    """
+    changed = {
+        key
+        for key in set(old_task) | set(new_task)
+        if old_task.get(key) != new_task.get(key)
+    }
+    return bool(changed) and changed <= _TERMINAL_TEXT_REVISABLE_FIELDS
+
+
+def _terminal_rejection_hint(task_id: str, fields: set[str], status: str) -> str:
+    """终态字段被拒时的可执行指引（AC6："可自查"而非只报不可修改）。"""
+    revisable = sorted(fields & _TERMINAL_TEXT_REVISABLE_FIELDS)
+    if revisable:
+        return (
+            f"字段 {revisable} 属规格文本，可走修订通道（写 AMEND 审计事件、"
+            "快照随 master 同步）："
+            f"python .orchd/__main__.py amend --revise-terminal {task_id} "
+            "--reason \"<修订理由>\""
+        )
+    return (
+        f"{status} 任务的 {sorted(fields)} 属执行字段，不因文本修订通道放行；"
+        f"确需变更请先经用户裁决走逃生口回退："
+        f"python .orchd/__main__.py force-status --task {task_id} --status pending "
+        "--reason \"<理由>\" --force（completed→pending 另需 --evidence-sha <提交>）"
+    )
+
+
+def amend(
+    orchd_dir: Path,
+    master: Master,
+    store: Store,
+    revise_terminal: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
     """增量更新 snapshot：按状态约束矩阵过滤变更。
 
     约束矩阵：
     - pending：可改全部字段
     - claimed：仅允许修改 verify_command / reviewers 白名单字段，其余拒绝（E007）
     - done / in_review（review 组）：仅允许修改 reviewers
-    - completed / cancelled：拒绝
+    - completed / cancelled：默认拒绝；``revise_terminal`` 指向该任务时，纯文本规格
+      字段（acceptance_criteria / brief / name / deliverables）可修订并写 AMEND 审计
+      事件，其余字段仍逐项走既有通道判定（task-terminal-spec-revision-channel）
 
     review 阶段归一化比对：对于 done / in_review 状态的任务，先将新定义的
     reviewers 字段还原为旧值，再与旧定义做全量比对；若相等则说明仅有
@@ -231,8 +338,16 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     注册任务并改写 master，污染 master 注册来源。分支判定仅在 amend 阶段
     强制：init / validate / status 等只读或冷启动命令不受限。
 
+    Args:
+        orchd_dir: ``.orchd/`` 目录（快照与账本根）。
+        master: 待生效的 master 定义。
+        store: 账本 Store（本函数内自持锁）。
+        revise_terminal: 终态规格文本修订通道的开关——目标 task_id；仅该任务放行
+            文本字段修订（须为终态任务，否则 E007）。
+        reason: 修订理由（``revise_terminal`` 非空时必填、非空白，写入审计事件）。
+
     Returns:
-        变更摘要。
+        变更摘要（含 ``terminal_spec_revisions``：本次文本修订的 fields 与 rationale）。
     """
     orchd_dir = Path(orchd_dir)
     tasks = master.tasks
@@ -297,6 +412,8 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     source_errors: list[dict[str, Any]] = []
     attachable_sync: list[dict[str, Any]] = []
     terminal_decl_sync: list[dict[str, Any]] = []
+    # task-terminal-spec-revision-channel：本次终态规格文本修订明细（写审计事件 + 回响应）
+    terminal_text_revisions: list[dict[str, Any]] = []
 
     # task-intake-file-lock（AC1/AC3）：准入写锁 + 提交前 HEAD 推进检测。
     # 准入写（改 _master.json / IDEAS.md / ROADMAP.md）受独立 .intake.lock 串行，
@@ -332,6 +449,38 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
     store.acquire_lock()
     try:
         state = store.replay()
+
+        # task-terminal-spec-revision-channel：修订开关前置校验——先于任何写入，
+        # 不合规立即 E007/E005（不写事件、不改快照、不落任何副作用）。
+        revision_reason: str | None = None
+        if revise_terminal is not None:
+            revision_reason = validate_terminal_revision(reason)
+            if not any(t.get("id") == revise_terminal for t in tasks):
+                raise OrchdError(
+                    ErrorCode.E005,
+                    f"task '{revise_terminal}' not found in master",
+                    [{
+                        "task_id": revise_terminal,
+                        "hint": "--revise-terminal 指定的任务须已存在于 _master.json",
+                    }],
+                )
+            target_state = state.get(revise_terminal)
+            target_status = target_state.status if target_state else "pending"
+            if target_status not in ("completed", "cancelled"):
+                raise OrchdError(
+                    ErrorCode.E007,
+                    "invalid_state: --revise-terminal 仅适用于终态任务"
+                    f"（completed/cancelled），任务 {revise_terminal} 当前状态为 "
+                    f"{target_status}",
+                    [{
+                        "task_id": revise_terminal,
+                        "status": target_status,
+                        "hint": (
+                            "非终态任务的字段变更走常规 amend 矩阵（pending 可改全部 / "
+                            "claimed 与 review 组仅附加字段白名单），无需本通道"
+                        ),
+                    }],
+                )
 
         # L253：注册前结构校验——拦截非法字段入库（intake 期暴露，而非 done/validate 事后）
         # P2-4：并补跨引用校验（E006 重复 id / E005 未知 depends_on·module / E004 DAG 环），
@@ -463,30 +612,43 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                 # task-amend-terminal-drift-repair：终态任务 master≠snapshot 时，
                 # 区分"合法附加字段增量"与"核心字段变更"。附加字段白名单 → 自动
                 # 以 master 为准同步 snapshot（不报 E007）；含核心字段 → 仍 E007。
+                #
+                # task-terminal-spec-revision-channel：开关指向本任务时，先剥离纯文本
+                # 规格字段（有 AMEND 审计事件），**其余字段**仍须逐项落入既有两条通道
+                # （terminal attachable / 声明路径规范化），否则 E007——结构性护栏，
+                # 挡住"用文本字段夹带执行字段"的组合式规避。
                 changed_fields = {
                     key
                     for key in set(task) | set(old_task)
                     if task.get(key) != old_task.get(key)
                 }
+                text_revised: set[str] = set()
+                if revise_terminal == tid:
+                    text_revised = changed_fields & _TERMINAL_TEXT_REVISABLE_FIELDS
+                remaining = changed_fields - text_revised
+
                 if not changed_fields:
                     # 值级无差异（e.g. master 以 null 占位、快照缺键）→ 视为未变更，
                     # 避免 key 存在性差异把空 diff 误判为"终态不可修改"（假阳性 E007）。
                     unchanged_tasks.append(tid)
-                elif changed_fields <= _TERMINAL_ATTACHABLE_FIELDS:
+                elif not remaining:
+                    # 仅文本字段变更 → 走修订通道（审计事件在快照同步后写入）
+                    updated_tasks.append(tid)
+                elif remaining <= _TERMINAL_ATTACHABLE_FIELDS:
                     updated_tasks.append(tid)
                     attachable_sync.append({
                         "task_id": tid,
                         "status": status,
-                        "fields": sorted(changed_fields),
+                        "fields": sorted(remaining),
                     })
-                elif changed_fields <= {"files_to_edit", "exempt_files"}:
+                elif remaining <= {"files_to_edit", "exempt_files"}:
                     # task-terminal-decl-drift-channel：终态声明路径规范化通道。
                     # 仅当删的全不存在、增的全存在（相对 project_root）时放行并
                     # 同步 snapshot；否则仍 E007。防"借规范化之名篡改声明"。
                     sync_entries: list[dict[str, Any]] = []
                     normalized_ok = True
                     for field in ("files_to_edit", "exempt_files"):
-                        if field not in changed_fields:
+                        if field not in remaining:
                             continue
                         old_files = old_task.get(field, []) or []
                         new_files = task.get(field, []) or []
@@ -515,12 +677,45 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                                 f"{status} 为终态，声明路径变更非规范化"
                                 "（删的须不存在、增的须存在），不可修改"
                             ),
+                            "changed_fields": sorted(remaining),
+                            "diff": {
+                                field: {
+                                    "snapshot": old_task.get(field),
+                                    "master": task.get(field),
+                                }
+                                for field in sorted(remaining)
+                            },
+                            "hint": _terminal_rejection_hint(tid, remaining, status),
                         })
+                        continue
                 else:
+                    # AC6：列出差异字段两侧取值（snapshot vs master）+ 可执行指引，
+                    # 使同类漂移可自查（此前仅一句"为终态，不可修改"）。
                     errors.append({
                         "task_id": tid,
                         "status": status,
-                        "message": f"{status} 为终态，不可修改",
+                        "message": (
+                            f"{status} 为终态，字段 {sorted(remaining)} 不可修改"
+                            "（非附加字段 / 非文本修订白名单）"
+                        ),
+                        "changed_fields": sorted(remaining),
+                        "diff": {
+                            field: {
+                                "snapshot": old_task.get(field),
+                                "master": task.get(field),
+                            }
+                            for field in sorted(remaining)
+                        },
+                        "hint": _terminal_rejection_hint(tid, remaining, status),
+                    })
+                    continue
+
+                if text_revised:
+                    terminal_text_revisions.append({
+                        "task_id": tid,
+                        "status": status,
+                        "fields": sorted(text_revised),
+                        "rationale": revision_reason,
                     })
             elif status in ("done", "in_review"):
                 # T2（2026-08-08）+ M-2（2026-08-12）+ Bug #20c（2026-08-27）：
@@ -625,11 +820,47 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                     )
             quality_warnings.append(entry)
 
+        # task-decl-dir-notation-guard（AC3）：声明形态门禁——对本次新增或声明
+        # 变更的任务检出目录式/通配符声明 → E003 拒绝注册。存量未变更任务不触发
+        # （grandfather 豁免，返工时即被拦自愈）。detect_dir_or_glob_declarations
+        # 是唯一检出原语（spec.py），与消费点前缀匹配复用，禁双写。
+        _changed_ids = set(new_tasks) | set(updated_tasks)
+        _dir_glob_errors: list[dict[str, Any]] = []
+        for task in tasks:
+            tid = task.get("id", "")
+            if tid not in _changed_ids:
+                continue
+            hits = detect_dir_or_glob_declarations(task)
+            for h in hits:
+                _dir_glob_errors.append({
+                    "task_id": tid,
+                    "field": h["field"],
+                    "path": h["path"],
+                    "kind": h["kind"],
+                    "message": (
+                        f"{h['field']} 声明的路径 '{h['path']}' 为"
+                        f"{'目录式' if h['kind'] == 'directory' else '通配符'}声明，"
+                        "注册被拒绝（intake.md step 4 禁目录式/通配符声明，"
+                        "须展开为具体文件路径）"
+                    ),
+                })
+        if _dir_glob_errors:
+            raise OrchdError(
+                ErrorCode.E003,
+                "schema_validation_failed: 声明形态校验失败（目录式/通配符声明被拒）",
+                _dir_glob_errors,
+            )
+
         # Bug #20a（2026-08-27）：files_to_edit / exempt_files 路径存在性校验。
         # 摄入时检测声明了但不存在的路径，写入 conflict_warnings 供人工核对。
         # 不硬阻断（路径可能是待创建的新文件），仅告警。
+        # task-decl-dir-notation-guard（AC4）：仅遍历本次新增/变更任务，
+        # 存量任务不再产生 files_to_edit_path_not_found 告警（消除 121 个存量
+        # 目录式声明每次 amend 刷屏）。
         for task in tasks:
             tid = task.get("id", "")
+            if tid not in _changed_ids:
+                continue
             for field in ("files_to_edit", "exempt_files"):
                 for fp in task.get(field, []):
                     full = project_root / fp
@@ -661,6 +892,29 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
                 json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+
+        # task-terminal-spec-revision-channel：终态规格文本修订的 AMEND 审计事件。
+        # 复用既有事件类型（不新增类型、不改 ledger._apply_event 语义——AMEND 为纯审计
+        # 事件，_event_target_status 返回 None → 跳过状态机校验，不影响任务状态），
+        # 携带 fields 与 rationale，经 ledger/status 即可回查"谁在何时以何理由改了什么"。
+        # master 为唯一权威：快照已在上方按 master 重新生成，事件只作审计。
+        if terminal_text_revisions:
+            from orchd.gitops_ops import make_event
+            from orchd.ledger import resolve_agent_id
+
+            agent_id = resolve_agent_id(orchd_dir)
+            for revision in terminal_text_revisions:
+                store.append_event(make_event(
+                    revision["task_id"], agent_id, "AMEND",
+                    reason=_TERMINAL_REVISION_EVENT_REASON,
+                    fields=revision["fields"],
+                    rationale=revision["rationale"],
+                    hint=(
+                        "终态规格文本修订（amend --revise-terminal）：master 为唯一权威，"
+                        "mod-*/spec.json 快照已同步"
+                    ),
+                ))
+            store.update_checkpoint(store.replay())
     finally:
         store.release_lock()
 
@@ -678,6 +932,7 @@ def amend(orchd_dir: Path, master: Master, store: Store) -> dict[str, Any]:
         "whitelisted_updates": whitelisted_updates,
         "attachable_sync": attachable_sync,
         "terminal_decl_sync": terminal_decl_sync,
+        "terminal_spec_revisions": terminal_text_revisions,
         "unchanged_tasks": unchanged_tasks,
         "removed_tasks": removed_tasks,
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),

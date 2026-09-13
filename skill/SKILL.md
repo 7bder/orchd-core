@@ -5,9 +5,8 @@
 1. 读 `.orchd/SKILL.md`（纪律红线优先级最高，见下）。
 2. 定位 `.orchd/` 资源：规则见 `.orchd/rules/`（索引 `rules/README.md`），模板见 `templates/`。
 3. 按命令响应 `guidance` 导航：知识(`read`)→方法(`template`)→动作(`command`)；字段缺失即跳过。
-4. 经宿主根 `AGENTS.md` 接入：检测 `.orchd/` →无则自启安装→ 回本文件。
-5. **输出契约**：stdout 纯 JSON（guidance 为对象或省略，无内容省略键）；人看提示走 stderr，agent 只读 stdout。
-6. **转述契约**：收到 guidance 后向用户转述下一步；初始化用 SVG 卡片，日常用引用块 + 粗体 project_view / agent_view。
+4. **输出契约**：stdout 纯 JSON（guidance 为对象或省略，无内容省略键）；人看提示走 stderr，agent 只读 stdout。
+5. **转述契约**：收到 guidance 后向用户转述下一步；初始化用 SVG 卡片，日常用引用块 + 粗体 project_view / agent_view。
 
 ## Determine your mode
 - `.orchd/` 存在 → WORKER（摄入 / 纪律红线 / rules / guidance 全能力）
@@ -17,7 +16,7 @@
 ## WORKER mode（已有项目）
 - **零根入口**：统一 `python .orchd/__main__.py <命令>`，宿主根零额外文件、免装 orchd。
 - **无感引导**：JSON 响应自动附加 `guidance`，逐层导航 request/claim/done/review。
-- **多 worktree 并行**：生命周期引擎自动管理；各 worktree 共享账本（`ORCHD_HOME` 可覆盖）；merge 由引擎在主工作树执行，任务 worktree 永不 checkout main。
+- **多 worktree 并行**：生命周期引擎自动管理；merge 由引擎在主工作树执行（详见 rules/git.md）。
 
 ## 纪律红线（MUST / MUST NOT，违反 = 事故；优先级最高）
 **MUST NOT**：
@@ -40,10 +39,10 @@
 2. 不读不写；写前先读。
 3. done / review / amend 后核对引擎响应（verify 结果、commit、状态流转）。
 4. 测试/verify 用 `--basetemp` 指向系统临时目录，禁止项目内残留临时文件。
-5. 任何异常（verify 失败 / merge 冲突 / 状态不符）立即停止报告，不自行猜测处置。
-6. session 结束工作区干净，或在报告中说明。
-7. completed 关闭前运行 `status --audit-task` 清零声明文件完整性告警。
-8. 准入/会话锁（E012/E019）不盲重试：先查持有者，正常并发释放后自动成功；僵死则等其退出或接管后再重试。
+5. 任何异常立即停止报告，不自行猜测处置；session 结束工作区干净或说明。
+6. completed 关闭前运行 `status --audit-task` 清零声明文件完整性告警。
+7. 准入/会话锁（E012/E019）不盲重试：先查持有者，正常并发释放后自动成功；僵死则等其退出或接管后再重试。
+8. **读取纪律**：① 规则文件(.orchd/rules/**、SKILL.md、templates/**)已读且未变不重读(A1)；② >64KB 大文件禁整读，定位读(grep/offset+limit)(A2)；③ claim 响应已含任务定义与 review_comments/previous_changes，不再读 master.json(A3)。
 
 ## 按 exit_type 行动（错误出口处置纪律）
 
@@ -57,22 +56,20 @@
 | `await-external` | 查持有者→等待，**禁重试** | E009/E011/E012/E019 |
 | `continue` | warning 不阻断，可继续 | 深层征兆→lesson report |
 
-四通道(A异常/B批量/C手工dict/D Shell hook)与码→通道登记见 [rules/recovery.md](rules/recovery.md)。
+四通道（A/B/C/D）与码→通道登记见 [rules/recovery.md](rules/recovery.md)。
 
 ## 身份约定（会话级指纹）
 - 身份 = `ORCHD_SESSION_ID` 派生 12 位 hex 指纹；同对话不变，不同对话不同。
 - 归属 / 忙度 / 自审 / 锁所有权以指纹为主键；同 agent 不同 session 可并行领不同任务。
-- 自审默认仅提示不阻断（self_review_notice），线上可设 `config.enforce_self_review_block=true` 阻断。
-- 生命周期与违约后果详见 rules/session.md。
+- 自审默认仅提示（self_review_notice）不阻断；生命周期与违约后果详见 rules/session.md。
 
 ## 规则目录（见 rules/README.md）
 - 会话/claim → rules/session.md · 摄入 → rules/intake.md · verify → rules/verify.md
-- 分支/merge → rules/git.md · 审查(templates/spec-reviewer.md / templates/code-reviewer.md) → rules/review.md
+- 分支/merge → rules/git.md · 审查(templates/spec-reviewer.md / templates/code-reviewer.md；引擎语义变更同步三查) → rules/review.md
 - 测试纪律(复用 tests/conftest.py make_task/orchd_dir，参数化，不得另造副本) → rules/testing.md
 - 安装 → rules/install.md · 恢复 → rules/recovery.md · lesson → [skill-lesson.md](skill-lesson.md)
 
 ## Rules
 - One task per session. Exit after `python .orchd/__main__.py done`.
-- 审查模式缺省 two_phase；`project.review_mode: "unified"` 启用单阶段。
-- request 无候选即停止：不重试、不自行 claim，报告后等指令。
+- 引擎语义变更同步：新增状态 / 流程 / 规则文件 / 命令时须同步引导层三查（step 词表登记 / read-template 路由完备 / hint 与命令一致），详见 rules/review.md。
 - 认领角色按状态自动分流，身份由 `ORCHD_SESSION_ID` 派生；实现者禁自审(E016)。

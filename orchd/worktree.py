@@ -1303,13 +1303,41 @@ def remove_task_wt(
     removed = False
     discarded_uncommitted = False
     wt_existed = (wt_path / ".git").exists()
+    # task-worktree-recycle-cwd-selfheal（AC1）：回收前检测调用方进程 cwd 是否
+    # 位于待回收 worktree 内。Windows 下进程 cwd 会锁定目录，导致 git worktree
+    # remove 失败（已知原因却不自愈）。若命中则 os.chdir 到主工作树（stable_wt），
+    # 释放目录锁后再执行 remove；幂等：cwd 不在 worktree 内时零操作。
+    cwd_self_healed = False
+    try:
+        _cur_cwd = Path.cwd().resolve()
+        _wt_resolved = wt_path.resolve()
+        _cwd_inside = (
+            _cur_cwd == _wt_resolved
+            or str(_cur_cwd).startswith(str(_wt_resolved) + os.sep)
+        )
+    except OSError:
+        _cwd_inside = False
+    if _cwd_inside and stable_wt and stable_wt.exists():
+        try:
+            os.chdir(str(stable_wt))
+            cwd_self_healed = True
+        except OSError:
+            cwd_self_healed = False
+    if cwd_self_healed:
+        recycle_log.append({
+            "action": "cwd_self_heal",
+            "task_id": task_id,
+            "from": str(_cur_cwd),
+            "to": str(stable_wt),
+            "actor": actor,
+        })
     try:
         if wt_existed:
             # P2-9：先无 --force 移除（仅干净 worktree 可移，避免丢弃未提交改动）；
             # 脏 worktree 才回退 --force（终态回收 best-effort），并记 discarded 告警。
             proc = subprocess.run(
                 ["git", "worktree", "remove", str(wt_path)],
-                cwd=str(project_root),
+                cwd=str(stable_wt),
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -1318,7 +1346,7 @@ def remove_task_wt(
             if proc.returncode != 0:
                 proc = subprocess.run(
                     ["git", "worktree", "remove", "--force", str(wt_path)],
-                    cwd=str(project_root),
+                    cwd=str(stable_wt),
                     capture_output=True,
                     encoding="utf-8",
                     errors="replace",
@@ -1683,8 +1711,8 @@ def main_worktree_dirty_overlap(
         dirty = list_tracked_changes(main_root)
         if dirty is None:
             return []
-        declared = set(declared_files)
-        return sorted(set(dirty) & declared)
+        from orchd.pool import _prefix_overlap
+        return _prefix_overlap(dirty, declared_files)
     except Exception:
         return []
 
@@ -1707,8 +1735,18 @@ def missing_declared_branch_files(
         if not branch_files:
             # 无实际任务分支改动（测试/flat/未实现）不强制比对，避免误伤
             return []
-        declared = set(declared_files)
-        return sorted(declared - branch_files)
+        from orchd.pool import _is_path_covered as is_path_covered
+        # 目录式声明感知差集（task-decl-dir-match-conflict）：声明路径若被
+        # branch_files 中任一文件覆盖（即目录下有改动），则视为已覆盖。
+        declared = list(declared_files)
+        missing: list[str] = []
+        for dp in declared:
+            if dp in branch_files:
+                continue
+            if any(is_path_covered(dp, bf) for bf in branch_files):
+                continue
+            missing.append(dp)
+        return sorted(missing)
     except Exception:
         return []
 
@@ -1736,8 +1774,18 @@ def diagnose_missing_branch_files(
         branch_files = set(task_branch_files(pr, task_id))
         if not branch_files:
             return []
-        declared = set(declared_files)
-        missing = sorted(declared - branch_files)
+        from orchd.pool import _is_path_covered as is_path_covered
+        # 目录式声明感知差集：声明路径若被 branch_files 中任一文件覆盖（即目录下有改动），
+        # 则视为已覆盖，不报 missing；精确文件仍用差集判定。
+        declared = list(declared_files)
+        missing: list[str] = []
+        for dp in declared:
+            if dp in branch_files:
+                continue
+            if any(is_path_covered(dp, bf) for bf in branch_files):
+                continue
+            missing.append(dp)
+        missing = sorted(missing)
         if not missing:
             return []
 
@@ -1834,11 +1882,12 @@ def actual_changes_conflict(
         if tid == target_id:
             continue
         actual = _git_diff_names(project_root, tid)
-        overlap = target_files & set(actual)
+        from orchd.pool import _prefix_overlap
+        overlap = _prefix_overlap(target_files, actual)
         if overlap:
             conflicts.append({
                 "task_id": tid,
-                "files": sorted(overlap),
+                "files": overlap,
                 "claimed_by": claimed_by,
                 "source": "actual",
             })

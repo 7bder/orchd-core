@@ -422,6 +422,10 @@
           },
           "description": "文档单阶段审查 blocked 文件集合（可选）。含这些文件的任务保持双阶段审查。缺省回退硬编码 {SKILL.md, .orchd/shared/conventions.md, .orchd/_master.json}。"
         },
+        "conflict_policy": {
+          "type": "string",
+          "description": "在途冲突策略（可选，缺省 warn）。warn=「在途」任务（分支有未落 main 的提交：done / in_review / force-status 悬空态）与候选文件重叠时仅提示 + 降权排序，不阻断（缺省，保持流程通畅）；serialize=在途重叠候选被硬排除（响应含 blocked_by / 重叠文件 / 对方状态）；block=同 serialize 且需人工确认。故意不设 enum：非法值需可达以便引擎回退 warn 并在 degraded_guards 留痕（不得静默），而非在 schema 层直接拒绝。"
+        },
         "allow_auto_claim": {
           "type": "boolean",
           "default": false,

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import get_default_branch as _get_default_branch, hook_uninstall
+from orchd.worktree import load_bindings, unbind_task_wt
 from orchd.gitops_ops import make_event as _make_event
 from orchd.ledger import Store, TaskState, resolve_store_dir, review_claim_age_s, review_stale_timeout_s
 
@@ -45,6 +47,34 @@ _VERIFY_TIMEOUT = 120
 # 方案 C（task-full-regression-gate）：全量 pytest 冒烟超时上限（秒）。
 # 全量套件不含慢用例时约 35s，预留足够余量；失败仅告警不阻断 done。
 _FULL_REGRESSION_TIMEOUT = 300
+# retract 认领冷却期（秒）：任务被 retract 后默认 300s 内拒绝重新认领，
+# 区分「用户主动放弃」与「临时撤回」；--force 可绕过（task-retract-bind-cooloff）。
+_RETRACT_COOLDOWN_S = 300
+
+# 实现认领超时接管（W-2 对称通道，task-takeover-residue-alignment）：
+# 跨 agent 撤认他人 CLAIMED 仅在目标认领已超时（stale，押注作者/会话失联）时
+# 放行——与 REVIEW_CLAIMED 的 review_stale_timeout_s 对称，使 rules/session.md
+# 接管 SOP 第4步（接管方会话 retract 原 CLAIMED）可达（此前只能走 force-status）。
+# 默认 60 分钟：远大于正常实现 session 的活跃间隔；未超时仍报 E034，
+# 防借撤认抢活或绕过独立审查。env 覆盖仅供测试。
+_CLAIM_STALE_DEFAULT_S = 3600
+
+
+def claim_stale_timeout_s() -> float:
+    """返回实现认领超时秒数；环境变量 ``ORCHD_CLAIM_STALE_SECS`` 可覆盖（测试用）。
+
+    与 ``orchd.ledger.review_stale_timeout_s`` 同风格：非法 / 非正值回退默认，
+    解析失败静默回退（不因环境变量误设而放宽守卫）。
+    """
+    env = os.environ.get("ORCHD_CLAIM_STALE_SECS")
+    if env is not None:
+        try:
+            v = float(env)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _CLAIM_STALE_DEFAULT_S
 
 
 def retract(
@@ -56,6 +86,7 @@ def retract(
     *,
     task_id: str | None = None,
     event_type: str | None = None,
+    disposition: str = "abandon",
 ) -> dict[str, Any]:
     """撤回事件（级联）。
 
@@ -66,6 +97,12 @@ def retract(
     找到目标事件后，自动撤回该事件及其后同 task_id 的所有后续事件（级联撤回）。
     注意：FORCE_STATUS 事件不可撤回——它是管理员强制操作，具有不可逆语义，
     若需修正应再次调用 force_status 而非 retract。
+
+    disposition（task-retract-bind-cooloff，加法式）：
+      - abandon（默认）：用户主动放弃，触发认领冷却期 + 级联解绑 worktree
+      - retry：临时撤回后重试，不触发冷却（仍解绑，因为 worktree 需重建）
+      - handoff：移交给他人，不触发冷却（仍解绑）
+    旧事件无 disposition 字段时 replay 兼容视为 abandon。
     """
     store.acquire_lock()
     try:
@@ -117,20 +154,28 @@ def retract(
             )
 
         # E034: 撤认归属守卫（task-retract-ownership-guard）。
-        # 仅允许事件作者本人或 admin 撤回；跨 agent 撤认他人事件需走
-        # force-status/admin 控制面，防止实现者撤认独立审查者的 REVIEW_CLAIMED
-        # 以绕过独立审查（2026-08-24 自审+撤认绕过事件后的引擎层修复）。
+        # 仅允许事件作者本人或 admin 撤回；跨 agent 撤认他人事件走超时接管通道
+        # （见下）或 force-status/admin 控制面，防止实现者撤认独立审查者的
+        # REVIEW_CLAIMED 以绕过独立审查（2026-08-24 自审+撤认绕过事件后的引擎层修复）。
         # 注：admin 控制面语义为有意保留（test_admin_cross_retract_allowed 断言）；
         # 其「无认证」属 P2-11，根治需 1.6 Registry 认证机制，暂不在此移除。
         target_author = target_event.get("agent_id")
         if target_author is not None and target_author != agent_id and agent_id != "admin":
-            # W-2 僵尸审查认领接管：跨 agent 撤认他人 REVIEW_CLAIMED 仅在目标
-            # 认领已超时（stale，押注作者/会话失联）时放行——这正是"接管僵死审查"
-            # 的必要路径；未超时仍受 E034 保护，防实现者借撤认绕过独立审查。
+            # W-2 僵尸认领接管（对称通道）：跨 agent 撤认他人 CLAIMED /
+            # REVIEW_CLAIMED 仅在目标认领已超时（stale，押注作者/会话失联）时
+            # 放行——这正是「接管僵死任务 / 僵死审查」的必要路径；未超时仍受
+            # E034 保护，防借撤认抢活或绕过独立审查。
             stale_release = False
             if target_event.get("type") == "REVIEW_CLAIMED":
                 _age = review_claim_age_s(target_event.get("timestamp"))
                 if _age is not None and _age >= review_stale_timeout_s():
+                    stale_release = True
+            elif target_event.get("type") == "CLAIMED":
+                # CLAIMED 超时接管（与 REVIEW_CLAIMED 对称，task-takeover-residue-alignment）：
+                # 使 rules/session.md 接管 SOP 第4步（接管方会话 retract 原 CLAIMED）
+                # 可达——此前 CLAIMED 无对称超时通道，接管只能绕道 force-status。
+                _age = review_claim_age_s(target_event.get("timestamp"))
+                if _age is not None and _age >= claim_stale_timeout_s():
                     stale_release = True
             if not stale_release:
                 raise OrchdError(
@@ -140,8 +185,10 @@ def retract(
                     [{"event_id": target_event_id, "owner": target_author,
                       "caller": agent_id,
                       "hint": "跨 agent 撤认需事件作者本人或 admin 操作，或目标为超时（僵尸）"
-                              "审查认领（W-2，引擎按时间判定放行）；如确须纠正，请事件作者撤回"
-                              "或管理员 force-status"}],
+                              f"认领——CLAIMED 超时阈值 {claim_stale_timeout_s():.0f}s"
+                              f"（ORCHD_CLAIM_STALE_SECS 可覆盖）、REVIEW_CLAIMED 超时阈值 "
+                              f"{review_stale_timeout_s():.0f}s（ORCHD_REVIEW_STALE_SECS 可覆盖），"
+                              f"未超时仍受本守卫保护；如确须纠正，请事件作者撤回或管理员 force-status"}],
                 )
 
         # 找级联事件（同 task_id，在 target 之后的事件）
@@ -160,12 +207,35 @@ def retract(
                 task_id, agent_id, "RETRACT",
                 target_event_id=eid,
                 reason=reason,
+                disposition=disposition,
             )
             store.append_event(retract_ev)
             retracted_events.append(eid)
 
         new_state = store.replay()
         store.update_checkpoint(new_state)
+
+        # task-retract-bind-cooloff：级联解绑 worktree 绑定。
+        # 撤回 CLAIMED/REVIEW_CLAIMED 时，若任务在 session-worktrees.json 有绑定
+        # → unbind_task_wt（幂等，无绑定也返回 unbound=True）。
+        # 归属守卫由 retract 入口的 E034 保证（仅事件作者本人或 admin 可撤回），
+        # 此处不再重复检查绑定归属。
+        unbind_result = None
+        if target_event.get("type") in ("CLAIMED", "REVIEW_CLAIMED"):
+            try:
+                bindings = load_bindings(store.orchd_dir)
+                if task_id in bindings:
+                    unbind_result = unbind_task_wt(
+                        store.orchd_dir, task_id, lock_held=True,
+                    )
+                    unbind_result["recycle_log"] = (
+                        f"retract cascade unbind: task={task_id} "
+                        f"disposition={disposition} by {agent_id}"
+                    )
+                else:
+                    unbind_result = {"unbound": True, "task_id": task_id, "reason": "no_binding"}
+            except Exception as e:
+                unbind_result = {"unbound": False, "task_id": task_id, "error": str(e)}
     finally:
         store.release_lock()
 
@@ -178,7 +248,10 @@ def retract(
         "retracted_events": retracted_events,
         "task_id": task_id,
         "new_status": new_state.get(task_id, TaskState()).status,
+        "disposition": disposition,
     }
+    if unbind_result is not None:
+        result["unbind"] = unbind_result
     if integrity_warnings:
         result["integrity_warnings"] = integrity_warnings
     return result

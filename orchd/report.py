@@ -28,8 +28,22 @@ _MERGE_ACKS_FILENAME = "merge-acks.json"
 
 
 def merge_acks_path(project_root: Path) -> Path:
-    """返回人工销账清单路径 ``<project_root>/.orchd/merge-acks.json``。"""
-    return Path(project_root) / ".orchd" / _MERGE_ACKS_FILENAME
+    """返回人工销账清单路径（落 canonical 账本根）。
+
+    运行时状态文件须落在 ``resolve_store_dir`` 指向的 canonical 账本根：
+    flat 布局下即 ``<project_root>/.orchd``；container / ORCHD_HOME 重定向
+    布局下为 ``.orchd-runtime`` 等。落点须与 ``doctor.auto_clean`` 的保护
+    口径一致（运行时文件位于 canonical 根时受保护，位于 legacy flat 的
+    ``main/.orchd`` 时会被迁移）——否则 ``merge-ack`` 写入即被迁走、
+    ``audit-merge`` 永远读不到，人工销账失效。
+    """
+    orchd_dir = Path(project_root) / ".orchd"
+    try:
+        from orchd.ledger import resolve_store_dir
+
+        return Path(resolve_store_dir(orchd_dir)) / _MERGE_ACKS_FILENAME
+    except Exception:
+        return orchd_dir / _MERGE_ACKS_FILENAME
 
 
 def load_merge_acks(project_root: Path) -> dict[str, Any]:
@@ -165,6 +179,27 @@ def status(
             detail["attempt_count"] = ts.attempt_count
             if task_id in revive_by_task:
                 detail["revive_marker"] = revive_by_task[task_id]
+        # task-status-text-flag-silent-noop：单任务详情也支持 --text，
+        # 构造兼容 _format_text 的最小结构（tasks=[detail] + summary），
+        # 避免提前 return 跳过 _text 生成导致 --text 恒输出 JSON。
+        if text:
+            _s = detail.get("status", "pending")
+            # _format_text 期望 task_id 字段，而单任务 detail 用 id，做一次映射
+            _row = dict(detail)
+            _row["task_id"] = _row.get("id", task_id)
+            _single = {
+                "tasks": [_row],
+                "summary": {
+                    "total": 1, "active": 1 if _s in ("pending", "claimed", "done", "in_review") else 0,
+                    "pending": 1 if _s == "pending" else 0,
+                    "claimed": 1 if _s == "claimed" else 0,
+                    "done": 1 if _s == "done" else 0,
+                    "in_review": 1 if _s == "in_review" else 0,
+                    "completed": 1 if _s == "completed" else 0,
+                    "cancelled": 1 if _s == "cancelled" else 0,
+                },
+            }
+            return {"task": detail, "_text": _format_text(_single)}
         return {"task": detail}
 
     task_statuses: list[dict[str, Any]] = []
@@ -216,17 +251,29 @@ def status(
     # 绑定任务已终态但 worktree 仍在 → 回收；无独立 worktree 场景零操作）。
     if project_root is not None:
         try:
+            from orchd.doctor import auto_clean
             from orchd.ledger import resolve_store_dir
             from orchd.worktree import prune_orphans
 
             pruned = prune_orphans(project_root, resolve_store_dir(store.orchd_dir), state)
             if pruned.get("pruned"):
                 result["worktree_pruned"] = pruned
+            # task-doctor-auto-clean：读路径自动清洁（低风险残留自动清理，
+            # legacy 移入备份区，高风险仅报告；有过拓扑才并入结果，保持无残留时干净）。
+            ac = auto_clean(
+                project_root,
+                emit_stderr=_auto_clean_emit_stderr(project_root),
+            )
+            if ac.get("auto_cleaned") or ac.get("auto_moved") or ac.get("manual_notice"):
+                result["auto_clean"] = ac
         except Exception:
             pass
 
     if text:
         result["_text"] = _format_text(result)
+        ac = result.get("auto_clean")
+        if ac:
+            result["_text"] += _format_auto_clean_text(ac)
 
     return result
 
@@ -480,7 +527,9 @@ def task_integrity_audit(
             except Exception:
                 pass
         else:
-            residual = sorted(set(main_dirty) & set(declared))
+            # 目录式声明感知交集（task-decl-dir-match-guards）
+            from orchd.pool import _prefix_overlap
+            residual = sorted(_prefix_overlap(main_dirty, declared))
             if residual:
                 entry["main_residual"] = residual
         try:
@@ -900,14 +949,23 @@ def watchdog(
     # task-14-worktree-lifecycle（AC5）：孤儿 worktree 惰性清理（best-effort，
     # 绑定任务已终态但 worktree 仍在 → 回收；无独立 worktree 场景零操作）。
     worktree_pruned: dict[str, Any] | None = None
+    watchdog_auto_clean: dict[str, Any] | None = None
     if project_root is not None:
         try:
+            from orchd.doctor import auto_clean
             from orchd.ledger import resolve_store_dir
             from orchd.worktree import prune_orphans
 
             pruned = prune_orphans(project_root, resolve_store_dir(store.orchd_dir), state)
             if pruned.get("pruned"):
                 worktree_pruned = pruned
+            # task-doctor-auto-clean：watchdog 读路径自动清洁（同 status，并入返回）。
+            ac = auto_clean(
+                project_root,
+                emit_stderr=_auto_clean_emit_stderr(project_root),
+            )
+            if ac.get("auto_cleaned") or ac.get("auto_moved") or ac.get("manual_notice"):
+                watchdog_auto_clean = ac
         except Exception:
             pass
 
@@ -954,6 +1012,8 @@ def watchdog(
         result["takeover_results"] = takeover_results
     if worktree_pruned:
         result["worktree_pruned"] = worktree_pruned
+    if watchdog_auto_clean:
+        result["auto_clean"] = watchdog_auto_clean
     return result
 
 
@@ -988,4 +1048,51 @@ def _format_text(result: dict[str, Any]) -> str:
         f"done={summary['done']} in_review={summary['in_review']} "
         f"completed={summary['completed']} cancelled={summary['cancelled']}"
     )
+    return "\n".join(lines)
+
+
+def _auto_clean_emit_stderr(project_root: Path) -> bool:
+    """auto_clean 是否写 stderr：受 config.guidance_stderr 约束（task-guide-block-config）。
+
+    status()/watchdog() 挂载 auto_clean 时，其 ``[回收]`` stderr 与提示块同开关：
+    关闭（false）时读路径零 stderr、stdout 仍并入 auto_clean 字段，避免撞
+    test_guidance_stderr_disabled 契约。best-effort，读取失败回退默认 true。
+    """
+    try:
+        from orchd.spec import load_master
+
+        master_path = Path(project_root) / ".orchd" / "_master.json"
+        if not master_path.exists():
+            return True
+        master = load_master(master_path)
+        return bool(master.config.get("guidance_stderr", True))
+    except Exception:
+        # best-effort：读取失败回退默认 true，绝不阻塞主流程
+        return True
+
+
+def _format_auto_clean_text(ac: dict[str, Any]) -> str:
+    """把 status() 的 ``auto_clean`` 字段格式化为人类可读文本（--text 模式）。
+
+    与 _format_text 并列的 append 段：在任务表格汇总行之后输出自动清洁的
+    决策上下文（清理 / 备份 / 报告项），无内容时返回空串。
+    """
+    cleaned = ac.get("auto_cleaned") or []
+    moved = ac.get("auto_moved") or []
+    notice = ac.get("manual_notice") or []
+    if not (cleaned or moved or notice):
+        return ""
+    lines = [""]
+    if ac.get("disabled"):
+        lines.append("自动清洁：已关闭（ORCHD_AUTO_CLEAN=off/report，仅报告）")
+    else:
+        lines.append("自动清洁：")
+    for it in cleaned:
+        lines.append(f"  [清理] {Path(it['path']).name}（{it.get('type')}）")
+    for it in moved:
+        lines.append(f"  [备份] {Path(it['path']).name} → {it.get('backup')}")
+    for it in notice:
+        lines.append(
+            f"  [报告] {Path(it['path']).name}（{it.get('type')}）：{it.get('disposition')}"
+        )
     return "\n".join(lines)

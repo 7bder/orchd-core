@@ -38,6 +38,7 @@ from orchd.gitops_ops import (
     make_event as _make_event,
     verify_output_summary as _verify_output_summary,
 )
+from orchd.guide import NEXT_ACTION_AWAIT_REVIEW
 from orchd.ledger import Store, resolve_review_mode
 from orchd.review import find_last_done_event as _find_last_done_event
 from orchd.subproc import run_shell
@@ -110,6 +111,14 @@ def _done_impl(
     ``_done_precheck`` / ``_run_verify`` / ``_commit_and_verify_integrity`` /
     ``_write_done_event`` 四段阶段函数，本函数仅做编排；对外签名与返回结构零变化。
     """
+    # 0) task-done-root-resolution AC1/AC2：container 布局下从主工作树执行 done 时，
+    #    解析 project_root 到任务 worktree（分支实际 checkout 处）。strict 模式下
+    #    解析不到任务 worktree 时抛错阻断（不回退主工作树、不静默写 DONE）。
+    #    flat 布局与本身即任务 worktree 时原样返回（零回归）。
+    if project_root:
+        from orchd.gitops_ops import resolve_task_worktree
+        project_root = resolve_task_worktree(project_root, task_id, strict=True)
+
     # 1) 预校验（无锁）：任务查找 + files_to_edit + claimed 状态 + L1/root 守卫
     task_def, files_to_edit, degraded_guards = _done_precheck(
         store, tasks, task_id, agent_id, project_root,
@@ -118,38 +127,62 @@ def _done_impl(
     # 2) 跨 worktree 脏写检测（fail-closed，E017）
     _guard_cross_worktree_dirty(project_root, files_to_edit, task_id, degraded_guards)
 
-    # 3) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
+    # 2.5) 基线新鲜度闸口（task-done-base-freshness）：main 已在实现期间持续推进（本
+    #      仓库 main 已 297+ completed），任务分支基线与 main 漂移。既有 reconcile
+    #      （挂载点 ① 下一段）只在“main 推进且触及本任务文件”时才阻断，而“main 推进但
+    #      未触及 task 改动文件”的场景当前静默放行——实现者带陈旧基线 done、合并后到
+    #      review 期才暴露 drift（E015）。此处先判 task 分支是否落后 main，落后即阻断，
+    #      早发现避免 review 期 E015。仅判落后与否，不产生 git 写操作；与随后的
+    #      reconcile 冲突对账互补互不冲突。
+    _check_base_freshness(project_root, task_id, degraded_guards)
+
+    # 3) 与 main 对账（task-done-reconcile-main 挂载点 ①）：顺序约束——必须先对账、
+    #     后 verify，否则 verify 跑在对账前的旧内容上。此处仅在 main 推进且触及本任务
+    #     文件时检出冲突（2.5 已覆盖“未触及文件”的陈旧基线场景，二者互补）。
+    _reconcile_before_verify(project_root, task_id, degraded_guards)
+
+    # 4) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
     verify_record, early_done = _run_verify(store, task_def, task_id, project_root)
     if early_done is not None:
         return early_done
 
-    # 4) 自动提交 + 声明/残留/越界/干净完整性门禁（均 fail-closed）
+    # 5) 自动提交 + 声明/残留/越界/干净完整性门禁（均 fail-closed）
     commit_result = _commit_and_verify_integrity(
         store, task_def, task_id, agent_id, project_root,
         files_to_edit, changes_description, degraded_guards,
     )
 
-    # 5) 全量回归（task-full-regression-gate-r2：默认关闭，仅 config 显式 true 时跑）
+    # 6) 全量回归（task-full-regression-gate-r2：默认关闭，仅 config 显式 true 时跑）
     full_regression = _maybe_full_regression(store, files_to_edit, project_root)
 
-    # 6) 强切回默认分支（写事件前，task-done-switch-main）
+    # 7) 强切回默认分支（写事件前，task-done-switch-main）
     checked_out_main = None
     if project_root:
         # 延迟导入避免循环依赖
         from orchd.onboard import _checkout_default_strict
         checked_out_main = _checkout_default_strict(project_root)
 
-    # 7) 锁内二次校验 + 写 DONE/REVIEW_READY + checkpoint
+    # 7.5) task-engine-cli-friction-fix：切回主工作树后 os.chdir，保证同进程
+    #      内 done 后的后续操作（如 status 检查）不因 cwd 指向已回收的任务 worktree
+    #      而报 cwd does not exist。best-effort，异常静默跳过。
+    if project_root:
+        try:
+            import os
+            os.chdir(str(project_root))
+        except Exception:
+            pass
+
+    # 8) 锁内二次校验 + 写 DONE/REVIEW_READY + checkpoint
     written = _write_done_event(
         store, task_id, task_def, agent_id, changes_description, concerns, verify_record,
     )
 
-    # 8) 经验回灌 done 收尾 hook（best-effort，§8.6）
+    # 9) 经验回灌 done 收尾 hook（best-effort，§8.6）
     lessons_summary, lessons_require_review = _done_lessons_hook(
         store, task_id, verify_record, skip_lesson_review,
     )
 
-    # 9) 结果组装（degraded/author_mismatch/full_regression/commit/lessons 附带字段）
+    # 10) 结果组装（degraded/author_mismatch/full_regression/commit/lessons 附带字段）
     result = _assemble_done_result(
         task_id=task_id,
         attempt_count=written["attempt_count"],
@@ -167,7 +200,20 @@ def _done_impl(
         lessons_require_review=lessons_require_review,
     )
 
-    # 10) L3 pre-commit hook 卸载 + 释放本 agent session 锁（best-effort，锁外）
+    # task-done-cwd-hook-hygiene AC1：post_done_cwd 须指向 canonical 主工作树，
+    # 而非此处 project_root（已在上方 task-done-root-resolution 解析为任务 worktree）。
+    # 任务终态 worktree 回收后，若仍指向任务 worktree，则 guidance 生成的
+    # Set-Location 命令必失败（cwd does not exist）。改取 resolve_canonical_project_root
+    # 回到主工作树根，与 hint「请切回主工作树」方向一致。
+    # 在 _done_impl 中设置（_assemble_done_result 无 project_root 参数）。
+    if project_root:
+        from orchd.worktree import resolve_canonical_project_root
+
+        result["post_done_cwd"] = str(resolve_canonical_project_root(project_root))
+    else:
+        result["post_done_cwd"] = ""
+
+    # 11) L3 pre-commit hook 卸载 + 释放本 agent session 锁（best-effort，锁外）
     if project_root:
         hook_uninstall(project_root)
     if project_root:
@@ -226,6 +272,138 @@ def _done_precheck(
             )
 
     return task_def, files_to_edit, degraded_guards
+
+
+def _check_base_freshness(
+    project_root: Path | None,
+    task_id: str,
+    degraded_guards: list[dict[str, Any]],
+) -> None:
+    """done 前置基线新鲜度闸口（task-done-base-freshness）。
+
+    堵当前缺口：main 已持续推进（本仓库 main 已 297+ completed）时，任务分支基线与
+    main 漂移。既有 :func:`_reconcile_before_verify`（挂载点 ① 的 apply=True 落地对账）
+    只在「main 自 merge-base 推进且触及本任务改动文件」时才落到 merge-tree 探测冲突，
+    且 apply=True 语义是在任务 worktree **落地合并并保留现场**供实现者解决——对一个
+    「先要阻断」的闸口而言太重。
+
+    本闸口与 reconcile 同源判定（复用 :func:`reconcile_with_main`，apply=False 纯只读
+    探测，不落地、不动工作区、不建 MERGE_HEAD），但语义收紧为**只拦真正冲突**：
+
+    - main 未推进 / 任务分支不存在 / 无文件交集 / 可干净合并 → **放行**（由 code
+      APPROVED 的 merge 兜底；可干净快进的任务分支不阻断，是为避免 deadlock——
+      实现者无合法手段在 done 前手动 merge main，落后但无冲突就应允许 done）；
+    - main 推进且与 task 实际改动**同文件冲突** → 阻断，返回含「请先 merge main 并
+      重跑 verify」hint 的 E015，早发现避免 review 期 E015。
+
+    git 故障等异常 → best-effort 降级为 degraded_guard，不阻断 done（零回归）。
+    仅只读探测，不产生任何 git 写操作；与 reconcile 互补——本闸口聚焦「冲突即拦」，
+    apply=True 对账聚焦「已阻断后落地解决现场」。
+    """
+    if project_root is None:
+        return
+    from orchd.gitops_ops import reconcile_with_main as _reconcile_with_main
+
+    # 任务分支不存在（flat 降级 / 未建独立分支）→ 无对账对象，放行
+    # （reconcile_with_main 内部对 no_branch 返回 checked=False，先快速跳过省开销）
+    probe = _probe_task_branch(str(project_root), task_id)
+    if not probe:
+        return
+    try:
+        rec = _reconcile_with_main(project_root=project_root, task_id=task_id, apply=False)
+    except Exception as exc:  # reconcile 本不抛，防御性收纳
+        degraded_guards.append({
+            "guard": "base_freshness",
+            "task_id": task_id,
+            "error": str(exc),
+            "hint": (
+                "基线新鲜度判定异常降级（best-effort），done 继续；"
+                "如反复出现请检查仓库 git 状态"
+            ),
+        })
+        return
+    # 未探测(checked=False)或未冲突(clean=True) → 放行
+    if not rec.get("checked") or rec.get("clean", True):
+        return
+    # 真正冲突：main 推进且与本任务文件同路径冲突 → 阻断 early
+    raise OrchdError(
+        ErrorCode.E015,
+        "stale_base: 任务分支落后 main 且与 main 存在文件冲突",
+        [{
+            "task_id": task_id,
+            "branch": f"task/{task_id}",
+            "files": rec.get("files") or [],
+            "hint": (
+                "任务分支落后 main 且同文件冲突，请先 merge main 解决冲突并重跑 "
+                "verify；完成后重试 done，避免带陈旧基线提交后续 review 期暴露 drift"
+            ),
+        }],
+    )
+
+
+def _probe_task_branch(workdir: str, task_id: str) -> bool:
+    """任务分支存在性（best-effort）：不存在返回 False（由调用方放行）。"""
+    import subprocess
+
+    branch = f"task/{task_id}"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workdir, "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{branch}"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        return proc.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return True  # 探不明一律当作存在，交由 reconcile 判定
+
+
+def _reconcile_before_verify(
+    project_root: Path | None,
+    task_id: str,
+    degraded_guards: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """done 前置对账（task-done-reconcile-main 挂载点 ①）。
+
+    与 main 对账把冲突左移到实现者手里：main 自本任务 merge-base 以来推进且触及
+    本任务改动文件时，冲突在 done 阶段即被检出（原本要等 code APPROVED 的 merge
+    才爆发，代价是两轮审查全部作废——实测 task-test-cli-split-domains 4h15m / 1 文件）。
+
+    与 reviewer 认领挂载点**共用同一函数与同一触发条件**
+    （:func:`orchd.gitops_ops.reconcile_with_main`，防双写漂移），区别仅在
+    ``apply=True``：冲突时在任务 worktree 内保留合并现场（``MERGE_HEAD``）供实现者
+    直接解决，并以权威真源（``unmerged_paths``）校正冲突清单。
+
+    冲突 → 抛 E015（附真实冲突清单 + 可执行指引）；git 不可用等异常 → best-effort
+    降级为 degraded_guard，不阻断 done（零回归）。
+    """
+    if project_root is None:
+        return None
+    try:
+        from orchd.gitops_ops import reconcile_with_main
+
+        rec = reconcile_with_main(project_root, task_id, apply=True)
+    except Exception as exc:
+        degraded_guards.append({
+            "guard": "reconcile_with_main",
+            "task_id": task_id,
+            "error": str(exc),
+            "hint": "done 前置对账异常降级（best-effort），done 继续；"
+                    "如反复出现请检查仓库 git 状态",
+        })
+        return None
+    if rec.get("reason") != "conflict":
+        return rec
+    raise OrchdError(
+        ErrorCode.E015,
+        "merge_conflict: 任务分支与 main 对账冲突（done 前置）",
+        [{
+            "task_id": task_id,
+            "conflict_files": rec.get("files", []),
+            "worktree": rec.get("worktree"),
+            "reason": rec.get("reason"),
+            "hint": rec.get("action"),
+        }],
+    )
 
 
 def _run_verify(
@@ -288,6 +466,9 @@ def _run_verify(
             "exit_code": result.returncode,
             "elapsed_seconds": elapsed,
             "output_summary": _verify_output_summary(result.stdout, result.stderr),
+            # task-done-root-resolution AC4：记录 verify 实际执行位置（cwd），
+            # reviewer 可仅凭 DONE 事件的 verify 摘要辨识 verify 跑在哪个工作树。
+            "cwd": str(project_root),
         }
         return verify_record, None
     except subprocess.TimeoutExpired as exc:
@@ -412,7 +593,12 @@ def _commit_and_verify_integrity(
     commit_message = changes_description or task_def.get(
         "name", f"orchd: done {task_id}"
     )
-    commit_result = _done_auto_commit(project_root, files_to_edit, commit_message)
+    # task-done-exempt-files-commit：自动提交范围扩展为 files_to_edit ∪ exempt_files，
+    # 使 exempt_files 改动（如配套测试）随 done 自动提交进入任务分支 diff，不再被
+    # _guard_clean_workspace 以 E017 阻断。扩展仅限提交范围；declared_diff / zero_residual
+    # / out_of_scope 门禁仍以 files_to_edit 为准，与既有语义零回归。
+    commit_files = list(dict.fromkeys([*files_to_edit, *task_def.get("exempt_files", [])]))
+    commit_result = _done_auto_commit(project_root, commit_files, commit_message)
 
     _guard_declared_diff(project_root, task_id, files_to_edit, degraded_guards)
     _guard_zero_residual(project_root, task_id, files_to_edit, degraded_guards)
@@ -598,7 +784,7 @@ def _assemble_done_result(
     if lessons_summary is not None:
         result["lessons"] = lessons_summary
         if lessons_require_review:
-            result["next_action"] = "await_review"
+            result["next_action"] = NEXT_ACTION_AWAIT_REVIEW
             result["lesson_review_hint"] = (
                 f"本任务有 {lessons_summary.get('count', 0)} 条 guidance 增补建议待审核，"
                 f"收尾挂起：请运行 `orchd lesson review --task {task_id}` 确认后完成收尾"

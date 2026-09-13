@@ -10,13 +10,22 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
 from orchd.gitops import GUARD_FAIL_CLOSED, GUARD_WARN, check_workspace_state, run_guard
+from orchd.guide import (
+    NEXT_ACTION_EXIT,
+    NEXT_ACTION_REVIEW_FIRST,
+    NEXT_ACTION_SUBMIT_REVIEW,
+    NEXT_ACTION_WAIT,
+)
 from orchd.ledger import Store, TaskDerived, TaskState, is_fingerprint_agent_id as _is_fingerprint_agent_id
 from orchd.pool import (
+    Candidate,
+    INFLIGHT_MARKER,
     _build_claimed_files,
     build_pool,
     detect_file_conflict,
@@ -29,6 +38,16 @@ from orchd.review import (
     extract_review_comments as _extract_review_comments,
     request_reviewer as _request_reviewer,
 )
+from orchd.worktree import _git_diff_names
+
+# conflict_policy（task-inflight-conflict-visibility）：在途任务重叠的处置策略。
+# 缺省 warn —— 不新增任何跨任务硬阻断（硬阻断会造成互等死锁，且在途集合本身
+# 不稳定）；冲突风险由对账/真源修复在事后吸收。
+CONFLICT_POLICY_DEFAULT = "warn"
+CONFLICT_POLICIES = ("warn", "serialize", "block")
+
+# retract 认领冷却期（秒）：与 claim._RETRACT_COOLDOWN_S 保持一致（task-retract-bind-cooloff）。
+_RETRACT_COOLDOWN_S = 300
 
 
 # ------------------------------------------------------------------
@@ -104,24 +123,160 @@ def _find_review_priority_tasks(
     return review_tasks, excluded_self_review
 
 
-def _build_candidates(state, tasks, capabilities, exclude, sort_key, importance_thresholds):
+def _build_candidates(
+    state: dict[str, TaskState],
+    tasks: list[dict[str, Any]],
+    capabilities: list[str] | None,
+    exclude: list[str] | None,
+    sort_key: str | None,
+    importance_thresholds: dict[str, Any] | None,
+) -> list[Candidate]:
     candidates = build_pool(tasks, state, capabilities=capabilities, exclude=exclude)
     candidates = sort_candidates(candidates, sort_key=sort_key, importance_thresholds=importance_thresholds)
     return candidates
 
 
-def _filter_conflicts(candidates, state, tasks, project_root):
+# ------------------------------------------------------------------
+# 在途冲突真源与策略（task-inflight-conflict-visibility）
+# ------------------------------------------------------------------
+
+
+def _git_lines(project_root: Path, *args: str) -> list[str] | None:
+    """执行 git 子命令并返回非空输出行（best-effort）。
+
+    异常 / 非零退出 / 超时返回 None（「测不到」），调用方据此降级，
+    不把测不到伪装成空集。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_root), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+
+
+def _default_branch(project_root: Path) -> str:
+    """默认分支名（best-effort；取不到回退 "main"，与 worktree._git_diff_names 一致）。"""
+    try:
+        from orchd.gitops import get_default_branch
+
+        return get_default_branch(project_root) or "main"
+    except Exception:
+        return "main"
+
+
+def _inflight_files(
+    project_root: Path | None, tasks: list[dict[str, Any]]
+) -> dict[str, list[str]]:
+    """以 git 事实取「在途」任务 → 实际改动文件（task-inflight-conflict-visibility）。
+
+    「在途」= 分支 ``task/<id>`` 存在且有**未落默认分支的提交**（即不在
+    ``git for-each-ref --merged=<default>`` 结果内）。覆盖 done / in_review /
+    force-status 悬空态 —— 判定只看「改动是否已落 main」，与任务状态字段无关，
+    这正是修掉 _build_claimed_files 只看 claimed 之状态盲区的方式。
+
+    性能：批量 2 次 git 调用（列全部 task/* 分支 + 列已并入默认分支的分支），
+    与候选数 N 无关；随后仅对在途任务逐个取实际改动文件（O(M)，M = 在途任务数），
+    避免 O(N×M)。任一步失败即返回已收集部分（best-effort，与
+    ``worktree.actual_changes_conflict`` 的降级语义一致）。
+
+    Args:
+        project_root: 主工作树根；None / 非 git → 空结果。
+        tasks: 仅登记 _master.json 已知任务的分支，避免野生分支误报。
+
+    Returns:
+        {task_id: [实际改动文件]}；仅含「有未落 main 提交且改动非空」的任务。
+    """
+    if project_root is None:
+        return {}
+    known = {t.get("id", "") for t in tasks}
+    prefix = "task/"
+    refspec = f"refs/heads/{prefix}"
+    branches = _git_lines(
+        project_root, "for-each-ref", "--format=%(refname:short)", refspec
+    )
+    if not branches:
+        return {}
+    merged = set(
+        _git_lines(
+            project_root,
+            "for-each-ref",
+            f"--merged={_default_branch(project_root)}",
+            "--format=%(refname:short)",
+            refspec,
+        )
+        or []
+    )
+    inflight: dict[str, list[str]] = {}
+    for branch in branches:
+        if branch in merged or not branch.startswith(prefix):
+            continue
+        tid = branch[len(prefix):]
+        if tid not in known:
+            continue
+        files = _git_diff_names(project_root, tid) or []
+        if files:
+            inflight[tid] = files
+    return inflight
+
+
+def _resolve_conflict_policy(raw: Any, degraded_guards: list[dict[str, Any]]) -> str:
+    """解析 config.conflict_policy：缺省 warn；非法值回退 warn 并留痕（不得静默）。"""
+    if raw is None:
+        return CONFLICT_POLICY_DEFAULT
+    if isinstance(raw, str) and raw in CONFLICT_POLICIES:
+        return raw
+    degraded_guards.append({
+        "guard": "conflict_policy",
+        "severity": "warning",
+        "status": "fallback",
+        "reason": "conflict_policy_invalid",
+        "value": raw,
+        "fallback": CONFLICT_POLICY_DEFAULT,
+        "hint": (
+            f"config.conflict_policy 取值非法（{raw!r}），已回退 "
+            f"{CONFLICT_POLICY_DEFAULT}；合法值：{' / '.join(CONFLICT_POLICIES)}"
+        ),
+    })
+    return CONFLICT_POLICY_DEFAULT
+
+
+def _filter_conflicts(
+    candidates: list[Candidate],
+    state: dict[str, TaskState],
+    tasks: list[dict[str, Any]],
+    project_root: Path | None,
+    conflict_policy: str | None = None,
+) -> tuple[
+    list[Candidate],
+    list[dict[str, Any]],
+    dict[str, Any],
+    list[dict[str, Any]],
+    int,
+]:
     excluded_conflicts = []
     candidate_conflicts = {}
     kept = []
-    degraded_guards = []
+    degraded_guards: list[dict[str, Any]] = []
     guard_unavailable_count = 0
-    claimed_files = _build_claimed_files(state, tasks, include_pending=True)
+    policy = _resolve_conflict_policy(conflict_policy, degraded_guards)
+    # 在途集合一次计算（与候选数 N 无关）：批量 2 次 git 调用 + O(在途数) 次改动查询。
+    inflight_files = _inflight_files(project_root, tasks)
+    claimed_files = _build_claimed_files(
+        state, tasks, include_pending=True, inflight_files=inflight_files
+    )
     for cand in candidates:
         conflicts = detect_file_conflict(state, tasks, cand.task, include_pending=True, claimed_files=claimed_files)
-        actual_conflicts = []
+        # actual_changes_conflict 返回 list[dict]（与上方 conflicts 的 list[Conflict] dataclass
+        # 不同源）；显式注解避免 mypy 沿控制流把本变量误并为 dataclass 列表（纯类型层修正）。
+        actual_conflicts: list[dict[str, Any]] = []
         if project_root is not None:
-            def _guard():
+            def _guard() -> Any:
                 st = check_workspace_state(project_root)
                 if st.get("state") == "error":
                     raise RuntimeError(st.get("error") or st.get("reason"))
@@ -138,17 +293,45 @@ def _filter_conflicts(candidates, state, tasks, project_root):
                 excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get("files_to_edit", [])), "claimed_by": "guard_unavailable", "source": "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
                 continue
         dep_closure = get_dependency_closure(cand.task.get("id", ""), tasks)
-        excluded = []
+        # 显式注解：本列表由多来源 dict 字面量拼装（declared / inflight / actual），
+        # 无注解时 mypy 会按首个 append 收窄元素类型。
+        excluded: list[dict[str, Any]] = []
         pending_soft = []
         for c in conflicts:
             if c.claimed_by == "pending":
                 pending_soft.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by})
+            elif c.claimed_by == INFLIGHT_MARKER:
+                # 在途重叠按 conflict_policy 分流：warn（缺省）= 仅提示 + 降权排序，
+                # 不新增任何阻断；serialize / block = 硬排除并给出可解释字段。
+                other = state.get(c.task_id)
+                entry = {
+                    "task_id": c.task_id,
+                    "files": c.files,
+                    "claimed_by": c.claimed_by,
+                    "source": "inflight",
+                    "blocked_by": c.task_id,
+                    "other_status": (other.status if other else "pending"),
+                    "policy": policy,
+                }
+                if policy in ("serialize", "block"):
+                    excluded.append(entry)
+                else:
+                    pending_soft.append(entry)
             else:
-                excluded.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by})
-        for c in actual_conflicts:
-            if c.get("task_id") in dep_closure:
+                excluded.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by, "source": "declared"})
+        for ac in actual_conflicts:
+            if ac.get("task_id") in dep_closure:
                 continue
-            excluded.append({"task_id": c["task_id"], "files": c.get("files", []), "claimed_by": c.get("claimed_by", "actual"), "source": "actual"})
+            excluded.append({"task_id": ac["task_id"], "files": ac.get("files", []), "claimed_by": ac.get("claimed_by", "actual"), "source": "actual"})
+        # 去重（task-request-response-fidelity AC2）：同一（对方任务, 文件集合）组合只保留
+        # 一条，actual 优先于 declared（实际在途比声明更精确）。循环变量取 ac 以与上方
+        # Conflict dataclass 循环（c）区分，避免同作用域内两种类型混用。
+        _seen: dict[tuple[str, frozenset[str]], dict[str, Any]] = {}
+        for _e in excluded:
+            _key = (_e["task_id"], frozenset(_e.get("files", [])))
+            if _key not in _seen or _e.get("source") == "actual":
+                _seen[_key] = _e
+        excluded = list(_seen.values())
         if excluded:
             excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": excluded})
             continue
@@ -159,7 +342,20 @@ def _filter_conflicts(candidates, state, tasks, project_root):
     return kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count
 
 
-def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts, excluded_conflicts, degraded_guards, guard_unavailable_count, excluded_self_review, capabilities=None, exclude=None):
+def _route_by_role(
+    store: Store,
+    tasks: list[dict[str, Any]],
+    state: dict[str, TaskState],
+    derived: TaskDerived,
+    candidates: list[Candidate],
+    candidate_conflicts: dict[str, Any],
+    excluded_conflicts: list[dict[str, Any]],
+    degraded_guards: list[dict[str, Any]],
+    guard_unavailable_count: int,
+    excluded_self_review: list[dict[str, Any]],
+    capabilities: list[str] | None = None,
+    exclude: list[str] | None = None,
+) -> dict[str, Any]:
     if not candidates:
         # 四分支语义恢复（43e2f72~1 之前行为）：按 guard_unavailable > conflict_excluded > capability_mismatch > none_ready 优先级
         if guard_unavailable_count and guard_unavailable_count == len(excluded_conflicts) and excluded_conflicts:
@@ -178,7 +374,9 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
                         if dep_s not in ("completed", "cancelled"):
                             blocked_count += 1
                             break
-            result = {"candidate": None, "message": message, "next_action": "exit", "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+            # 显式注解（首处定义即声明）：本函数各分支 result 的 value 类型集合不同，
+            # 无注解时 mypy 按首处字面量收窄并在后续分支报 dict-item。
+            result: dict[str, Any] = {"candidate": None, "message": message, "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         elif excluded_conflicts:
             reason = "conflict_excluded"
             mismatched = []
@@ -195,7 +393,7 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
                         if dep_s not in ("completed", "cancelled"):
                             blocked_count += 1
                             break
-            result = {"candidate": None, "message": message, "next_action": "exit", "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+            result = {"candidate": None, "message": message, "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         elif capabilities:
             unfiltered = build_pool(tasks, state, capabilities=None, exclude=exclude)
             mismatched = [{"task_id": c.task.get("id", ""), "requires": list(c.task.get("requires", []))} for c in unfiltered if not set(c.task.get("requires", [])).issubset(set(capabilities))]
@@ -214,7 +412,7 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
                             if dep_s not in ("completed", "cancelled"):
                                 blocked_count += 1
                                 break
-                result = {"candidate": None, "message": message, "next_action": "exit", "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+                result = {"candidate": None, "message": message, "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
             else:
                 reason = "none_ready"
                 mismatched = []
@@ -230,7 +428,7 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
                             if dep_s not in ("completed", "cancelled"):
                                 blocked_count += 1
                                 break
-                result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": "exit", "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+                result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         else:
             reason = "none_ready"
             mismatched = []
@@ -246,7 +444,7 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
                         if dep_s not in ("completed", "cancelled"):
                             blocked_count += 1
                             break
-            result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": "exit", "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+            result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         if excluded_self_review:
             result["excluded_self_review"] = excluded_self_review
         if degraded_guards:
@@ -271,6 +469,19 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
     if task_id in candidate_conflicts:
         candidate["conflict_with"] = candidate_conflicts[task_id]
         warnings.append(f"file_conflict_pending: 与池内 {len(candidate_conflicts[task_id])} 个任务共享声明文件")
+        _inflight_n = sum(
+            1 for x in candidate_conflicts[task_id]
+            if x.get("claimed_by") == INFLIGHT_MARKER
+        )
+        if _inflight_n:
+            _pol = next(
+                (x.get("policy") for x in candidate_conflicts[task_id] if x.get("policy")),
+                CONFLICT_POLICY_DEFAULT,
+            )
+            warnings.append(
+                f"file_conflict_inflight: 其中 {_inflight_n} 个为在途任务（改动未落 main，"
+                f"conflict_policy={_pol}）；warn 下仅提示不阻断"
+            )
     if ts and ts.attempt_count > 0:
         candidate["rework"] = True
         candidate["attempt_count"] = ts.attempt_count
@@ -285,6 +496,84 @@ def _route_by_role(store, tasks, state, derived, candidates, candidate_conflicts
     return result
 
 
+def _filter_cooldown_tasks(
+    candidates: list[Candidate], store: Store
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    """剔除在 retract 认领冷却期内的任务（task-retract-bind-cooloff）。
+
+    扫描 ledger 找每个候选任务最近一条 RETRACT 事件（disposition=abandon），
+    若在 _RETRACT_COOLDOWN_S 内且无后续 CLAIMED → 剔除。
+    """
+    from datetime import datetime
+    if not candidates:
+        return candidates, []
+    all_events = store._read_ledger_lines(from_line=1)
+    # 按 task_id 收集最近 RETRACT 和 CLAIMED 时间
+    task_last_retract = {}
+    task_last_claimed = {}
+    for ev in all_events:
+        tid = ev.get("task_id")
+        etype = ev.get("type")
+        if etype == "RETRACT" and not ev.get("retracted"):
+            task_last_retract[tid] = ev
+        elif etype == "CLAIMED" and not ev.get("retracted"):
+            task_last_claimed[tid] = ev.get("timestamp")
+
+    kept = []
+    cooldown_excluded = []
+    now = None
+    for cand in candidates:
+        tid = cand.task.get("id", "")
+        retract_ev = task_last_retract.get(tid)
+        if retract_ev is None:
+            kept.append(cand)
+            continue
+        # disposition 非 abandon 不冷却
+        if retract_ev.get("disposition", "abandon") != "abandon":
+            kept.append(cand)
+            continue
+        # 有后续 CLAIMED 不冷却
+        claimed_ts = task_last_claimed.get(tid)
+        if claimed_ts:
+            try:
+                rt = datetime.fromisoformat(retract_ev["timestamp"])
+                ct = datetime.fromisoformat(claimed_ts)
+                if ct > rt:
+                    kept.append(cand)
+                    continue
+            except (ValueError, KeyError):
+                pass
+        # 检查时间
+        try:
+            rt = datetime.fromisoformat(retract_ev["timestamp"])
+            if now is None:
+                now = datetime.now(rt.tzinfo) if rt.tzinfo else datetime.now()
+            seconds_ago = (now - rt).total_seconds()
+        except (ValueError, KeyError):
+            kept.append(cand)
+            continue
+        if seconds_ago < _RETRACT_COOLDOWN_S:
+            cooldown_excluded.append({"task_id": tid, "retracted_at": retract_ev["timestamp"], "seconds_ago": seconds_ago})
+        else:
+            kept.append(cand)
+    return kept, cooldown_excluded
+
+
+def _held_review_claim(
+    state: dict[str, TaskState], agent_id: str
+) -> tuple[str, str] | None:
+    """本 agent 已领未提交的审查认领 ``(tid, review_phase)``；无则 None。
+
+    判据与 :func:`orchd.guide._summarize` 的 ``my_review_tid`` 同源（in_review 且
+    ``review_claimed_by`` 为当前 agent），保证 request 出口与 guidance step 不漂移
+    （task-guidance-review-priority-fix）。
+    """
+    for tid, ts in state.items():
+        if ts.status == "in_review" and ts.review_claimed_by == agent_id:
+            return tid, (ts.review_phase or "unified")
+    return None
+
+
 def request(
     store: Store,
     tasks: list[dict[str, Any]],
@@ -297,6 +586,7 @@ def request(
     importance_thresholds: dict[str, Any] | None = None,
     enforce_self_review_block: bool = False,
     project_root: Path | None = None,
+    conflict_policy: str | None = None,
 ) -> dict[str, Any]:
     state = store.replay()
     derived = store.scan_task_derived()
@@ -307,24 +597,50 @@ def request(
             project_root = None
     if role == "reviewer":
         return _request_reviewer(store, state, tasks, agent_id, derived, enforce_self_review_block=enforce_self_review_block)
+    # task-guidance-review-priority-fix：本会话已持有未提交的审查认领时先给「提交」出口，
+    # 不再产 review_first 指向他任务的审查——否则 agent 去 claim 会被 E011 review busy
+    # 拒绝（orchd/onboard/claim.py 的 review busy 分支），手上认领悬空未提交。
+    # 与 _classify 的 submit_review 优先级保持一致（引导给出的命令不得被门禁拒绝）。
+    held_review = _held_review_claim(state, agent_id)
+    if held_review is not None:
+        held_tid, held_phase = held_review
+        return {
+            "candidate": None,
+            "message": (
+                f"本会话已持有未提交的审查认领：{held_tid}（{held_phase} 阶段），"
+                "请先提交审查结论再领取新任务"
+            ),
+            "next_action": NEXT_ACTION_SUBMIT_REVIEW,
+            "review_held": {"task_id": held_tid, "review_phase": held_phase},
+            "pool_size": 0,
+        }
     review_priority, excluded_self_review = _find_review_priority_tasks(store, state, tasks, agent_id, derived, enforce_self_review_block=enforce_self_review_block)
     if review_priority:
         best_review = review_priority[0]
         rp_entry = {"task_id": best_review["task_id"], "review_phase": best_review["review_phase"], "name": best_review["name"], "total_available": len(review_priority)}
         if best_review.get("is_self_review"):
             rp_entry["is_self_review"] = True
-        resp: dict[str, Any] = {"candidate": None, "review_priority": rp_entry, "message": f"有 {len(review_priority)} 个待审查任务可领取", "next_action": "review_first", "pool_size": 0}
+        # AC1（task-request-response-fidelity）：审查优先分支不得硬编码 pool_size: 0——
+        # 复用主路径同一口径（_build_candidates + 冷却剔除 + _filter_conflicts）算出真实
+        # 可领取实现候选数，并给 blocked_by 归因，避免 candidate=null + pool_size=0 被读成
+        # 「没活」。
+        _impl_candidates = _build_candidates(state, tasks, capabilities, exclude, sort_key, importance_thresholds)
+        _impl_candidates, _ = _filter_cooldown_tasks(_impl_candidates, store)
+        _impl_kept, _, _, _, _ = _filter_conflicts(_impl_candidates, state, tasks, project_root, conflict_policy)
+        resp: dict[str, Any] = {"candidate": None, "review_priority": rp_entry, "message": f"有 {len(review_priority)} 个待审查任务可领取", "next_action": NEXT_ACTION_REVIEW_FIRST, "pool_size": len(_impl_kept), "blocked_by": "review_priority"}
         if excluded_self_review:
             resp["excluded_self_review"] = excluded_self_review
         return resp
     if max_active is not None:
         active = sum(1 for ts in state.values() if ts.status == "claimed")
         if active >= max_active:
-            return {"candidate": None, "message": f"max_active {active}/{max_active}", "next_action": "wait", "reason": "max_active_reached", "pool_size": 0, "active_count": active, "max_active": max_active}
+            return {"candidate": None, "message": f"max_active {active}/{max_active}", "next_action": NEXT_ACTION_WAIT, "reason": "max_active_reached", "pool_size": 0, "active_count": active, "max_active": max_active}
     candidates = _build_candidates(state, tasks, capabilities, exclude, sort_key, importance_thresholds)
-    kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count = _filter_conflicts(candidates, state, tasks, project_root)
+    # task-retract-bind-cooloff：剔除冷却期任务（已放弃任务不再被推荐）
+    candidates, cooldown_excluded = _filter_cooldown_tasks(candidates, store)
+    kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count = _filter_conflicts(candidates, state, tasks, project_root, conflict_policy)
     if not kept and guard_unavailable_count and guard_unavailable_count == len(excluded_conflicts):
-        return {"candidate": None, "message": "guard_unavailable", "next_action": "exit", "pool_size": 0, "blocked_count": 0, "reason": "guard_unavailable", "mismatched": [], "excluded_conflicts": excluded_conflicts, "degraded_guards": degraded_guards}
+        return {"candidate": None, "message": "guard_unavailable", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": 0, "reason": "guard_unavailable", "mismatched": [], "excluded_conflicts": excluded_conflicts, "degraded_guards": degraded_guards}
     if excluded_conflicts and not kept:
         # will be handled by _route
         pass

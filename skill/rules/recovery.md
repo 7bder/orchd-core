@@ -72,12 +72,12 @@
 
 | 通道 | 产生方式 | 是否经 attach_error_guidance | 典型码 |
 |---|---|---|---|
-| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E014/E016-E019/E022/E025/E027/E033/E034/E036 |
+| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E019/E022/E025/E027/E033/E034/E036 |
 | **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | E004/E005/E006/E023/E024/E026/E028/E029 |
 | **C 手工 dict** | 代码里手拼 `{"code":"Exxx", ...}` 后 return | ❌ 否（需 structured_error 接线） | E021/E028/E030/E031/E032/E035 |
 | **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | E020 |
 
-**E015 (merge_conflict) 是死映射**：全包无 `raise OrchdError(E015)`，仅 review.py result reason。通道登记为空集。
+**E015 (merge_conflict) 已接入通道 A**（不再是死映射）：`done` 前置对账在 `orchd/onboard/lifecycle/core.py` 新增 `raise OrchdError(E015)` 位点（task-done-reconcile-main 挂载点①）；`orchd/review.py` 仍以手工 dict 挂 `result` 的 reason 路径保留。`ERROR_CODE_CHANNELS` 登记由空集改为 `{"A"}`。
 
 ### 被占场景 SOP（E009 / E011）
 

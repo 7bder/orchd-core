@@ -24,6 +24,7 @@ _ledger.jsonl / _checkpoint.json，且该白名单须有测试守护。
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -62,17 +63,23 @@ _SESSION_TTL_SECONDS = 1800  # 30 分钟
 
 # 保护白名单：--fix 绝不触碰这些文件/目录。
 # 硬编码在 doctor.py 内，确保即使调用方误用也不会损伤核心状态。
-_PROTECTED_PATHS = frozenset({
+# 分两类：源码资产（与位置无关恒保护）与运行时状态（canonical 账本根保护、
+# legacy 位置可清——container 布局下 main/.orchd 的 flat 遗留属于可清残留，
+# 见 _detect_legacy_flat_residues）。
+_SOURCE_ASSETS = frozenset({
     "_master.json",
     "IDEAS.md",
     "IDEAS-archive.md",
     "ROADMAP.md",
+})
+_RUNTIME_STATE_FILES = frozenset({
     "_ledger.jsonl",
     "_checkpoint.json",
     "_full_regression.json",
     "session-worktrees.json",
     "merge-acks.json",
 })
+_PROTECTED_PATHS = _SOURCE_ASSETS | _RUNTIME_STATE_FILES
 
 
 def _run_git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -96,6 +103,31 @@ def _run_git(project_root: Path, args: list[str]) -> subprocess.CompletedProcess
 def _make_check(name: str, status: str, hint: str) -> dict[str, str]:
     """构造单个诊断项。name 为检查名，status 为 ok/fail，hint 为提示。"""
     return {"name": name, "status": status, "hint": hint}
+
+
+
+def _detect_stale_worktree_registry(project_root: Path) -> list[dict[str, str]]:
+    """检测 git worktree 注册中的 prunable 项（有注册、工作目录已不存在）。
+
+    解析 ``git worktree list --porcelain`` 输出，找含 ``prunable`` 标记的
+    worktree。返回 [{path, reason}] 列表；git 不可用时返回空（不干扰其他检查）。
+    """
+    result = _run_git(project_root, ["worktree", "list", "--porcelain"])
+    if result.returncode != 0:
+        return []
+    stale: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            if current is not None and "prunable" in current:
+                stale.append(current)
+            current = {"path": line[len("worktree "):].strip()}
+        elif line.startswith("prunable") and current is not None:
+            current["prunable"] = line[len("prunable"):].strip() or "prunable"
+            current["reason"] = current["prunable"]
+    if current is not None and "prunable" in current:
+        stale.append(current)
+    return stale
 
 
 def _resolve_git_dir(project_root: Path, git_dir: str) -> Path:
@@ -330,14 +362,21 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
         )
 
     # 5) P0-19：残留任务 worktree 空目录检测（Windows git worktree remove 不完整）。
-    # 扫描主工作树父目录（container 布局的 task_wt_root）下 task-* 目录：
-    # 无 .git 文件 + 无绑定 → 残留空目录，报告供 prune_orphans 清理。
+    # 扫描根用 detect_layout 的 task_wt_root（与 prune_orphans 一致）：container →
+    # 容器根；flat 无任务 worktree 概念 → 直接 ok（不再用 main_wt.parent 硬编码，
+    # 避免 flat 布局误报主工作树父目录的无关 task-* 目录）。
     try:
-        main_wt = Path(project_root).resolve()
-        task_wt_root = main_wt.parent  # container: 平级目录；flat: 同级
-        if task_wt_root.is_dir():
+        from orchd.worktree import detect_layout
+
+        layout = detect_layout(Path(project_root))
+        task_wt_root = layout.get("task_wt_root")
+        if layout.get("layout") != "container" or task_wt_root is None:
+            checks.append(
+                _make_check("worktree_residual", "ok", "flat 布局无任务 worktree，跳过")
+            )
+        elif Path(task_wt_root).is_dir():
             residuals = []
-            for entry in sorted(task_wt_root.iterdir()):
+            for entry in sorted(Path(task_wt_root).iterdir()):
                 if (entry.is_dir()
                         and entry.name.startswith("task-")
                         and not (entry / ".git").exists()):
@@ -357,8 +396,33 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
                 checks.append(
                     _make_check("worktree_residual", "ok", "无残留任务 worktree 目录")
                 )
+        else:
+            checks.append(
+                _make_check("worktree_residual", "ok", "task_wt_root 不存在")
+            )
     except OSError:
         pass
+
+    # 5b) P0-19b：stale worktree 注册（有 git 登记、工作目录已不存在 = prunable）。
+    # 与 worktree_residual 方向相反：后者扫「目录存在但无 .git 登记」，本条扫
+    # 「.git/worktrees 有登记但目录已删」。doctor --fix 执行 git worktree prune。
+    stale = _detect_stale_worktree_registry(project_root)
+    if stale:
+        paths = [s["path"] for s in stale]
+        checks.append(
+            _make_check(
+                "worktree_stale_registry",
+                "fail",
+                f"发现 {len(stale)} 个 prunable worktree 注册（目录已不存在但 git 仍登记）："
+                + "、".join(Path(p).name for p in paths[:10])
+                + ("..." if len(paths) > 10 else "")
+                + "。运行 orchd doctor --fix 执行 git worktree prune 清理。",
+            )
+        )
+    else:
+        checks.append(
+            _make_check("worktree_stale_registry", "ok", "无 prunable worktree 注册")
+        )
 
     # 6) in_review 任务 worktree/分支完整性（2026-08-30 分支丢失复盘 §3）：
     # in_review 是审查等待期（任务可能 idle 数小时），恰是误删高危窗口；
@@ -578,27 +642,106 @@ def _resolve_runtime_dir(orchd_dir: Path) -> Path:
         return orchd_dir
 
 
+def _detect_residual_dirs(project_root: Path) -> list[dict[str, Any]]:
+    """检测残留任务 worktree 目录（P0-19 类，无 .git 登记 + 无活跃绑定）。
+
+    判定与 prune_orphans 的 P0-19 分支一致：目录存在但无 .git 文件
+    （Windows git worktree remove 不完整）且无 session-worktrees 绑定。
+    container 布局下任务 worktree 与主工作树平级（task_wt_root）；flat 布局
+    无任务 worktree 概念 → 返回空。
+    """
+    residues: list[dict[str, Any]] = []
+    try:
+        from orchd.worktree import detect_layout, load_bindings
+        from orchd.ledger import resolve_store_dir
+
+        layout = detect_layout(Path(project_root))
+        if layout.get("layout") != "container":
+            return residues
+        task_wt_root = Path(layout["task_wt_root"])
+        bindings = load_bindings(resolve_store_dir(Path(project_root) / ".orchd"))
+    except Exception:
+        return residues
+
+    if not task_wt_root.is_dir():
+        return residues
+    for entry in sorted(task_wt_root.iterdir()):
+        if (entry.is_dir()
+                and entry.name.startswith("task-")
+                and not (entry / ".git").exists()
+                and entry.name not in bindings):
+            residues.append({
+                "path": str(entry),
+                "type": "residual_dir",
+                "reason": "残留任务 worktree 目录（无 .git 登记且无活跃绑定）",
+                "action": "delete_dir",
+            })
+    return residues
+
+
+def _detect_legacy_flat_residues(project_root: Path) -> list[dict[str, Any]]:
+    """检测 flat 布局遗留的状态文件（container / ORCHD_HOME 重定向生效时）。
+
+    ``resolve_store_dir(orchd_dir) != orchd_dir`` 说明账本根已重定向
+    （container → ``<容器>/.orchd-runtime``，或 ORCHD_HOME 指定），此时
+    ``orchd_dir`` 下的运行时状态文件（_ledger.jsonl / _checkpoint.json 等）是
+    历史 flat 遗留，--fix 备份后删除。flat 布局（无重定向）→ 零操作。
+    """
+    residues: list[dict[str, Any]] = []
+    orchd_dir = Path(project_root) / ".orchd"
+    try:
+        from orchd.ledger import resolve_store_dir
+
+        canonical = resolve_store_dir(orchd_dir)
+    except Exception:
+        return residues
+    if canonical.resolve() == orchd_dir.resolve():
+        return residues  # flat：无重定向，canonical 即 orchd_dir，零操作
+    if not orchd_dir.is_dir():
+        return residues
+    for name in sorted(_RUNTIME_STATE_FILES):
+        p = orchd_dir / name
+        if p.is_file():
+            residues.append({
+                "path": str(p),
+                "type": "legacy_flat_residue",
+                "reason": (
+                    f"container 布局下 flat 遗留状态文件（canonical 在 {canonical}），"
+                    "--fix 备份后删除"
+                ),
+                "action": "delete",
+            })
+    return residues
+
+
 def detect_residues(project_root: Path) -> list[dict[str, Any]]:
     """扫描 orchd 运行时残留，返回待清理项列表。
 
-    检测五类残留：
+    检测八类残留：
     1. 孤儿 session 锁文件（对应 worktree 已不存在）
     2. 僵尸 session runtime 文件（超 TTL 未更新的 session 记录）
     3. 残留 intake 标记（.intake.lock 文件，无 live flock 持锁）
     4. 已误提交入 git 的锁文件（.git 目录外的 .lock 文件出现在 git ls-files 中）
     5. 幽灵任务（账本/checkpoint 派生存在但不在 ``_master.json``）
+    6. stale worktree 注册（prunable，目录已删但 git 仍登记）
+    7. 残留任务 worktree 目录（无 .git 登记 + 无活跃绑定，P0-19 类）
+    8. flat 遗留状态文件（container 重定向生效时 main/.orchd 的历史 runtime 文件）
 
-    运行时残留（1/2/3）以**共享账本根**为扫描根（与 Store 同根，见
+    运行时残留（1/2/3/8）以**共享账本根**为扫描根（与 Store 同根，见
     :func:`_resolve_runtime_dir`）：container 布局扫 ``<容器>/.orchd-runtime/``，
     flat 扫 ``<project_root>/.orchd``。
 
     所有检测均为只读，不执行任何写操作。返回的每项包含：
     - path: 残留文件绝对路径
     - type: 残留类型（orphan_session_lock / zombie_session / intake_lock /
-      git_tracked_lock / ghost_task）
+      git_tracked_lock / ghost_task / stale_worktree_registry / residual_dir /
+      legacy_flat_residue）
     - reason: 判定依据
-    - action: 建议动作（delete / git_rm_cached_then_delete / retract_ghost /
-      ghost_task_manual）
+    - action: 建议动作（delete / delete_dir / git_rm_cached_then_delete /
+      git_worktree_prune / retract_ghost / ghost_task_manual）
+    - disposition: 处置档（auto_clean / legacy_move / manual），判据与自动清理
+      通道同源（``_AUTO_CLEAN_TYPES`` / ``_LEGACY_MOVE_TYPES``）；卫生门禁据此
+      只对 manual 档判失败，auto_clean / legacy_move 档交由清理通道处置
     """
     residues: list[dict[str, Any]] = []
     orchd_dir = Path(project_root) / ".orchd"
@@ -620,6 +763,27 @@ def detect_residues(project_root: Path) -> list[dict[str, Any]]:
     # 5) 幽灵任务：账本/checkpoint 派生存在、但不在 _master.json（task-runtime-hygiene AC1）
     residues.extend(_detect_ghost_tasks(project_root))
 
+    # 6) stale worktree 注册（prunable）：--fix 执行 git worktree prune
+    for s in _detect_stale_worktree_registry(project_root):
+        residues.append({
+            "path": s["path"],
+            "type": "stale_worktree_registry",
+            "reason": s.get("reason", "prunable"),
+            "action": "git_worktree_prune",
+        })
+
+    # 7) 残留任务 worktree 目录（P0-19，--fix 关闭 doctor 断链：worktree_residual → delete_dir）
+    residues.extend(_detect_residual_dirs(project_root))
+
+    # 8) flat 遗留状态文件（container 布局下 main/.orchd 的历史 runtime 文件）
+    residues.extend(_detect_legacy_flat_residues(project_root))
+
+    # 与自动清理通道判据对齐（task-takeover-residue-alignment AC3）：为每项标注处置档
+    # （auto_clean / legacy_move / manual），单一事实源为 _AUTO_CLEAN_TYPES /
+    # _LEGACY_MOVE_TYPES——卫生门禁据此区分「清理器即将处理」与「需人工处置」，不再把
+    # auto-clean 级残留当卫生失败报红（消除检测器与清理通道抢跑的抖动）。
+    for item in residues:
+        item.setdefault("disposition", _residue_disposition(item.get("type")))
     return residues
 
 
@@ -694,33 +858,68 @@ def _detect_zombie_sessions(orchd_dir: Path) -> list[dict[str, Any]]:
 
 
 def _detect_residual_intake_locks(orchd_dir: Path) -> list[dict[str, Any]]:
-    """检测残留 intake 标记（.intake.lock 无 live flock 持锁）。
+    """检测残留 intake 标记（.intake.lock 无 live flock 且已超时）。
 
-    .intake.lock 是准入锁文件，正常 acquire/release 不删除文件。
-    若文件存在但无 live flock 持锁（说明进程已退出但文件未清理），
-    则属于残留，可安全删除。
+    .intake.lock 是准入锁文件，正常 acquire/release 不删除文件（task-intake-lock-path-fix
+    AC5：准入写释放后留下的新鲜标记不得立即判残留，否则卫生门禁每次准入写后闪红约 120s）。
+    判据与 ``ledger.intake_lock_check`` 的 timeout 语义对齐：仅当无 live flock 持有
+    **且**标记年龄 >= ``_INTAKE_LOCK_TIMEOUT``（默认 120s）时才算残留；新鲜标记
+    （刚释放，flock 已放但文件保留）返回空。超时残留仍可被 ``intake_lock_check``
+    自动清除（AC3 timeout_cleaned 语义不回归）。
 
-    复用 ledger.intake_lock_check 的语义：检查 ExclusiveFileLock 是否被持有。
+    时间源优先用标记内 JSON ``timestamp``（acquire 写入的诊断标记），缺失/非法时
+    回退文件 mtime；均不可得时保守跳过（不误报）。
     """
     residues: list[dict[str, Any]] = []
     if not orchd_dir.is_dir():
         return residues
 
-    # 检查 .orchd 根目录的 .intake.lock
+    # 检查运行时根的 .intake.lock（调用方已解析到共享账本根，container/flat 兼容）
     intake_lock = orchd_dir / ".intake.lock"
-    if intake_lock.is_file():
+    if not intake_lock.is_file():
+        return residues
+    try:
+        from orchd.lockfile import ExclusiveFileLock
+        held = ExclusiveFileLock(intake_lock).check().get("held", False)
+    except Exception:
+        return residues  # 无法判定持有态时保守跳过，避免误报
+    if held:
+        return residues  # 被 live flock 持有 = 活跃锁，非残留
+
+    try:
+        from orchd.ledger import _INTAKE_LOCK_TIMEOUT
+
+        timeout_s = float(_INTAKE_LOCK_TIMEOUT)
+    except Exception:
+        timeout_s = 120.0
+    age_s: float | None = None
+    try:
+        content = intake_lock.read_text(encoding="utf-8")
         try:
-            from orchd.lockfile import ExclusiveFileLock
-            held = ExclusiveFileLock(intake_lock).check().get("held", False)
-        except Exception:
-            held = False  # 无法判定时保守跳过
-        if not held:
-            residues.append({
-                "path": str(intake_lock),
-                "type": "intake_lock",
-                "reason": ".intake.lock 文件存在但无 live flock 持锁（进程已退出）",
-                "action": "delete",
-            })
+            data = json.loads(content)
+            ts = float(data.get("timestamp", 0))
+            if ts > 0:
+                age_s = time.time() - ts
+        except (ValueError, TypeError, AttributeError):
+            pass
+    except (OSError, IOError):
+        return residues
+    if age_s is None:
+        try:
+            age_s = time.time() - intake_lock.stat().st_mtime
+        except OSError:
+            return residues
+    if age_s < timeout_s:
+        return residues  # 新鲜标记：准入写刚释放，门禁不闪红
+    residues.append({
+        "path": str(intake_lock),
+        "type": "intake_lock",
+        "reason": (
+            ".intake.lock 无 live flock 且已超时 "
+            f"（age {age_s:.1f}s >= {timeout_s:.0f}s，进程已退出）"
+        ),
+        "action": "delete",
+    })
 
     return residues
 
@@ -847,21 +1046,28 @@ def _ghost_retract_target(events: list[dict[str, Any]]) -> str | None:
 def _is_protected_path(path: Path, project_root: Path) -> bool:
     """检查路径是否在保护白名单中（--fix 绝不触碰）。
 
-    白名单硬编码在 _PROTECTED_PATHS 中，覆盖引擎核心状态文件。
-    比较时取相对路径的最后一段（文件名），确保无论绝对路径如何都生效。
+    源码资产（_master.json / IDEAS.md 等）与位置无关恒保护；运行时状态文件
+    （_ledger.jsonl / _checkpoint.json 等）仅当位于 canonical 账本根时保护——
+    container 布局下 main/.orchd 的 flat 遗留属于可清残留（不保护，由
+    _detect_legacy_flat_residues 检出后备份清理）。
     """
+    name = path.name
+    if name in _SOURCE_ASSETS:
+        return True
+    if name in _RUNTIME_STATE_FILES:
+        orchd_dir = Path(project_root) / ".orchd"
+        canonical = _resolve_runtime_dir(orchd_dir)
+        try:
+            path.resolve().relative_to(canonical.resolve())
+            return True
+        except ValueError:
+            return False
+    # 完整相对路径保护（保持向后兼容：白名单内完整路径也保护）
     try:
         rel = path.relative_to(project_root)
+        return str(rel) in _PROTECTED_PATHS
     except ValueError:
-        # path 不在 project_root 下，按文件名判定
-        rel = Path(path.name)
-    # 检查文件名是否在白名单中
-    if rel.name in _PROTECTED_PATHS:
-        return True
-    # 检查完整相对路径
-    if str(rel) in _PROTECTED_PATHS:
-        return True
-    return False
+        return False
 
 
 def doctor(project_root: Path) -> dict[str, Any]:
@@ -994,6 +1200,43 @@ def doctor_fix(
                 })
             continue
 
+        if action == "git_worktree_prune":
+            try:
+                prune_result = _run_git(project_root, ["worktree", "prune"])
+                if prune_result.returncode != 0:
+                    errors.append({
+                        **item,
+                        "error": f"git worktree prune 失败: {prune_result.stderr.strip()}",
+                    })
+                else:
+                    cleaned.append({**item, "backup": None})
+            except Exception as exc:
+                errors.append({
+                    **item,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            continue
+
+        if action == "delete_dir":
+            # 残留任务 worktree 目录：先 rmdir（空目录），非空则 _rmtree_force
+            # （Windows 句柄场景兜底，与 prune_orphans P0-19 分支语义一致）。
+            try:
+                if path.is_dir():
+                    try:
+                        path.rmdir()
+                    except OSError:
+                        from orchd.worktree import _rmtree_force
+
+                        if not _rmtree_force(path):
+                            raise OSError(f"目录清理失败: {path}")
+                cleaned.append({**item, "backup": None})
+            except Exception as exc:
+                errors.append({
+                    **item,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            continue
+
         try:
             if action == "git_rm_cached_then_delete":
                 # 先从 git 移除追踪，再删除文件
@@ -1045,4 +1288,210 @@ def doctor_fix(
             f"{len(errors)} 项失败）。"
             f"备份目录：{backup_path}"
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 自动清洁（task-doctor-auto-clean）
+# ---------------------------------------------------------------------------
+# 分级模型（与手动 doctor --fix 共享 detect_residues 单一事实源）：
+#   Auto-Clean（低风险，直接处理，无备份）：
+#     orphan_session_lock / zombie_session → 直接删文件
+#     residual_dir → 删目录（rmdir / _rmtree_force 兜底）
+#     stale_worktree_registry → git worktree prune
+#   Legacy move（可回滚）：legacy_flat_residue → 移入 .doctor-backup/legacy/<ts>/ 滚动区
+#   Manual notice（高风险 / 无自动通道，仅报告不执行）：
+#     ghost_task / git_tracked_lock / intake_lock
+# 环境变量 ORCHD_AUTO_CLEAN ∈ {off, report} → 全部降级为只报告（disabled=True）。
+_AUTO_CLEAN_TYPES = frozenset({
+    "orphan_session_lock",
+    "zombie_session",
+    "residual_dir",
+    "stale_worktree_registry",
+})
+_LEGACY_MOVE_TYPES = frozenset({"legacy_flat_residue"})
+
+# 卫生门禁豁免档位（单一事实源，消费方 scripts/verify_project_hygiene.py）：
+# 属这两档的残留由自动清理通道处置，不与清理器抢跑、不计入卫生失败判定。
+AUTO_CLEAN_DISPOSITIONS: tuple[str, ...] = ("auto_clean", "legacy_move")
+
+
+def _residue_disposition(rtype: str | None) -> str:
+    """残留项处置档：``auto_clean`` / ``legacy_move`` / ``manual``。
+
+    判据与自动清理通道同源（``_AUTO_CLEAN_TYPES`` / ``_LEGACY_MOVE_TYPES``）：
+    - ``auto_clean``  ：读路径（status / watchdog）的 ``auto_clean`` 会直接处置；
+    - ``legacy_move`` ：移入 ``.doctor-backup/legacy/<ts>/`` 滚动备份区；
+    - ``manual``      ：无自动通道、仅报告（ghost_task / git_tracked_lock / intake_lock）。
+
+    卫生门禁（``scripts/verify_project_hygiene.py``）只对 ``manual`` 档失败，
+    避免「检测器报清理器即将删除之物」的抖动（residue-report-autoclean-alignment）。
+    """
+    if rtype in _AUTO_CLEAN_TYPES:
+        return "auto_clean"
+    if rtype in _LEGACY_MOVE_TYPES:
+        return "legacy_move"
+    return "manual"
+
+
+def _auto_clean_item(project_root: Path, item: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """执行单个 Auto-Clean 残留的清理（best-effort，失败返回 (False, 带 error)）。"""
+    path = Path(item["path"])
+    action = item.get("action", "delete")
+    try:
+        if action == "git_worktree_prune":
+            res = _run_git(project_root, ["worktree", "prune"])
+            if res.returncode != 0:
+                return False, {**item, "error": res.stderr.strip()}
+            return True, {**item, "disposition": "pruned"}
+        if action == "delete_dir":
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    from orchd.worktree import _rmtree_force
+
+                    if not _rmtree_force(path):
+                        raise OSError(f"目录清理失败: {path}")
+            return True, {**item, "disposition": "deleted"}
+        if path.exists():
+            path.unlink()
+        return True, {**item, "disposition": "deleted"}
+    except Exception as exc:
+        return False, {**item, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _auto_move_legacy(
+    project_root: Path, item: dict[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    """把 flat 遗留状态文件移入 ``.orchd/.doctor-backup/legacy/<ts>/`` 滚动备份区。
+
+    移动而非删除：早期 flat 布局的运行时文件可能仍含历史状态，保留供人工回滚。
+    备份根按时间戳分桶，同名不冲突；移动失败返回 (False, 带 error)。
+    """
+    path = Path(item["path"])
+    backup_root = (
+        Path(project_root) / ".orchd" / ".doctor-backup" / "legacy" / f"{int(time.time())}"
+    )
+    try:
+        backup_root.mkdir(parents=True, exist_ok=True)
+        dest = backup_root / path.name
+        if path.exists():
+            shutil.move(str(path), str(dest))
+        return True, {**item, "backup": str(dest), "disposition": "moved"}
+    except Exception as exc:
+        return False, {**item, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def auto_clean(
+    project_root: Path, *, emit_stderr: bool = True
+) -> dict[str, Any]:
+    """doctor 自动清洁：读路径（status / watchdog）自动执行的低风险残留清理。
+
+    分级判定与手动 ``doctor --fix`` 共享 ``detect_residues`` 单一事实源：
+    - Auto-Clean 类型（orphan_session_lock / zombie_session / residual_dir /
+      stale_worktree_registry）直接删/prune，无备份；
+    - legacy_flat_residue 移入 ``.orchd/.doctor-backup/legacy/<ts>/`` 滚动备份区
+      （可回滚）；
+    - 高风险项（ghost_task / git_tracked_lock / intake_lock）仅计入
+      ``manual_notice``，不自动执行。
+
+    环境变量 ``ORCHD_AUTO_CLEAN`` ∈ {off, report} 时降级为只报告不执行
+    （``disabled=True``）。
+
+    stderr 留痕与开关契约（task-doctor-auto-clean 返工）：
+    - ``emit_stderr=False`` 时完全静默（status/watchdog 挂载处按
+      ``config.guidance_stderr`` 传入），结果仍并入返回 JSON 的 ``auto_clean`` 字段；
+    - 仅对**真正发生**的 sanitize/move 动作（含失败留痕）写 ``[回收]`` stderr，
+      ``manual_notice`` / ``reported_only`` 这类未做任何清理的项**不发** stderr，
+      避免读路径噪声。
+    全程 best-effort，单项失败不中断其余项，亦不抛异常。
+
+    Args:
+        project_root: canonical 项目根。
+        emit_stderr: 是否写 ``orchd ▸ [回收]`` stderr（默认 True）。
+
+    Returns:
+        {
+            "auto_cleaned": [...],   # 已自动清理的残留项
+            "auto_moved": [...],     # 已移入备份区的残留项
+            "manual_notice": [...],  # 仅报告不执行的项
+            "disabled": bool,        # ORCHD_AUTO_CLEAN 关闭时为 True
+        }
+    """
+    project_root = Path(project_root).resolve()
+    mode = os.environ.get("ORCHD_AUTO_CLEAN", "").strip().lower()
+    disabled = mode in ("off", "report")
+
+    from orchd.worktree import _log_recycle, _recycle_actor
+
+    actor = _recycle_actor()
+    auto_cleaned: list[dict[str, Any]] = []
+    auto_moved: list[dict[str, Any]] = []
+    manual_notice: list[dict[str, Any]] = []
+
+    for item in detect_residues(project_root):
+        rtype = item.get("type")
+        target = str(Path(item.get("path", "")))
+        if disabled:
+            # 关闭 / 只报告：不执行、不留痕，仅计数报告
+            manual_notice.append({**item, "disposition": "reported_only"})
+            continue
+        if rtype in _AUTO_CLEAN_TYPES:
+            ok, record = _auto_clean_item(project_root, item)
+            if ok:
+                if emit_stderr:
+                    _log_recycle([{
+                        "action": "auto_clean",
+                        "type": rtype,
+                        "target": target,
+                        "disposition": record.get("disposition"),
+                        "reason": item.get("reason", ""),
+                        "actor": actor,
+                    }])
+                auto_cleaned.append(record)
+            else:
+                if emit_stderr:
+                    _log_recycle([{
+                        "action": "auto_clean_failed",
+                        "type": rtype,
+                        "target": target,
+                        "error": record.get("error", ""),
+                        "actor": actor,
+                    }])
+                manual_notice.append(record)
+        elif rtype in _LEGACY_MOVE_TYPES:
+            ok, record = _auto_move_legacy(project_root, item)
+            if ok:
+                if emit_stderr:
+                    _log_recycle([{
+                        "action": "auto_move",
+                        "type": rtype,
+                        "target": target,
+                        "disposition": "moved_to_backup",
+                        "backup": record.get("backup"),
+                        "reason": item.get("reason", ""),
+                        "actor": actor,
+                    }])
+                auto_moved.append(record)
+            else:
+                if emit_stderr:
+                    _log_recycle([{
+                        "action": "auto_move_failed",
+                        "type": rtype,
+                        "target": target,
+                        "error": record.get("error", ""),
+                        "actor": actor,
+                    }])
+                manual_notice.append(record)
+        else:
+            # ghost_task / git_tracked_lock / intake_lock 等高风险项：仅报告、
+            # 零 stderr（未执行任何清理动作，读写路径均不发噪声）
+            manual_notice.append({**item, "disposition": "manual"})
+
+    return {
+        "auto_cleaned": auto_cleaned,
+        "auto_moved": auto_moved,
+        "manual_notice": manual_notice,
+        "disabled": disabled,
     }

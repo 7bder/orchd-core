@@ -1,4 +1,4 @@
-"""gitops guard 域：守卫体系（16 函数 + 4 常量）。
+"""gitops guard 域：守卫体系（18 个 def = 17 个模块级函数 + 1 个嵌套函数；4 个常量）。
 
 整块迁移自 orchd/gitops.py，函数体逐字一致，仅 import 行调整。
 """
@@ -160,6 +160,7 @@ def run_guard(
     fallback: Any = None,
     context: dict[str, Any] | None = None,
     hint: str = "",
+    na_hint: str | None = None,
     error_code: ErrorCode = ErrorCode.E030,
 ) -> Any:
     """执行一个完整性 / 安全门禁，按错误语义三分类统一处置。
@@ -180,7 +181,12 @@ def run_guard(
             fallback 与"校验通过"的返回值可区分（如用 None 表示未知、
             ``[]`` 表示无问题），避免重演"空清单被当成无缺失"。
         context: 附加上下文（task_id / command 等），进降级记录与错误 details。
-        hint: 处置建议，进降级记录与错误 details。
+        hint: 校验故障（非 ``NotApplicableError`` 的异常）的处置建议，进降级记录
+            与错误 details——fail-closed 文案（如「检测未生效，已 fail-closed
+            阻断」）只应出现在这里，**不得**被"环境不适用"的合法降级复用。
+        na_hint: ``NotApplicableError``（环境不适用，合法降级、不阻断）分支的
+            独立处置建议；缺省时按 status 生成「环境不适用，本次未阻断」文案，
+            与 fail-closed 文案可区分（task-done-guard-layout-strict L3）。
         error_code: ``on_error=GUARD_FAIL_CLOSED`` 时抛出的错误码（默认 E030；
             L1 分支守卫 / L2 session 锁传 E018）。
 
@@ -203,7 +209,10 @@ def run_guard(
             status=GUARD_STATUS_NOT_APPLICABLE,
             reason=str(exc) or "环境不适用",
             context=context,
-            hint=hint or None,
+            hint=na_hint or (
+                "环境不适用，本次未阻断（门禁按降级语义放行，非校验通过）；"
+                "原因见 reason"
+            ),
         )
         return fallback
     except Exception as exc:  # noqa: BLE001  语义三分类的第三类：校验故障
@@ -305,8 +314,8 @@ def _build_wrong_branch_hint(
             wt_name = f"task-{short}"
         if wt_exists:
             hint_parts.append(
-                f"container 布局下请进入任务 worktree 目录 {wt_name}/ "
-                f"（或 cd ../{wt_name}）"
+                f"{command} 应在任务 worktree 执行：container 布局下请进入"
+                f"任务 worktree 目录 {wt_name}/（或 cd ../{wt_name}）"
             )
         else:
             hint_parts.append(
@@ -533,6 +542,21 @@ def guard_claim(
         )
 
 
+def _layout_is_not_container(project_root: Path) -> bool:
+    """判定项目是否为非 container 布局（best-effort，布局未知 / 探测失败 → True）。
+
+    done 分支守卫的布局分流依据：container 布局（多 worktree）下只允许任务分支，
+    默认分支（主工作树）不在白名单内——从主工作树执行 done 会被拒绝；flat /
+    布局未知一律视为"非 container"，保持既有默认分支放行语义（零回归）。
+    """
+    try:
+        from orchd.worktree import detect_layout
+
+        return detect_layout(project_root).get("layout") != "container"
+    except Exception:
+        return True
+
+
 def guard_done_branch(
     project_root: Path | None,
     *,
@@ -541,7 +565,16 @@ def guard_done_branch(
     agent_id: str | None = None,
     degraded: list[dict[str, Any]] | None = None,
 ) -> None:
-    """done 前置分支守卫（L1+L2 意图化封装）：须在 ``task/{task_id}`` 或默认分支。
+    """done 前置分支守卫（L1+L2 意图化封装）：须在 ``task/{task_id}``，container
+    布局下默认分支不再放行（布局感知收紧，task-done-guard-layout-strict）。
+
+    **布局分流**：
+    - flat 布局（或布局未知 / project_root=None 的非 git 降级）：``task/{task_id}``
+      或默认分支均可（既有行为，零回归）；
+    - container 布局：仅 ``task/{task_id}``——done 应在其任务 worktree 内执行
+      （root 解析由 task-done-root-resolution 承担；本守卫是纵深防御，防"解析
+      逻辑因环境异常未生效"时再次从主工作树执行 done 而静默劣化），从主工作树
+      执行 done 拒绝（E018，hint 指引"应在任务 worktree 执行"）。
 
     **不要求干净**——files_to_edit 范围内的未提交改动是正常状态（由引擎
     ensure_committed 兜底提交）；干净校验放在自动提交之后
@@ -549,9 +582,12 @@ def guard_done_branch(
     """
     default = get_default_branch(project_root) if project_root else None
     default = default or "main"
+    allowed: set[str] = {f"task/{task_id}"}
+    if project_root is None or _layout_is_not_container(project_root):
+        allowed.add(default)
     guard_write_command(
         project_root,
-        allowed_branches={f"task/{task_id}", default},
+        allowed_branches=allowed,
         require_clean=False,
         command="done",
         orchd_dir=orchd_dir,

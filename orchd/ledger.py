@@ -224,7 +224,7 @@ class TaskState:
 
 # 僵尸审查认领（W-2）：审查认领超过该时长且未见提交，即由 request / status /
 # doctor 浮出、可供接管。默认 10 分钟（复用本次实测校准值）。
-_REVIEW_STALE_DEFAULT_S = 600
+_REVIEW_STALE_DEFAULT_S = 300
 
 
 def review_stale_timeout_s() -> float:
@@ -611,7 +611,18 @@ def session_start(
     path = _session_runtime_path(orchd_dir, identity["session_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {**data, "path": str(path), "started": True}
+    return {
+        **data,
+        "path": str(path),
+        "started": True,
+        "inject_action": {
+            "description": "将 session_token 注入 ORCHD_SESSION_ID 环境变量，后续命令即识别为同一会话身份",
+            "powershell": f'$env:ORCHD_SESSION_ID="{token}"',
+            "bash": f'export ORCHD_SESSION_ID="{token}"',
+            "env_var": "ORCHD_SESSION_ID",
+            "token": token,
+        },
+    }
 
 
 def session_current(orchd_dir: Path) -> dict[str, Any]:
@@ -634,7 +645,9 @@ def session_current(orchd_dir: Path) -> dict[str, Any]:
             [{
                 "hint": (
                     "请先运行 'orchd session start' 并在后续命令中将返回的 "
-                    "session_token 注入 ORCHD_SESSION_ID"
+                    "session_token 注入 ORCHD_SESSION_ID；"
+                    "若已有活跃 session（session current 可查），可直接复用其 "
+                    "session_token 注入 ORCHD_SESSION_ID，无需重复 start"
                 ),
             }],
         )
@@ -646,7 +659,7 @@ def session_current(orchd_dir: Path) -> dict[str, Any]:
             "session_not_found: 当前指纹没有对应的 session runtime 文件",
             [{
                 "session_id": identity["session_id"],
-                "hint": "请先运行 'orchd session start' 开启会话，并将 session_token 注入 ORCHD_SESSION_ID",
+                "hint": "请先运行 'orchd session start' 开启会话，并将 session_token 注入 ORCHD_SESSION_ID；若已有活跃 session 可复用其 session_token，无需重复 start",
             }],
         )
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -1944,6 +1957,13 @@ class Store:
                 comments = event.get("comments")
                 if comments:
                     info.review_comments.setdefault(tid, []).append(comments)
+                # task-review-comments-gate-and-stale-timeout（B）：与
+                # extract_review_comments 对齐，历史空打回注入占位（derived 缓存路径）。
+                elif event.get("verdict") == "CHANGES_REQUESTED":
+                    info.review_comments.setdefault(tid, []).append(
+                        "[该次打回未附审查意见（历史数据），请联系审查者补充；"
+                        "当前版本已强制要求 CHANGES_REQUESTED 必须附意见]"
+                    )
             elif etype == "REVIEW_CLAIMED":
                 aid = event.get("agent_id")
                 if aid:

@@ -48,7 +48,11 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     from orchd.ledger import Store, resolve_store_dir, resolve_workspace_root
     from orchd.onboard import _decode_subprocess_output
     from orchd.spec import load_master
-    from orchd.split import amend
+    from orchd.split import (
+        amend,
+        is_text_only_spec_revision,
+        validate_terminal_revision,
+    )
 
     # amend-only-canonical（task-master-single-copy）：分支守卫前移——在 canonical
     # 化**之前**检查调用方 cwd 所在分支。此前守卫位于 split.amend 内且基于
@@ -96,6 +100,14 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     orchd_dir = master_path.parent
     store = Store(orchd_dir)
     project_root = orchd_dir.parent
+
+    # task-terminal-spec-revision-channel：终态规格文本修订通道（--revise-terminal）。
+    # --reason 非空硬校验前移到此处（任何写入 / dry-run 之前 fail-fast）；终态性校验
+    # 留在 split.amend 内（那里有 status 权威来源），两处共用 validate_terminal_revision
+    # 单一事实源。
+    revise_terminal = getattr(args, "revise_terminal", None)
+    if revise_terminal is not None:
+        validate_terminal_revision(getattr(args, "reason", None))
 
     # task-amend-decl-patch-channel：声明域 CLI 补登（--task + --files-to-edit /
     # --exempt-files / --verify-command）。列表类为并集追加语义（只增：CLI 表达
@@ -167,13 +179,28 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         or existing_tasks.get(t.get("id", "")) != t
     ]
 
+    # task-terminal-spec-revision-channel：纯文本修订不改 verify_command → 重跑 dry-run
+    # 无信息量；且目标任务的**存量** E024/E027（历史定义缺 --basetemp / 含不安全段）
+    # 会把这次文本修订整体阻断，使通道对历史终态任务不可用。故把"仅文本修订"的目标
+    # 任务同时剔出 dry-run 与存量告警阻断集合（只影响开关指向的那一个任务）。
+    dry_run_skipped: list[str] = []
+    if revise_terminal is not None:
+        old_def = existing_tasks.get(revise_terminal)
+        new_def = next(
+            (t for t in master.tasks if t.get("id") == revise_terminal), None,
+        )
+        if (old_def is not None and new_def is not None
+                and is_text_only_spec_revision(old_def, new_def)):
+            dry_run_skipped.append(revise_terminal)
+    dry_run_changed = [tid for tid in changed if tid not in dry_run_skipped]
+
     # dry-run 试跑将变更任务的 verify_command（与 done 相同 shell 执行、同 cwd、
     # 限时 30s；2026-08-08 升级：assertion_mismatch 类失败阻断注册（E028），
     # E024/E027（缺 basetemp / 不安全段）阻断注册；expected_pending 仅提示）
     task_map = {t.get("id", ""): t for t in master.tasks}
     dry_run_results: list[dict[str, Any]] = []
     blocking_errors: list[dict[str, Any]] = []
-    for tid in changed:
+    for tid in dry_run_changed:
         verify_cmd = task_map.get(tid, {}).get("verify_command")
         if not verify_cmd:
             continue
@@ -241,7 +268,7 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # AC4 grandfather：仅收集 changed 任务（或新注册任务）的 E024/E027，
     # 存量任务命中仅 warning 不阻断——避免存量 E027/E024 阻塞任何后续 amend。
     qerrors = validate_quality(master)
-    changed_set = set(changed)
+    changed_set = set(dry_run_changed)
     for qe in qerrors:
         if qe.code in (ErrorCode.E024, ErrorCode.E027):
             # 从 path（$.tasks[i].verify_command）解析任务 index → 定位 task id
@@ -270,8 +297,12 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             blocking_errors,
         )
 
-    # 校验通过后执行 amend（写入 snapshot + checkpoint）
-    result = amend(orchd_dir, master, store)
+    # 校验通过后执行 amend（写入 snapshot + checkpoint；透传终态文本修订通道）
+    result = amend(
+        orchd_dir, master, store,
+        revise_terminal=revise_terminal,
+        reason=getattr(args, "reason", None),
+    )
 
     # 成功后 best-effort 自动提交（锁外、不阻塞状态机，语义对齐 merged:false）
     summary = ", ".join(changed) if changed else "snapshot refresh"
@@ -319,6 +350,9 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
 
     if dry_run_results:
         result["verify_dry_run"] = dry_run_results
+    if dry_run_skipped:
+        # 透明化：本次跳过 dry-run 的任务（纯文本修订，verify_command 未变）
+        result["verify_dry_run_skipped"] = dry_run_skipped
     return result
 
 
@@ -406,12 +440,18 @@ def register(sub) -> None:
     p.add_argument("--master", default=".orchd/_master.json")
     p.add_argument("--task", default=None,
                    help="声明域补登：目标任务 id（需至少再带一个补丁字段）")
-    p.add_argument("--files-to-edit", nargs="*", default=None,
-                   help="补登 files_to_edit（并集追加，只增不删）")
-    p.add_argument("--exempt-files", nargs="*", default=None,
-                   help="补登 exempt_files（并集追加，只增不删）")
+    p.add_argument("--files-to-edit", nargs="*", action="extend", default=None,
+                   help="补登 files_to_edit（并集追加，只增不删；支持重复标志累加）")
+    p.add_argument("--exempt-files", nargs="*", action="extend", default=None,
+                   help="补登 exempt_files（并集追加，只增不删；支持重复标志累加）")
     p.add_argument("--verify-command", default=None,
                    help="覆写 verify_command")
+    p.add_argument("--revise-terminal", default=None, dest="revise_terminal",
+                   help="终态任务规格文本修订：目标 task_id（须为 completed/cancelled，"
+                        "需配 --reason；仅放行 acceptance_criteria / brief / name / "
+                        "deliverables，写 AMEND 审计事件并同步快照）")
+    p.add_argument("--reason", default=None,
+                   help="修订理由（--revise-terminal 必填、非空；写入 AMEND 审计事件）")
     p.set_defaults(func=_cmd_amend)
 
     # retract

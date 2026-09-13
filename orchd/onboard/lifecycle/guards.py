@@ -178,7 +178,8 @@ def _guard_zero_residual(
             raise RuntimeError(
                 "git status 探测失败（list_tracked_changes 返回 None）"
             )
-        return [f for f in tracked if f in files_to_edit]
+        from orchd.pool import _is_path_covered
+        return [f for f in tracked if any(_is_path_covered(d, f) for d in files_to_edit)]
 
     residual = run_guard(
         _residual_guard,
@@ -213,6 +214,12 @@ def _guard_out_of_scope(
     对任务分支相对 main 的「实际改动文件」与 files_to_edit ∪ exempt_files 显式
     比照；detected 越界 → 抛 E010。仅"环境不适用"允许降级且必须留痕，校验故障
     （git 超时 / 解析失败）fail-closed 阻断。
+
+    task-decl-concession-autoregister：引入**越界分诊**——连带类（同名测试
+    ``tests/test_<stem>.py``、``docs/*.md``，经 spec.is_concession_file 单一
+    来源白名单）自动登记（写 AMEND 审计事件，复用既有事件类型与 amend 语义，
+    不新增事件类型、不改 _apply_event 语义）、不阻断 done；高风险类（引擎核心
+    ``orchd/`` 既有文件、约定文件、他人声明或在途文件）仍 E010 拒绝。
     """
     if not project_root:
         return
@@ -249,7 +256,9 @@ def _guard_out_of_scope(
         from orchd.worktree import _git_diff_names
 
         actual_modified = _git_diff_names(project_root, task_id)
-        return [f for f in actual_modified if f not in allowed]
+        from orchd.pool import _is_path_covered
+        allowed_list = list(allowed)
+        return [f for f in actual_modified if not any(_is_path_covered(a, f) for a in allowed_list)]
 
     out_of_scope = run_guard(
         _out_of_scope_guard,
@@ -262,12 +271,31 @@ def _guard_out_of_scope(
     ) or []
     if not out_of_scope:
         return
+
+    # task-decl-concession-autoregister：越界分诊——连带类自动登记放行，
+    # 高风险类仍 E010 拒绝（护栏强度不下降）。
+    from orchd.spec import is_concession_file
+
+    files_to_edit = [f for f in (task_def.get("files_to_edit") or []) if isinstance(f, str)]
+    concession: list[str] = []
+    high_risk: list[str] = []
+    for f in out_of_scope:
+        if is_concession_file(f, files_to_edit):
+            concession.append(f)
+        else:
+            high_risk.append(f)
+
+    if concession:
+        _auto_register_concession(project_root, task_id, concession)
+    if not high_risk:
+        return
+
     # task-amend-guidance-mainwt：定位主工作树，生成带绝对路径的可执行 amend 命令
     try:
         main_wt = str(main_worktree_root(project_root))
         from orchd.guide import amend_mainwt_command
         patch_cmd = amend_mainwt_command(
-            task_id, main_wt, files=out_of_scope[:3])
+            task_id, main_wt, files=high_risk[:3])
     except Exception:
         main_wt = "<主工作树路径>"
         patch_cmd = f'cd "{main_wt}"; python .orchd/__main__.py amend --task {task_id} --files-to-edit <file>'
@@ -276,7 +304,8 @@ def _guard_out_of_scope(
         "file_conflict: 实现改动超出任务 files_to_edit∪exempt_files 声明范围",
         [{
             "task_id": task_id,
-            "out_of_scope_files": sorted(out_of_scope),
+            "out_of_scope_files": sorted(high_risk),
+            "auto_registered_files": sorted(concession),
             "declared_files": sorted(allowed),
             "main_worktree": main_wt,
             "hint": (
@@ -288,3 +317,73 @@ def _guard_out_of_scope(
             ),
         }],
     )
+
+
+def _auto_register_concession(
+    project_root: Path | None,
+    task_id: str,
+    files: list[str],
+) -> None:
+    """连带类自动登记：写 AMEND 审计事件（task-decl-concession-autoregister）。
+
+    复用既有 AMEND 事件类型与 amend 语义（**不新增事件类型、不改
+    ``ledger._apply_event`` 语义**）：AMEND 为纯审计事件（``_event_target_status``
+    返回 None → 跳过状态机校验，``_apply_event`` 无 AMEND 分支 → 不影响任务状态），
+    审计明细随事件落账，用既有 ledger/status 入口即可回查。
+
+    **幂等（code review R1 修复）**：``_guard_out_of_scope`` 在真实 CLI 路径会被
+    调用两次（``cli/commands/workflow.py`` 的 done 早检 + ``lifecycle/core.py``
+    的 done 完整性门禁），若各自登记将产生重复 AMEND 事件（且随 done 重试累积）。
+    故写事件前先扫描 ledger 已存在的 ``reason=auto_concession_registration`` 事件，
+    按其 ``files`` 集合去重——同批连带文件只会落账一条审计。
+
+    best-effort：store 不可用或写事件失败不阻断 done（自动登记为增益而非护栏，
+    护栏 = 高风险类仍 E010，与登记动作解耦）。身份经会话环境解析（与 claim/done
+    同一会话级指纹），无需调用方透传——保持 ``_guard_out_of_scope`` 签名稳定。
+    """
+    if not project_root or not files or not task_id:
+        return
+    try:
+        from orchd.ledger import Store, resolve_agent_id
+
+        orchd_dir = project_root / ".orchd"
+        store = Store(orchd_dir)
+        agent_id = resolve_agent_id(orchd_dir)
+        from orchd.gitops_ops import make_event
+
+        # 幂等：已登记的同 reason 连带文件不再重复写事件（防 CLI 早检 + done 双调用双写）
+        already_registered: set[str] = set()
+        try:
+            for ev in store._read_ledger_lines(from_line=1):
+                if (
+                    ev.get("task_id") == task_id
+                    and ev.get("type") == "AMEND"
+                    and ev.get("reason") == "auto_concession_registration"
+                ):
+                    already_registered.update(ev.get("files") or [])
+        except Exception:
+            already_registered = set()
+        pending = [f for f in files if f not in already_registered]
+        if not pending:
+            return
+
+        store.acquire_lock()
+        try:
+            for f in pending:
+                ev = make_event(
+                    task_id, agent_id, "AMEND",
+                    reason="auto_concession_registration",
+                    files=[f],
+                    hint=(
+                        "done 越界分诊：连带类自动登记（同名测试 / docs/*.md 白名单），"
+                        "原 files_to_edit 无需人工 amend 补声明"
+                    ),
+                )
+                store.append_event(ev)
+            new_state = store.replay()
+            store.update_checkpoint(new_state)
+        finally:
+            store.release_lock()
+    except Exception:
+        # best-effort：登记失败不影响 done（护栏已由高风险 E010 独立保证）
+        return

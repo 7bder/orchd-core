@@ -92,3 +92,12 @@ orchd-dashboard/
 .orchd-runtime-backup-*/
 _e020_tests_extract.txt
 $null
+
+# 大版本审查报告（review/：2026-09-10 全维度审查，总览 + 4 篇分维度 + 并行 agent 报告）
+# 未跟踪的审查过程产物，暂不入库；文件保留在本地，需留档时再复制入 docs/
+/review/
+
+# 引擎运行时 hook 产物（task-done-cwd-hook-hygiene）：task-decl-hooks-autoset 将
+# core.hooksPath 指向 .githooks 后，claim 期安装的 L3 pre-commit hook 落进被跟踪的
+# .githooks/ 目录；该运行时产物须忽略，避免活跃 claim 期 git status 常显未跟踪。
+.githooks/pre-commit

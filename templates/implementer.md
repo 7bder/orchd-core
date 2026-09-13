@@ -8,7 +8,7 @@
 
 1. **认领任务**：`python .orchd/__main__.py request` 获取候选 → 确认能力匹配 → `python .orchd/__main__.py claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
    - **若 `request` 返回无候选（`candidate=None` / `next_action=exit`）**：立即停止，不尝试 `claim`、不重试 `request`、不 `--auto-claim`；向用户报告并等待下一条指令（引擎分配为准）。
-2. **阅读上下文**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）
+2. **阅读上下文（按版本/按需读，2026-09-13 读取纪律）**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）；**claim 响应已含任务定义全文与 review_comments/previous_changes，无需再读 master.json**；规则文件（.orchd/rules/**、SKILL.md、templates/**）会话内已读且版本未变不重读；>64KB 大文件用 grep/offset+limit 定位读（读取纪律 A1/A2/A3 详见 .orchd/SKILL.md）
 3. **实现**：修改 files_to_edit 中列出的文件，交付功能代码 + 测试代码
 4. **自验**：执行 verify_command 确认通过
 5. **报告完成**：`python .orchd/__main__.py done --task {id} --changes "变更描述"`

@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 # 引导语义：返回 {step, read, template, command, hint} 结构，供 agent/用户据以行动。
-# step    —— 建议执行的下一步动作标识（first_time / request_review / request_impl /
-#             done / wait_review / request_new_idea / optional_cancel / done_all）
+# step    —— 建议执行的下一步动作标识；**全部取值见模块级常量 GUIDANCE_STEPS**
+#             （单一事实源，此处不复述清单——历史教训：复述清单漏了 5 个实际取值，
+#             并留了一个全仓无人返回的死词汇 request_new_idea）
 # read    —— 知识路由：该读的规则文件路径数组（可空数组 [] 表示无建议）
 # template—— 方法路由：该用的模板路径数组（可空数组 [] 表示无建议）
 # command —— 建议执行的 orchd 命令（含参数占位，用户替换占位符）
@@ -38,6 +40,74 @@ from typing import Any
 # orchd 入口命令前缀（零根入口 .orchd/__main__.py，容器布局下从项目根运行）。
 # 集中为模块级常量：入口变更时只改此处，避免 20+ 处命令/hint 字符串漂移。
 _ENTRY_CMD = "python .orchd/__main__.py"
+
+
+# ---------------------------------------------------------------------------
+# guidance step 词表与旁路导航映射（单一事实源，task-guide-step-vocab-and-routing-fix）
+# ---------------------------------------------------------------------------
+# 本集合登记 **guidance 的 step 全部可能取值**：各分支、模块文档与完备性断言
+# （tests/test_guidance_sync.py）均以此为准，禁止散落裸字面量。
+#
+# ⚠ 扫描范围提示：orchd/gitops_ops.py 里也有 "step" 键（create / checkout），
+# 那是**分支状态字段**、与 guidance 语义无关；做全包 AST 扫描时必须排除该处，
+# 不得把它并入本词表。
+GUIDANCE_STEPS: frozenset[str] = frozenset({
+    "first_time",       # 未初始化项目（无 _master.json）
+    "empty_project",    # 已初始化但 0 任务
+    "claim_review",     # 有可领审查任务
+    "submit_review",    # 本 agent 已领审查、待提交结论（原实现缺此出口 → 死循环）
+    "wait_review",      # 审查已被他人领取 / 有任务在实现中
+    "rework_first",     # 有返工任务（曾被审查打回）待认领
+    "request_impl",     # 有待认领实现任务
+    "done",             # 本 agent 已认领实现任务，待 done
+    "optional_cancel",  # 存在已取消任务（可选处置）
+    "done_all",         # 全部任务已完成
+    "check_status",     # 兜底：无可匹配分支
+    "stop_wait",        # request 无候选：停止等待用户指令
+    "lesson_review",    # done 收尾挂起：lessons 暂存待人工审核
+    "recover",          # 错误恢复指引（error_guidance）
+    "audit_merge",      # review code APPROVED 后附 audit_merge guidance（task-review-completion-guidance）
+})
+
+# 旁路导航（next_action）词表 + → guidance step 的**单一映射（单一决策源）**。
+# next_action 由 orchd/onboard/request.py、orchd/review.py 与
+# orchd/onboard/lifecycle/core.py 产出；历史上它与 guidance.step 是两套互不相识的
+# 词表（无一致性约束），且各调用点各自裸写字面量。
+# task-guidance-completeness-gate 完成**调用点合流**：词表只在 guide 声明，
+# 调用点一律引用下列常量，不得再写裸字面量——tests/test_guidance_sync.py 断言
+# 「orchd/ 内除本模块外无任何 next_action 字符串字面量」。
+NEXT_ACTION_EXIT: str = "exit"                  # request/review 无候选：停止等指令
+NEXT_ACTION_WAIT: str = "wait"                  # request 触达 max_active：等待
+NEXT_ACTION_REVIEW_FIRST: str = "review_first"  # request 有可领审查：优先领取
+NEXT_ACTION_REVIEW_TAKEOVER: str = "review_takeover"  # 僵尸审查认领：可接管
+NEXT_ACTION_AWAIT_REVIEW: str = "await_review"  # done 收尾 lessons 待审核
+# 本会话已领审查未提交（review_claimed_by == 自己）：先提交手上的结论，不谈领新任务。
+# task-guidance-review-priority-fix 补登记：此前 submit_review 只有 step 词表条目而无
+# 对应 next_action 取值 → request 在「已持有审查认领」时只能产 review_first，把会话引向
+# 他任务的审查（必被 claim 的 E011 review busy 拒绝），手上的认领就此悬空未提交。
+NEXT_ACTION_SUBMIT_REVIEW: str = "submit_review"
+
+NEXT_ACTION_TO_STEP: dict[str, str] = {
+    NEXT_ACTION_EXIT: "stop_wait",
+    NEXT_ACTION_WAIT: "wait_review",
+    NEXT_ACTION_REVIEW_FIRST: "claim_review",
+    # review_takeover（request 巡检到僵尸审查认领，candidate=None 时抬升）：动作语义
+    # 是「接管并重新领取审查」（retract REVIEW_CLAIMED → re-claim），归入 claim_review。
+    NEXT_ACTION_REVIEW_TAKEOVER: "claim_review",
+    NEXT_ACTION_AWAIT_REVIEW: "lesson_review",
+    NEXT_ACTION_SUBMIT_REVIEW: "submit_review",
+}
+
+
+def step_for_next_action(next_action: str | None) -> str:
+    """next_action → guidance step（单一映射；未知取值兜底 check_status）。
+
+    未登记取值返回 ``check_status`` 是**降级**语义：映射覆盖率由测试锁定
+    （新增 next_action 取值而未登记 → 测试失败），不在运行期静默猜测。
+    """
+    if not next_action:
+        return "check_status"
+    return NEXT_ACTION_TO_STEP.get(next_action, "check_status")
 
 
 def amend_patch_cmd(task, files=None, exempt=None, verify=None, entry=_ENTRY_CMD):
@@ -111,7 +181,8 @@ def _resolve_paths(
     规则：
     - ``paths`` 中的每条解析候选位置：``base_dir`` 下及其**父目录**下（规则在
       ``.orchd/rules/``、模板在项目根 ``templates/``，故双候选兜底）；任一命中
-      实际文件即保留，都不存在则静默跳过（best-effort 降级，不抛异常）。
+      实际文件即保留，都不存在则剔除（best-effort，不抛异常）——剔除项由
+      :func:`resolve_read_paths` 写 ``degraded`` 留痕，不再静默。
     - 绝对路径直接判定，不做拼接。
     - ``base_dir`` 为 None 或空 → 不做存在性校验，原样返回（纯函数 / 单测场景）。
     - 空数组 → 返回空数组（无害，向下兼容）。
@@ -123,20 +194,34 @@ def _resolve_paths(
     Returns:
         过滤后只含实际存在文件的路径数组（顺序保持）。
     """
+    kept, _dropped = _split_paths(paths, base_dir)
+    return kept
+
+
+def _split_paths(
+    paths: list[str],
+    base_dir: str | os.PathLike[str] | None,
+) -> tuple[list[str], list[str]]:
+    """把 read/template 路径拆成 ``(存在的, 不存在的)``（存在性判定单一实现）。
+
+    task-guide-step-vocab-and-routing-fix：原先「不存在即静默剔除」让路由漂移
+    不可见（缺哪个规则文件无人知道）。拆出 dropped 供 :func:`resolve_read_paths`
+    写 ``degraded`` 降级标记留痕（对齐 conflict_policy 的 degraded_guards 约定），
+    同时保持 :func:`_resolve_paths` 的既有签名与语义不变。
+    """
     if not paths or base_dir is None:
-        return list(paths)
+        return list(paths), []
     root = os.path.abspath(os.fspath(base_dir))
     parent = os.path.dirname(root)
     kept: list[str] = []
+    dropped: list[str] = []
     for p in paths:
         if os.path.isabs(p):
-            if os.path.isfile(p):
-                kept.append(p)
+            (kept if os.path.isfile(p) else dropped).append(p)
             continue
         candidates = (os.path.join(root, p), os.path.join(parent, p))
-        if any(os.path.isfile(c) for c in candidates):
-            kept.append(p)
-    return kept
+        (kept if any(os.path.isfile(c) for c in candidates) else dropped).append(p)
+    return kept, dropped
 
 
 def resolve_read_paths(
@@ -148,26 +233,76 @@ def resolve_read_paths(
     知识路由闭环的引擎侧接口（task-guide-routing-loop）：调用方（cli.py
     ``_attach_guidance`` 注入点）在附加 guidance 后透传 ``base_dir``，本函数
     返回**新增 ``read``/``template`` 键**的 guidance 副本，指向实际存在的规则/
-    模板文件，不存在时静默跳过。空数组 / base_dir None 时原样返回（无害降级）。
+    模板文件，不存在时剔除并写 ``degraded`` 留痕（不再静默）。
+    空数组 / base_dir None 时原样返回（无害降级）。
 
     Args:
         guidance: 原始 guidance 字典（含 read/template 数组）。
         base_dir: 规则/模板根目录（.orchd/）；None 时跳过校验。
 
     Returns:
-        过滤后的 guidance 字典（加法式，仅调整 read/template 两键，不碰
-        step/command/hint 结构；含 agent_view/project_view 时递归过滤，
-        保证双视角与顶层 read/template 一致）。
+        过滤后的 guidance 字典（加法式，仅调整 read/template 两键，并在发生
+        剔除时附加 ``degraded`` 标记；不碰 step/command/hint 结构；含
+        agent_view/project_view 时递归过滤，保证双视角与顶层 read/template 一致）。
     """
     out = dict(guidance)
-    out["read"] = _resolve_paths(guidance.get("read") or [], base_dir)
-    out["template"] = _resolve_paths(guidance.get("template") or [], base_dir)
+    read_kept, read_dropped = _split_paths(guidance.get("read") or [], base_dir)
+    tpl_kept, tpl_dropped = _split_paths(guidance.get("template") or [], base_dir)
+    out["read"] = read_kept
+    out["template"] = tpl_kept
+    dropped = sorted(set(read_dropped) | set(tpl_dropped))
+    if dropped:
+        # AC6 降级留痕：路径缺失不再静默——写 degraded 标记，由 slim 层并入 hint。
+        out["degraded"] = {"kind": "read_paths_missing", "dropped": dropped}
     # 双视角（task-guidance-dual-view-engine）：递归过滤子视角的 read/template，
     # 避免顶层已过滤而 agent_view/project_view 仍指向不存在路径的不一致。
     for key in ("agent_view", "project_view"):
         sub = guidance.get(key)
         if isinstance(sub, dict):
             out[key] = resolve_read_paths(sub, base_dir)
+    return out
+
+
+def attach_read_versions(
+    guidance: dict[str, Any],
+    base_dir: str | os.PathLike[str] | None,
+) -> dict[str, Any]:
+    """为 guidance 的 read[] 每条路径附加 {mtime, size} 版本标注（纯函数，加法式）。
+
+    task-guidance-read-versions：配合读取纪律，agent 依据版本标注判断规则/模板
+    文件是否变化，未变则不重读。本函数**只读 stat，不读文件内容**。
+
+    - best-effort：文件缺失 / stat 异常跳过该条（不抛异常，不阻塞）。
+    - 加法式：新增顶层键 ``read_versions``（dict[path, {mtime, size}]），
+      ``read[]`` 保持字符串数组契约不变。
+    - 双视角递归：agent_view / project_view 若为 dict 则同样附加。
+    - 空 read / base_dir None 时 read_versions={}（无害降级）。
+
+    Args:
+        guidance: 已通过 resolve_read_paths 过滤的 guidance 字典。
+        base_dir: 规则/模板根目录（.orchd/）；None 时跳过 stat。
+
+    Returns:
+        新增 read_versions 键的 guidance 副本（不修改入参）。
+    """
+    out = dict(guidance)
+    versions: dict[str, dict[str, float | int]] = {}
+    if base_dir is not None:
+        base = Path(base_dir)
+        for rel in guidance.get("read") or []:
+            if not isinstance(rel, str):
+                continue
+            try:
+                st = (base / rel).stat()
+                versions[rel] = {"mtime": st.st_mtime, "size": st.st_size}
+            except (OSError, ValueError):
+                continue  # best-effort：缺失/异常跳过该条
+    out["read_versions"] = versions
+    # 双视角递归
+    for key in ("agent_view", "project_view"):
+        sub = guidance.get(key)
+        if isinstance(sub, dict):
+            out[key] = attach_read_versions(sub, base_dir)
     return out
 
 
@@ -197,6 +332,10 @@ def _summarize(
     first_rework_tid: str | None = None
     first_unclaimed_review: str | None = None
     first_unclaimed_review_phase: str | None = None
+    # 本 agent 已领未提交的审查（task-guide-step-vocab-and-routing-fix）：原实现只
+    # 计数 my_in_review 却不产出出口，导致 in_review 全被领走时引导指回 request。
+    my_review_tid: str | None = None
+    my_review_phase: str | None = None
     for task in tasks:
         tid = task.get("id", "")
         ts = state.get(tid)
@@ -211,6 +350,9 @@ def _summarize(
         if s == "in_review":
             if agent_id and ts and ts.review_claimed_by == agent_id:
                 counts["my_in_review"] = counts.get("my_in_review", 0) + 1
+                if my_review_tid is None:
+                    my_review_tid = tid
+                    my_review_phase = ts.review_phase or "unified"
             if ts and ts.review_claimed_by is None and first_unclaimed_review is None:
                 first_unclaimed_review = tid
                 first_unclaimed_review_phase = ts.review_phase or "unified"
@@ -220,6 +362,8 @@ def _summarize(
     counts["first_rework_tid"] = first_rework_tid
     counts["first_unclaimed_review"] = first_unclaimed_review
     counts["first_unclaimed_review_phase"] = first_unclaimed_review_phase
+    counts["my_review_tid"] = my_review_tid
+    counts["my_review_phase"] = my_review_phase
     return counts
 
 
@@ -243,13 +387,23 @@ def _classify(
             "focus_tid": None,
         }
     if c.get("in_review", 0) > 0:
-        return {
-            "step": "claim_review" if c.get("first_unclaimed_review") else "request_review",
-            "focus_tid": c.get("first_unclaimed_review"),
-        }
-    if c.get("rework", 0) > 0 and c["claimed"] == 0:
+        # 优先级（task-guidance-review-priority-fix）：**先收尾本 agent 已领未提交的审查，
+        # 再谈领新审查**。原先 first_unclaimed_review 判定在前，导致只要池中存在任何未认领
+        # 审查，submit_review 出口就永不可达——会话被引去领他任务的审查，而该 claim 会被
+        # orchd/onboard/claim.py 的 E011 review busy 拒绝，手上已领的审查就此悬空未提交
+        # （2026-09-13 实测 evt-cd8fa533，任务冻结在 in_review/code）。
+        if c.get("my_review_tid"):
+            # 本 agent 已领审查未提交 → 先给出可推进出口
+            return {"step": "submit_review", "focus_tid": c["my_review_tid"]}
+        if c.get("first_unclaimed_review"):
+            return {"step": "claim_review", "focus_tid": c["first_unclaimed_review"]}
+        # 审查已被他人领取：本 agent 无可做之事 → 等待（不再产出 request_review 死路）
+        return {"step": "wait_review", "focus_tid": None}
+    if c.get("rework", 0) > 0 and not c.get("my_claimed"):
         return {"step": "rework_first", "focus_tid": c.get("first_rework_tid")}
-    if c["pending"] > 0 and c["claimed"] == 0:
+    if c["pending"] > 0 and not c.get("my_claimed"):
+        # 忙度只看**本 agent** 的 claimed（原实现用全局 claimed，导致其他会话一旦有
+        # 任务在实现，本 agent 永远拿不到 request_impl，与 request 的候选结论打架）
         return {"step": "request_impl", "focus_tid": None}
     if c.get("my_claimed"):
         return {"step": "done", "focus_tid": c["my_claimed"][0]}
@@ -314,6 +468,27 @@ def stop_wait_guidance() -> dict[str, Any]:
     }
 
 
+def lesson_review_guidance(task_id: str | None = None) -> dict[str, Any]:
+    """done 收尾挂起（``next_action=await_review``）的引导（纯函数）。
+
+    ``orchd/onboard/lifecycle/core.py`` 在 lessons ``require_review`` 时把 done 结果
+    置 ``next_action="await_review"``，但该取值既不在 guidance 词表内、也无引导分支
+    —— 本函数补上出口（经 :data:`NEXT_ACTION_TO_STEP` 映射），并顺带补上
+    ``skill-lesson.md`` 的知识路由（此前零路由）。
+    """
+    tid = task_id or "<task_id>"
+    return {
+        "step": "lesson_review",
+        "read": ["skill-lesson.md", "rules/session.md"],
+        "template": [],
+        "command": f"{_ENTRY_CMD} lesson review --task {tid}",
+        "hint": (
+            f"任务 {tid} 已提交 done，但其 lessons 暂存建议待人工审核："
+            f"先审暂存条目（可 --approve-all / --reject）再完成收尾。"
+        ),
+    }
+
+
 def _derive(
     state: dict[str, Any],
     tasks: list[dict[str, Any]],
@@ -375,29 +550,44 @@ def _review_step_guidance(
     if step == "claim_review":
         unclaimed_tid = c.get("first_unclaimed_review")
         phase = c.get("first_unclaimed_review_phase")
+        # unified 阶段：**省略 --type**（claim 默认锁任务当前阶段）。历史上本分支产出
+        # `claim --type review`，而 claim 的 --type choices 仅 [spec, code] → 非法命令。
         if review_mode == "unified" or not phase or phase == "unified":
-            cmd = f"{_ENTRY_CMD} claim --task {unclaimed_tid} --type review"
+            cmd = f"{_ENTRY_CMD} claim --task {unclaimed_tid} --confirm"
             phase_label = "unified"
         else:
-            cmd = f"{_ENTRY_CMD} claim --task {unclaimed_tid} --type {phase}"
+            cmd = f"{_ENTRY_CMD} claim --task {unclaimed_tid} --type {phase} --confirm"
             phase_label = phase
         return {
             "step": "claim_review",
-            "read": ["rules/review.md"],
+            "read": ["rules/review.md", "rules/testing.md"],
             "template": review_templates,
             "command": cmd,
             "hint": (
-                f"有 {c['in_review']} 个任务待审查：先领取审查任务（{phase_label} 阶段），"
-                f"代码审查通过后任务才算完成。"
+                f"有 {c['in_review']} 个任务待审查：领取审查任务（{phase_label} 阶段）——"
+                f"须在任务 worktree 内执行且带 --confirm；代码审查通过任务才算完成。"
             ),
         }
-    if step == "request_review":
+    if step == "submit_review":
+        tid = c.get("my_review_tid")
+        phase = c.get("my_review_phase")
+        unified = review_mode == "unified" or not phase or phase == "unified"
+        # review 的 --type choices 仅 [spec, code]；unified 单阶段模式须省略该参数。
+        type_arg = "" if unified else f" --type {phase}"
+        phase_label = "unified" if unified else phase
         return {
-            "step": "request_review",
-            "read": ["rules/review.md"],
+            "step": "submit_review",
+            "read": ["rules/review.md", "shared/conventions.md"],
             "template": review_templates,
-            "command": f"{_ENTRY_CMD} request",
-            "hint": f"有 {c['in_review']} 个任务待审查：先领取审查任务，代码审查通过后任务才算完成。",
+            "command": (
+                f"{_ENTRY_CMD} review --task {tid}{type_arg} "
+                f"--verdict APPROVED|CHANGES_REQUESTED"
+            ),
+            "hint": (
+                f"任务 {tid} 的审查（{phase_label} 阶段）已由你领取但尚未提交："
+                f"按 files_to_review 核对后提交 review 结论；code 阶段 APPROVED 后"
+                f"须回主工作树运行 {_ENTRY_CMD} status --audit-merge 确认零告警。"
+            ),
         }
     return None
 
@@ -416,7 +606,7 @@ def _impl_step_guidance(
     if step == "rework_first":
         return {
             "step": "rework_first",
-            "read": ["rules/review.md", "rules/session.md"],
+            "read": ["rules/review.md", "rules/session.md", "rules/testing.md"],
             "template": ["templates/implementer.md"],
             "command": f"{_ENTRY_CMD} request",
             "hint": (
@@ -427,19 +617,34 @@ def _impl_step_guidance(
     if step == "request_impl":
         return {
             "step": "request_impl",
-            "read": ["rules/intake.md", "rules/session.md"],
+            # rules/safety.md（引擎改动触碰 §9.1 停服边界）路由到实现入口：领实现任务时
+            # 先确认改动是否触碰停服边界（task-guidance-completeness-gate 路由补全）。
+            "read": ["rules/session.md", "rules/intake.md", "rules/testing.md",
+                     "rules/safety.md"],
             "template": ["templates/implementer.md"],
             "command": f"{_ENTRY_CMD} request",
+            # hint 保持紧凑（task-guidance-block-budget-root-fix：预算由 _BLOCK_MAX
+            # 求和不等式统一管理，不再有 200 字符硬编码上限）；
+            # 测试纪律经 read 路由送达，不挤占 hint 额度。
             "hint": f"有 {c['pending']} 个待认领任务：现在没有活跃实现，可领取一个新任务。",
         }
     if step == "done":
         tid = cls["focus_tid"]
         return {
             "step": "done",
-            "read": ["rules/session.md", "rules/verify.md", "rules/git.md"],
+            # read 按**本 step 的优先级**排序：slim 层截断（max_read）时先丢次要项，
+            # verify.md 必须保留（done 的第一动作就是确认 verify_command 与预算）。
+            # rules/windows.md（Windows 下 shell/管道编码陷阱）随 done 路由：
+            # verify_command 由引擎在本机执行，Windows 环境约束与该步直接相关
+            # （task-guidance-completeness-gate 路由补全）。
+            "read": ["rules/verify.md", "rules/testing.md", "rules/session.md",
+                     "rules/git.md", "rules/windows.md"],
             "template": ["templates/implementer.md"],
             "command": f"{_ENTRY_CMD} done --task {tid} --changes '<描述>'",
-            "hint": f"任务 {tid} 已认领给当前 agent：实现完成后用 {_ENTRY_CMD} done 提交（verify 通过后进入审查）。",
+            "hint": (
+                f"任务 {tid} 已认领给当前 agent：在**任务 worktree**（container 布局）内"
+                f"用 {_ENTRY_CMD} done 提交，verify 通过后进入审查、引擎自动切回主分支。"
+            ),
         }
     return None
 
@@ -477,13 +682,28 @@ def _terminal_step_guidance(
             "command": f"{_ENTRY_CMD} status --text",
             "hint": "所有任务已完成：可提交新 idea 供拆解，或进入下一阶段规划。",
         }
-    # 兜底：pending 有但被阻塞等
+    if step == "audit_merge":
+        # review code APPROVED + merge 成功后的完成态引导（task-review-completion-guidance）。
+        # 实际构造由 orchd/review.py _build_completion_guidance 完成（含 worktree
+        # 回收残留处置），此处保留词表构造分支以满足 GUIDANCE_STEPS 单一来源约束。
+        return {
+            "step": "audit_merge",
+            "read": ["rules/review.md"],
+            "template": [],
+            "command": f"{_ENTRY_CMD} status --audit-merge",
+            "hint": "任务已审查通过并合并：请在主工作树执行 status --audit-merge 确认无警告。",
+        }
+    # 兜底：无可匹配分支（pending 被阻塞 / 未知状态组合）——留痕，避免兜底静默
     return {
         "step": "check_status",
-        "read": [],
+        "read": ["rules/session.md"],
         "template": [],
         "command": f"{_ENTRY_CMD} status --text",
-        "hint": "查看当前任务池状态，确认下一步可执行的命令。",
+        "hint": (
+            "查看当前任务池状态，确认下一步可执行的命令"
+            "（当前无可匹配的引导分支，已降级兜底）。"
+        ),
+        "degraded": {"kind": "no_branch_matched", "fallback_step": "check_status"},
     }
 
 
@@ -529,9 +749,10 @@ def _active_transition(
             "mine": mine,
             "hint": (
                 f"任务 {task_id} 已认领{'给你' if mine else f'（{holder}）'}（实现中）："
-                f"在 task/{task_id} 分支实现并提交，完成后用 {_ENTRY_CMD} done 提交并自动切回主分支。"
+                f"在 task/{task_id} 分支实现并提交（container 布局下在任务 worktree 内执行，"
+                f"勿在主工作树改任务文件），完成后用 {_ENTRY_CMD} done 提交并自动切回主分支。"
             ),
-            "read": ["rules/session.md", "rules/git.md", "rules/verify.md"],
+            "read": ["rules/session.md", "rules/git.md", "rules/verify.md", "rules/testing.md"],
         }
     if s in ("done", "in_review"):
         reviewing = "、正在审查中" if (s == "in_review" and ts.review_claimed_by) else ""
@@ -541,6 +762,8 @@ def _active_transition(
             "hint": (
                 f"任务 {task_id} 已提交待审查{reviewing}：不要在任务分支继续改动，"
                 "审查通过后引擎自动合并并回收任务环境。"
+                f"审查者：code 阶段 APPROVED 后须回主工作树运行 {_ENTRY_CMD} status "
+                "--audit-merge 确认零告警。"
             ),
             "read": ["rules/review.md", "rules/git.md"],
         }
@@ -559,8 +782,10 @@ def _terminal_transition(
             "hint": (
                 f"任务 {task_id} 已审查通过并合并（completed）：任务完成，"
                 "其分支/环境已回收，可进入下一步。"
+                f"审查者请运行 {_ENTRY_CMD} status --audit-merge 确认 "
+                "merge_audit.warnings 为空（rules/review.md 硬要求）。"
             ),
-            "read": [],
+            "read": ["rules/review.md"],
         }
     if s == "cancelled":
         return {
@@ -743,30 +968,65 @@ def slim_guidance(
         out["branch_ctx"] = bc
     if tier >= 2:
         out["read"] = _merge_read(guidance, max_read)
+        # task-guidance-read-versions：read_versions 与 read 同步保留（加法式），
+        # 仅保留 read 中实际存在路径的版本信息，避免与截断后的 read 不一致。
+        _rv = guidance.get("read_versions") or {}
+        if _rv:
+            out["read_versions"] = {k: v for k, v in _rv.items() if k in out["read"]}
     return out
+
+
+def _truncate(text: str, limit: int) -> str:
+    """超限时保留前缀 + 省略号（省略号单字符，结果不超 limit）。
+
+    task-guidance-completeness-gate：hint 预算的统一截断原语（红线段与总量共用），
+    避免两处各写一份截断逻辑导致口径漂移。
+    """
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _merge_hint(
     guidance: dict[str, Any],
     ctx: dict[str, Any] | None,
 ) -> str:
-    """合并 base_hint + transition hint + 红线摘要为单行（去重保序）。
+    """合并 base_hint + 红线摘要 + transition hint 为单行（去重保序，带预算）。
 
     W-1 收敛：transition 语义与红线 ≤1 条一并并入 hint，rules 不再作为
     顶层独立键（防信息超载）。无内容时返回空串（调用方据此省略 hint 键）。
+
+    task-guidance-completeness-gate 两级预算（AC4）：
+    - 红线段（``红线：`` + rules[0] 的 TL;DR 全文，原文可达 306 字符）截断到
+      :data:`_REDLINE_MAX`——保留「红线：」前缀 + 首条要点 + 省略号；
+    - 合并结果再收敛到 :data:`_HINT_MAX` 以内（红线排在 transition 之前，
+      超限时优先牺牲可裁剪的 transition 上下文，红线要点保持完整可见）。
     """
     hint_bits: list[str] = []
     base_hint = guidance.get("hint")
     if base_hint:
         hint_bits.append(base_hint)
+    rules = guidance.get("rules") or []
+    if rules:
+        _read_for_redline = guidance.get("read") or []
+        hint_bits.append(_truncate_redline_semantic(
+            f"{_REDLINE_PREFIX}{rules[0]}",
+            budget=_HINT_MAX,
+            read_paths=_read_for_redline,
+            rule_count=len(rules),
+        ))
     ctx = ctx or {}
     transition = ctx.get("transition")
     if isinstance(transition, dict) and transition.get("hint"):
         hint_bits.append(transition["hint"])
-    rules = guidance.get("rules") or []
-    if rules:
-        hint_bits.append(_REDLINE_PREFIX + rules[0])
-    return "；".join(dict.fromkeys(hint_bits))  # 去重保序，单行
+    degraded = guidance.get("degraded")
+    if isinstance(degraded, dict) and degraded.get("kind"):
+        # 降级留痕可见化：渲染层不再硬编码 200 字符裁剪，hint 可容纳完整细节。
+        _detail = degraded.get("detail") or degraded.get("dropped") or ""
+        _detail_str = f"（{_detail}）" if _detail else ""
+        hint_bits.append(f"{_DEGRADED_PREFIX}{degraded['kind']}{_detail_str}")
+    merged = "；".join(dict.fromkeys(hint_bits))  # 去重保序，单行
+    return _truncate(merged, _HINT_MAX)
 
 
 def _merge_read(
@@ -824,20 +1084,9 @@ def apply_guidance_mode(
     cmd = guidance.get("command")
     if cmd:
         out["command"] = cmd
-    hint_bits: list[str] = []
-    base_hint = guidance.get("hint")
-    if base_hint:
-        hint_bits.append(base_hint)
-    ctx = ctx or {}
-    transition = ctx.get("transition")
-    if isinstance(transition, dict) and transition.get("hint"):
-        hint_bits.append(transition["hint"])
-    # slim 也保留红线摘要并入 hint（与旧 slim_guidance 行为一致，
-    # agent 无需读全文即可感知最强约束；不含独立 read/rules 字段）。
-    rules = guidance.get("rules") or []
-    if rules:
-        hint_bits.append(_REDLINE_PREFIX + rules[0])
-    hint = "；".join(dict.fromkeys(hint_bits))  # 去重保序，单行
+    # hint 构造与 slim_guidance 共用 _merge_hint 单一实现（含红线摘要与降级留痕），
+    # 避免两处各写一份导致口语/留痕不一致。
+    hint = _merge_hint(guidance, ctx)
     if hint:
         out["hint"] = hint
     return out
@@ -845,6 +1094,60 @@ def apply_guidance_mode(
 
 # 红线并入 hint 的前缀（task-guide-tiering：只留 ≤1 条最强红线）
 _REDLINE_PREFIX: str = "红线："
+# 降级留痕并入 hint 的前缀（AC6：路径缺失 / 兜底分支不再静默）
+_DEGRADED_PREFIX: str = "引导降级："
+# hint 预算（task-guidance-completeness-gate AC4）：合并结果总量上限。
+_HINT_MAX: int = 300
+
+# task-guidance-block-budget-root-fix：stderr 提示块预算单一真源。
+_BLOCK_MAX: int = 1600
+_MAX_COMMAND_LEN: int = 200
+_MAX_READ_LEN: int = 500
+_MAX_CASES_LEN: int = 400
+
+
+def _block_layout_overhead() -> int:
+    """渲染布局固定开销（sep*2 + 前缀 + 换行 + 空行）。"""
+    sep = "─" * 40
+    return (
+        1 + len(sep) + 1 +
+        len("orchd ▸ ") + 1 +
+        len("建议执行：") + 1 +
+        len(sep) + 1 + 1
+    )
+
+
+def _assert_budget_consistency() -> None:
+    """常量自洽断言：布局开销 + 各内容预算 <= _BLOCK_MAX。"""
+    total = _block_layout_overhead() + _HINT_MAX + _MAX_COMMAND_LEN + _MAX_READ_LEN + _MAX_CASES_LEN
+    assert total <= _BLOCK_MAX, (
+        f"guidance block budget overflow: {total} > {_BLOCK_MAX}"
+    )
+
+
+_assert_budget_consistency()
+
+
+def _truncate_redline_semantic(text, budget, read_paths, rule_count=1):
+    """红线语义截断：按点分割只装整点，装不下退化为红线 N 条（见路径）。"""
+    if len(text) <= budget:
+        return text
+    import re
+    points = re.split(r'(?<=[；。;])', text)
+    fitted = []
+    current = ""
+    for p in points:
+        if not p:
+            continue
+        if len(current) + len(p) <= budget - 1:
+            current += p
+            fitted.append(p)
+        else:
+            break
+    if fitted:
+        return current + "…"
+    read_hint = read_paths[0] if read_paths else "rules/review.md"
+    return f"{_REDLINE_PREFIX}{rule_count} 条（见 {read_hint}）"
 
 
 def next_guidance(
@@ -873,7 +1176,8 @@ def next_guidance(
             ``"two_phase"`` 双阶段模板。缺省 two_phase 向后兼容。
 
     Returns:
-        引导结构：顶层 5 键 + agent_view + project_view。
+        引导结构：顶层 5 键 + agent_view + project_view；发生降级时另附
+        ``degraded`` 标记（加法式，非降级场景键集不变）。
     """
     agent_view = _derive(state, tasks, agent_id, has_master, review_mode)
     project_view = _derive(state, tasks, None, has_master, review_mode)
@@ -887,6 +1191,9 @@ def next_guidance(
         "agent_view": agent_view,
         "project_view": project_view,
     }
+    # 降级留痕（AC6，加法式）：仅在该视角发生降级时出现，非降级场景键集不变。
+    if isinstance(agent_view.get("degraded"), dict):
+        out["degraded"] = agent_view["degraded"]
     return out
 
 
@@ -1007,7 +1314,10 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     ("E013", "引擎未初始化：先运行 init 初始化工作区再操作", ("rules/install.md",), f"{_ENTRY_CMD} init", "auto", "exec-command"),
     ("E014", "verify 失败：查看 verify 输出，修复实现后重试 done", ("rules/verify.md",), "python -m pytest <定向测试>", "suggest", "exec-command"),
     ("E015", "合并冲突：停止操作并报告冲突详情，人工裁决（勿自行强推）", ("rules/git.md",), "git status", "manual", "git-diagnose"),
-    ("E016", "自审被阻断：当前会话已实现 {task_id}，需换会话/身份重新 claim --task {task_id} --type review，或由他人审查", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --type review --confirm", "suggest", "manual-action"),
+    # E016 命令相位无关（task-guidance-completeness-gate AC6）：claim 的 --type choices
+    # 仅 [spec, code]，unified 单阶段须省略该参数——历史上此处写 `--type review` 属非法取值
+    # （与 _review_step_guidance 的 unified 分支口径一致）。
+    ("E016", "自审被阻断：当前会话已实现 {task_id}，需换会话/身份重新 claim --task {task_id} --confirm（相位无关），或由他人审查", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
     ("E017", "工作区脏：先提交/清理未提交改动，再重试", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
     ("E018", "分支错误：确认处于正确分支", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
     ("E019", "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
@@ -1025,7 +1335,7 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     ("E031", "ROADMAP 规划章节未落地 IDEAS：章节 {chapter} 需先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS pending 后再 intake", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
     ("E032", "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
     ("E033", "会话身份缺失：先 session start 注入 ORCHD_SESSION_ID", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
-    ("E034", "撤认归属守卫：仅事件作者 {owner} 或 admin 可撤回 {task_id}，当前 {caller} 无权，请切换身份或停止", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
+    ("E034", "撤认归属守卫：仅事件作者 {owner} 或 admin 可撤回 {task_id}，当前 {caller} 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 3600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
     ("E035", "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
     ("E036", "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
 )
@@ -1081,8 +1391,9 @@ ERROR_CODE_CHANNELS: dict[str, frozenset[str]] = {
     "E035": frozenset({"C"}),       # session_collision_warning: cli手工dict (warning)
     # ── 通道 D（Shell hook）──
     "E020": frozenset({"D"}),       # out_of_scope_commit: git hook echo
-    # ── 脱节（死映射，无实际抛出点）──
-    "E015": frozenset(),            # merge_conflict: 无 raise OrchdError，仅 result reason
+    # ── 通道 A 补登记（task-done-reconcile-main）──
+    "E015": frozenset({"A"}),       # merge_conflict: done 前置对账 raise OrchdError ×1
+                                    # （onboard/lifecycle/core.py 挂载点①）；review.py 仍手工 dict 挂 result reason
 }
 
 # 通道有效值（用于断言新增码必须登记有效通道）

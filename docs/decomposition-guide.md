@@ -390,6 +390,8 @@ acceptance_criteria:                    对应测试策略:
 **冲突预防规则**：如果两个任务逻辑上需要修改同一文件，要么建立 depends_on（串行），要么将共享修改提取为独立的上游任务。
 
 > **2026-08-08 语义更新**：`amend` 不再拒绝冲突注册（仅返回 `conflict_warnings` warning）。冲突硬边界在 `request` 依赖感知强制过滤——与 pending/claimed **非依赖**任务冲突的候选会被硬排除（`excluded_conflicts`），依赖链（祖先/子孙）上共享文件的任务放行（`conflict_with`）。因此本规则的意图由引擎在领取阶段自动执行：未按 depends_on 串行化的共享文件任务对，第二个将无法被领取（直至冲突解除）。
+>
+> **2026-09-12 更新（task-inflight-conflict-visibility）**：冲突视野补齐「**在途**」——分支上已有改动、尚未落 main 的任务（含 done / in_review / force-status 悬空态），以 **git 事实**判定而非状态字段（此前刚 done 未 merge 的任务会逃出视野，实测数十秒盲区）。在途重叠按 `config.conflict_policy` 分流：缺省 `warn` = 仅加 `conflict_with`（`source=inflight`）+ 降权排序，**不阻断**；`serialize` / `block` 才硬排除。因此**拆解期不必为"在途重叠"额外串行化**，串行化要求仍聚焦 claimed / pending 声明文件重叠；同时 `files_to_edit` / `exempt_files` 必须枚举具体文件路径（禁目录式声明与通配），否则冲突检测漏检、E010 误报。**形态硬校验（task-decl-dir-notation-guard，E003 拒绝注册）的覆盖面仅限 `files_to_edit` / `exempt_files`**——`files_to_read` 不受此约束（见 §6.2）。
 
 
 ### 6.2 files_to_read
@@ -404,6 +406,8 @@ acceptance_criteria:                    对应测试策略:
 | `reference` | 提供上下文但非必需 | 按需查阅 |
 
 **hint 写法**：说明"这个文件里什么内容与本任务相关"，而非重复文件名。例如："当前 List 实现，需替换的 RemoveAt(0) 在第 47 行"。
+
+**声明形态（2026-09-13，task-decl-dir-notation-docs）**：`files_to_read` **允许目录式路径与通配符**（如 `orchd/cli/`、`tests/test_*.py`）。依据：该字段供上下文查阅，不参与冲突检测 / E010 越界判定 / E026 测试推导，故不做形态硬校验（`detect_dir_or_glob_declarations` 仅扫描 `files_to_edit` / `exempt_files`）。这与 §6.1 的禁目录式条款不矛盾——§6.1 的形态约束覆盖面仅限 `files_to_edit` / `exempt_files`。
 
 ### 6.3 数量控制
 

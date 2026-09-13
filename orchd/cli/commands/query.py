@@ -115,7 +115,19 @@ def _cmd_doctor(args):
             dry_run=dry_run,
             backup_dir=Path(backup_dir) if backup_dir else None,
         )
-        exit_code = 0 if result.get("dry_run", False) else 0
+        # 退出码语义（脚本化感知残留）：dry-run 有可清项 → 1；--fix 有失败 → 1；
+        # 否则 0。与只读模式「有 fail 项 → 1」保持一致。
+        exit_code = 0
+        if dry_run:
+            cleanable = (
+                len(result.get("detected", []))
+                - len(result.get("skipped_protected", []))
+                - len(result.get("skipped_manual", []))
+            )
+            if cleanable > 0:
+                exit_code = 1
+        elif result.get("errors"):
+            exit_code = 1
         return result, exit_code
 
     # 只读检测模式
@@ -123,6 +135,35 @@ def _cmd_doctor(args):
     if not result["repo_ok"]:
         return result, 1
     return result, 0
+
+def _format_audit_text(audit: dict) -> str:
+    """task-status-text-flag-silent-noop：将 audit 结果字典格式化为人类可读文本。
+
+    递归展开顶层键值，列表/字典缩进展示；超长值截断。best-effort，
+    任何异常回退 repr 截断。
+    """
+    try:
+        lines = []
+        for k, v in audit.items():
+            if isinstance(v, (list, tuple)):
+                lines.append(f"{k}: {len(v)} item(s)")
+                for i, item in enumerate(v[:5]):
+                    if isinstance(item, dict):
+                        lines.append(f"  [{i}] " + ", ".join(f"{ik}={iv}" for ik, iv in list(item.items())[:4]))
+                    else:
+                        lines.append(f"  [{i}] {str(item)[:80]}")
+                if len(v) > 5:
+                    lines.append(f"  ... and {len(v) - 5} more")
+            elif isinstance(v, dict):
+                lines.append(f"{k}:")
+                for ik, iv in list(v.items())[:6]:
+                    lines.append(f"  {ik}: {str(iv)[:80]}")
+            else:
+                lines.append(f"{k}: {str(v)[:100]}")
+        return "\n".join(lines)
+    except Exception:
+        return repr(audit)[:500]
+
 
 @_cli_skeleton
 def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
@@ -162,6 +203,24 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             result["session_collision_warning"] = collision
     if integrity_warnings:
         result["integrity_warnings"] = integrity_warnings
+    # task-status-text-flag-silent-noop：--audit-* 仅全局模式生效；
+    # 单任务模式（args.task）时不再静默忽略，stderr 给出明确提示。
+    import sys as _sys
+    _audit_flags = [
+        ("audit_merge", "--audit-merge"),
+        ("audit_intake", "--audit-intake"),
+        ("audit_revive", "--audit-revive"),
+        ("audit_task", "--audit-task"),
+    ]
+    if args.task is not None:
+        for _flag, _opt in _audit_flags:
+            if getattr(args, _flag, False):
+                print(
+                    f"orchd status: {_opt} 仅在全局模式（无 task-id）下生效，"
+                    f"当前指定了 task '{args.task}'，该标志已被忽略。"
+                    f"正确用法：orchd status {_opt}（不加 task-id）",
+                    file=_sys.stderr,
+                )
     if args.audit_merge and args.task is None:
         result["merge_audit"] = merge_audit(store, tasks, orchd_dir.parent)
     if getattr(args, "audit_intake", False) and args.task is None:
@@ -176,6 +235,18 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         # --text 为人类可读展示层：只输出表格，不再混入 JSON。
         # 末尾追加无感引导文字（task-guide-seamless-guidance，best-effort）。
         table = result.pop("_text")
+        # task-status-text-flag-silent-noop：--text 叠加 --audit-* 时，
+        # 巡检结论追加到表格文本，杜绝「算完即丢」。
+        for _audit_key, _label in (
+            ("merge_audit", "Merge Audit"),
+            ("intake_audit", "Intake Audit"),
+            ("revive_audit", "Revive Audit"),
+            ("audit_task", "Task Integrity Audit"),
+        ):
+            _audit = result.get(_audit_key)
+            if _audit is not None:
+                table += f"\n\n=== {_label} ===\n"
+                table += _format_audit_text(_audit)
         try:
             from orchd.guide import status_guidance_text
             from orchd.ledger import resolve_review_mode

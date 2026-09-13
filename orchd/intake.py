@@ -145,6 +145,24 @@ def _intake_guard(project_root: Path) -> dict[str, Any] | None:
     return None
 
 
+def _resolve_lock_orchd_dir(project_root: Path) -> Path:
+    """准入锁用 .orchd 目录（防双嵌套，task-intake-lock-path-fix）。
+
+    ``resolve_workspace_root`` 在自包含布局（IDEAS.md 位于 .orchd/ 内）下已返回
+    ``<project>/.orchd``，再拼 ``/ ".orchd"`` 会双重嵌套为 ``.orchd/.orchd``，
+    使准入锁落错路径并分裂（amend 经 split.py 传真实 orchd_dir 则落在共享账本根）。
+    此处统一经 ``resolve_canonical_project_root`` 定位 canonical 主工作树根，
+    再拼一次 ``.orchd``——container 与 flat、自包含与根布局均收敛到同一真实目录。
+    """
+    try:
+        from orchd.worktree import resolve_canonical_project_root
+
+        canonical = resolve_canonical_project_root(Path(project_root))
+    except Exception:
+        canonical = Path(project_root)
+    return Path(canonical) / ".orchd"
+
+
 def intake_commit(
     project_root: Path,
     message: str | None = None,
@@ -192,10 +210,16 @@ def intake_commit(
 
     # 3) 强制提交摄入产物（IDEAS.md + ROADMAP.md）—— 受准入写锁串行
     # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
-    orchd_dir = workspace_root / ".orchd"
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
-        paths = [str(workspace_root / "IDEAS.md"), str(workspace_root / "ROADMAP.md")]
+        # task-engine-cli-friction-fix：提交范围加入 _master.json（摄入产物），
+        # 消除新任务注册后 _master.json 残留未提交态、agent 需人工 git commit 的摩擦。
+        paths = [
+            str(workspace_root / "IDEAS.md"),
+            str(workspace_root / "ROADMAP.md"),
+            str(_resolve_lock_orchd_dir(project_root) / "_master.json"),
+        ]
         commit_message = message or "chore(intake): orchd intake — commit intake products"
         commit = ensure_committed(project_root, paths, commit_message)
         result: dict[str, Any] = {
@@ -334,7 +358,7 @@ def roadmap_land(
 
     # 4) 生成 IDEAS pending 条目（追加到 IDEAS.md 末尾）—— 受准入写锁串行
     # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
-    orchd_dir = ws / ".orchd"
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
         roadmap_rel = roadmap.relative_to(project_root).as_posix()
@@ -388,12 +412,12 @@ def _find_idea_entry(text: str, title: str) -> dict[str, Any] | None:
     """
     lines = text.splitlines()
     target: dict[str, Any] | None = None
+    # 第一优先级：精确标题匹配（整标题相等，或以 " " + title 结尾=去日期前缀）
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith("## "):
             continue
         header = stripped[3:].strip()
-        # 匹配标题本体：整标题相等，或标题以 " {title}" 结尾（去掉日期前缀）
         if header == title or header.endswith(" " + title):
             j = i + 1
             while j < len(lines) and not lines[j].strip().startswith("## "):
@@ -413,7 +437,58 @@ def _find_idea_entry(text: str, title: str) -> dict[str, Any] | None:
                 "end": j,
             }
             break
+    # 第二优先级（兜底）：裸 slug 匹配条目的 - id: 字段
+    # （精确标题优先，不改变既有命中语义；仅当精确匹配未命中时才走兜底）
+    if target is None:
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("## "):
+                continue
+            header = stripped[3:].strip()
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("## "):
+                j += 1
+            entry_id = ""
+            status = ""
+            for k in range(i + 1, j):
+                s = lines[k].strip()
+                if s.startswith("- id:"):
+                    entry_id = s[len("- id:"):].strip()
+                for marker in ("- status:", "status:"):
+                    if s.startswith(marker):
+                        status = s[len(marker):].strip()
+                        break
+            if entry_id == title:
+                target = {
+                    "header_line": i,
+                    "title": header,
+                    "status": status,
+                    "lines": lines[i:j],
+                    "end": j,
+                }
+                break
     return target
+
+
+def _list_idea_headers(text: str) -> list[str]:
+    """提取 IDEAS.md 中所有条目标题（去日期前缀后的部分），供近似候选匹配。
+
+    Returns:
+        标题列表（每项为 ``## `` 后去除日期前缀的标题本体）。
+    """
+    headers: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("## "):
+            continue
+        header = stripped[3:].strip()
+        # 去除日期前缀（YYYY-MM-DD ），保留标题本体
+        import re
+        m = re.match(r"^\d{4}-\d{2}-\d{2}\s+", header)
+        if m:
+            header = header[m.end():]
+        headers.append(header)
+    return headers
 
 
 def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, Any]:
@@ -478,7 +553,7 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
     import datetime
 
     # 写入 IDEAS.md —— 受准入写锁串行（task-admission-lock-engine：D 项）
-    orchd_dir = ws / ".orchd"
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
         date = datetime.date.today().isoformat()
@@ -562,7 +637,21 @@ def _idea_transition(
     text = ideas.read_text(encoding="utf-8")
     entry = _find_idea_entry(text, title)
     if entry is None:
-        return {key: False, "reason": "not_found", "title": title}
+        import difflib
+        all_headers = _list_idea_headers(text)
+        candidates = difflib.get_close_matches(title, all_headers, n=3, cutoff=0.3)
+        return {
+            key: False,
+            "reason": "not_found",
+            "title": title,
+            "hint": (
+                "标题须含「（id: <slug>）」后缀（propose 写入的完整标题格式为 "
+                "「YYYY-MM-DD <标题>（id: <slug>）」）。可传完整标题、去日期前缀标题，"
+                "或裸 slug（<slug> 与条目内 - id: 字段精确相等）。查看完整标题："
+                "python .orchd/__main__.py ideas list，或直接读 .orchd/IDEAS.md。"
+            ),
+            "candidates": candidates,
+        }
     if entry["status"] != "study":
         return {
             key: False,
@@ -574,7 +663,7 @@ def _idea_transition(
 
     lines = entry["lines"]
     # 改写状态 + 提交 —— 受准入写锁串行（task-admission-lock-engine：D 项）
-    orchd_dir = ws / ".orchd"
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
         new_lines: list[str] = []
