@@ -275,16 +275,62 @@ def detect_container_root_cwd(cwd: Path, orchd_dir: Path) -> tuple[str | None, P
     return None, None
 
 
+def nearest_git_root(start: Path) -> Path | None:
+    """起点所属的**最近 git 仓库根**（``git rev-parse --show-toplevel``，绝对路径）。
+
+    与 :func:`main_worktree_root` 的分工：后者用 ``--git-common-dir`` 区分
+    「linked worktree → 共同主根」与「独立仓库 → 自身」服务 canonical 根解析；
+    本函数只回答「起点当前站在哪个 git 仓库里」，用作 ``.orchd`` 向上查找时
+    **不可逾越的边界**。非 git 目录 / git 不可用 / 异常 → None（调用方降级）。
+    """
+    root = _git_toplevel(Path(start))
+    return root.resolve() if root is not None else None
+
+
+def find_orchd_dir_within_git_boundary(start: Path | None = None) -> Path:
+    """从 ``start``（默认 cwd）向上定位第一个 ``.orchd/``，但不越过最近 git 仓库根。
+
+    边界规则（task-canonical-root-boundary-guard，AC1）：
+
+    - 起点位于某 git 仓库 R 内：仅在闭区间 ``[start .. R 根]`` 内查找 ``.orchd``。
+      区间内（含 R 根）有 ``.orchd`` → 返回它；一路到 R 根都没有 → 返回
+      ``start/.orchd``（按 flat/自身处理），**绝不**继续爬到 R 的祖先。这堵住
+      「pytest tmp_path 落在宿主仓库内、其层级目录又被 ``git init`` 成独立仓库」
+      时解析越过内层仓库顶、误把宿主真实 ``.orchd`` 当工作区的事故。
+    - linked worktree：R 根即该任务 worktree 根，其下有引擎传播的 ``.orchd``，
+      在区间内即命中（master 读取再由 resolve_canonical_project_root 归主，零回归）。
+    - 起点不在任何 git 仓库（``nearest_git_root`` 为 None）：维持历史行为，逐级
+      向上直到命中（发布态自包含 / 非 git 降级路径，零回归）。
+    """
+    start = Path(start or Path.cwd()).resolve()
+    git_root = nearest_git_root(start)
+    for parent in [start, *start.parents]:
+        candidate = parent / ".orchd"
+        if candidate.is_dir():
+            return candidate
+        if git_root is not None and parent == git_root:
+            # 已查至最近 git 仓库根仍无 .orchd：停止，禁止越界继续上爬。
+            break
+    return start / ".orchd"
+
+
 def resolve_canonical_project_root(project_root: Path) -> Path:
     """解析 canonical 项目根（统一共享读入口：主工作树根，task-canonical-project-root）。
 
     业务读（pool/status/request 等加载 ``_master.json``）统一从 canonical 主工作树
     读取，避免任务 worktree 本地 checkout 副本与主工作树不同步导致的任务池不一致。
 
+    仓库边界（task-canonical-root-boundary-guard，AC1/AC2）：本函数与
+    :func:`find_orchd_dir_within_git_boundary` 同源遵守「不得越过起点所属的最近
+    git 仓库根」。标记缺失时经 ``main_worktree_root`` 的 ``--git-common-dir``
+    判定——**独立 git 仓库**的 common-dir 指向其自身 ``.git`` → 返回该仓库根
+    （其根无 ``.orchd`` 时按 flat/自身处理，不爬向宿主）；仅 **linked worktree**
+    （common-dir 指向共享主 ``.git``）才归主工作树根。
+
     - container 布局 → 返回主工作树根（``<容器>/main/``，布局标记权威）；
     - flat 布局 → 返回 ``project_root`` 自身（单 worktree，零回归）；
     - 标记缺失 → git 公共目录定位主工作树（linked worktree 返回同一主 ``.git``，
-      主 worktree / flat 返回自身）；
+      主 worktree / 独立仓库 / flat 返回自身）；
     - 非 git / 解析失败 → best-effort 返回 ``project_root``（调用方降级，不阻断）。
 
     Args:

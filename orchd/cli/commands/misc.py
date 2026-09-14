@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +40,11 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
     test-suite-slim §5.3 修复三处缺陷：
     - Python 解释器路径反斜杠转正斜杠，避免 Windows Git Bash 双引号内反斜杠被
       当转义符吞掉（嵌套引号 bug）；
-    - basetemp 用项目内固定可复用目录（pytest 每次运行前清空其内容），不再用
-      ``$$`` 每次新建且从不清理，消除系统临时目录膨胀；
+    - basetemp 落**系统临时目录**下的固定可复用子目录（task-release-chain-hardening），
+      不能放项目内：旧版 ``build/fullreg-basetemp`` 使 pytest ``tmp_path`` 进入仓库，
+      canonical root 解析据此爬到真实 ``.orchd``，同一条命令实测 140 failed；出仓后
+      0 failed。固定子目录而非 ``$$``：full-regression 是发版门禁、一次一人跑，
+      固定路径可复用，避免 ``$$`` 每次新建且从不清理导致临时目录膨胀；
     - 显式 ``-c pyproject.toml`` 确保读到 addopts 的 ``-n auto --dist=loadscope``
       并行配置，不依赖 shell cwd 推断 rootdir。
     """
@@ -52,14 +56,16 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
 
     project_root = Path(args.path).resolve() if args.path else Path.cwd()
     orchd_dir = project_root / ".orchd"
-    # 固定可复用 basetemp：pytest 每次运行前清空该目录，避免 $$ 每次新建且泄漏
-    basetemp = project_root / "build" / "fullreg-basetemp"
+    # basetemp 出仓到系统临时目录（task-release-chain-hardening）：若落在项目内，
+    # pytest tmp_path 进入仓库会污染 canonical root 解析（实测 140 failed）。
+    basetemp = Path(tempfile.gettempdir()) / "orchd-fullreg-basetemp"
     basetemp.mkdir(parents=True, exist_ok=True)
     # Git Bash 双引号内反斜杠会被当转义符；统一正斜杠（POSIX 路径本无反斜杠，无副作用）
     py = sys.executable.replace("\\", "/")
+    basetemp_arg = str(basetemp).replace("\\", "/")
     reg_cmd = (
         f'"{py}" -m pytest tests/ -q -c pyproject.toml '
-        f"--basetemp=build/fullreg-basetemp"
+        f"--basetemp={basetemp_arg}"
     )
     reg_started = time.monotonic()
     try:

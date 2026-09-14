@@ -391,12 +391,17 @@ def is_fingerprint_agent_id(agent_id: str) -> bool:
 
 
 def _find_orchd_dir() -> Path:
-    """从当前工作目录向上定位 .orchd 目录（发布态自包含布局）。"""
-    cwd = Path.cwd()
-    for parent in [cwd] + list(cwd.parents):
-        if (parent / ".orchd").is_dir():
-            return parent / ".orchd"
-    return cwd / ".orchd"
+    """从当前工作目录向上定位 .orchd 目录（发布态自包含布局）。
+
+    仓库边界（task-canonical-root-boundary-guard，AC1/AC2）：与 CLI 侧
+    ``orchd.cli._util._find_orchd_dir`` **同源**委托
+    :func:`orchd.worktree.find_orchd_dir_within_git_boundary`——不越过起点所属
+    的最近 git 仓库根：内层独立 git 仓库无 ``.orchd`` 时返回 ``cwd/.orchd``
+    （flat/自身），绝不爬到宿主真实 ``.orchd``；非 git 目录维持逐级向上（零回归）。
+    """
+    from orchd.worktree import find_orchd_dir_within_git_boundary
+
+    return find_orchd_dir_within_git_boundary(Path.cwd())
 
 
 def resolve_store_dir(orchd_dir: Path) -> Path:
@@ -765,6 +770,10 @@ def resolve_workspace_root(project_root: Path) -> Path:
     再按上述布局规则定位文档根：intake/ideas/amend 在任务 worktree 内调用时
     仍统一从主工作树读 IDEAS/ROADMAP/SKILL，避免 worktree 本地 ``.orchd/``
     拷贝（引擎传播的 SKILL.md 等）过期导致摄入/引导不一致。
+
+    仓库边界（task-canonical-root-boundary-guard，AC2）：本函数不自行扫祖先，
+    一律经 ``resolve_canonical_project_root`` 归位，故同源遵守「不得越过起点
+    所属最近 git 仓库根」——内层独立 git 仓库不会被误归到宿主工作区文档根。
 
     判定：``.orchd/`` 下已存在任一工作区文档 → 发布态；否则若项目根存在 → 开发态；
     两者都无 → 默认返回 ``.orchd/``（发布态默认，AC3）。

@@ -114,17 +114,21 @@ def _reject_container_root_cwd() -> None:
 
 
 def _find_orchd_dir() -> Path:
-    """查找 .orchd/ 目录。
+    """查找 .orchd/ 目录（CLI 主路径，task-canonical-root-boundary-guard）。
 
-    搜索策略：从当前工作目录开始，逐级向上遍历父目录，返回第一个包含
-    ``.orchd/`` 子目录的路径。若一直未找到，则回退为 ``cwd / ".orchd"``。
+    搜索策略：从当前工作目录开始逐级向上，返回第一个包含 ``.orchd/`` 的路径；
+    一直未找到则回退 ``cwd / ".orchd"``。
+
+    仓库边界（AC1/AC2）：与 ``orchd.ledger._find_orchd_dir`` **同源**委托
+    :func:`orchd.worktree.find_orchd_dir_within_git_boundary`——遍历不得越过
+    cwd 所属的最近 git 仓库根。pytest tmp_path 落在宿主仓库内且其层级目录被
+    ``git init`` 成独立仓库时，旧实现会越过内层仓库顶误定位到宿主真实
+    ``.orchd``（实测真仓库被切到 task/t1、残留分支）；现内层独立仓库无
+    ``.orchd`` 即返回 ``cwd/.orchd``，非 git 目录维持逐级向上（零回归）。
     """
-    cwd = Path.cwd()
-    for parent in [cwd] + list(cwd.parents):
-        candidate = parent / ".orchd"
-        if candidate.is_dir():
-            return candidate
-    return cwd / ".orchd"
+    from orchd.worktree import find_orchd_dir_within_git_boundary
+
+    return find_orchd_dir_within_git_boundary(Path.cwd())
 
 
 def _flatten_nargs(values: list[str] | None) -> list[str] | None:
@@ -244,40 +248,79 @@ def _maybe_archive_ideas(orchd_dir: Path) -> dict:
         master_path = cand
         orchd_dir = canonical / ".orchd"
     try:
-        from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
         from orchd.ideas import archive_resolved_ideas
         from orchd.spec import load_master
 
         master = load_master(master_path)
-    except Exception:
-        return {"archived": [], "kept": 0, "skipped": "archive_error"}
+    except Exception as exc:
+        # AC4：archive_error 必须带可审计原因，不再吞掉异常类型/消息。
+        return _archive_error_result("load_master", exc)
     project_root = orchd_dir.parent
     try:
         result = archive_resolved_ideas(project_root, master)
-    except Exception:
-        return {"archived": [], "kept": 0, "skipped": "archive_error"}
+    except Exception as exc:
+        return _archive_error_result("archive", exc)
     if result.get("archived"):
-        current_branch = get_current_branch(project_root)
-        default_branch = get_default_branch(project_root) or "main"
-        if current_branch is not None and current_branch != default_branch:
-            result["commit"] = {
-                "performed": False,
-                "reason": "not_on_main",
-                "branch": current_branch,
-            }
-        else:
-            # AC3（task-12-engine-path-abstraction）：工作区文档走统一工作区根
-            # helper（默认 .orchd/，兼容旧根路径）——ensure_committed 用相对
-            # project_root 的路径，工作区根为 .orchd/ 时路径前缀 .orchd/。
-            from orchd.ledger import resolve_workspace_root
-            ws_root = resolve_workspace_root(project_root)
-
-            def _rel(name: str) -> str:
-                return str((ws_root / name).relative_to(project_root))
-
-            result["commit"] = ensure_committed(
-                project_root,
-                [_rel("IDEAS.md"), _rel("IDEAS-archive.md")],
-                "chore(ideas): 自动归档已完结条目",
-            )
+        result["commit"] = _commit_archived_ideas(project_root)
     return result
+
+
+def _archive_error_result(stage: str, exc: BaseException) -> dict:
+    """归档失败的结构化降级结果（永不阻断调用方，AC4 可审计）。"""
+    return {
+        "archived": [],
+        "kept": 0,
+        "skipped": "archive_error",
+        "error": {
+            "stage": stage,
+            "type": type(exc).__name__,
+            "message": str(exc)[:300],
+        },
+    }
+
+
+def _commit_archived_ideas(project_root: Path) -> dict:
+    """归档写盘后，在【canonical 主工作树】提交 IDEAS 文档（AC4 错位根治）。
+
+    ``archive_resolved_ideas`` 经 ``resolve_workspace_root`` 把 IDEAS.md /
+    IDEAS-archive.md 写入 **canonical 主工作树**（container 布局为 main/）。旧实现却用
+    触发命令的 ``project_root``（review 时为任务 worktree）做分支判定、相对路径换算与
+    提交，于是 ``(ws_root/...).relative_to(任务worktree)`` 跨根抛 ValueError：文件已写
+    canonical 主工作树却未提交，上层只得到无原因的 archive_error，且主工作树残留未提交
+    的摄入产物。此处让分支判定 / 相对路径 / ensure_committed 全部对齐文件真正落点
+    canonical 根，写与提交同源，从根上消除 archive_error 与脏工作区。
+    """
+    from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
+    from orchd.ledger import resolve_workspace_root
+    from orchd.worktree import resolve_canonical_project_root
+
+    canon_root = Path(resolve_canonical_project_root(project_root))
+    current_branch = get_current_branch(canon_root)
+    default_branch = get_default_branch(canon_root) or "main"
+    if current_branch is not None and current_branch != default_branch:
+        return {
+            "performed": False,
+            "reason": "not_on_main",
+            "branch": current_branch,
+        }
+    # AC3（task-12-engine-path-abstraction）：工作区文档走统一工作区根 helper
+    # （默认 .orchd/，兼容旧根路径）——ensure_committed 用相对 canon_root 的路径，
+    # 工作区根为 .orchd/ 时路径前缀 .orchd/。
+    ws_root = resolve_workspace_root(canon_root)
+
+    def _rel(name: str) -> str:
+        return str((ws_root / name).relative_to(canon_root))
+
+    try:
+        return ensure_committed(
+            canon_root,
+            [_rel("IDEAS.md"), _rel("IDEAS-archive.md")],
+            "chore(ideas): 自动归档已完结条目",
+        )
+    except Exception as exc:
+        # best-effort 静默降级，但必须可审计，且不让异常逃逸成命令 exit 1。
+        return {
+            "performed": False,
+            "reason": "commit_error",
+            "error": {"type": type(exc).__name__, "message": str(exc)[:300]},
+        }
