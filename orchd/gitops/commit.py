@@ -7,8 +7,34 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from orchd.gitops._const import _GIT_COMMIT_TIMEOUT, _GIT_TIMEOUT
 from orchd.gitops._run import _run_git
 from orchd.gitops.query import _probe_git_repo_ready
+
+
+def _cleanup_index_locks(project_root: Path) -> None:
+    """清理被强杀的 git commit 遗留的索引锁（index.lock / next-index-*.lock）。
+
+    仅在 commit 超时（TimeoutExpired）后调用：超时意味着 git 进程被强杀，
+    可能留下 ``.git/index.lock`` / ``.git/next-index-*.lock``（含 linked
+    worktree 的独立 git dir）。best-effort：解析 git dir 失败或删除失败
+    均静默跳过，不阻断提交结果。``commit_failed``（rc!=0）分支**不得**调用
+    本函数——那是 git 自身可恢复的失败，删锁可能破坏并发中的其他提交。
+    """
+    try:
+        proc = _run_git(project_root, ["rev-parse", "--git-dir"], timeout=_GIT_TIMEOUT)
+        if proc.returncode != 0:
+            return
+        git_dir = Path((proc.stdout or "").strip())
+        if not git_dir.is_absolute():
+            git_dir = project_root / git_dir
+        for lock in [git_dir / "index.lock", *git_dir.glob("next-index-*.lock")]:
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
 
 
 def _filter_committable_paths(project_root: Path, paths: list[str]) -> list[str]:
@@ -20,9 +46,9 @@ def _filter_committable_paths(project_root: Path, paths: list[str]) -> list[str]
         ap = Path(p) if Path(p).is_absolute() else project_root / p
         if ap.exists():
             existing_paths.append(p)
-    # roadmap-untracked：过滤被 .gitignore 忽略的路径（如 .orchd/ROADMAP.md），
-    # git add 遇被忽略路径会 fatal 中止；被忽略路径直接剔除，未跟踪但未被忽略
-    # 的新文件仍保留，维持引擎兜底提交语义。
+    # roadmap-untracked：过滤被 .gitignore 忽略的路径（如 .orchd/ 内的运行时 /
+    # 历史 ROADMAP 残留副本），git add 遇被忽略路径会 fatal 中止；被忽略路径直接
+    # 剔除，未跟踪但未被忽略的新文件仍保留，维持引擎兜底提交语义。
     non_ignored_paths: list[str] = []
     for p in existing_paths:
         try:
@@ -58,9 +84,24 @@ def _commit_filtered_paths(
             "reason": "commit_failed",
             "message": (diff.stderr or diff.stdout).strip()[:300] or "git diff --cached failed",
         }
-    # commit 同样限定 paths：不提交声明范围外的 staged 内容，不 push
+    # commit 同样限定 paths：不提交声明范围外的 staged 内容，不 push。
+    # 写操作使用独立超时预算（_GIT_COMMIT_TIMEOUT）：pre-commit hook 等写路径
+    # 单次可越过读操作 10s 上限，超时不再吞成 commit_failed（AC1/AC2）。
     try:
-        commit = _run_git(project_root, ["commit", "-m", message, "--", *paths])
+        commit = _run_git(
+            project_root,
+            ["commit", "-m", message, "--", *paths],
+            timeout=_GIT_COMMIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _cleanup_index_locks(project_root)
+        return {
+            "performed": False,
+            "reason": "commit_timeout",
+            "message": "git commit timed out",
+            "timeout_seconds": _GIT_COMMIT_TIMEOUT,
+            "detail": str(exc) if str(exc) else "subprocess.TimeoutExpired",
+        }
     except (subprocess.SubprocessError, FileNotFoundError):
         return {"performed": False, "reason": "commit_failed", "message": "git commit failed"}
     if commit.returncode != 0:

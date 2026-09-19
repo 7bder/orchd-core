@@ -54,13 +54,13 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
     try:
         from orchd.ledger import Store
         from orchd.spec import load_master
-        from orchd.worktree import resolve_canonical_project_root
+        from orchd.worktree import resolve_master_path_from_dir
 
         orchd_dir = _find_orchd_dir()
         state = Store(orchd_dir).replay()
-        # master 任务定义统一从 canonical 主工作树读（task-canonical-project-root）
-        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
-        master_path = canonical_root / ".orchd" / "_master.json"
+        # master 任务定义统一从 canonical 主工作树读（task-canonical-project-root），
+        # 规则收敛到底座（task-cli-master-rule-single-source）。
+        master_path = resolve_master_path_from_dir(orchd_dir)
         tasks = load_master(master_path).tasks if master_path.exists() else []
 
         from orchd.guide import (
@@ -297,11 +297,10 @@ def _guidance_stderr_enabled() -> bool:
     """
     try:
         from orchd.spec import load_master
-        from orchd.worktree import resolve_canonical_project_root
+        from orchd.worktree import resolve_master_path_from_dir
 
         orchd_dir = _find_orchd_dir()
-        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
-        master_path = canonical_root / ".orchd" / "_master.json"
+        master_path = resolve_master_path_from_dir(orchd_dir)
         if not master_path.exists():
             return True
         master = load_master(master_path)

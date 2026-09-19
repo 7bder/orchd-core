@@ -74,6 +74,7 @@ from orchd.cli.commands.init import (
     _cmd_validate,
 )
 from orchd.cli.commands.misc import (
+    _cmd_context_digest,
     _cmd_full_regression,
     _cmd_intake,
     _cmd_layout_migrate,
@@ -115,14 +116,43 @@ def main(argv: list[str] | None = None) -> int:
     命令处理函数可返回 dict（自动 JSON 输出，exit code 0）或
     ``(dict, exit_code)`` 元组（JSON 输出 + 自定义 exit code），
     例如 watchdog 在检测到僵死任务时返回 ``(result, 1)``。
+
+    stdout 恒为纯 JSON 契约（task-cli-json-error-envelope）：裸跑无子命令时
+    help 改写 stderr；非法/缺参时捕获 argparse 的 SystemExit，在 stderr 保留
+    argparse 原文的同时向 stdout 输出 E007 JSON 错误封套（exit code 保持 2）。
+    ``--help`` / ``--version`` 的 SystemExit(0) 原样放行（显式请求，既有测试
+    以 stdout 承载其输出）。
     """
     _fix_windows_console_encoding()
     _auto_inject_session_id()
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # task-cli-json-error-envelope AC2：argparse 的 error() 已把 usage/error
+        # 写入 stderr（原文保留）；这里补 stdout 的 JSON 错误封套，退出码沿用 2。
+        # SystemExit(0) 是 --help/--version 的正常出口，原样放行。
+        code = exc.code if isinstance(exc.code, int) else 2
+        if code == 0:
+            raise
+        from orchd.guide import attach_error_guidance
+
+        resp: dict[str, Any] = {
+            "error": {
+                "code": "E007",
+                "message": "invalid_usage: argparse 解析失败（非法参数或缺少必需参数）",
+                "details": [{"exit_code": code, "argv": list(sys.argv[1:])}],
+            }
+        }
+        resp = attach_error_guidance(resp, "E007", _find_orchd_dir())
+        _output(resp)
+        _emit_guidance(resp)
+        return 2
 
     if not hasattr(args, "func"):
-        parser.print_help()
+        # task-cli-json-error-envelope AC1：裸跑无子命令——help 改写 stderr，
+        # stdout 不再混入非 JSON（退出码保持 2）。
+        parser.print_help(sys.stderr)
         return 2
 
     command = _command_name(args)

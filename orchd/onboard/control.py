@@ -55,9 +55,9 @@ _RETRACT_COOLDOWN_S = 300
 # 跨 agent 撤认他人 CLAIMED 仅在目标认领已超时（stale，押注作者/会话失联）时
 # 放行——与 REVIEW_CLAIMED 的 review_stale_timeout_s 对称，使 rules/session.md
 # 接管 SOP 第4步（接管方会话 retract 原 CLAIMED）可达（此前只能走 force-status）。
-# 默认 60 分钟：远大于正常实现 session 的活跃间隔；未超时仍报 E034，
-# 防借撤认抢活或绕过独立审查。env 覆盖仅供测试。
-_CLAIM_STALE_DEFAULT_S = 3600
+# 默认 10 分钟：实现 session 失联判定窗口（与 REVIEW_CLAIMED 的 300s 对称）；
+# 未超时仍报 E034，防借撤认抢活或绕过独立审查。env 覆盖仅供测试。
+_CLAIM_STALE_DEFAULT_S = 600
 
 
 def claim_stale_timeout_s() -> float:
@@ -197,7 +197,7 @@ def retract(
                          if ev.get("event_id") == target_event_id)
         cascade_ids = [target_event_id]
         for ev in all_events[target_idx + 1:]:
-            if ev.get("task_id") == task_id and ev.get("type") != "RETRACT":
+            if ev.get("task_id") == task_id and ev.get("type") not in ("RETRACT", "FORCE_STATUS"):
                 cascade_ids.append(ev.get("event_id"))
 
         # 逐条写 RETRACT
@@ -223,10 +223,10 @@ def retract(
         unbind_result = None
         if target_event.get("type") in ("CLAIMED", "REVIEW_CLAIMED"):
             try:
-                bindings = load_bindings(store.orchd_dir)
+                bindings = load_bindings(resolve_store_dir(store.orchd_dir))
                 if task_id in bindings:
                     unbind_result = unbind_task_wt(
-                        store.orchd_dir, task_id, lock_held=True,
+                        resolve_store_dir(store.orchd_dir), task_id, lock_held=True,
                     )
                     unbind_result["recycle_log"] = (
                         f"retract cascade unbind: task={task_id} "
@@ -404,6 +404,7 @@ def force_status(
     project_root: Path | None = None,
     evidence_sha: str | None = None,
     test_data: bool = False,
+    force_recycle: bool = False,
 ) -> dict[str, Any]:
     """强制设置任务状态。
 
@@ -428,6 +429,13 @@ def force_status(
         标记 ``test_data=True``，使 ``revive_audit`` / ``status`` 的复活扫描能区分
         生产复活与测试污染（测试数据不产生审计告警）。仅作事件标记，不影响状态机
         流转与任何门禁逻辑；生产路径默认 ``False``（零回归）。
+
+        ``force_recycle``（task-force-status-force-recycle-flag）：终态回收
+        （completed / cancelled）删 ``task/<id>`` 分支时的显式丢弃开关，透传给
+        :func:`orchd.worktree.remove_task_wt`。缺省 ``False``——未合并到主分支的
+        任务分支**拒绝删除**并留痕 ``branch_delete_refused``（红线：不得用 ``-D``
+        销毁未合并提交）；仅显式 ``True``（CLI ``--force-recycle``）才允许 ``-D``，
+        提交不可恢复，动作记入 ``recycle_log``（``mode=-D`` + ``unmerged_commits``）。
         """
     if target_status not in _FORCE_TARGETS:
         raise OrchdError(
@@ -546,12 +554,30 @@ def force_status(
         result["merge"] = merge_state
     # task-14-worktree-lifecycle（AC3）：终态（completed/cancelled）自动回收任务
     # worktree（git worktree remove + 删分支 + 解绑，best-effort）。
+    # force-recycle：显式丢弃未合并分支（缺省 False → remove_task_wt 拒绝删除
+    # 未合并分支并返回 branch_delete_refused，红线保护）。
     if target_status in ("completed", "cancelled") and project_root:
         from orchd.worktree import remove_task_wt
 
-        result["worktree_recycled"] = remove_task_wt(
-            project_root, task_id, resolve_store_dir(store.orchd_dir)
-        )
+        try:
+            result["worktree_recycled"] = remove_task_wt(
+                project_root, task_id, resolve_store_dir(store.orchd_dir),
+                force_recycle=force_recycle,
+            )
+        except Exception as exc:
+            # best-effort（task-unbind-recycle-audit-best-effort）：解绑/回收
+            # 异常降级为结构化 warning 并透出，不再导致 force_status 落 E999。
+            code = getattr(getattr(exc, "code", None), "name", type(exc).__name__)
+            result["worktree_recycled"] = {
+                "removed": False,
+                "unbound": False,
+                "error": f"{code}: {exc}"[:300],
+                "warnings": [{
+                    "code": "worktree_recycle_failed",
+                    "task_id": task_id,
+                    "error": f"{code}: {exc}"[:300],
+                }],
+            }
         # L3 pre-commit hook 卸载（best-effort）：force_status 直达终态时兜底，
         # 防止任务级 hook 残留（与 done/retract 一致）。
         hook_uninstall(project_root)

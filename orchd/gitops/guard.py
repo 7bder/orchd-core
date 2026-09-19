@@ -396,6 +396,32 @@ def _record_git_unavailable_guard(
     )
 
 
+# 会话锁未持锁降级的人读原因（task-session-lock-degrade-observability AC3）：
+# 按 session_lock 的 reason 分类给出可操作语义——**争用**与**环境故障**的处置
+# 方向完全不同（前者等/重试，后者修磁盘/权限/占用），不可混成一句「锁失败」。
+_SESSION_LOCK_DEGRADE_REASONS = {
+    "flock_contended": (
+        "会话锁被其他进程持有（flock 争用）：本会话未持锁，"
+        "本次写命令未经会话锁保护（正常并发语义，非环境故障）"
+    ),
+    "lock_dir_unwritable": (
+        "锁目录不可写（IO/权限故障）：本会话未持锁，本次写命令未经会话锁保护"
+    ),
+    "lock_write_failed": (
+        "锁标记写入失败（IO/文件占用故障）：本会话未持锁，本次写命令未经会话锁保护"
+    ),
+}
+
+
+def _session_lock_degrade_reason(lock_state: dict[str, Any]) -> str:
+    """会话锁未持锁的可读降级原因（未知 reason 码原样透出，不掩盖）。"""
+    code = lock_state.get("reason") or "unknown"
+    known = _SESSION_LOCK_DEGRADE_REASONS.get(code)
+    if known:
+        return known
+    return f"会话锁获取失败（reason={code}）：本会话未持锁，本次写命令未经会话锁保护"
+
+
 def guard_write_command(
     project_root: Path | None,
     *,
@@ -410,6 +436,15 @@ def guard_write_command(
 
     fail-closed：state=error（git 超时/IO 故障）抛 E018 阻断；state=unavailable
     （无 git/非仓库）降级跳过但记入 degraded；分支不符→E018，工作区脏→E017。
+
+    **L2 会话锁降级可观测**（task-session-lock-degrade-observability AC3）：会话锁
+    未持有（``ensure_session_lock`` 返回 ``acquired=False``）时经
+    :func:`record_degraded_guard` 并入 ``degraded``（guard=``session_lock``、
+    E030/warning），使「本次未经会话锁保护」从 stderr-only 变为结构化可检索字段。
+    best-effort 语义不变（**不阻断**；fail-closed 属门禁行为变更，另议），且
+    ``ensure_session_lock`` 的业务拒绝（E019 workspace_busy / 身份缺失）原样上抛
+    ——那是并发保护**生效**的证据，不得吞成降级。未发生降级时响应字段集合不变
+    （沿用「有降级才补字段」约定）。
 
     Args:
         degraded: 可选降级登记列表，调用方放进响应使降级可审计。
@@ -427,7 +462,46 @@ def guard_write_command(
             _record_git_unavailable_guard(degraded, command, state)
 
     if git_available and orchd_dir is not None and agent_id is not None:
-        ensure_session_lock(orchd_dir, agent_id, branch)
+        # AC3：捕获持锁态——此前该返回值被丢弃（R2-7 只补了 stderr 留痕），会话锁失效
+        # 时写命令照常执行且响应里看不到。未持锁 → 并入 degraded_guards 供 agent 与
+        # 审计按结构化字段检索「本次未经会话锁保护」。
+        lock_state = ensure_session_lock(orchd_dir, agent_id, branch)
+        if not lock_state.get("acquired"):
+            record_degraded_guard(
+                degraded,
+                guard_name="session_lock",
+                status=GUARD_STATUS_FAILED,
+                reason=_session_lock_degrade_reason(lock_state),
+                error=lock_state.get("error"),
+                context={
+                    "command": command,
+                    "reason": lock_state.get("reason"),
+                    "gate_acquired": lock_state.get("gate_acquired"),
+                },
+                hint=lock_state.get("hint"),
+            )
+        elif not lock_state.get("gate_acquired"):
+            # task-session-gate-degrade-surface：持锁但门锁未串行化
+            # （acquired=True 且 gate_acquired=False）——此前只有返回态与
+            # stderr 可见，写命令响应查不到。并入 degraded_guards 使「本次
+            # 未经门锁串行化」结构化可检索；仍 best-effort，不阻断命令执行。
+            record_degraded_guard(
+                degraded,
+                guard_name="session_gate",
+                status=GUARD_STATUS_FAILED,
+                reason=(
+                    "会话锁标记写入成功，但门锁未获取（检查+写入未串行化）："
+                    "本次写命令未经门锁串行化保护"
+                ),
+                context={
+                    "command": command,
+                    "gate_acquired": False,
+                },
+                hint=(
+                    "门锁降级为 best-effort，不阻断命令执行；并发下可能多个 "
+                    "session 同时通过检查，请排查门锁文件占用/权限后重试"
+                ),
+            )
 
 
 def _resolve_claim_check_root(project_root: Path | None) -> Path | None:

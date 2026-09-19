@@ -48,6 +48,35 @@ from orchd.ledger import (
 )
 
 
+def is_self_review_author(
+    done_event: dict[str, Any] | None,
+    agent_id: str,
+    session_id: str | None,
+) -> bool:
+    """判定「本次审查/认领是否为自审」：实现者（DONE 作者）与审查者是否同一身份。
+
+    判定口径为全仓单一事实源（v4，2026-09-15 停服升级时，由 claim 与
+    select_review_candidate 的历史私有副本收敛于此，三段判定完全等价）：
+
+    - DONE 事件与当前 ``session_id`` 均已知 → 要求 session 与 agent 同时匹配；
+    - 否则退化为仅比较 ``agent_id``（旧数据 / 无 session 环境）。
+
+    自审事实的落账由调用方完成：REVIEW_CLAIMED / REVIEW_SUBMITTED 事件写入
+    ``is_self_review`` 字段（派生为 TaskState.review_self_review），使事后审计
+    直接读账本即可认定，不再依赖 ``DONE.agent_id == REVIEW_CLAIMED.agent_id``
+    的启发式推导（该推导在 session 维度不可靠）。
+    """
+    if not done_event:
+        return False
+    done_author = done_event.get("agent_id")
+    done_session = done_event.get("session_id")
+    if not done_author:
+        return False
+    if done_session and session_id:
+        return done_session == session_id and done_author == agent_id
+    return done_author == agent_id
+
+
 def _recent_transitions(
     store: Store, task_id: str, limit: int = 5, derived: TaskDerived | None = None,
 ) -> list[dict[str, Any]]:
@@ -149,18 +178,13 @@ def request_reviewer(
                 continue
             # self-review：DONE 实现指纹 == 当前 reviewer 指纹。
             # 默认仅标注照常分配；enforce=True 时排除（AC1）。
+            # v4（2026-09-15 停服升级）：判定收敛到 is_self_review_author（单一事实源），
+            # 与 claim / review_submit 的落账口径严格一致，消除私有副本漂移。
             from orchd.ledger import resolve_session_identity
             current_session = resolve_session_identity(store.orchd_dir)["session_id"]
-            done_author, _ = extract_last_done(store, tid, derived)
-            done_ev = find_last_done_event(store, tid, derived)
-            done_session = done_ev.get("session_id") if done_ev else None
-            if done_author:
-                if done_session and current_session:
-                    is_self = done_session == current_session and done_author == agent_id
-                else:
-                    is_self = done_author == agent_id
-            else:
-                is_self = False
+            is_self = is_self_review_author(
+                find_last_done_event(store, tid, derived), agent_id, current_session
+            )
             if is_self and enforce_self_review_block:
                 continue
             entry = {
@@ -247,6 +271,39 @@ def extract_review_comments(
                 "当前版本已强制要求 CHANGES_REQUESTED 必须附意见]"
             )
     return comments
+
+
+def extract_review_history(store: Store, task_id: str) -> list[dict[str, Any]]:
+    """该任务全部 REVIEW_SUBMITTED 的结构化意见（只读回看，task-review-comments-readback）。
+
+    每项 {"review_type", "verdict", "timestamp", "comments"}，与 claim 侧
+    extract_review_comments 同源扫描（空打回历史占位口径一致）。
+    只读：不写事件、不改任务状态；completed（含归档）任务同样可读。
+    """
+    history: list[dict[str, Any]] = []
+    if not store.ledger_exists():
+        return history
+    events = store._read_ledger_lines(from_line=1)
+    for ev in events:
+        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+            continue
+        if ev.get("comments"):
+            body = ev["comments"]
+        # 空打回历史占位口径与 extract_review_comments 一致（此处只读呈现）。
+        elif ev.get("verdict") == "CHANGES_REQUESTED":
+            body = (
+                "[该次打回未附审查意见（历史数据），请联系审查者补充；"
+                "当前版本已强制要求 CHANGES_REQUESTED 必须附意见]"
+            )
+        else:
+            continue
+        history.append({
+            "review_type": ev.get("review_type"),
+            "verdict": ev.get("verdict"),
+            "timestamp": ev.get("timestamp"),
+            "comments": body,
+        })
+    return history
 
 
 def extract_last_done(
@@ -435,10 +492,15 @@ def _review_submit_impl(
     CHANGES_REQUESTED 时任务回退 pending。
     """
     # 意图化守卫（task-14-git-policy-layer）：任意分支、不要求干净。
+    # AC4（task-session-lock-degrade-observability）：此前该调用点是四个意图化封装
+    # （claim / done / clean / review）中唯一**未透传 degraded** 的——会话锁降级条目
+    # 只生成、不入响应，review 路径的「本次未经会话锁保护」不可见。此处补齐接线。
+    degraded: list[dict[str, Any]] = []
     guard_review_write(
         project_root,
         orchd_dir=store.orchd_dir,
         agent_id=agent_id,
+        degraded=degraded,
     )
     # task-14-worktree-lifecycle（AC2）：目标 root == 任务 worktree（不一致 E018，
     # 防错目录审查）。flat 单会话绑定=主工作树 → 恒通过；无绑定 → best-effort 跳过。
@@ -520,9 +582,17 @@ def _review_submit_impl(
                           "否则实现者返工后无法获知需要修复什么"}],
             )
 
+        # v4（2026-09-15 停服升级）：自审事实落账——提交审查时把「实现者 == 审查者」
+        # 写入事件（与 REVIEW_CLAIMED 同口径、同一判定函数），TaskState.review_self_review
+        # 随之派生；事后审计直接读账本，不必再用 DONE.agent_id == REVIEW_CLAIMED.agent_id
+        # 的启发式推导。
+        is_self_review = is_self_review_author(
+            derived.last_done.get(task_id), agent_id, current_session
+        )
         event = make_event(
             task_id, agent_id, "REVIEW_SUBMITTED",
             verdict=verdict,
+            is_self_review=is_self_review,
         )
         # review-unify-r2：unified 单阶段（review_type 为 None）不写 review_type
         # 字段（R2-b：新事件无 review_type）；two_phase 保留 spec/code 供 replay
@@ -538,6 +608,9 @@ def _review_submit_impl(
             "review_type": review_type,
             "verdict": verdict,
         }
+        if is_self_review:
+            # 与 claim 的 self_review_notice 呼应：非阻断提示，便于调用方即时知情
+            result["is_self_review"] = True
         if integrity_warnings:
             result["integrity_warnings"] = integrity_warnings
 
@@ -850,6 +923,11 @@ def _review_submit_impl(
         result["guidance"] = _build_completion_guidance(
             task_id, result.get("worktree_recycled")
         )
+
+    # AC4：守卫降级不静默——会话锁未持有时非空，并入响应（沿用「有降级才补字段」
+    # 约定，无降级则维持既有字段集合不变）。
+    if degraded:
+        result["degraded_guards"] = degraded
 
     return result
 

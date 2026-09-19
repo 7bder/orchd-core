@@ -29,7 +29,7 @@
 
 | 情况 | 行为 |
 |---|---|
-| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 14 个 + 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
+| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **36 个**（`orchd/guide.py::_ERROR_GUIDANCE_TABLE` 全量覆盖 E001-E036）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
 | **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --resolved` 沉淀；未解决 → 停止报告 |
 | **红线 14 纪律场景**（candidate=None / next_action=exit） | 维持不变：停止等待，**不**视为自愈 |
 
@@ -70,12 +70,14 @@
 
 ### 四条错误产生通道
 
-| 通道 | 产生方式 | 是否经 attach_error_guidance | 典型码 |
+| 通道 | 产生方式 | 是否经 attach_error_guidance | 典型码（登记口径以 `orchd/guide.py::ERROR_CODE_CHANNELS` 为唯一真源） |
 |---|---|---|---|
-| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E019/E022/E025/E027/E033/E034/E036 |
-| **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | E004/E005/E006/E023/E024/E026/E028/E029 |
+| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E002/E007-E019/E025/E027/E033/E034/E036（含 E015；**E003/E005/E022 为 A+B 双通道**；E004/E006 不在 A） |
+| **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | E004/E006/E023/E024/E026/E028/E029/E031（+ 双通道 E003/E005/E022） |
 | **C 手工 dict** | 代码里手拼 `{"code":"Exxx", ...}` 后 return | ❌ 否（需 structured_error 接线） | E021/E028/E030/E031/E032/E035 |
 | **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | E020 |
+
+**通道登记核对（2026-09-15，按 `ERROR_CODE_CHANNELS` 实测）**：A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）、B+C 双通道 2 码（E028/E031，同时出现在上表 B 批量校验与 C 手工 dict 通道）、A+B 双通道 3 码（E003/E005/E022）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
 
 **E015 (merge_conflict) 已接入通道 A**（不再是死映射）：`done` 前置对账在 `orchd/onboard/lifecycle/core.py` 新增 `raise OrchdError(E015)` 位点（task-done-reconcile-main 挂载点①）；`orchd/review.py` 仍以手工 dict 挂 `result` 的 reason 路径保留。`ERROR_CODE_CHANNELS` 登记由空集改为 `{"A"}`。
 
@@ -96,3 +98,26 @@
 |---|---|---|
 | **E012 lock_timeout** | 准入写锁持有超时 | 用 `watchdog` 查看锁持有者 → 正常并发释放后自动成功；僵死则等其退出（flock 进程退出自动释放）或按 watchdog 指引接管 |
 | **E019 workspace_busy** | 工作区被其他会话占用 | 用 `watchdog` 查看持有会话 → 等待其释放或按需接管；**不要重试原命令** |
+
+## 已接受风险登记（accepted risks，2026-09-19 起）
+
+> 口径：本节登记「已知存在、经裁决**决定不修**的风险」——登记即表示这不是遗漏，而是取舍结论。
+> 每条必须写明：机制 / 为何接受 / 影响面 / 人工检索方式 / 复审触发条件。
+> **登记不等于豁免**：一旦出现实测反例（如真发生数据不一致、丢事件），须立即开任务重评。
+
+### A-1 · 命令层 guard 降级不阻断（INV-3a；2026-09-19 用户裁决 A1(b) 定级）
+
+- **机制**：`orchd/gitops/guard.py` 的命令层准入守卫在「未拿到准入锁（`acquired=false`）」或
+  「持锁但门锁未串行化（`gate_acquired=false`）」时，只调用 `record_degraded_guard(...)` 写入
+  结构化降级记录（`code=E030 / severity=warning`），**不阻断命令执行**；该函数 docstring 自述
+  「fail-closed 属门禁行为变更，另议」——本轮把「另议」正式收敛为**已接受风险**。
+- **为何接受**：① 缺真实频率数据（尚无「拿不到锁」的实测样本），改为 fail-closed 会拒绝共享盘
+  （NFS / SMB）与锁竞争场景下**本可成功执行**的命令，属可用性换正确性；② 影响面可审计且非裸奔
+  ——降级记录按 E030 可检索，且 done 侧另有 fail-closed 的声明 / 越界门禁兜底
+  （锁定用例 `tests/test_done.py::TestDoneGuardFailClosed`）。
+- **人工检索方式**：写命令响应里的 `degraded_guards`（按 `code=E030` / `guard_name=session_lock`
+  过滤）；`doctor` 与账本告警同码（E030），可统一检索「哪些门禁没在守」。
+- **复审触发条件**：出现实测反例（并发写导致状态不一致 / 丢事件），或降级记录累计到可观测阈值时，
+  开任务重评；届时若选 fail-closed，须先补「拿不到锁的频率」统计作为依据。
+- **定级依据来源**：pass5 全量审查（`review/orchestra-full-review-20260919-pass5-Qoder.md`）标为
+  「两轮挂另议」；本轮由用户裁决采纳定级。

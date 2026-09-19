@@ -101,8 +101,50 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _append_line_unlocked(path: Path, entry: dict[str, Any]) -> bool:
+    """单行 JSONL 追加（无锁写原语，task-lessons-review-write-seam）。
+
+    调用方须已持有 lessons 锁（ExclusiveFileLock）。行编码（json.dumps +
+    "\\n" 追加写）与加锁版 :func:`_append_jsonl` 同源，是全仓唯一的追加实现。
+
+    Returns:
+        True 写入成功；False IO 失败。
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+        return True
+    except OSError:
+        return False
+
+
+def _write_rows_unlocked(path: Path, rows: list[dict[str, Any]]) -> bool:
+    """整体覆写 JSONL（无锁写原语，task-lessons-review-write-seam）。
+
+    调用方须已持有 lessons 锁（ExclusiveFileLock）。行编码与加锁版
+    :func:`_rewrite_jsonl` 同源，是全仓唯一的覆写实现。持锁（独立锁文件
+    lessons.lock）期间整体覆写「数据文件」path：锁 fd 属于锁文件本身，
+    不可用于写数据；path 为不同文件，无 Windows msvcrt 字节锁的跨句柄冲突问题。
+
+    Returns:
+        True 成功；False IO 失败。
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+        path.write_text(content, encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def _append_jsonl(path: Path, obj: dict[str, Any], lock_path: Path) -> bool:
     """追加一行 JSONL（持 ExclusiveFileLock，best-effort 超时跳过）。
+
+    加锁 + 调无锁原语 :func:`_append_line_unlocked`（嵌套持锁安全：
+    ExclusiveFileLock 进程级可重入，同进程同路径 depth+1，不死锁）。
 
     Returns:
         True 写入成功；False 锁超时跳过（不阻塞主流程）。
@@ -113,19 +155,15 @@ def _append_jsonl(path: Path, obj: dict[str, Any], lock_path: Path) -> bool:
     except OrchdError:
         return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(obj, ensure_ascii=False) + "\n"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-        return True
-    except OSError:
-        return False
+        return _append_line_unlocked(path, obj)
     finally:
         lock.release()
 
 
 def _rewrite_jsonl(path: Path, rows: list[dict[str, Any]], lock_path: Path) -> bool:
     """整体重写 JSONL（持 ExclusiveFileLock，互斥写，设计 §6.3）。
+
+    加锁 + 调无锁原语 :func:`_write_rows_unlocked`（嵌套持锁安全，同上）。
 
     Returns:
         True 成功；False 锁超时跳过。
@@ -136,15 +174,7 @@ def _rewrite_jsonl(path: Path, rows: list[dict[str, Any]], lock_path: Path) -> b
     except OrchdError:
         return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
-        # 持锁（独立锁文件 lessons.lock）期间整体覆写「数据文件」path。
-        # 锁 fd 属于锁文件本身，不可用于写数据；path 为不同文件，
-        # 无 Windows msvcrt 字节锁的跨句柄冲突问题。
-        path.write_text(content, encoding="utf-8")
-        return True
-    except OSError:
-        return False
+        return _write_rows_unlocked(path, rows)
     finally:
         lock.release()
 
@@ -152,10 +182,19 @@ def _rewrite_jsonl(path: Path, rows: list[dict[str, Any]], lock_path: Path) -> b
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 def load_lessons_config(orchd_dir: Path | str) -> dict[str, Any]:
     """读取 lessons 配置（设计 §9.5 / §10.1），缺省：enabled=true / require_review=true
-    / review_timeout_minutes=60。best-effort：任何异常回退默认。"""
+    / review_timeout_minutes=60。best-effort：任何异常回退默认。
+
+    task-master-path-resolver-convergence：master **路径解析**统一走
+    :func:`orchd.worktree.resolve_master_path_from_dir`（唯一真源）。此前裸读
+    ``<orchd_dir>/_master.json``：container 布局下任务 worktree 已抑制该副本 →
+    宿主在 master 里配的 lessons 段被无声忽略，全部回落默认值
+    （``require_review=True`` / ``review_timeout_minutes=60``）。
+    """
     default = {"enabled": True, "require_review": True, "review_timeout_minutes": 60}
     try:
-        mp = Path(orchd_dir) / "_master.json"
+        from orchd.worktree import resolve_master_path_from_dir
+
+        mp = resolve_master_path_from_dir(orchd_dir)
         if mp.exists():
             cfg = json.loads(mp.read_text(encoding="utf-8")).get("config", {})
             lessons = cfg.get("lessons")
@@ -539,6 +578,121 @@ def run_done_lesson_hook(
 
 
 # ── 审查收口：review / resolve / archive ──────────────────────────────────────
+def _review_task_transaction(
+    orchd_dir: Path | str,
+    *,
+    task_id: str,
+    approve_all: bool,
+    reject_indices: set[int],
+) -> dict[str, Any]:
+    """review_task 的单次持锁事务：落库 + 摘除 staged 在同一锁窗口内完成。
+
+    并发语义（task-lessons-review-single-transaction）：持锁期间其他进程
+    无法 append/rewrite，消除「append 成功但 rewrite 未完成」的中间态被
+    并发 review 重复 promote 的窗口。重跑 review 不产生重复条目。
+    失败语义保持不静默：落库失败保留 staged + deferred；回写失败
+    staged_write_skipped 留痕。锁获取失败由调用方降级处理。
+    """
+    lock = ExclusiveFileLock(_lock_path(orchd_dir))
+    try:
+        lock.acquire(blocking=False, timeout_s=LOCK_TIMEOUT_S)
+    except OrchdError:
+        return {"lock_failed": True}
+
+    try:
+        # 持锁后重新读取 staged（事务一致性：避免锁获取前的快照已过期）
+        all_staged = _read_jsonl(_staged_path(orchd_dir))
+        staged = [e for e in all_staged if e.get("task_id") == task_id]
+        if not staged:
+            return {"promoted": [], "rejected": [], "timed_out": False,
+                    "note": "无暂存建议"}
+
+        cfg = load_lessons_config(orchd_dir)
+        timeout = int(cfg.get("review_timeout_minutes", 60))
+        timed_out = False
+        now = time.time()
+        for s in staged:
+            da = s.get("detected_at")
+            if da:
+                try:
+                    dt = time.strptime(da, "%Y-%m-%dT%H:%M:%S%z")
+                    if (now - time.mktime(dt)) > timeout * 60:
+                        timed_out = True
+                except (ValueError, OverflowError):
+                    pass
+
+        promoted: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        kept_staged: list[dict[str, Any]] = []
+        deferred: list[dict[str, Any]] = []
+
+        lib_path = _lib_path(orchd_dir)
+        lib_path.parent.mkdir(parents=True, exist_ok=True)
+
+        for idx, s in enumerate(staged):
+            if idx in reject_indices:
+                rejected.append({"trigger_key": (s.get("trigger") or {}).get("key"),
+                                 "symptom": s.get("symptom")})
+                continue
+            if not approve_all and idx not in reject_indices:
+                # 未 approve 且未 reject → 保留在 staged（等待后续处理）
+                kept_staged.append(s)
+                continue
+            lesson_id = _next_lesson_id(orchd_dir)
+            status = "verified" if s.get("resolved") else "proposed"
+            entry = {
+                "id": lesson_id,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "trigger": s.get("trigger"),
+                "symptom": s.get("symptom"),
+                "solution": s.get("solution", ""),
+                "source": s.get("source"),
+                "severity": s.get("severity", "blocking"),
+                "status": status,
+                "hits": 0,
+                "conflicts_with": s.get("conflicts_with"),
+                "lengths": {"symptom": len(s.get("symptom", "")),
+                            "solution": len(s.get("solution", ""))},
+            }
+            # 无锁原语追加（调用方已持 lessons 锁；ExclusiveFileLock 进程级可重入，
+            # 嵌套持锁 depth+1 不死锁——此前“避免嵌套锁死锁”注释为事实错误）：
+            # 落库失败 → 保留 staged + deferred 登记（task-intake-atomic-lock-consistent AC3）
+            if not _append_line_unlocked(lib_path, entry):
+                kept_staged.append(s)
+                deferred.append({
+                    "trigger_key": (s.get("trigger") or {}).get("key"),
+                    "symptom": s.get("symptom"),
+                    "reason": "append_failed",
+                })
+                continue
+            promoted.append({
+                "id": lesson_id,
+                "status": status,
+                "trigger_key": (s.get("trigger") or {}).get("key"),
+                "symptom": s.get("symptom"),
+                "source": s.get("source"),
+            })
+
+        # 无锁原语回写 staged（调用方已持 lessons 锁，同上无嵌套锁风险）：
+        # 先移除本任务全部条目，再并回 kept_staged（未 approve/reject 的 +
+        # 落库失败待重试的）——已成功 promote 的条目即在此被摘除。
+        final_staged = [x for x in all_staged if x.get("task_id") != task_id] + kept_staged
+        staged_written = _write_rows_unlocked(_staged_path(orchd_dir), final_staged)
+
+        result: dict[str, Any] = {"promoted": promoted, "rejected": rejected,
+                                  "timed_out": timed_out}
+        if deferred:
+            result["deferred"] = deferred
+            result["hint"] = "部分 lesson 落库失败（并发冲突/IO），已保留在 staged 供重试"
+        if not staged_written:
+            # 回写失败：已入库条目可能仍留在暂存区——显式留痕不静默
+            result["staged_write_skipped"] = True
+            result["staged_hint"] = "staged 回写未成功（IO 失败）：重跑 review 前请先核对暂存区"
+        return result
+    finally:
+        lock.release()
+
+
 def review_task(
     orchd_dir: Path | str,
     *,
@@ -552,71 +706,25 @@ def review_task(
     - reject（指定 staged 内序号）→ 丢弃，不入库。
     - 确认后清理该任务 staged 行；超时降级：detected_at 超 review_timeout_minutes
       仍被 review → 标注 timed_out（自动放行，不阻塞）。
-    Returns: {promoted:[...], rejected:[...], timed_out:bool}
+    - 落库 + 摘除 staged 在**单次持锁事务**内完成（task-lessons-review-single-transaction）：
+      消除并发窗口，重跑 review 不产生重复条目。
+    - 落库失败 → 保留 staged + deferred 登记；回写失败 → staged_write_skipped 留痕。
+    - 锁获取失败 → 整体跳过，返回 lock_skipped 提示（不静默降级）。
+    Returns: {promoted:[...], rejected:[...], timed_out:bool, 可选 deferred / hint /
+        staged_write_skipped / staged_hint / lock_skipped}
     """
-    reject_indices = set(reject_indices or [])
-    staged = [e for e in _read_jsonl(_staged_path(orchd_dir)) if e.get("task_id") == task_id]
-    if not staged:
-        return {"promoted": [], "rejected": [], "timed_out": False, "note": "无暂存建议"}
-    cfg = load_lessons_config(orchd_dir)
-    timeout = int(cfg.get("review_timeout_minutes", 60))
-    timed_out = False
-    now = time.time()
-    for s in staged:
-        da = s.get("detected_at")
-        if da:
-            try:
-                # 解析 %z 时间戳
-                dt = time.strptime(da, "%Y-%m-%dT%H:%M:%S%z")
-                if (now - time.mktime(dt)) > timeout * 60:
-                    timed_out = True
-            except (ValueError, OverflowError):
-                pass
-
-    promoted: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
-    kept_staged: list[dict[str, Any]] = []
-    all_staged = _read_jsonl(_staged_path(orchd_dir))
-    for idx, s in enumerate(staged):
-        if idx in reject_indices:
-            rejected.append({"trigger_key": (s.get("trigger") or {}).get("key"),
-                             "symptom": s.get("symptom")})
-            continue
-        if not approve_all and idx not in reject_indices:
-            # 未 approve 且未 reject → 保留在 staged（等待后续处理）
-            kept_staged.append(s)
-            continue
-        lesson_id = _next_lesson_id(orchd_dir)
-        status = "verified" if s.get("resolved") else "proposed"
-        entry = {
-            "id": lesson_id,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "trigger": s.get("trigger"),
-            "symptom": s.get("symptom"),
-            "solution": s.get("solution", ""),
-            "source": s.get("source"),
-            "severity": s.get("severity", "blocking"),
-            "status": status,
-            "hits": 0,
-            "conflicts_with": s.get("conflicts_with"),
-            "lengths": {"symptom": len(s.get("symptom", "")),
-                        "solution": len(s.get("solution", ""))},
+    reject_set = set(reject_indices or [])
+    result = _review_task_transaction(
+        orchd_dir, task_id=task_id, approve_all=approve_all,
+        reject_indices=reject_set,
+    )
+    if result.get("lock_failed"):
+        return {
+            "promoted": [], "rejected": [], "timed_out": False,
+            "lock_skipped": True,
+            "hint": "lessons 锁获取失败（并发冲突），review 未执行，请稍后重试",
         }
-        # 入库后从 staged 移除
-        all_staged = [x for x in all_staged if x is not s]
-        _append_jsonl(_lib_path(orchd_dir), entry, _lock_path(orchd_dir))
-        promoted.append({
-            "id": lesson_id,
-            "status": status,
-            "trigger_key": (s.get("trigger") or {}).get("key"),
-            "symptom": s.get("symptom"),
-            "source": s.get("source"),
-        })
-    # 写回 staged（保留未处理 + 移除已处理）
-    final_staged = [x for x in all_staged if x.get("task_id") != task_id] + kept_staged
-    _rewrite_jsonl(_staged_path(orchd_dir), final_staged, _lock_path(orchd_dir))
-    return {"promoted": promoted, "rejected": rejected, "timed_out": timed_out}
-
+    return result
 
 def resolve_lesson(
     orchd_dir: Path | str, *, lesson_id: str, approve: bool

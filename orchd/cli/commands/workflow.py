@@ -398,9 +398,40 @@ def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     return result
 
 
+def _cmd_review_show(args) -> dict:
+    """只读回看任务全部历史审查意见（task-review-comments-readback）。
+
+    与 --verdict 互斥（同时提供直接拒绝）；不写任何事件、不改任务状态、
+    不要求会话身份；completed（含归档）与无意见任务均可调用（无意见返回空列表）。
+    --type 在回看模式下不作过滤（回看全部历史）。
+    """
+    from orchd.ledger import Store
+    from orchd.cli import _load_tasks
+    from orchd.review import extract_review_history
+
+    if getattr(args, "verdict", None) is not None:
+        raise OrchdError(
+            ErrorCode.E007,
+            "--show 与 --verdict 只能二选一",
+            [{"arguments": ["--show", "--verdict"]}],
+        )
+    tasks, orchd_dir, _ = _load_tasks()
+    task_map = {t.get("id", ""): t for t in tasks}
+    if task_map.get(args.task) is None:
+        raise OrchdError(
+            ErrorCode.E005,
+            f"task '{args.task}' not found in master",
+            [{"task_id": args.task, "hint": f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
+        )
+    store = Store(orchd_dir)
+    history = extract_review_history(store, args.task)
+    return {"task_id": args.task, "comments": history, "count": len(history)}
+
+
 def _cmd_review(args) -> dict:
     from orchd.cli import _load_tasks
     from orchd.cli import _maybe_archive_ideas
+    from orchd.cli._util import _preimport_archive_deps
 
     """提交审查结果（spec review 或 code review）。
 
@@ -413,13 +444,34 @@ def _cmd_review(args) -> dict:
     from orchd.ledger import Store
     from orchd.review import review_submit
 
+    if getattr(args, "show", False):
+        return _cmd_review_show(args)
+    if getattr(args, "verdict", None) is None:
+        raise OrchdError(
+            ErrorCode.E007,
+            "必须提供 --verdict（提交模式），或改用 --show 只读回看",
+            [{"arguments": ["--verdict", "--show"]}],
+        )
     comments = _resolve_text_arg(
         args.comments, args.comments_file, "--comments", "--comments-file",
         required=False,
     )
     tasks, orchd_dir, _ = _load_tasks()
+    task_map = {t.get("id", ""): t for t in tasks}
+    if task_map.get(args.task) is None:
+        raise OrchdError(
+            ErrorCode.E005,
+            f"task '{args.task}' not found in master",
+            [{"task_id": args.task, "hint": f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
+        )
     store = Store(orchd_dir)
     agent_id = _require_agent_id(orchd_dir)
+    # 终态归档依赖预导入（task-review-archive-selfdelete-fix AC1）：review_submit
+    # 成功（code APPROVED）会终态回收任务 worktree，连带删除本进程 orchd 源码
+    # 目录；归档唯一懒加载点 orchd.ideas 必须在源码尚存时绑定进 sys.modules，
+    # 否则回收后再导入即 ModuleNotFoundError（归档静默失效）。预导入失败不阻断
+    # ——_maybe_archive_ideas 的子进程兜底会接管。
+    _preimport_archive_deps()
     result = review_submit(
         store, tasks, agent_id=agent_id, task_id=args.task,
         review_type=args.type, verdict=args.verdict, comments=comments,
@@ -480,8 +532,11 @@ def register(sub) -> None:
     # two_phase 模式仍须传 spec/code。
     p.add_argument("--type", required=False, choices=["spec", "code"],
                    help="审查阶段（spec/code）；unified 单阶段模式下可省略")
-    p.add_argument("--verdict", required=True, choices=["APPROVED", "CHANGES_REQUESTED"])
+    p.add_argument("--verdict", required=False, choices=["APPROVED", "CHANGES_REQUESTED"],
+                   help="审查结论（提交模式必填；--show 回看模式下不得提供）")
     p.add_argument("--comments")
     p.add_argument("--comments-file", help="从文件读取审查意见（UTF-8），与 --comments 二选一")
+    p.add_argument("--show", action="store_true",
+                   help="只读回看该任务全部历史审查意见（与 --verdict 互斥，不写事件）")
     p.set_defaults(func=_cmd_review)
 

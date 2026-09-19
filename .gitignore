@@ -35,9 +35,11 @@ pytest_tmp_*/
 .pytest_tmp_full/
 
 # orchd 自托管（§8.4）：工作区文档与共享上下文跟踪，运行时状态忽略
-# 工作区文档（task-12-workspace-docs：IDEAS/ROADMAP/IDEAS-archive/SKILL 归置 .orchd/；
+# 工作区文档（task-12-workspace-docs：IDEAS/IDEAS-archive/SKILL 归置 .orchd/；
 # task-skill-hub-refactor：规则目录 rules/ 归置 .orchd/rules/）
-# ROADMAP.md 自 2026-08-25 起不纳入 git（仅未来版本规划的本地工作文档，见 CHANGELOG.md 版本历史）
+# ROADMAP.md 唯一源 = 宿主项目根（非 .orchd/ 内），纳入 git（见
+# orchd/ledger.py::resolve_roadmap_path）；.orchd/ROADMAP.md 为旧布局残留，
+# 引擎忽略它（resolve_roadmap_path 不读 .orchd/ 内副本）。
 .orchd/*
 !.orchd/_master.json
 !.orchd/shared/

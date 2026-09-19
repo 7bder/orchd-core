@@ -29,6 +29,28 @@ from orchd.cli._util import (
 
 
 
+def _aggregate_validation_items(
+    items: list[dict[str, Any]], top_n: int = 5
+) -> dict[str, Any]:
+    """validate 聚合视图（task-diagnostics-aggregate-budget）。
+
+    按 code 计数 + top-N（保持输入序头部），复用 validate 自身 code 分档，
+    不另立分档表。manual 档优先语义由 watchdog 侧 doctor disposition 承载，
+    此处仅按 code 分组计数。
+    """
+    total = len(items)
+    counts: dict[str, int] = {}
+    for it in items:
+        code = str(it.get("code", "unknown"))
+        counts[code] = counts.get(code, 0) + 1
+    return {
+        "total": total,
+        "truncated": total > top_n,
+        "top": items[:top_n],
+        "by_code": counts,
+    }
+
+
 def _cmd_validate(args) -> dict:
     """校验 _master.json 的结构与引用完整性。
 
@@ -40,11 +62,13 @@ def _cmd_validate(args) -> dict:
     已完成任务无意义，且其核心字段（files_to_edit / acceptance_criteria）
     受 E007 终态保护无法改写。豁免按当前状态动态生效：任务被 force-status
     重置回 pending 后豁免自动失效，不掩盖新任务的质量问题。
+    口径统一（task-amend-quality-warning-terminal-filter）：终态豁免判据收敛到
+    orchd.spec.filter_terminal_quality_warnings 单一真源（E023/E026/E027/E029
+    一律豁免），与 amend 共用；--include-terminal 可回放全部历史缺陷。
     """
-    import re
-
     from orchd.ledger import Store
     from orchd.spec import (
+        filter_terminal_quality_warnings,
         layout_marker_warnings,
         load_master,
         roadmap_landing_warnings,
@@ -52,13 +76,15 @@ def _cmd_validate(args) -> dict:
         validate_references,
         validate_structure,
     )
-    from orchd.worktree import resolve_canonical_project_root
+    from orchd.worktree import resolve_master_path_from_dir
 
     # task-master-single-copy：container 任务 worktree 已抑制副本，本地无 _master.json
     # 时回退 canonical 主工作树（唯一权威）；flat 布局 canonical == 本地，零回归。
+    # （task-cli-master-rule-single-source：回退规则收敛到底座；显式 --master 路径
+    # 存在时仍优先使用，不改变 CLI 参数语义。）
     master_path = Path(args.path)
     if not master_path.exists():
-        cand = resolve_canonical_project_root(master_path.parent.parent) / ".orchd" / "_master.json"
+        cand = resolve_master_path_from_dir(master_path.parent)
         if cand.exists():
             master_path = cand
 
@@ -67,24 +93,19 @@ def _cmd_validate(args) -> dict:
     quality_warnings = validate_quality(master)  # E022/E023/E024 为质量告警，不判 invalid
 
     # 终态任务集合；无可用 ledger（新项目 / replay 失败）时跳过过滤，validate 保持可运行。
+    # --include-terminal 逃生口：回放全部历史任务定义缺陷（含终态）。
     terminal_ids: set[str] | None = None
     try:
         state = Store(master_path.parent).replay()
         terminal_ids = {tid for tid, ts in state.items() if ts.status in ("completed", "cancelled")}
     except Exception:
         terminal_ids = None
+    if getattr(args, "include_terminal", False):
+        terminal_ids = set()
 
-    def _keep_quality_warning(e) -> bool:
-        if terminal_ids is None or e.code.name not in ("E029", "E023"):
-            return True
-        m = re.match(r"\$\.tasks\[(\d+)\]", e.path or "")
-        if not m:
-            return True
-        idx = int(m.group(1))
-        tid = master.tasks[idx].get("id") if idx < len(master.tasks) else None
-        return tid not in terminal_ids
-
-    quality_warnings = [e for e in quality_warnings if _keep_quality_warning(e)]
+    quality_warnings, exempted_terminal_warnings = filter_terminal_quality_warnings(
+        quality_warnings, master.tasks, terminal_ids
+    )
 
     # intake-dual-path（2026-08-15）：ROADMAP 规划章节落地兜底（E031 告警，不判 invalid）。
     # 独立追加：E031 非任务级质量项，不参与终态豁免过滤；dict 结构，与 ValidationError 并存。
@@ -103,17 +124,35 @@ def _cmd_validate(args) -> dict:
 
     errors_list = [{"code": e.code.name, "path": e.path, "message": e.message} for e in structure_errors]
     warnings_list = [_warn_dict(e) for e in quality_warnings]
+    full = bool(getattr(args, "full", False))
+
+    errors_annot = annotate_validation_items(errors_list, master_path.parent)
+    warnings_annot = annotate_validation_items(warnings_list, master_path.parent)
+    errors_summary = _aggregate_validation_items(errors_annot)
+    warnings_summary = _aggregate_validation_items(warnings_annot)
+    if not full:
+        errors_out = errors_summary["top"]
+        warnings_out = warnings_summary["top"]
+    else:
+        errors_out = errors_annot
+        warnings_out = warnings_annot
 
     if structure_errors:
         return {
             "valid": False,
-            "errors": annotate_validation_items(errors_list, master_path.parent),
-            "warnings": annotate_validation_items(warnings_list, master_path.parent),
+            "errors": errors_out,
+            "warnings": warnings_out,
+            "errors_summary": errors_summary,
+            "warnings_summary": warnings_summary,
+            "exempted_terminal_warnings": exempted_terminal_warnings,
         }
     return {
         "valid": True,
-        "errors": [],
-        "warnings": annotate_validation_items(warnings_list, master_path.parent),
+        "errors": errors_out,
+        "warnings": warnings_out,
+        "errors_summary": errors_summary,
+        "warnings_summary": warnings_summary,
+        "exempted_terminal_warnings": exempted_terminal_warnings,
     }
 
 def _cmd_bootstrap(args) -> dict:
@@ -189,6 +228,10 @@ def register(sub) -> None:
     # validate
     p = sub.add_parser("validate", help="校验 _master.json")
     p.add_argument("path", nargs="?", default=".orchd/_master.json")
+    p.add_argument("--include-terminal", action="store_true",
+                   help="回放终态任务定义缺陷（含 completed/cancelled，不做终态豁免）")
+    p.add_argument("--full", action="store_true",
+                   help="输出全量明细（默认聚合视图 total/truncated/top，--full 回退全量数组）")
     p.set_defaults(func=_cmd_validate)
 
     # bootstrap

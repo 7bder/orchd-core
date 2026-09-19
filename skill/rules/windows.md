@@ -24,7 +24,7 @@ orchd 协议文本（`AGENTS.md`、`SKILL.md`、`rules/*.md`、`templates/*.md`�
 
 ## 管道编码（中文 Windows）
 
-- 中文 Windows 上 git/子进程输出编码：引擎已统一 UTF-8 解码（gitops.py / onboard.py）。
+- 中文 Windows 上 git/子进程输出编码：引擎已统一 UTF-8 解码（`orchd/gitops_ops.py` 的稳健解码 helper（UTF-8 优先 / GBK 回退 / 有损兜底）+ `orchd/subproc.py`；原扁平模块 `gitops.py` / `onboard.py` 已拆分为 `orchd/gitops/` / `orchd/onboard/` 子模块）。
 - **管道消费 orchd JSON 须按 UTF-8 解码**：`python .orchd/__main__.py pool --all | python -c "json.load(sys.stdin)"` 在中文 Windows 会 JSONDecodeError/乱码（消费方 stdin 按 GBK 解码 UTF-8 字节流）。
 - 规避方式：设 `PYTHONIOENCODING=utf-8` 或 `python -X utf8`、或显式 `encoding='utf-8'` 解码。
 - 此为 CLI 写 stdout 给管道消费方的编码契约，与 task-encoding-hardening 的引擎读子进程输出解码不同向，详见 README「Windows 管道编码」。
@@ -38,3 +38,12 @@ PowerShell 5.1 把内容经管道喂给原生进程时，默认以 **UTF-16LE（
 - **推荐**：改用临时文件 + 显式路径复核（`git show <rev>:<path> > "$TMP/x.py"` 后由 Python 读文件），绕开管道形态转换；
 - 或先显式设置 `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)`（必要时连同 `[Console]::OutputEncoding`）再管道；
 - 或直接用 Git Bash（`bash -lc`）执行同一命令（见上节「Windows shell 命令执行规则」）。
+
+## PowerShell 落盘与分流（JSON 消费）
+
+引擎 stdout 本身是严格可解析 JSON（`orchd/cli/skeleton.py::_output` 已净化不安全字符），解析失败一律先查**调用侧**两处手法，勿报引擎缺陷：
+
+- **禁 `>` 落盘 JSON**：PowerShell 5.1 的 `>` 写 UTF-16LE+BOM，且中文先被控制台按 GBK 解码损坏。统一走字节级捕获器（`scripts/orchd_cap.py`，subprocess 捕获 + 分流落盘，退出码透传）：
+  `python scripts/orchd_cap.py --out C:/Temp/s.json --err C:/Temp/s.err -- status`
+- **禁 `2>&1` 混流**：stderr 的 `orchd ▸` 引导块是给人看的，混进文件则任何解析必炸。stdout/stderr 必须分流（捕获器默认即分流）。
+- **解析**：stdout 按 UTF-8（BOM 容错 `utf-8-sig`）一次 strict `json.loads` 即可；`--text` 类命令本来就不是 JSON，不得按 JSON 解析。

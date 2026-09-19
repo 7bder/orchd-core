@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -37,7 +38,6 @@ from orchd.errors import ErrorCode, OrchdError
 _SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
 _DEFAULT_SCHEMA_PATH = _SCHEMA_DIR / "_master.schema.json"
 
-
 # ------------------------------------------------------------------
 # 连带文件自动登记（task-decl-concession-autoregister）：白名单单一来源
 # ------------------------------------------------------------------
@@ -49,7 +49,9 @@ _DEFAULT_SCHEMA_PATH = _SCHEMA_DIR / "_master.schema.json"
 # 其余越界文件一律高风险类，仍 E010 拒绝、需显式确认。
 
 
-def derive_related_test_file(fe: str, tests_root: str | Path | None = None) -> str | None:
+def derive_related_test_file(fe: str,
+                             tests_root: str | Path | None = None
+                             ) -> str | None:
     """从引擎源码文件推导对应测试文件（单一来源，E026 与 done 分诊共用）。
 
     ``orchd/<stem>.py`` → ``tests/test_<stem>.py``；嵌套路径（``orchd/a/b/x.py``）
@@ -134,7 +136,8 @@ def is_path_covered(declared: str, target: str) -> bool:
     return False
 
 
-def detect_dir_or_glob_declarations(task: dict[str, Any]) -> list[dict[str, str]]:
+def detect_dir_or_glob_declarations(
+        task: dict[str, Any]) -> list[dict[str, str]]:
     """检出任务声明中的目录式/通配符路径（task-decl-dir-notation-guard AC1/AC3）。
 
     扫描 ``files_to_edit`` 与 ``exempt_files``，返回命中清单。判定：
@@ -160,12 +163,20 @@ def detect_dir_or_glob_declarations(task: dict[str, Any]) -> list[dict[str, str]
                 hits.append({"field": decl_field, "path": fp, "kind": "glob"})
                 continue
             if fp.endswith("/"):
-                hits.append({"field": decl_field, "path": fp, "kind": "directory"})
+                hits.append({
+                    "field": decl_field,
+                    "path": fp,
+                    "kind": "directory"
+                })
                 continue
             # 实际为目录（如 orchd/cli 无尾斜杠但对应目录存在）
             try:
                 if Path(fp).is_dir():
-                    hits.append({"field": decl_field, "path": fp, "kind": "directory"})
+                    hits.append({
+                        "field": decl_field,
+                        "path": fp,
+                        "kind": "directory"
+                    })
             except OSError:
                 pass
     return hits
@@ -265,7 +276,10 @@ def load_master(path: Path | str) -> Master:
         raise OrchdError(
             ErrorCode.E001,
             f"file not found: {path}",
-            [{"path": str(path), "message": "目标文件不存在"}],
+            [{
+                "path": str(path),
+                "message": "目标文件不存在"
+            }],
         )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -273,7 +287,10 @@ def load_master(path: Path | str) -> Master:
         raise OrchdError(
             ErrorCode.E002,
             f"invalid JSON in {path}: {exc}",
-            [{"path": str(path), "message": str(exc)}],
+            [{
+                "path": str(path),
+                "message": str(exc)
+            }],
         ) from exc
     return Master(raw=raw, source_path=path)
 
@@ -288,17 +305,25 @@ def validate_structure(master: Master) -> list[ValidationError]:
     version = master.raw.get("schema_version", 1)
     validator = _build_validator(version)
     errors: list[ValidationError] = []
-    for err in sorted(validator.iter_errors(master.raw), key=lambda e: list(e.absolute_path)):
-        json_path = "$" + "".join(
-            f"[{p}]" if isinstance(p, int) else f".{p}" for p in err.absolute_path
-        )
+    for err in sorted(validator.iter_errors(master.raw),
+                      key=lambda e: list(e.absolute_path)):
+        json_path = "$" + "".join(f"[{p}]" if isinstance(p, int) else f".{p}"
+                                  for p in err.absolute_path)
+        # 从 $.tasks[i] 路径解析 task id，增强诊断信息
+        tid = None
+        for i, p in enumerate(err.absolute_path):
+            if isinstance(p, int) and i + 1 < len(err.absolute_path):
+                next_p = err.absolute_path[i + 1]
+                if isinstance(next_p, str) and p < len(master.tasks):
+                    tid = master.tasks[p].get("id")
+                    break
+        message = f"task '{tid}': {err.message}" if tid else err.message
         errors.append(
             ValidationError(
                 code=ErrorCode.E003,
                 path=json_path,
-                message=err.message,
-            )
-        )
+                message=message,
+            ))
     return errors
 
 
@@ -331,8 +356,7 @@ def validate_references(master: Master) -> list[ValidationError]:
                     code=ErrorCode.E006,
                     path=f"$.tasks[{i}].id",
                     message=f"duplicate task_id: '{tid}'",
-                )
-            )
+                ))
         else:
             task_ids.append(tid)
 
@@ -344,8 +368,7 @@ def validate_references(master: Master) -> list[ValidationError]:
                     code=ErrorCode.E006,
                     path=f"$.modules[{i}].id",
                     message=f"duplicate module_id: '{mid}'",
-                )
-            )
+                ))
         else:
             module_ids.append(mid)
 
@@ -362,8 +385,7 @@ def validate_references(master: Master) -> list[ValidationError]:
                     code=ErrorCode.E005,
                     path=f"$.tasks[{i}].module",
                     message=f"module '{mod}' not found in modules[]",
-                )
-            )
+                ))
         # depends_on 引用
         for j, dep in enumerate(t.get("depends_on", [])):
             if dep not in task_id_set:
@@ -371,9 +393,9 @@ def validate_references(master: Master) -> list[ValidationError]:
                     ValidationError(
                         code=ErrorCode.E005,
                         path=f"$.tasks[{i}].depends_on[{j}]",
-                        message=f"depends_on references unknown task_id: '{dep}'",
-                    )
-                )
+                        message=
+                        f"depends_on references unknown task_id: '{dep}'",
+                    ))
 
     # --- E005: shared 文件存在性 ---
     # shared 中声明的文件由 BOOTSTRAP 阶段负责写入，路径为相对于项目根的相对路径。
@@ -389,12 +411,9 @@ def validate_references(master: Master) -> list[ValidationError]:
                     ValidationError(
                         code=ErrorCode.E005,
                         path=f"$.shared.{key}",
-                        message=(
-                            f"shared file not found: '{rel}'"
-                            f"（BOOTSTRAP 声明了 shared.{key} 但未写入该文件）"
-                        ),
-                    )
-                )
+                        message=(f"shared file not found: '{rel}'"
+                                 f"（BOOTSTRAP 声明了 shared.{key} 但未写入该文件）"),
+                    ))
 
     # --- E004: DAG 环检测（Kahn 拓扑排序） ---
     # 构建邻接表与入度表（仅使用已存在的 ID，避免 E005 干扰）
@@ -410,7 +429,8 @@ def validate_references(master: Master) -> list[ValidationError]:
                 in_degree[tid] += 1
                 dependents[dep].append(tid)
 
-    queue: deque[str] = deque(tid for tid, deg in in_degree.items() if deg == 0)
+    queue: deque[str] = deque(tid for tid, deg in in_degree.items()
+                              if deg == 0)
     visited_count = 0
 
     while queue:
@@ -428,9 +448,9 @@ def validate_references(master: Master) -> list[ValidationError]:
             ValidationError(
                 code=ErrorCode.E004,
                 path="$.tasks",
-                message=f"dependency cycle detected involving: {', '.join(sorted(cycle_nodes))}",
-            )
-        )
+                message=
+                f"dependency cycle detected involving: {', '.join(sorted(cycle_nodes))}",
+            ))
 
     return errors
 
@@ -441,16 +461,36 @@ def validate_references(master: Master) -> list[ValidationError]:
 
 # 模糊词白名单：这些词虽然看似模糊，但在特定上下文中是可验证的
 _VAGUE_WORDS_WHITELIST = {
-    "自检通过", "测试通过", "验证通过", "正常输出", "正常运行",
-    "无报错", "无异常", "无错误", "符合预期", "满足要求",
+    "自检通过",
+    "测试通过",
+    "验证通过",
+    "正常输出",
+    "正常运行",
+    "无报错",
+    "无异常",
+    "无错误",
+    "符合预期",
+    "满足要求",
     # task-e023-vague-whitelist：可验证连词（精确子串，不可能误伤裸"正常"）
-    "正常仓库", "健康仓库", "正常执行", "正常报", "main 正常",
+    "正常仓库",
+    "健康仓库",
+    "正常执行",
+    "正常报",
+    "main 正常",
 }
 
 # 模糊词检测列表
 _VAGUE_WORDS = [
-    "应该能", "合理地", "适当", "正常", "充分", "足够",
-    "良好的", "优雅的", "健壮的", "高效的",
+    "应该能",
+    "合理地",
+    "适当",
+    "正常",
+    "充分",
+    "足够",
+    "良好的",
+    "优雅的",
+    "健壮的",
+    "高效的",
 ]
 
 # 跨平台 basetemp 模板（task-cross-platform-release / task-cross-platform-validation）
@@ -477,7 +517,9 @@ def _is_doc_task(t: dict) -> bool:
     仅按 files_to_edit 后缀白名单判定——空 files_to_edit 视为非文档（代码类），
     避免漏校验。
     """
-    files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
+    files_edit = [
+        f for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+    ]
     if not files_edit:
         return False
     return all(f.lower().endswith(_DOC_SUFFIXES) for f in files_edit)
@@ -493,18 +535,75 @@ def is_code_task(t: dict) -> bool:
 
 
 def _tests_root_from_master(master: Master) -> Path | None:
-    """从 _master.json 所在位置推导 tests/ 目录，不存在返回 None（E026 存在性兜底）。
+    """从 _master.json 所在位置推导 tests/ 目录，不存在返回 None（E026 存在性兜底）。"""
+    tests = _project_root_from_master(master) / "tests"
+    return tests if tests.is_dir() else None
+
+
+# ------------------------------------------------------------------
+# 声明口径一致性校验（task-intake-decl-consistency-gate，2026-09-17）
+# ------------------------------------------------------------------
+# why：撰稿人手写的 brief / verify_command 与机器声明、仓库实际三者之间此前无一致性
+# 校验，漂移只能等执行期由 agent 撞上——实测三例：verify_command 引用
+# tests/test_precommit.py 与 tests/test_intake.py（两者均不存在，只能 amend 现场修正）；
+# files_to_edit 声明当时不存在的 tests/test_session.py（被迫新建文件以满足 E010）。
+#
+# 错误码归属（task-decl-consistency-error-code 已落地专用码）：
+# 校验① → E037（verify_reference_drift，阻断级，终态豁免）
+# 校验② → E038（brief_decl_count_mismatch，warning 级，终态豁免）
+# E027 回归原语义（verify_command 不安全/不兼容段），E029 回归原语义（粒度越界/建议拆分）。
+# 历史背景：task-intake-decl-consistency-gate 交付时因声明边界复用 E027/E029，
+# 导致 guidance 文案串味（「建议拆分」用于数量口径不一致）、按码统计无法区分
+# 「命令不安全」与「声明口径漂移」。本任务拆出专用码并同步 errors.py / guide.py /
+# TERMINAL_EXEMPT_QUALITY_CODES，存量 387 条任务零新增误报（14 例历史命中均为终态豁免）。
+_DECL_COUNT_RE = re.compile(r"files_to_edit\s*[）)」\"']?\s*控\s*(\d+)")
+# verify_command 中「仓库内相对路径」识别后缀白名单：只认带明确文件后缀的 token，
+# 宁可漏判不可误判（目录目标如 `ruff check orchd/`、选项 `-q` 均不参与判定）。
+_VERIFY_PATH_SUFFIXES = (
+    ".py",
+    ".md",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".txt",
+    ".sh",
+    ".ps1",
+)
+# 含以下字符的 token 不做路径解析：shell 元字符（$ ` | > < ( ) & ; * ? { } [ ]）、
+# 反斜杠（Windows 路径形态）与冒号（env 展开 / 盘符）。
+_VERIFY_PATH_SKIP_CHARS = frozenset("$`|><()&;*?{}[]\\:")
+
+
+def _project_root_from_master(master: Master) -> Path:
+    """从 _master.json 位置推导项目根（声明路径的存在性基准）。
 
     .orchd/ 布局（``<root>/.orchd/_master.json``）→ 项目根为 source_path.parent.parent；
     根布局（``<root>/_master.json``）→ 项目根为 source_path.parent。
     """
     src = master.source_path
-    if src.parent.name == ".orchd":
-        project_root = src.parent.parent
-    else:
-        project_root = src.parent
-    tests = project_root / "tests"
-    return tests if tests.is_dir() else None
+    return src.parent.parent if src.parent.name == ".orchd" else src.parent
+
+
+def _verify_command_path_tokens(verify_cmd: str) -> list[str]:
+    """抽取 verify_command 中「按仓库根解析」的路径 token（保守判定）。
+
+    跳过：以 ``-`` 开头（选项）、以 ``/`` 开头（绝对路径如 /dev/null）、无已知文件
+    后缀（如 ruff 的目标目录 ``orchd/``）、含 shell 元字符 / 反斜杠 / 冒号的 token。
+    """
+    out: list[str] = []
+    for raw in verify_cmd.split():
+        tok = raw.strip("\"'")
+        if not tok or tok.startswith("-") or tok.startswith("/"):
+            continue
+        if not tok.endswith(_VERIFY_PATH_SUFFIXES):
+            continue
+        if any(ch in _VERIFY_PATH_SKIP_CHARS for ch in tok):
+            continue
+        out.append(tok)
+    return out
 
 
 def validate_quality(master: Master) -> list[ValidationError]:
@@ -517,12 +616,20 @@ def validate_quality(master: Master) -> list[ValidationError]:
     1. E022 —— verify_command 缺失（warning；代码类任务在 amend 注册点按
        ``_is_doc_task`` 判定阻断，文档/基础设施类仅 warning）。
     2. E023 —— acceptance_criteria 含模糊词（warning），白名单豁免常见可验证语义。
+    3. E037 —— verify_command 引用的仓库内路径既未声明（files_to_edit /
+       exempt_files）又不存在 → 阻断级：声明口径一致性（task-decl-consistency-error-code；
+       终态任务由调用方按 TERMINAL_EXEMPT_QUALITY_CODES 豁免）。
+    4. E038 —— brief 的「files_to_edit 控 N」与实际声明数不一致 → warning
+       （同任务；**非拆分建议**，专用码从 E029 拆出）。
+    5. E024 / E026 / E029 其余项 —— 见各代码块内注释（basetemp / 测试连带 / 粒度锚点）。
 
     Returns:
-        ValidationError 列表（E022/E023/E024/E026/E027…）；合法时返回空列表。
+        ValidationError 列表（E022/E023/E024/E026/E027/E029/E037/E038…）；合法时返回空列表。
     """
     errors: list[ValidationError] = []
     tasks = master.tasks
+    # 声明路径存在性的解析基准（校验①用）：与 E026 的 tests/ 推导同源，单一真源。
+    project_root = _project_root_from_master(master)
 
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
@@ -532,57 +639,74 @@ def validate_quality(master: Master) -> list[ValidationError]:
         #   代码类（files_to_edit 含非文档文件）→ amend 注册点阻断；
         #   文档/基础设施类（全部文档后缀）→ 维持 warning。
         verify_cmd = t.get("verify_command")
-        if not verify_cmd or (isinstance(verify_cmd, str) and not verify_cmd.strip()):
+        if not verify_cmd or (isinstance(verify_cmd, str)
+                              and not verify_cmd.strip()):
             is_code = not _is_doc_task(t)
             errors.append(
                 ValidationError(
                     code=ErrorCode.E022,
                     path=f"$.tasks[{i}].verify_command",
-                    message=(
-                        f"task '{tid}' missing verify_command (required for automated validation)"
-                        + ("" if not is_code else "；代码类任务缺 verify_command，注册被阻断")
-                    ),
-                )
-            )
+                    message=
+                    (f"task '{tid}' missing verify_command (required for automated validation)"
+                     +
+                     ("" if not is_code else "；代码类任务缺 verify_command，注册被阻断")),
+                ))
 
         # R4（task-constraint-quality-checks）：任务拆解粒度启发式越界（warning 级）。
         # 越界即提示拆分，不做注册阻断（触碰 §9.2 内容域，硬阻断留待人工决策）。
-        files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
+        files_edit = [
+            f for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+        ]
         if len(files_edit) > _GRANULARITY_MAX_FILES:
             errors.append(
                 ValidationError(
                     code=ErrorCode.E029,
                     path=f"$.tasks[{i}].files_to_edit",
-                    message=(
-                        f"task '{tid}' files_to_edit 数量 {len(files_edit)} 超过粒度锚点 "
-                        f"{_GRANULARITY_MAX_FILES}（建议拆分，warning 不阻断）"
-                    ),
-                )
-            )
+                    message=
+                    (f"task '{tid}' files_to_edit 数量 {len(files_edit)} 超过粒度锚点 "
+                     f"{_GRANULARITY_MAX_FILES}（建议拆分，warning 不阻断）"),
+                ))
+        # E038（task-decl-consistency-error-code）：brief 的数量口径
+        # 「files_to_edit 控 N」与实际声明数不一致 → warning（不阻断，**非拆分建议**）。
+        # 专用码从 E029 拆出，避免与「粒度越界/建议拆分」语义串味。
+        brief_text = t.get("brief")
+        if isinstance(brief_text, str) and brief_text:
+            count_m = _DECL_COUNT_RE.search(brief_text)
+            if count_m and int(count_m.group(1)) != len(files_edit):
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E038,
+                        path=f"$.tasks[{i}].brief",
+                        message=(
+                            f"task '{tid}' brief 声明的 files_to_edit 数量口径 "
+                            f"{count_m.group(1)} 与实际声明 {len(files_edit)} 不一致"
+                            "（warning 不阻断；此处非拆分建议：请对齐 brief 文案与声明集合）"),
+                    ))
+
         est_hours = t.get("estimated_hours")
-        if isinstance(est_hours, (int, float)) and est_hours > _GRANULARITY_MAX_HOURS:
+        if isinstance(est_hours,
+                      (int, float)) and est_hours > _GRANULARITY_MAX_HOURS:
             errors.append(
                 ValidationError(
                     code=ErrorCode.E029,
                     path=f"$.tasks[{i}].estimated_hours",
                     message=(
                         f"task '{tid}' estimated_hours {est_hours} 超过粒度锚点 "
-                        f"{_GRANULARITY_MAX_HOURS}（建议拆分，warning 不阻断）"
-                    ),
-                )
-            )
-        ac_list2 = [a for a in (t.get("acceptance_criteria") or []) if isinstance(a, str)]
+                        f"{_GRANULARITY_MAX_HOURS}（建议拆分，warning 不阻断）"),
+                ))
+        ac_list2 = [
+            a for a in (t.get("acceptance_criteria") or [])
+            if isinstance(a, str)
+        ]
         if len(ac_list2) > _GRANULARITY_MAX_AC:
             errors.append(
                 ValidationError(
                     code=ErrorCode.E029,
                     path=f"$.tasks[{i}].acceptance_criteria",
-                    message=(
-                        f"task '{tid}' acceptance_criteria 数量 {len(ac_list2)} 超过粒度锚点 "
-                        f"{_GRANULARITY_MAX_AC}（建议拆分，warning 不阻断）"
-                    ),
-                )
-            )
+                    message=
+                    (f"task '{tid}' acceptance_criteria 数量 {len(ac_list2)} 超过粒度锚点 "
+                     f"{_GRANULARITY_MAX_AC}（建议拆分，warning 不阻断）"),
+                ))
 
         # E023: acceptance_criteria 模糊词检测
         ac_list = t.get("acceptance_criteria", [])
@@ -599,9 +723,9 @@ def validate_quality(master: Master) -> list[ValidationError]:
                         ValidationError(
                             code=ErrorCode.E023,
                             path=f"$.tasks[{i}].acceptance_criteria[{j}]",
-                            message=f"task '{tid}' acceptance_criteria[{j}] contains vague term '{vague}' (use quantifiable criteria)",
-                        )
-                    )
+                            message=
+                            f"task '{tid}' acceptance_criteria[{j}] contains vague term '{vague}' (use quantifiable criteria)",
+                        ))
                     break  # 一条 AC 只报一次
 
         # E024: verify_command 含 pytest 但缺 --basetemp（沙箱坑，warning）
@@ -609,18 +733,18 @@ def validate_quality(master: Master) -> list[ValidationError]:
         # 2026-08-08 精确化：仅匹配"真正执行 pytest 子进程"的命令段
         # （python -m pytest / pytest 命令行），python -c 内容断言（字符串含
         # pytest 字样但不跑 pytest）不再命中。
-        if verify_cmd and _runs_pytest(verify_cmd) and "--basetemp" not in verify_cmd:
+        if verify_cmd and _runs_pytest(
+                verify_cmd) and "--basetemp" not in verify_cmd:
             errors.append(
                 ValidationError(
                     code=ErrorCode.E024,
                     path=f"$.tasks[{i}].verify_command",
-                    message=(
-                        f"task '{tid}' verify_command 含 pytest 但缺 --basetemp"
-                        "（pytest 默认落系统 Temp 触发沙箱拦截 → done E014；"
-                        "按 SKILL.md 自检约定加 --basetemp=\"${TMPDIR:-/tmp}/orchd-vf-$$\"）"
-                    ),
-                )
-            )
+                    message=
+                    (f"task '{tid}' verify_command 含 pytest 但缺 --basetemp"
+                     "（pytest 默认落系统 Temp 触发沙箱拦截 → done E014；"
+                     "按 SKILL.md 自检约定加 --basetemp=\"${TMPDIR:-/tmp}/orchd-vf-$$\"）"
+                     ),
+                ))
 
         # E027: verify_command 不安全/不兼容（warning，amend 注册点阻断）
         # 2026-08-08 实踩 task-release-pipeline 三类：
@@ -638,12 +762,38 @@ def validate_quality(master: Master) -> list[ValidationError]:
                     ValidationError(
                         code=ErrorCode.E027,
                         path=f"$.tasks[{i}].verify_command",
+                        message=(f"task '{tid}' verify_command 含不安全/不兼容段"
+                                 f"（{'；'.join(unsafe_reasons)}）"),
+                    ))
+
+            # E037（task-decl-consistency-error-code）：声明口径一致性——
+            # verify_command 引用的仓库内路径必须 ∈ files_to_edit ∪ exempt_files，或
+            # 磁盘已存在。两者皆不满足时 verify 在 done 期必然失败（引用已删除/拼错的
+            # 文件），属**确定性错误**，注册点即拒。终态任务由调用方按
+            # TERMINAL_EXEMPT_QUALITY_CODES 豁免。
+            declared_paths = {
+                f
+                for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+            } | {
+                f
+                for f in (t.get("exempt_files") or []) if isinstance(f, str)
+            }
+            missing_refs = sorted({
+                tok
+                for tok in _verify_command_path_tokens(verify_cmd)
+                if tok not in declared_paths and not (project_root /
+                                                      tok).exists()
+            })
+            if missing_refs:
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E037,
+                        path=f"$.tasks[{i}].verify_command",
                         message=(
-                            f"task '{tid}' verify_command 含不安全/不兼容段"
-                            f"（{'；'.join(unsafe_reasons)}）"
-                        ),
-                    )
-                )
+                            f"task '{tid}' verify_command 引用的路径既未声明、也不存在："
+                            f"{missing_refs}（声明口径一致性：请将路径加入 files_to_edit / "
+                            "exempt_files，或把 verify_command 改指向实际存在的文件）"),
+                    ))
 
         # E026: 引擎源码变更但对应测试未声明（warning，intake 期预警）
         # 2026-08-08 实踩：errors.py 新增错误码必然连带 tests/test_errors.py 计数断言，
@@ -653,17 +803,18 @@ def validate_quality(master: Master) -> list[ValidationError]:
         # task-roadmap-section-parse-fix（AC6）：存在性兜底——tests/ 下实际不存在的
         # 派生测试文件（如 orchd/gitops_ops.py → tests/test_gitops_ops.py 不存在）不产生
         # 无法满足的预警（E026 跳过）；tests/ 目录缺失时同样跳过（无从验证即不预警）。
-        files_edit = [f for f in (t.get("files_to_edit") or []) if isinstance(f, str)]
-        exempts = [f for f in (t.get("exempt_files") or []) if isinstance(f, str)]
+        files_edit = [
+            f for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+        ]
+        exempts = [
+            f for f in (t.get("exempt_files") or []) if isinstance(f, str)
+        ]
         tests_root = _tests_root_from_master(master)
         for fe in files_edit:
             expect_test = derive_related_test_file(fe, tests_root)
-            if (
-                expect_test is not None
-                and expect_test not in files_edit
-                and expect_test not in exempts
-                and any(f.startswith("tests/") for f in files_edit)
-            ):
+            if (expect_test is not None and expect_test not in files_edit
+                    and expect_test not in exempts
+                    and any(f.startswith("tests/") for f in files_edit)):
                 errors.append(
                     ValidationError(
                         code=ErrorCode.E026,
@@ -671,11 +822,143 @@ def validate_quality(master: Master) -> list[ValidationError]:
                         message=(
                             f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
                             "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
-                            "否则 E020 hook 会拦截）"
-                        ),
-                    )
-                )
+                            "否则 E020 hook 会拦截）"),
+                    ))
 
+    return errors
+
+
+# 终态任务质量告警豁免口径（task-amend-quality-warning-terminal-filter，单一真源）：
+# 质量类告警 E023/E026/E027/E029 对终态（completed/cancelled）任务一律豁免——
+# 拆分/改写终态任务定义无意义（E007 终态保护无法改写）。validate 与 amend 共用；
+# E022（代码类缺 verify_command 注册阻断）与 E024 不在豁免之列。
+TERMINAL_EXEMPT_QUALITY_CODES = frozenset({"E023", "E026", "E027", "E029", "E037", "E038"})
+
+
+def _quality_warning_code_name(w: Any) -> str:
+    """质量告警条目的错误码名（兼容 ValidationError 与 dict 两种形态）。"""
+    code = w.code if hasattr(w, "code") else w.get("code")
+    name = code.name if hasattr(code, "name") else str(code)
+    return name.split(".")[-1]
+
+
+def _quality_warning_task_index(path: Any) -> int | None:
+    """告警 path（$.tasks[i]…）的任务下标；非任务级路径返回 None。"""
+    if not isinstance(path, str) or not path.startswith("$.tasks["):
+        return None
+    head, sep, _ = path[len("$.tasks["):].partition("]")
+    return int(head) if sep and head.isdigit() else None
+
+
+def filter_terminal_quality_warnings(
+    warnings: list[Any],
+    tasks: list[dict[str, Any]],
+    terminal_ids: set[str] | None,
+) -> tuple[list[Any], int]:
+    """过滤终态任务的质量类告警（validate/amend 共用，task-amend-quality-warning-terminal-filter）。
+
+    Args:
+        warnings: ValidationError 列表或同形 dict 列表（{"code", "path"}，
+            code 接受 "E026" 或 "ErrorCode.E026" 两种形态）。
+        tasks: path 下标对应的任务定义列表（顺序须与判据产出一致，
+            即 master.tasks 顺序）。
+        terminal_ids: 终态任务 id 集合；为 None 时（ledger 不可用/replay 失败）
+            不过滤（回退现行为）。
+
+    Returns:
+        (kept, exempted_count)：保留条目与本次豁免条数（调用方负责可见输出，
+        不得静默吞掉计数）。
+    """
+    if terminal_ids is None:
+        return list(warnings), 0
+    kept: list[Any] = []
+    exempted = 0
+    for w in warnings:
+        if _quality_warning_code_name(w) not in TERMINAL_EXEMPT_QUALITY_CODES:
+            kept.append(w)
+            continue
+        path = w.path if hasattr(
+            w, "path") else (w.get("path") if isinstance(w, dict) else None)
+        idx = _quality_warning_task_index(path)
+        tid = tasks[idx].get(
+            "id") if idx is not None and 0 <= idx < len(tasks) else None
+        if tid is not None and tid in terminal_ids:
+            exempted += 1
+            continue
+        kept.append(w)
+    return kept, exempted
+
+
+def _validate_additional_sources(
+    t: dict,
+    i: int,
+    tid: str,
+    workspace_root,
+    project_root,
+) -> list["ValidationError"]:
+    """additional_sources 独立遍历（task-additional-sources-standalone-validation）。
+
+    与主 ``source`` 共享同一检查函数（``_check_idea_reference`` /
+    ``_check_roadmap_reference``）与错误路径语义（``path`` 前缀仍为
+    ``$.tasks[i].additional_sources[j]``、错误码 E025、消息口径与 source 一致）。
+
+    独立性：由调用方置于主 source 短路（无 source / 非 str / 终态任务 /
+    source 格式非法）**之前**执行，故四类短路路径下附加引用仍被逐条校验。
+    本函数自身不做任何短路（含终态任务亦校验）。
+    """
+    import re as _re
+
+    # spec.py 依赖方向为 errors.py，此处惰性导入 ledger 纯路径 helper
+    # （与 validate_source 同模式，无循环依赖：ledger 不导入 spec）。
+    from orchd.ledger import resolve_roadmap_path
+
+    errors: list["ValidationError"] = []
+    additional = t.get("additional_sources")
+    if additional and isinstance(additional, list):
+        for j, asrc in enumerate(additional):
+            if not isinstance(asrc, str):
+                errors.append(ValidationError(
+                    code=ErrorCode.E025,
+                    path=f"$.tasks[{i}].additional_sources[{j}]",
+                    message=f"task '{tid}' additional_sources[{j}] 非字符串",
+                ))
+                continue
+            if not _re.fullmatch(r"(idea|roadmap|debug):[a-z0-9-]+", asrc):
+                errors.append(ValidationError(
+                    code=ErrorCode.E025,
+                    path=f"$.tasks[{i}].additional_sources[{j}]",
+                    message=(f"task '{tid}' additional_sources[{j}] '{asrc}' 格式非法"
+                             "（须 ^(idea|roadmap|debug):[a-z0-9-]+$）"),
+                ))
+                continue
+            aprefix, _, aref = asrc.partition(":")
+            aref = aref.strip()
+            base_path = f"$.tasks[{i}].additional_sources[{j}]"
+            if aprefix == "idea":
+                ideas_path = workspace_root / "IDEAS.md"
+                if not ideas_path.exists():
+                    errors.append(ValidationError(
+                        code=ErrorCode.E025,
+                        path=base_path,
+                        message=f"task '{tid}' additional_sources 引用 IDEAS.md 但文件缺失",
+                    ))
+                    continue
+                for se in _check_idea_reference(tid, i, aref, ideas_path):
+                    se.path = base_path
+                    errors.append(se)
+            elif aprefix == "roadmap":
+                rpath = resolve_roadmap_path(project_root)
+                if not rpath.exists():
+                    errors.append(ValidationError(
+                        code=ErrorCode.E025,
+                        path=base_path,
+                        message=f"task '{tid}' additional_sources 引用 ROADMAP.md 但文件缺失",
+                    ))
+                    continue
+                for se in _check_roadmap_reference(tid, i, aref, rpath):
+                    se.path = base_path
+                    errors.append(se)
+            # debug: 前缀无文件引用校验，与 source 一致
     return errors
 
 
@@ -716,7 +999,7 @@ def validate_source(
     # AC3（task-12-engine-path-abstraction）：IDEAS.md / ROADMAP.md 走统一工作区根
     # helper（默认 .orchd/，兼容旧根路径）。spec.py 依赖方向为 errors.py，此处
     # 采用函数内惰性导入 ledger 的纯路径 helper（无循环依赖：ledger 不导入 spec）。
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import resolve_roadmap_path, resolve_workspace_root
     workspace_root = resolve_workspace_root(project_root)
 
     # P2-2（2026-08-19 审查）：对终态任务（completed/cancelled）豁免 source 校验。
@@ -735,6 +1018,11 @@ def validate_source(
 
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
+        # task-additional-sources-standalone-validation：附加引用独立遍历——
+        # 先于主 source 的全部短路（无 source / 非 str / 终态 / 格式非法）执行，
+        # 四类路径下仍逐条校验（E025 形同虚设的旁路消除）。
+        errors.extend(
+            _validate_additional_sources(t, i, tid, workspace_root, project_root))
         source = t.get("source")
         if not source or not isinstance(source, str):
             continue
@@ -752,12 +1040,9 @@ def validate_source(
                 ValidationError(
                     code=ErrorCode.E025,
                     path=f"$.tasks[{i}].source",
-                    message=(
-                        f"task '{tid}' source '{source}' 格式非法"
-                        "（须 ^(idea|roadmap|debug):[a-z0-9-]+$）"
-                    ),
-                )
-            )
+                    message=(f"task '{tid}' source '{source}' 格式非法"
+                             "（须 ^(idea|roadmap|debug):[a-z0-9-]+$）"),
+                ))
             continue
 
         if prefix == "idea":
@@ -768,22 +1053,25 @@ def validate_source(
                         code=ErrorCode.E025,
                         path=f"$.tasks[{i}].source",
                         message=f"task '{tid}' 引用 IDEAS.md 但文件缺失（无法溯源）",
-                    )
-                )
+                    ))
                 continue
             errors.extend(_check_idea_reference(tid, i, ref_id, ideas_path))
         elif prefix == "roadmap":
-            roadmap_path = workspace_root / "ROADMAP.md"
+            # task-roadmap-root-resolution：ROADMAP 走独立定位（宿主根优先、
+            # .orchd/ 回退），与 roadmap-land / intake 同一份文件——此前由工作区
+            # 文档根拼出（.orchd/ 下存在 IDEAS/SKILL 即锁定 .orchd/），与 validate
+            # 系 _find_workspace_file 的根回退定位分裂。
+            roadmap_path = resolve_roadmap_path(project_root)
             if not roadmap_path.exists():
                 errors.append(
                     ValidationError(
                         code=ErrorCode.E025,
                         path=f"$.tasks[{i}].source",
                         message=f"task '{tid}' 引用 ROADMAP.md 但文件缺失（无法溯源）",
-                    )
-                )
+                    ))
                 continue
-            errors.extend(_check_roadmap_reference(tid, i, ref_id, roadmap_path))
+            errors.extend(
+                _check_roadmap_reference(tid, i, ref_id, roadmap_path))
         # debug: 前缀标记外部来源手工注册的任务，不校验文件引用
 
     return errors
@@ -801,21 +1089,18 @@ def _exact_ref_match(ref_id: str, title: str) -> bool:
         pos = title.find(ref_id, start)
         if pos == -1:
             return False
-        before_ok = pos == 0 or (
-            not title[pos - 1].isalnum() and title[pos - 1] not in ("-", "_")
-        )
+        before_ok = pos == 0 or (not title[pos - 1].isalnum()
+                                 and title[pos - 1] not in ("-", "_"))
         after = pos + len(ref_id)
-        after_ok = after == len(title) or (
-            not title[after].isalnum() and title[after] not in ("-", "_")
-        )
+        after_ok = after == len(title) or (not title[after].isalnum()
+                                           and title[after] not in ("-", "_"))
         if before_ok and after_ok:
             return True
         start = pos + 1
 
 
-def _check_idea_reference(
-    tid: str, task_idx: int, ref_id: str, ideas_path: Path
-) -> list[ValidationError]:
+def _check_idea_reference(tid: str, task_idx: int, ref_id: str,
+                          ideas_path: Path) -> list[ValidationError]:
     """核对 IDEAS.md：存在 ``- id: <ref_id>`` 精确匹配的条目且 status 为 pending。
 
     ideas-archive-exact-match（2026-08-22）：idea ref 只匹配条目 ``- id: == ref``
@@ -860,21 +1145,19 @@ def _check_idea_reference(
             ValidationError(
                 code=ErrorCode.E025,
                 path=f"$.tasks[{task_idx}].source",
-                message=f"task '{tid}' 引用 idea '{ref_id}' 但 IDEAS.md 中无匹配条目（- id: == {ref_id}）",
-            )
-        )
+                message=
+                f"task '{tid}' 引用 idea '{ref_id}' 但 IDEAS.md 中无匹配条目（- id: == {ref_id}）",
+            ))
         return errors
     if matched["status"] != "pending":
         errors.append(
             ValidationError(
                 code=ErrorCode.E025,
                 path=f"$.tasks[{task_idx}].source",
-                message=(
-                    f"task '{tid}' 引用 idea '{ref_id}' 但该条目 status='{matched['status']}'"
-                    "（须为 pending 才能作为新任务来源）"
-                ),
-            )
-        )
+                message=
+                (f"task '{tid}' 引用 idea '{ref_id}' 但该条目 status='{matched['status']}'"
+                 "（须为 pending 才能作为新任务来源）"),
+            ))
     return errors
 
 
@@ -896,26 +1179,23 @@ def _roadmap_section_headers(text: str) -> list[str]:
     return headers
 
 
-def _check_roadmap_reference(
-    tid: str, task_idx: int, ref_id: str, roadmap_path: Path
-) -> list[ValidationError]:
+def _check_roadmap_reference(tid: str, task_idx: int, ref_id: str,
+                             roadmap_path: Path) -> list[ValidationError]:
     """核对 ROADMAP.md：存在 ``## / ### 版本`` 章节头且包含引用 id。"""
     errors: list[ValidationError] = []
     text = roadmap_path.read_text(encoding="utf-8")
     section_headers = _roadmap_section_headers(text)
     # P3（2026-08-13 full-audit-v2）：精确匹配（完整词），避免前缀误命中
-    matched = any(_exact_ref_match(ref_id, header) for header in section_headers)
+    matched = any(
+        _exact_ref_match(ref_id, header) for header in section_headers)
     if not matched:
         errors.append(
             ValidationError(
                 code=ErrorCode.E025,
                 path=f"$.tasks[{task_idx}].source",
-                message=(
-                    f"task '{tid}' 引用 roadmap '{ref_id}' 但 ROADMAP.md 的"
-                    "## / ### 版本 章节头均不包含该 id"
-                ),
-            )
-        )
+                message=(f"task '{tid}' 引用 roadmap '{ref_id}' 但 ROADMAP.md 的"
+                         "## / ### 版本 章节头均不包含该 id"),
+            ))
     return errors
 
 
@@ -958,7 +1238,15 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
     （detail 含 ``§版本``）——规划章节必须曾进入执行层，或被显式标记历史；否则提醒。缺失 → warning
     （不判 invalid，对齐 E022/E023/E024 质量告警语义）。ROADMAP.md 缺失时返回空（跳过）。
     """
-    roadmap = _find_workspace_file(orchd_dir, "ROADMAP.md")
+    # task-roadmap-root-resolution：ROADMAP 定位与其余工作区文档解耦——统一走
+    # resolve_roadmap_path（宿主根优先、.orchd/ 回退），与 roadmap-land / E025
+    # 溯源定位到**同一份文件**（IDEAS / IDEAS-archive 仍走 _find_workspace_file）。
+    # 入参形态兼容：orchd_dir 名为 .orchd 时，项目根为其父级。
+    from orchd.ledger import resolve_roadmap_path
+
+    project_root = orchd_dir.parent if orchd_dir.name == ".orchd" else orchd_dir
+    roadmap_candidate = resolve_roadmap_path(project_root)
+    roadmap = roadmap_candidate if roadmap_candidate.is_file() else None
     if roadmap is None:
         return []
     ideas = _find_workspace_file(orchd_dir, "IDEAS.md")
@@ -967,7 +1255,8 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
     # 均视为「已落地」——archive_resolved_ideas 会在条目全部终态后把条目移入
     # IDEAS-archive.md（先写归档、再删主文件），已落地且已实现的章节不得「回弹告警」。
     archive = _find_workspace_file(orchd_dir, "IDEAS-archive.md")
-    archive_text = archive.read_text(encoding="utf-8") if archive is not None else ""
+    archive_text = archive.read_text(
+        encoding="utf-8") if archive is not None else ""
     warnings: list[dict[str, Any]] = []
     for sec in _parse_roadmap_sections(roadmap.read_text(encoding="utf-8")):
         if sec["historical"] or not sec["id"]:
@@ -984,12 +1273,10 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
     保留 ``{code, path, message}`` 既有键（消费方断言面不变），加法式附加
     ``details``（list 契约）与 ``guidance``（按码指引，command 指向 roadmap-land）。
     """
-    message = (
-        f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
-        "IDEAS.md 与 IDEAS-archive.md 均缺引用该章节的 detail；处置二选一——"
-        "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS pending；"
-        "② 若该版本已发布或已放弃，标记历史或移出 ROADMAP"
-    )
+    message = (f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
+               "IDEAS.md 与 IDEAS-archive.md 均缺引用该章节的 detail；处置二选一——"
+               "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS pending；"
+               "② 若该版本已发布或已放弃，标记历史或移出 ROADMAP")
     try:
         from orchd.ledger import structured_error
 
@@ -997,12 +1284,12 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
             "E031",
             message,
             [{
-                "path": f"roadmap §{sec['version']}",
-                "hint": (
-                    f"处置二选一：① 运行 `orchd roadmap-land {sec['version']}` 为该规划章节"
-                    "生成 IDEAS pending 落地条目（摄入协议：先落地再注册任务）；"
-                    "② 若该版本已发布或已放弃，在 ROADMAP.md 将章节标题标记「历史」或移出"
-                ),
+                "path":
+                f"roadmap §{sec['version']}",
+                "hint":
+                (f"处置二选一：① 运行 `orchd roadmap-land {sec['version']}` 为该规划章节"
+                 "生成 IDEAS pending 落地条目（摄入协议：先落地再注册任务）；"
+                 "② 若该版本已发布或已放弃，在 ROADMAP.md 将章节标题标记「历史」或移出"),
             }],
             None,
         )
@@ -1096,6 +1383,64 @@ def _verify_unsafe_reasons(verify_cmd: str) -> list[str]:
     return reasons
 
 
+def _strip_single_quoted_segments(verify_cmd: str) -> str:
+    """按 shell 引号状态机剥离**最外层**单引号字面段，返回供扫描的「活跃文本」。
+
+    为什么必须是状态机（task-verify-danger-quote-state-machine）：单引号只有在
+    **不在双引号内**时才是定界符。正则剥除法 `re.sub(r"'[^']*'", "", cmd)`
+    无法表达该状态——它会把 `echo "'$(curl … | sh)'"` 里那段「双引号内、被单引号
+    包着」的文本当作字面量整体剥掉，而 bash 语义下双引号内的 `'` 只是普通字符、
+    其中的 `$(…)` 照旧展开 → 判定 `danger=[]` 放行，实跑却执行替换（已实证绕过）。
+
+    状态与保守口径（沿用 .orchd/rules/verify.md 的保守拦截纪律）：
+    - 不在双引号内的 `'…'`：shell 字面量，整段剥离（无替换 / 执行语义）；
+    - 双引号段：原样保留（其间 `$(…)` / 反引号 / `$var` 照旧展开，剥离即漏报）；
+      双引号内的 `'` 不构成定界符，按普通字符保留（故嵌套形态同样被检出）；
+    - 未闭合的单引号不剥离（其内容照旧参与判定——宁可多报，不可放过）；
+    - 不做转义还原、不做引号以外的语法解释（判定只服务保守拦截）。
+
+    Args:
+        verify_cmd: 原始 verify_command 串。
+
+    Returns:
+        移除最外层单引号字面段后的串，供构式扫描使用（执行点仍用原始串）。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(verify_cmd)
+    in_double = False
+    while i < n:
+        ch = verify_cmd[i]
+        if in_double:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                # 双引号内的转义序列原样保留（不解释），仅避免把 \" 误判为闭合引号
+                out.append(verify_cmd[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            close = verify_cmd.find("'", i + 1)
+            if close == -1:
+                # 未闭合：保守——不剥离，原样参与判定
+                out.append(ch)
+                i += 1
+                continue
+            i = close + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _dangerous_shell_reasons(verify_cmd: str) -> list[str]:
     """检测 verify_command 中可用于 shell 注入的构式（P1-4）。
 
@@ -1103,25 +1448,33 @@ def _dangerous_shell_reasons(verify_cmd: str) -> list[str]:
     命令替换、管道、命令链、重定向、危险外部命令。注册期 E027 warning，
     执行期（done / amend dry-run）硬阻断。
 
+    判定输入为**原始串**，仅按引号状态机剥离**最外层**单引号字面段（见
+    :func:`_strip_single_quoted_segments`）：执行点 orchd/onboard/lifecycle/core.py
+    ::_run_verify 用原始 verify_cmd 经 shell=True 执行，双引号内 `$(...)` / 反引号 /
+    `$var` 同样被 shell 展开，故不得把引号内容整体剥离后再判定（剥离会与执行点语义
+    脱钩，形成绕过）；双引号内的单引号不构成定界符，同样不得据此豁免。
+
+    Args:
+        verify_cmd: 原始 verify_command 串。
+
     Returns:
         命中原因列表；无命中返回空列表。
     """
     import re as _re
     reasons: list[str] = []
-    # 剥离引号内容后再查（合法 python -c "..." 内容里的 ; 等不参与构式判定；
-    # 但 $()/` 在引号外出现仍属 shell 语义）
-    stripped = _re.sub(r"([\"'])(.*?)\1", "", verify_cmd, flags=_re.DOTALL)
-    # 命令替换 / 反引号：任意代码执行，合法 verify 从不使用
-    if _re.search(r"\$\(|`", stripped):
+    scanned = _strip_single_quoted_segments(verify_cmd)
+    # 命令替换 / 反引号：任意代码执行，合法 verify 从不使用（双引号内同样生效）
+    if _re.search(r"\$\(|`", scanned):
         reasons.append("含命令替换 $(...) 或反引号")
     # sh/bash -c：执行任意命令串。不拦 bash -n（语法检查）与 .sh 后缀（合法）
-    if _re.search(r"\b(?:sh|bash)\s+-c\b", stripped):
+    if _re.search(r"\b(?:sh|bash)\s+-c\b", scanned):
         reasons.append("含 sh/bash -c 任意命令执行")
     # 危险外部命令：任意系统副作用 / 网络外联
     # 注：不拦截管道 | 与重定向 >/< —— 现有 master 合法使用（>/dev/null、| grep），
     # 其后的恶意命令由本清单（curl/wget/rm 等）覆盖。
-    for bad in ("rm", "curl", "wget", "nc", "chmod", "chown", "reboot", "shutdown", "mkfs", "dd"):
-        if _re.search(rf"\b{_re.escape(bad)}\b", stripped, _re.IGNORECASE):
+    for bad in ("rm", "curl", "wget", "nc", "chmod", "chown", "reboot",
+                "shutdown", "mkfs", "dd"):
+        if _re.search(rf"\b{_re.escape(bad)}\b", scanned, _re.IGNORECASE):
             reasons.append(f"含危险命令 {bad}")
             break
     return reasons
@@ -1154,15 +1507,11 @@ def _basetemp_platform_issues(verify_cmd: str) -> list[str]:
     # Windows 专用片段
     windows_pat = r"%LOCALAPPDATA%|%TEMP%|%RANDOM%|\\\\|\\Temp"
     if _re.search(windows_pat, basetemp):
-        reasons.append(
-            "basetemp 路径含 Windows 专用片段"
-            f"（{basetemp}），非跨平台——应改 {_CROSS_PLATFORM_BASETEMP}"
-        )
+        reasons.append("basetemp 路径含 Windows 专用片段"
+                       f"（{basetemp}），非跨平台——应改 {_CROSS_PLATFORM_BASETEMP}")
     # POSIX 专用：${TMPDIR 无 :- 回退（跨平台模板 ${TMPDIR:-/tmp} 是针对的例外）
-    if _re.search(r"\$\{TMPDIR(?![^}]*:-)", basetemp) or "$(mktemp" in basetemp:
-        reasons.append(
-            "basetemp 路径含 POSIX 专用片段"
-            f"（{basetemp}），非跨平台——应改 {_CROSS_PLATFORM_BASETEMP}"
-        )
+    if _re.search(r"\$\{TMPDIR(?![^}]*:-)",
+                  basetemp) or "$(mktemp" in basetemp:
+        reasons.append("basetemp 路径含 POSIX 专用片段"
+                       f"（{basetemp}），非跨平台——应改 {_CROSS_PLATFORM_BASETEMP}")
     return reasons
-

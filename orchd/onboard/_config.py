@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.ledger import Store
+from orchd.worktree import resolve_master_path as _master_path
 
 
 def _load_config_blocked(store: Store) -> set[str] | None:
@@ -21,7 +22,7 @@ def _load_config_blocked(store: Store) -> set[str] | None:
     best-effort：master 缺失/解析失败返回 None（不抛异常）。
     """
     try:
-        master_path = store.orchd_dir / "_master.json"
+        master_path = _master_path(store)
         if not master_path.exists():
             return None
         import json as _json

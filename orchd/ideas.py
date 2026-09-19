@@ -12,16 +12,41 @@ IDEAS.md 的"只增不减"膨胀优化。全程 best-effort 非阻塞，任何�
 - ``source: idea:<ref>`` 是自动归档的唯一映射依据；无 source 的存量条目
   无法自动映射，由 ``ideas-archive`` 手动命令一次性回填。
 
-依赖方向：ideas.py → 标准库（pathlib）+ orchd.ledger（读任务终态，可选）。
+依赖方向：ideas.py → 标准库（pathlib）+ orchd.errors（准入锁超时降级）+
+orchd.intake（``_atomic_write_text`` / ``_resolve_lock_orchd_dir``，**模块级**导入：
+``cli._util._preimport_archive_deps`` 预导入 orchd.ideas 时会连带绑定 orchd.intake，
+使任务 worktree 终态回收删除源码后进程内归档仍可原子写 + 取准入锁）+
+orchd.ledger（读任务终态与准入锁，惰性导入）。
+
+task-intake-atomic-lock-consistent（AC2）：IDEAS.md 的「读-改-写」与
+IDEAS-archive.md 的追加写入整体纳入 ``.intake.lock`` 串行（与 amend / intake /
+idea propose- confirm 共用同一把准入写锁），两次写入统一走
+``intake._atomic_write_text``（tmp + ``os.replace``），崩溃不留半截文件。
+
+task-archive-lock-unavailable-recovery：锁不可用（E012 / OSError）时不再静默
+丢弃积压——写入「待归档标记」（时间戳 / 可归档条目数 / 原因）到账本根运行时
+文件（``ledger.resolve_store_dir`` 解析，与 ``_ledger.jsonl`` 同级，不随工作区
+文档走 git），下次归档触发时优先重试并在成功后清除标记（幂等）；同时暴露
+结构化读取 API（``read_archive_pending``）供 doctor/状态命令巡检接线。硬约束
+保持：标记写入**不触碰** IDEAS.md / IDEAS-archive.md。
 """
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.errors import OrchdError
+from orchd.intake import _atomic_write_text, _resolve_lock_orchd_dir
+
 # 终态集合：某 idea 下全部任务处于终态 → 该条目可归档
 _TERMINAL = {"completed", "cancelled"}
+
+# 待归档标记文件名（账本根运行时文件；task-archive-lock-unavailable-recovery：
+# 锁不可用时的兜底留痕，与 _ledger.jsonl 同级，不随工作区文档走 git）
+_ARCHIVE_PENDING_FILE = "archive-pending.json"
 
 # 归档文件头注释（新建时写入）
 _ARCHIVE_HEADER = (
@@ -49,6 +74,8 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
         - ``status``: 条目状态（未声明则为空串）。
         - ``id``: 条目显式 id（``- id:`` 字段，缺失则为空串）——归档按 id
           精确归属的权威锚点（ideas-archive-exact-match）。
+        - ``notes``: 条目备注（``- notes:`` 字段，缺失则为空串，
+          task-idea-multi-source-attribution 孤儿可见性用）。
         - ``start_line`` / ``end_line``: 原始行为区间（0-based，半开区间
           ``[start_line, end_line)``），用于 ``extract_entry_block`` 精确切块。
     """
@@ -65,6 +92,7 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
                 "title": stripped[3:].strip(),
                 "status": "",
                 "id": "",
+                "notes": "",
                 "start_line": i,
                 "end_line": None,
             }
@@ -76,6 +104,11 @@ def parse_ideas(text: str) -> list[dict[str, Any]]:
             for marker in ("- id:", "id:"):
                 if stripped.startswith(marker):
                     current["id"] = stripped[len(marker):].strip()
+                    break
+            # task-idea-multi-source-attribution：解析 notes（孤儿可见性用）
+            for marker in ("- notes:", "notes:"):
+                if stripped.startswith(marker):
+                    current["notes"] = stripped[len(marker):].strip()
                     break
     if current:
         current["end_line"] = len(lines)
@@ -121,16 +154,27 @@ def find_resolved_entries(
     """
     task_status = task_status or {}
 
-    # 按 ref_id 分组：source: idea:<ref>
+    # 按 ref_id 分组：source: idea:<ref> + additional_sources[] 中的 idea:<ref>
+    # task-idea-multi-source-attribution：归档匹配同时覆盖 source 与 additional_sources，
+    # 任一命中即随任务完结归档。
     ref_groups: dict[str, list[str]] = {}
     for t in master.tasks:
+        tid = t.get("id", "")
+        # 主 source
         source = t.get("source")
-        if not source or not isinstance(source, str):
-            continue
-        prefix, _, ref_id = source.partition(":")
-        if prefix != "idea" or not ref_id:
-            continue
-        ref_groups.setdefault(ref_id, []).append(t.get("id", ""))
+        if source and isinstance(source, str):
+            prefix, _, ref_id = source.partition(":")
+            if prefix == "idea" and ref_id:
+                ref_groups.setdefault(ref_id, []).append(tid)
+        # additional_sources（加法式：不改变 source 语义）
+        additional = t.get("additional_sources")
+        if additional and isinstance(additional, list):
+            for asrc in additional:
+                if not isinstance(asrc, str):
+                    continue
+                aprefix, _, aref = asrc.partition(":")
+                if aprefix == "idea" and aref:
+                    ref_groups.setdefault(aref, []).append(tid)
 
     resolved_refs = {
         ref_id
@@ -165,6 +209,69 @@ def _entry_is_resolved(entry: dict[str, Any], resolved_refs: set[str]) -> bool:
     return eid in resolved_refs
 
 
+def find_orphan_entries(
+    master,
+    entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """列出孤儿 idea 条目（task-idea-multi-source-attribution，只读不阻断）。
+
+    孤儿定义：条目 ``status: pending`` 且 ``notes`` 标注「注册为 task-xxx」，
+    但该 task 的 ``source`` 与 ``additional_sources`` 均不引用此条目 id。
+    此类条目因任务承接多 idea 时只写了主 source 而漏挂次级引用，导致永远
+    等不到归档。本函数仅做可见性（供 doctor/CLI 后续巡检接线），不自动
+    修改 _master.json 或 IDEAS.md。
+
+    Args:
+        master: 已加载的 Master 对象。
+        entries: parse_ideas 解析出的条目列表。
+
+    Returns:
+        孤儿条目子列表（含 id / title / 注册的 task_id）。
+    """
+    # 收集所有任务引用的 idea ref（source + additional_sources）
+    referenced_refs: set[str] = set()
+    task_ref_map: dict[str, list[str]] = {}  # task_id -> [ref_ids]
+    for t in master.tasks:
+        tid = t.get("id", "")
+        refs: list[str] = []
+        source = t.get("source")
+        if source and isinstance(source, str):
+            prefix, _, ref_id = source.partition(":")
+            if prefix == "idea" and ref_id:
+                refs.append(ref_id)
+        additional = t.get("additional_sources")
+        if additional and isinstance(additional, list):
+            for asrc in additional:
+                if isinstance(asrc, str):
+                    aprefix, _, aref = asrc.partition(":")
+                    if aprefix == "idea" and aref:
+                        refs.append(aref)
+        for r in refs:
+            referenced_refs.add(r)
+            task_ref_map.setdefault(tid, []).append(r)
+
+    orphans: list[dict[str, Any]] = []
+    import re as _re
+    for e in entries:
+        if (e.get("status") or "").strip() != "pending":
+            continue
+        eid = (e.get("id") or "").strip()
+        if not eid or eid in referenced_refs:
+            continue
+        # 检查 notes 是否标注「注册为 task-xxx」
+        notes = e.get("notes") or e.get("note") or ""
+        if isinstance(notes, str):
+            m = _re.search(r"注册为\s*(task-[a-z0-9-]+)", notes)
+            if m:
+                orphans.append({
+                    "id": eid,
+                    "title": e.get("title", ""),
+                    "registered_task": m.group(1),
+                    "notes": notes,
+                })
+    return orphans
+
+
 def _remove_blocks(
     text: str, entries: list[dict[str, Any]], resolved: list[dict[str, Any]]
 ) -> str:
@@ -186,6 +293,11 @@ def _remove_blocks(
 def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     """主入口：把已完结 idea 条目从 IDEAS.md 移入 IDEAS-archive.md。
 
+    并发与原子性（task-intake-atomic-lock-consistent AC2）：IDEAS.md 的「读-改-写」
+    与 IDEAS-archive.md 的追加写入整体在 ``.intake.lock`` 持有范围内完成（与 amend /
+    intake / idea propose-confirm 共用同一把准入写锁）；两次写入统一走
+    ``intake._atomic_write_text``（tmp + ``os.replace``），崩溃不留半截文件。
+
     Args:
         project_root: 项目根目录。
         master: 已加载的 Master 对象。
@@ -194,7 +306,8 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
         结构化结果，永不抛异常：
         - ``{"archived": [...], "kept": n}`` 成功归档；archived 为标题列表。
         - ``{"archived": [], "kept": 0, "skipped": "<原因>"}`` 无 IDEAS.md /
-          读取失败 / 无可归档条目 / 写入失败（best-effort 降级）。
+          读取失败 / 无可归档条目 / 写入失败 / 准入锁不可用（best-effort 降级，
+          绝不无锁并发归档）。
     """
     project_root = Path(project_root)
     # AC3（task-12-engine-path-abstraction）：工作区文档（IDEAS.md /
@@ -203,7 +316,12 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     # canonical 共享读（task-canonical-workspace-docs，2026-08-25）：container 布局
     # 下 resolve_workspace_root 解析到 canonical 主工作树根，归档源（IDEAS.md）与
     # 归档目标（IDEAS-archive.md）统一在主工作树读写，任务 worktree 本地副本不参与。
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import (
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+        resolve_workspace_root,
+    )
 
     # canonical 工作区根（task-canonical-workspace-docs，2026-08-25）：
     # resolve_workspace_root 先解析到 canonical 主工作树根（container 布局返回
@@ -214,12 +332,9 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     if not ideas_path.exists():
         return {"archived": [], "kept": 0, "skipped": "no_ideas_file"}
 
-    try:
-        text = ideas_path.read_text(encoding="utf-8")
-    except (OSError, IOError, UnicodeDecodeError):
-        return {"archived": [], "kept": 0, "skipped": "read_error"}
-
     # 读取任务终态（best-effort：ledger 不可用则无证据，不归档）
+    # 注：终态快照在取锁前计算（只读，轻微陈旧最多让条目延后一轮归档），使锁窗口
+    # 只覆盖「读 IDEAS.md → 写归档 + 改写 IDEAS.md」，不扩大到账本重放。
     task_status: dict[str, str] = {}
     try:
         from orchd.ledger import Store
@@ -232,28 +347,155 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     except Exception:
         pass
 
-    entries = parse_ideas(text)
-    resolved = find_resolved_entries(master, entries, task_status)
-    if not resolved:
-        return {"archived": [], "kept": len(entries)}
-
-    blocks = [extract_entry_block(text, e) for e in resolved]
-    new_ideas = _remove_blocks(text, entries, resolved)
-
-    archive_path = workspace_root / "IDEAS-archive.md"
+    # 取锁前的只读预扫描（task-archive-lock-unavailable-recovery）：计算当前可归档
+    # 条目，供锁不可用时写入待归档标记（计数/留痕用，不参与实际写入）。锁内仍以
+    # 重新读取的最新 IDEAS.md 为准做归档（读-改-写在锁窗口内），预扫描只读、轻微
+    # 陈旧最多让标记计数延后一轮，不引入并发写。
+    pre_resolved: list[dict[str, Any]] = []
     try:
-        if archive_path.exists():
-            archive_text = archive_path.read_text(encoding="utf-8")
-        else:
-            archive_text = _ARCHIVE_HEADER
-        if archive_text and not archive_text.endswith("\n"):
-            archive_text += "\n"
-        archive_text += "".join(blocks)
+        pre_entries = parse_ideas(ideas_path.read_text(encoding="utf-8"))
+        pre_resolved = find_resolved_entries(master, pre_entries, task_status)
+    except (OSError, IOError, UnicodeDecodeError):
+        pass
 
-        # 先写归档文件（成功后再改主文件，避免主文件已删而归档丢失）
-        archive_path.write_text(archive_text, encoding="utf-8")
-        ideas_path.write_text(new_ideas, encoding="utf-8")
-    except (OSError, IOError):
-        return {"archived": [], "kept": len(entries), "skipped": "write_error"}
+    # AC2（task-intake-atomic-lock-consistent）：归档全流程纳入准入写锁。此前
+    # 「读 IDEAS.md → 改主文件 + 写归档」无锁，与 amend / intake / idea
+    # propose-confirm 等文档写者并发时可用旧文本覆盖对方改动（丢写）。锁被占/超时
+    # 则降级为不归档（best-effort 跳过，绝不无锁并发归档），保持本函数永不抛异常。
+    lock_dir = _resolve_lock_orchd_dir(project_root)
+    try:
+        lk = intake_lock_acquire(lock_dir, resolve_agent_id(lock_dir))
+    except (OrchdError, OSError) as exc:
+        # 兜底重试标记（task-archive-lock-unavailable-recovery）：锁不可用时不静默
+        # 丢弃积压——写入待归档标记（时间戳 / 可归档条目数 / 原因），下次归档触发
+        # 时优先重试；绝不无锁写 IDEAS.md / IDEAS-archive.md（硬约束保持）。
+        _record_archive_pending(
+            project_root,
+            reason=(
+                f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            ),
+            pending_count=len(pre_resolved),
+            pending_ids=[(e.get("id") or "") for e in pre_resolved],
+        )
+        return {"archived": [], "kept": 0, "skipped": "lock_unavailable"}
+    try:
+        try:
+            text = ideas_path.read_text(encoding="utf-8")
+        except (OSError, IOError, UnicodeDecodeError):
+            return {"archived": [], "kept": 0, "skipped": "read_error"}
 
-    return {"archived": [e["title"] for e in resolved], "kept": len(entries) - len(resolved)}
+        entries = parse_ideas(text)
+        resolved = find_resolved_entries(master, entries, task_status)
+        if not resolved:
+            # 无待归档条目：若存在上次锁不可用遗留的积压标记，说明条目已被并发/
+            # 手动处理，清除标记（幂等），避免残留造成巡检误报。
+            _clear_archive_pending(project_root)
+            return {"archived": [], "kept": len(entries)}
+
+        blocks = [extract_entry_block(text, e) for e in resolved]
+        new_ideas = _remove_blocks(text, entries, resolved)
+
+        archive_path = workspace_root / "IDEAS-archive.md"
+        try:
+            if archive_path.exists():
+                archive_text = archive_path.read_text(encoding="utf-8")
+            else:
+                archive_text = _ARCHIVE_HEADER
+            if archive_text and not archive_text.endswith("\n"):
+                archive_text += "\n"
+            archive_text += "".join(blocks)
+
+            # 先写归档文件（成功后再改主文件，避免主文件已删而归档丢失）；两次写入
+            # 均原子（tmp + os.replace，AC2）——任一步失败主文件保持原状，不留半截。
+            _atomic_write_text(archive_path, archive_text)
+            _atomic_write_text(ideas_path, new_ideas)
+        except (OSError, IOError):
+            return {"archived": [], "kept": len(entries), "skipped": "write_error"}
+
+        # 归档成功：清除积压标记（幂等；不存在则无动作）
+        _clear_archive_pending(project_root)
+        return {
+            "archived": [e["title"] for e in resolved],
+            "kept": len(entries) - len(resolved),
+        }
+    finally:
+        intake_lock_release(lk)
+
+
+def _archive_pending_path(project_root) -> Path:
+    """解析待归档标记文件路径（账本根运行时文件）。
+
+    账本根经 ``ledger.resolve_store_dir`` 解析（ORCHD_HOME 优先 → container 布局
+    ``<容器>/.orchd-runtime/`` → flat 回退 ``.orchd/``），与 ``_ledger.jsonl``
+    同级；标记是运行时状态，不随工作区文档（IDEAS.md / IDEAS-archive.md）走 git，
+    也不参与仓库 diff。
+    """
+    from orchd.ledger import resolve_store_dir
+
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
+    return resolve_store_dir(orchd_dir) / _ARCHIVE_PENDING_FILE
+
+
+def _record_archive_pending(
+    project_root,
+    *,
+    reason: str,
+    pending_count: int,
+    pending_ids: list[str],
+) -> None:
+    """锁不可用时写入待归档标记（best-effort，失败静默降级）。
+
+    标记内容：UTC 时间戳（ISO-8601）、可归档条目数、原因、待归档条目 id。
+    写入原子化（tmp + os.replace，复用 intake 契约）；**不触碰** IDEAS.md /
+    IDEAS-archive.md——标记只是运行时留痕，供下次归档触发时优先重试，以及
+    doctor/状态命令巡检发现「长期不归档」积压。
+    """
+    marker = {
+        "reason": reason,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pending_count": pending_count,
+        "pending_ids": pending_ids,
+    }
+    try:
+        _atomic_write_text(
+            _archive_pending_path(project_root),
+            json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+        )
+    except (OSError, IOError, TypeError):
+        pass
+
+
+def _clear_archive_pending(project_root) -> None:
+    """清除待归档标记（幂等：不存在即无动作；失败静默降级）。
+
+    归档成功、或确认无待归档条目后调用——积压已被处理，残留标记会造成巡检
+    误报，必须清除。
+    """
+    try:
+        _archive_pending_path(project_root).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_archive_pending(project_root) -> dict[str, Any] | None:
+    """结构化读取待归档标记（供 doctor/状态命令巡检接线）。
+
+    Args:
+        project_root: 项目根目录。
+
+    Returns:
+        标记内容 dict（含 reason / timestamp / pending_count / pending_ids）；
+        标记不存在或文件损坏 / 读取失败时返回 None（安全降级，永不抛异常）。
+    """
+    path = _archive_pending_path(project_root)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, IOError, UnicodeDecodeError):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data

@@ -365,14 +365,27 @@
             "description": "必要连带豁免文件列表（可选）。声明任务实现必需但不在 files_to_edit 内的文件（如新增错误码连带更新的测试断言文件），E020 hook 校验豁免，引擎 ensure_committed 不兜底提交（须实现者自行 commit）。"
           },
           "source": {
-              "type": ["string", "null"],
-              "pattern": "^(idea|roadmap|debug):[a-z0-9-]+$",
-              "description": "任务来源（可选）。格式 ^(idea|roadmap|debug):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id；debug: 前缀标记外部来源手工注册的任务（无文件引用校验）。缺省无 source 时校验通过（向后兼容存量任务）。"
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^(idea|roadmap|debug):[a-z0-9-]+$",
+            "description": "任务来源（可选）。格式 ^(idea|roadmap|debug):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id；debug: 前缀标记外部来源手工注册的任务（无文件引用校验）。缺省无 source 时校验通过（向后兼容存量任务）。"
           },
           "verify_timeout_seconds": {
             "type": "integer",
             "minimum": 1,
             "description": "verify_command 执行超时（秒，可选）。缺省回退引擎默认 _VERIFY_TIMEOUT=120。全量 pytest 慢机器/沙箱拦截场景可调大（如 300）。"
+          },
+          "additional_sources": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(idea|roadmap|debug):[a-z0-9-]+$"
+            },
+            "default": [],
+            "uniqueItems": true,
+            "description": "附加来源列表（可选，task-idea-multi-source-attribution）。一个任务承接多个 idea 时，除主 source 外的次级引用列于此。格式与 source 相同，E025 按与 source 相同口径逐条校验；ideas-archive 归档匹配同时覆盖 source 与 additional_sources（任一命中即随任务完结归档）。加法式：不动既有单值 source 语义。"
           }
         }
       }

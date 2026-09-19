@@ -288,7 +288,13 @@ def merge_audit(
     扫描全部 task/* 分支（含未注册的幽灵分支）与 main 的差异：
     - 已注册任务的 completed 分支：main 不包含其 tip 时告警
       （branch_not_merged_into_main）；已并入 main 但分支未删告警
-      （merged_but_not_cleaned）；非 completed（进行中）任务分支不告警。
+      （merged_but_not_cleaned）。
+    - 已注册任务的 cancelled 分支：只要分支仍存在即告警
+      （cancelled_branch_not_cleaned，含 ahead_count）——终态回收对未合并分支
+      默认拒绝删除（W-3 红线：不得用 -D 销毁未合并提交），取消后的分支会留在
+      仓库里；旧实现只巡 completed，使这类残留完全静默。可见化后由人决定人工
+      处置或走 force-status --force-recycle（task-force-status-force-recycle-flag）。
+    - 进行中（pending / claimed / done / in_review）任务分支不告警。
     - 未注册任务的幽灵分支（agent 绕过 claim 手动建的分支）：立即告警
       （unregistered_task_branch），含分支名与差异摘要。
     只读：不执行 merge/checkout/reset/commit/push。非 git 仓库、无 main
@@ -359,9 +365,19 @@ def merge_audit(
             })
             continue
         ts = state.get(tid)
-        if not ts or ts.status != "completed":
+        if not ts or ts.status not in ("completed", "cancelled"):
             continue  # 进行中任务的分支不告警
         ahead = _ahead(branch)
+        if ts.status == "cancelled":
+            # 终态回收对未合并分支默认拒绝删除（W-3 红线），取消后的任务分支会留在
+            # 仓库里；旧实现只巡 completed → 这类残留完全静默。此处显式可见化。
+            warnings.append({
+                "task_id": tid,
+                "branch": branch,
+                "reason": "cancelled_branch_not_cleaned",
+                "ahead_count": ahead,
+            })
+            continue
         if ahead > 0:
             warnings.append({
                 "task_id": tid,
@@ -395,7 +411,7 @@ def merge_audit(
     # 人工销账清单（task-merge-warning-ack）：resolve_sha 自动判定未覆盖的
     # 旧事件 / 无 sha 场景，由人工确认后跳过告警。
     merge_acks = load_merge_acks(root)
-    for tid in registered_ids:
+    for tid in sorted(registered_ids):
         ts = state.get(tid)
         if not ts or ts.status != "completed" or not ts.merge_warning:
             continue
@@ -647,7 +663,7 @@ def revive_audit(
             "hint": "该任务曾被从 completed 强制复活为 pending（completed→pending），"
                     "请确认是否有授权（revive-guard 要求 --force + --evidence-sha 的 git 证据）",
         }
-        for tid, m in markers.items()
+        for tid, m in sorted(markers.items())
     ]
     return {"skipped": False, "warnings": warnings}
 
@@ -671,7 +687,6 @@ def intake_audit(project_root: Path) -> dict[str, Any]:
         "IDEAS.md",
         ".orchd/IDEAS.md",
         "ROADMAP.md",
-        ".orchd/ROADMAP.md",
     }
     hit = sorted(f for f in dirty if f in products)
     warnings = [
@@ -688,6 +703,118 @@ def intake_audit(project_root: Path) -> dict[str, Any]:
     return {"skipped": False, "warnings": warnings}
 
 
+# 诊断输出预算（task-diagnostics-aggregate-budget）：默认聚合 top-N + --full 逃生舱。
+# 聚合分档复用既有单一真源，不另立分档表：
+# - watchdog 明细分档复用自身已有字段（stuck_kind / reason）；
+# - auto_clean 档位复用 orchd.doctor._residue_disposition + AUTO_CLEAN_DISPOSITIONS，
+#   manual 档优先入选 top-N。
+_DIAGNOSTICS_TOP_N = 5
+
+
+def _aggregate_top(
+    items: list[dict[str, Any]],
+    *,
+    sort_key=None,
+    group_key=None,
+    top_n: int = _DIAGNOSTICS_TOP_N,
+) -> dict[str, Any]:
+    """通用聚合视图：{total, truncated, top, by_type}。
+
+    Args:
+        items: 全量明细（已按确定序排列，top 截取保持该序的头部语义）。
+        sort_key: 可选二次排序键；为 None 时保持输入序（调用方保证确定序）。
+        group_key: 分组计数键；为 None 时不产出 by_type。
+        top_n: top 保留数，缺省 5。
+
+    Returns:
+        {"total": N, "truncated": bool, "top": [...], "by_type": {...}}，
+        空列表时 by_type 为 {}。
+    """
+    total = len(items)
+    ordered = sorted(items, key=sort_key, reverse=True) if sort_key is not None else list(items)
+    top = ordered[:top_n]
+    agg: dict[str, Any] = {
+        "total": total,
+        "truncated": total > top_n,
+        "top": top,
+    }
+    if group_key is not None:
+        counts: dict[str, int] = {}
+        for it in items:
+            try:
+                k = str(group_key(it))
+            except Exception:
+                k = "unknown"
+            counts[k] = counts.get(k, 0) + 1
+        agg["by_type"] = counts
+    else:
+        agg["by_type"] = {}
+    return agg
+
+
+def _auto_clean_disposition_summary(
+    auto_clean: dict[str, Any] | None,
+    top_n: int = _DIAGNOSTICS_TOP_N,
+) -> dict[str, Any] | None:
+    """auto_clean 聚合（分档复用 doctor 单一真源，manual 优先）。
+
+    分档一律取 :func:`orchd.doctor._residue_disposition`，档位集合取
+    ``AUTO_CLEAN_DISPOSITIONS``；manual 档实例优先入选 top-N（新的覆盖维度
+    与既有 disposition 语义对齐，不另立分档表）。
+    """
+    if not auto_clean:
+        return None
+    try:
+        from orchd.doctor import AUTO_CLEAN_DISPOSITIONS, _residue_disposition
+    except Exception:
+        return None
+    items: list[dict[str, Any]] = []
+    for key in ("auto_cleaned", "auto_moved", "manual_notice"):
+        for it in auto_clean.get(key, []) or []:
+            if isinstance(it, dict):
+                items.append({**it, "_src": key})
+    def _disp(it: dict[str, Any]) -> str:
+        try:
+            return str(_residue_disposition(it.get("type"), it.get("action")))
+        except Exception:
+            return "manual"
+    counts: dict[str, int] = {}
+    for it in items:
+        d = _disp(it)
+        counts[d] = counts.get(d, 0) + 1
+    # manual 优先，其余保持输入序；档位合法性对齐 AUTO_CLEAN_DISPOSITIONS + manual。
+    allowed = set(AUTO_CLEAN_DISPOSITIONS) | {"manual"}
+    ordered = sorted(
+        items, key=lambda it: (0 if _disp(it) == "manual" else 1)
+    )
+    total = len(items)
+    return {
+        "total": total,
+        "truncated": total > top_n,
+        "top": [{k: v for k, v in it.items() if not k.startswith("_")} for it in ordered[:top_n]],
+        "by_disposition": {k: v for k, v in counts.items() if k in allowed},
+    }
+
+
+def _stale_claim_dual_action(task_id: str) -> str:
+    """stale_claims 双出路建议（task-diagnostics-aggregate-budget 移交项）。
+
+    既有唯一出路（force-status 回退 pending）会让 agent 停在“等死会话回来”；
+    另一条合法续做路径为新会话先 done 记账再接管（done 按认领者记账、不比对
+    caller，任务从 claimed 推进到审查；审查打回回 pending 后新会话再 claim
+    接管实现）。两者并列给出，不改判定口径。
+    """
+    return (
+        f"建议二选一: (1) orchd force-status --task {task_id} --status pending"
+        " --reason 'stale session takeover'（回退重做）; "
+        f"(2) 新会话先 done 记账再接管（先执行 done --task {task_id}"
+        " 按原认领者记账、不比对 caller，任务从 claimed 推进到审查；"
+        "审查通过即完成；若审查打回（CHANGES_REQUESTED）回 pending 后"
+        f"再 claim --task {task_id} --confirm 接管实现。注意：claimed 状态下"
+        "直接 claim 会撞 E009（claim 无 stale 豁免），不得跳过 done 直接认领）"
+    )
+
+
 def watchdog(
     store: Store,
     tasks: list[dict[str, Any]],
@@ -695,6 +822,7 @@ def watchdog(
     project_root: Path | None = None,
     agent_id: str | None = None,
     takeover: bool = False,
+    full: bool = False,
 ) -> dict[str, Any]:
     """巡检：检测两类僵死任务 + L2 session 锁僵死锁清理。
 
@@ -750,7 +878,7 @@ def watchdog(
                 "agent": ev.get("agent_id", ""),
             }
 
-    for tid, ts in state.items():
+    for tid, ts in sorted(state.items()):
         if ts.status == "claimed" and tid in claim_times:
             elapsed = (now - claim_times[tid]).total_seconds() / 60
             if elapsed > timeout_min:
@@ -798,7 +926,7 @@ def watchdog(
         session_dir = session_runtime_dir(store.orchd_dir)
         sessions_by_id: dict[str, dict[str, Any]] = {}
         if session_dir.exists():
-            for f in session_dir.glob("*.json"):
+            for f in sorted(session_dir.glob("*.json")):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
@@ -807,7 +935,7 @@ def watchdog(
                 if sid:
                     sessions_by_id[sid] = data
 
-        for tid, ts in state.items():
+        for tid, ts in sorted(state.items()):
             if ts.status not in ("claimed", "done", "in_review"):
                 continue
             for role, sid, owner in (
@@ -841,10 +969,7 @@ def watchdog(
                         "owner": owner,
                         "session_id": sid,
                         "reason": reason,
-                        "action": (
-                            f"建议运行: orchd force-status --task {tid} --status pending"
-                            " --reason 'stale session takeover'"
-                        ),
+                        "action": _stale_claim_dual_action(tid),
                     })
     except Exception:
         # best-effort：session runtime 不可用时静默降级，不影响既有 watchdog 行为
@@ -992,16 +1117,52 @@ def watchdog(
         # best-effort：准入锁巡检失败不影响既有 watchdog 行为
         pass
 
+    # 诊断预算：默认聚合视图（total/truncated/top + by_type），--full 回退全量。
+    # 排序键：stuck 按 stuck_minutes 降序；stale 按既有确定序（state/tid 序）保持，
+    # 不引入新排序以免与 task-output-order-determinism 的确定序冲突。
+    # manual 档优先：auto_clean.manual_notice 如存在，按 disposition 置 manual 在前
+    # （分档取自 doctor._residue_disposition 单一真源，此处仅排序不另立表）。
+    def _stuck_sort_key(it: dict[str, Any]) -> float:
+        try:
+            return float(it.get("stuck_minutes", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    stuck_agg = _aggregate_top(
+        stuck,
+        sort_key=_stuck_sort_key,
+        group_key=lambda it: it.get("stuck_kind", "unknown"),
+    )
+    stale_claims_agg = _aggregate_top(
+        stale_claims,
+        group_key=lambda it: it.get("reason", "unknown"),
+    )
+    stale_sessions_agg = _aggregate_top(
+        stale_sessions,
+        group_key=lambda it: it.get("reason", "unknown"),
+    )
+    if full:
+        stuck_field: Any = stuck
+        stale_claims_field: Any = stale_claims
+        stale_sessions_field: Any = stale_sessions
+    else:
+        stuck_field = stuck_agg
+        stale_claims_field = stale_claims_agg
+        stale_sessions_field = stale_sessions_agg
+
     result = {
-        "stuck_tasks": stuck,
+        "stuck_tasks": stuck_field,
+        "stuck_tasks_summary": stuck_agg,
         "intake_lock": intake_lock_alert,
         "summary": f"{len(stuck)} 个任务可能僵死",
         # 扩展字段（便于脚本集成）
         "stuck_count": len(stuck),
         "timeout_min": timeout_min,
         "session_lock": session_lock_stale,
-        "stale_sessions": stale_sessions,
-        "stale_claims": stale_claims,
+        "stale_sessions": stale_sessions_field,
+        "stale_sessions_summary": stale_sessions_agg,
+        "stale_claims": stale_claims_field,
+        "stale_claims_summary": stale_claims_agg,
         # task-engine-audit-coverage：任务完整性巡检（只读 best-effort；
         # project_root 为 None / 非 git 时返回 skipped 结构，不影响既有字段）。
         "task_integrity": task_integrity_audit(
@@ -1014,6 +1175,9 @@ def watchdog(
         result["worktree_pruned"] = worktree_pruned
     if watchdog_auto_clean:
         result["auto_clean"] = watchdog_auto_clean
+        auto_summary = _auto_clean_disposition_summary(watchdog_auto_clean)
+        if auto_summary is not None:
+            result["auto_clean_summary"] = auto_summary
     return result
 
 
@@ -1057,11 +1221,16 @@ def _auto_clean_emit_stderr(project_root: Path) -> bool:
     status()/watchdog() 挂载 auto_clean 时，其 ``[回收]`` stderr 与提示块同开关：
     关闭（false）时读路径零 stderr、stdout 仍并入 auto_clean 字段，避免撞
     test_guidance_stderr_disabled 契约。best-effort，读取失败回退默认 true。
+
+    master 路径经 ``orchd.worktree.resolve_master_path_from_dir`` 单一真源解析
+    （本地优先 → canonical 主工作树回退）：container 容器根视角读到 canonical
+    权威配置，不再裸读本地副本静默回落 true。缺省与失败语义不变。
     """
     try:
         from orchd.spec import load_master
+        from orchd.worktree import resolve_master_path_from_dir
 
-        master_path = Path(project_root) / ".orchd" / "_master.json"
+        master_path = resolve_master_path_from_dir(Path(project_root) / ".orchd")
         if not master_path.exists():
             return True
         master = load_master(master_path)
@@ -1076,6 +1245,10 @@ def _format_auto_clean_text(ac: dict[str, Any]) -> str:
 
     与 _format_text 并列的 append 段：在任务表格汇总行之后输出自动清洁的
     决策上下文（清理 / 备份 / 报告项），无内容时返回空串。
+
+    纵深容错（task-status-text-autoclean-path）：单项缺 ``path`` 时用 ``backup``
+    回退、再缺则显示 ``?``——读路径展示绝不因单项缺键崩整表（此前 ``it['path']``
+    硬取致 ``status --text`` 落 E999）。
     """
     cleaned = ac.get("auto_cleaned") or []
     moved = ac.get("auto_moved") or []
@@ -1088,11 +1261,14 @@ def _format_auto_clean_text(ac: dict[str, Any]) -> str:
     else:
         lines.append("自动清洁：")
     for it in cleaned:
-        lines.append(f"  [清理] {Path(it['path']).name}（{it.get('type')}）")
+        name = Path(it.get("path") or it.get("backup") or "?").name
+        lines.append(f"  [清理] {name}（{it.get('type')}）")
     for it in moved:
-        lines.append(f"  [备份] {Path(it['path']).name} → {it.get('backup')}")
+        name = Path(it.get("path") or "?").name
+        lines.append(f"  [备份] {name} → {it.get('backup') or '?'}")
     for it in notice:
+        name = Path(it.get("path") or "?").name
         lines.append(
-            f"  [报告] {Path(it['path']).name}（{it.get('type')}）：{it.get('disposition')}"
+            f"  [报告] {name}（{it.get('type')}）：{it.get('disposition')}"
         )
     return "\n".join(lines)

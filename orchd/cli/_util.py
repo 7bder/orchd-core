@@ -8,6 +8,9 @@
   - _flatten_nargs: 展平 nargs="*" 参数
   - _load_tasks: 加载 master 并返回 (tasks, orchd_dir, master)
   - _maybe_archive_ideas: 任务终态后触发 IDEAS 归档
+  - _orchd_source_recycled / _archive_ideas_via_subprocess: 引擎源码目录被终态
+    回收后的归档兜底（在 canonical 主工作树起子进程执行 ideas-archive）
+  - _preimport_archive_deps: 回收动作前预导入终态归档依赖（orchd.ideas）
 
 这些函数不依赖 commands 子包，移到独立模块后，parser.py 和 commands/*.py
 均可安全导入，避免 __init__ -> parser -> commands -> parser 的循环导入。
@@ -16,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -162,15 +166,17 @@ def _load_tasks(master_path: str | None = None) -> tuple[list, Path, Any]:
     经 ``resolve_store_dir`` 解析到共享账本根；project_root 物理操作基准不受影响）。
     """
     from orchd.spec import load_master
-    from orchd.worktree import resolve_canonical_project_root
+    from orchd.worktree import resolve_master_path_from_dir
 
     if master_path:
         path = Path(master_path)
         orchd_dir = path.parent
     else:
         orchd_dir = _find_orchd_dir()
-        canonical_root = resolve_canonical_project_root(orchd_dir.parent)
-        path = canonical_root / ".orchd" / "_master.json"
+        # canonical-master-read 收敛到底座：本地优先 → canonical 回退
+        # （task-cli-master-rule-single-source；两态结论与原逐字实现一致，
+        # 仅本地残留副本时读本地，分歧方向更保守）。
+        path = resolve_master_path_from_dir(orchd_dir)
     master = load_master(path)
     return master.tasks, orchd_dir, master
 
@@ -205,6 +211,104 @@ def _resolve_canonical_orchd_dir(task_orchd_dir: Path) -> Path | None:
         return None
 
 
+def _orchd_source_recycled() -> bool:
+    """本进程 orchd 包源码目录是否已被回收（container 终态回收删除任务 worktree）。
+
+    container 布局下进程以 ``python .orchd/__main__.py``（cwd = 任务 worktree）
+    启动，``orchd.__file__`` 指向任务 worktree 内的引擎副本；review code APPROVED
+    的终态回收会删除该目录，此后**未绑定**模块的懒加载都会
+    ``ModuleNotFoundError``（模块已加载时自身仍可运行，仅源码目录消失）。
+
+    Returns:
+        True = 源码目录已消失（懒加载不可用，需子进程兜底）；无法判定时 False。
+    """
+    module = sys.modules.get("orchd")
+    src_file = getattr(module, "__file__", None) if module is not None else None
+    if not src_file:
+        return False
+    try:
+        return not Path(src_file).parent.is_dir()
+    except OSError:
+        return False
+
+
+def _archive_ideas_via_subprocess(orchd_dir: Path) -> dict:
+    """源码已回收时的归档兜底：在 canonical 主工作树起子进程执行 ideas-archive。
+
+    子进程以 ``<canonical 主工作树>/.orchd/__main__.py`` 重新加载引擎源码，
+    归档结果经 stdout JSON 返回（只取 archived / kept / skipped / error / commit
+    契约字段，形状与进程内归档一致）。失败（入口缺失 / 非零退出 / 输出非 JSON /
+    超时）一律返回 ``_archive_error_result`` 结构化降级——不阻断调用方、不静默。
+
+    Args:
+        orchd_dir: canonical 主工作树的 ``.orchd`` 目录。
+
+    Returns:
+        子进程归档结果或结构化降级结果。
+    """
+    import json
+    import subprocess
+
+    entry = orchd_dir / "__main__.py"
+    if not entry.is_file():
+        return _archive_error_result(
+            "subprocess", FileNotFoundError(f"canonical 入口不存在: {entry}")
+        )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(entry), "ideas-archive"],
+            cwd=str(orchd_dir.parent), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120, check=False,
+        )
+    except Exception as exc:
+        return _archive_error_result("subprocess", exc)
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        detail = tail[-1][:200] if tail else ""
+        return _archive_error_result(
+            "subprocess", RuntimeError(f"exit={proc.returncode}: {detail}")
+        )
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as exc:
+        return _archive_error_result("subprocess_parse", exc)
+    if not isinstance(payload, dict):
+        return _archive_error_result(
+            "subprocess_parse",
+            ValueError(f"unexpected payload type: {type(payload).__name__}"),
+        )
+    result: dict[str, Any] = {
+        "archived": payload.get("archived", []),
+        "kept": payload.get("kept", 0),
+    }
+    for key in ("skipped", "error", "commit"):
+        if key in payload:
+            result[key] = payload[key]
+    return result
+
+
+def _preimport_archive_deps() -> None:
+    """在可能触发 worktree 终态回收的动作之前预导入终态归档依赖（AC1）。
+
+    ``orchd.ideas`` 是终态归档的全仓唯一懒加载点（``_maybe_archive_ideas``）。
+    review code APPROVED 会终态回收任务 worktree、连带删除本进程的 orchd 源码
+    目录；源码消失后再懒加载即 ``ModuleNotFoundError``（归档静默失效）。在回收
+    动作之前调用本函数，令模块绑定进 ``sys.modules``，回收后归档调用不再触盘。
+
+    依赖方向：``cli._util → orchd.ideas`` 已是 conventions.md 登记的既有边
+    （ideas.py 非零内部依赖：ideas.py → errors.py / intake.py，模块级导入
+    _atomic_write_text / _resolve_lock_orchd_dir），故预导入放在本模块而非调用方，
+    避免新增未登记的依赖边。
+
+    best-effort：预导入失败不抛异常——``_maybe_archive_ideas`` 的子进程兜底
+    （``_archive_ideas_via_subprocess``）会接管。
+    """
+    try:
+        import orchd.ideas  # noqa: F401
+    except Exception:
+        pass
+
+
 def _maybe_archive_ideas(orchd_dir: Path) -> dict:
     """best-effort：任务进入终态后触发 IDEAS 归档并自动提交。
 
@@ -234,31 +338,44 @@ def _maybe_archive_ideas(orchd_dir: Path) -> dict:
         if orchd_dir is None or not orchd_dir.exists():
             return {"archived": [], "kept": 0,
                     "skipped": "worktree_recycled_no_canonical"}
-    master_path = orchd_dir / "_master.json"
-    if not master_path.exists():
-        # task-master-single-copy：container 任务 worktree 已抑制副本，本地无可读
-        # _master.json 时回退 canonical 主工作树（唯一权威）；flat 布局 canonical ==
-        # 本地，零回归。archived 判定基于权威 master，避免任务 worktree 因缺副本而漏归档。
-        from orchd.worktree import resolve_canonical_project_root
-
-        canonical = resolve_canonical_project_root(orchd_dir.parent)
-        cand = canonical / ".orchd" / "_master.json"
-        if not cand.exists():
-            return {"archived": [], "kept": 0, "skipped": "no_master"}
-        master_path = cand
-        orchd_dir = canonical / ".orchd"
+    # 源码层守卫（task-review-archive-selfdelete-fix AC2）：终态回收同时删除了
+    # 本进程的 orchd 源码目录。此时若归档依赖未在回收前预导入（orchd.ideas 是
+    # 全仓唯一懒加载点），进程内 import 必然 ModuleNotFoundError —— 改为在
+    # canonical 主工作树另起子进程执行 ideas-archive（新进程重新加载源码）。
+    # 已预导入（AC1，review 路径）时模块已绑定 sys.modules，进程内归档照常可用。
+    if _orchd_source_recycled() and "orchd.ideas" not in sys.modules:
+        return _archive_ideas_via_subprocess(orchd_dir)
     try:
         from orchd.ideas import archive_resolved_ideas
         from orchd.spec import load_master
+        from orchd.worktree import resolve_master_path_from_dir
 
+        # task-master-single-copy：container 任务 worktree 已抑制副本，本地无可读
+        # _master.json 时回退 canonical 主工作树（唯一权威）；flat 布局 canonical ==
+        # 本地，零回归。archived 判定基于权威 master，避免任务 worktree 因缺副本而漏归档。
+        # （task-cli-master-rule-single-source：回退规则收敛到底座，no_master
+        # 提前返回分支语义保留。import 须在 try 内：源码回收场景下懒加载失败应
+        # 走下方降级（子进程兜底 / archive_error），不得外抛。）
+        master_path = resolve_master_path_from_dir(orchd_dir)
+        if not master_path.exists():
+            return {"archived": [], "kept": 0, "skipped": "no_master"}
+        if master_path.parent != orchd_dir:
+            # 回退发生（解析落到 canonical 主工作树）→ 后续归档/提交按权威目录走
+            orchd_dir = master_path.parent
         master = load_master(master_path)
     except Exception as exc:
+        # 源码已回收时的懒加载失败（预导入不完整 / 依赖未绑定）→ 子进程兜底，
+        # 不再降级为 archive_error。
+        if _orchd_source_recycled():
+            return _archive_ideas_via_subprocess(orchd_dir)
         # AC4：archive_error 必须带可审计原因，不再吞掉异常类型/消息。
         return _archive_error_result("load_master", exc)
     project_root = orchd_dir.parent
     try:
         result = archive_resolved_ideas(project_root, master)
     except Exception as exc:
+        if _orchd_source_recycled():
+            return _archive_ideas_via_subprocess(orchd_dir)
         return _archive_error_result("archive", exc)
     if result.get("archived"):
         result["commit"] = _commit_archived_ideas(project_root)

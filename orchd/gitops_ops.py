@@ -19,7 +19,8 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,12 +48,42 @@ from orchd.ledger import generate_event_id, resolve_session_identity
 # ------------------------------------------------------------------
 
 
-def now_iso() -> str:
-    """返回当前时间的本地时区 ISO 8601 字符串（精确到秒）。
+# 进程内严格单调保证的状态（L-2）：同进程连续生成的时间戳严格递增，
+# 使同一写入方的事件永不落入归并平局分支（见 event_sort_key 的第三元）。
+_LAST_TIMESTAMP: datetime | None = None
+_TS_LOCK = threading.Lock()
 
-    先获取 UTC 当前时间，再转换为系统本地时区，避免跨时区机器产生时间混乱。
+
+def now_iso() -> str:
+    """返回当前时刻的 UTC ISO 8601 字符串（微秒精度，进程内严格单调）。
+
+    历史实现为「本地时区 + 秒精度」（``datetime.now(timezone.utc).astimezone()
+    .isoformat(timespec="seconds")``）。该字符串被 ``ledger_sync`` 当作**跨设备
+    归并的排序键第一元**，而带本地 offset 的字符串按字典序比较会跨时区因果倒置
+    （``-08:00`` 机器的 ``00:00:00+08:00`` 会被排到 ``17:00:00+09:00`` 之后），
+    两机因此收敛到不同状态、「幂等收敛」契约失效（task-ledger-order-determinism
+    L-2；用户裁决 A —— 按 AC 原样执行）。
+
+    现口径：
+
+    - **UTC 绝对时刻**：``2026-09-15T05:40:12.123456+00:00``（不再依赖本地时区，
+      归并侧按 aware 绝对时刻比较，跨时区天然可比）；
+    - **微秒精度**：同秒事件不再并列（旧秒精度下 48% 的历史事件与同写入方事件撞秒）；
+    - **进程内严格单调**：同一进程内若当前时刻 <= 上次发出的时刻（同微秒连续调用、
+      时间回拨），自动 +1µs 递增，保证同一写入方事件绝不共享时间戳 —— 这使归并
+      排序键的平局分支只在跨写入方时生效，从而既满足跨设备确定性归并，又不破坏
+      同写入方事件的语义顺序（CLAIMED→DONE→REVIEW_READY；2026-09-10 实踩防线）。
+
+    兼容性：旧本地时区/秒精度事件**原样保留不重写**，归并侧按带偏移绝对时刻比较
+    （见 ``orchd.ledger.parse_event_time``）。
     """
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    global _LAST_TIMESTAMP
+    with _TS_LOCK:
+        ts = datetime.now(timezone.utc)
+        if _LAST_TIMESTAMP is not None and ts <= _LAST_TIMESTAMP:
+            ts = _LAST_TIMESTAMP + timedelta(microseconds=1)
+        _LAST_TIMESTAMP = ts
+    return ts.isoformat(timespec="microseconds")
 
 
 def make_event(
@@ -466,9 +497,19 @@ def try_delete_task_branch(project_root: Path, task_id: str) -> bool:
 
 
 def _read_task_verify_command(project_root: Path, task_id: str) -> str | None:
-    """从 _master.json 读取任务的 verify_command（best-effort，失败返回 None）。"""
+    """从 _master.json 读取任务的 verify_command（best-effort，失败返回 None）。
+
+    task-master-path-resolver-convergence：master **路径解析**统一走
+    :func:`orchd.worktree.resolve_master_path_from_dir`。此前裸拼
+    ``project_root/.orchd/_master.json``，而调用点已把 workdir 经
+    :func:`main_worktree_root` canonical 化（口径不一）——container 布局下
+    project_root 可能是任务 worktree（副本被抑制）→ 取不到 verify_command，
+    union 合并静默降级为逐文件 pytest。
+    """
     try:
-        master_path = project_root / ".orchd" / "_master.json"
+        from orchd.worktree import resolve_master_path_from_dir
+
+        master_path = resolve_master_path_from_dir(Path(project_root) / ".orchd")
         if not master_path.exists():
             return None
         import json

@@ -25,10 +25,12 @@ from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import (
+    GUARD_STATUS_NOT_APPLICABLE,
     ensure_committed,
     guard_clean_workspace as _guard_clean_workspace,
     guard_done_branch as _guard_done_branch,
     hook_uninstall,
+    record_degraded_guard,
     release_session_lock_if_owned,
     session_lock_check,
     session_lock_release,
@@ -41,6 +43,13 @@ from orchd.gitops_ops import (
 from orchd.guide import NEXT_ACTION_AWAIT_REVIEW
 from orchd.ledger import Store, resolve_review_mode
 from orchd.review import find_last_done_event as _find_last_done_event
+from orchd.shared_entries import (
+    GLOBAL_SHARED_FILES,
+    SHARED_ENTRY_TESTS,
+    BaselineTestProbe,
+    missing_baseline_test_coverage,
+    missing_shared_entry_tests,
+)
 from orchd.subproc import run_shell
 
 # 同包门禁（直接导入子模块，避免循环依赖）
@@ -140,6 +149,15 @@ def _done_impl(
     #     后 verify，否则 verify 跑在对账前的旧内容上。此处仅在 main 推进且触及本任务
     #     文件时检出冲突（2.5 已覆盖“未触及文件”的陈旧基线场景，二者互补）。
     _reconcile_before_verify(project_root, task_id, degraded_guards)
+
+    # 3.5) 共享入口 verify 覆盖门禁（task-shared-entry-verify-gate，E039）：改了被多个
+    #      既有测试文件断言的共享入口（如 .githooks/pre-push、orchd/cli/__init__.py）时，
+    #      verify_command 必须含其登记的既有测试——否则「只跑自己新写的测试」会让既有断言
+    #      静默变红并随双审入库（2026-09-19 一夜三次：prepush-tag-gate / cli-json-envelope
+    #      / canonical-root-dedup）。刻意早于 verify 执行：缺口是静态可判定的，先判先省。
+    _guard_shared_entry_coverage(
+        project_root, task_def, task_id, files_to_edit, degraded_guards
+    )
 
     # 4) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
     verify_record, early_done = _run_verify(store, task_def, task_id, project_root)
@@ -339,6 +357,265 @@ def _check_base_freshness(
             ),
         }],
     )
+
+
+# 形态 A 的基线 ref 候选（按序解析）：远端默认分支优先，其后是常见本地默认分支名。
+# **不硬编码 main**——宿主默认分支为 master（或改名 / 浅克隆无 main）时，硬编码会让形态 A
+# 静默失效且无痕（task-e039-escape-hatch-bypass-fix，pass6 Q-2；违反 L-12「不可用即结构化
+# 上报」）。
+_BASELINE_REF_CANDIDATES = ("main", "master")
+
+
+def _resolve_baseline_ref(project_root: Path) -> str | None:
+    """解析形态 A 的基线 ref（``origin/HEAD`` → ``main`` → ``master``），全失败返回 ``None``。
+
+    ``git symbolic-ref refs/remotes/origin/HEAD`` 指向远端默认分支（形如
+    ``refs/remotes/origin/main``），是「本任务从哪条线分出」最权威的线索；远端信息缺失时
+    回落本地 ``main`` / ``master``。候选须能 ``rev-parse`` 到 commit 才算命中。
+    """
+    candidates: list[str] = []
+    try:
+        head = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if head.returncode == 0 and head.stdout.strip():
+            ref = head.stdout.strip()
+            if ref.startswith("refs/remotes/"):
+                candidates.append(ref[len("refs/remotes/"):])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    candidates.extend(_BASELINE_REF_CANDIDATES)
+    for candidate in candidates:
+        try:
+            probe = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+                cwd=str(project_root),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip():
+            return candidate
+    return None
+
+
+def _uncommitted_changes(project_root: Path) -> list[str]:
+    """任务工作树内已跟踪文件的未提交改动（best-effort，取不到返回空列表）。
+
+    用于共享入口门禁的「实际改动」清单——引擎 auto-commit 发生在 done 靠后阶段，故
+    done 判定时刻工作树可能带未提交改动。失败按空列表处理：调用方的 fail-open 口径
+    由 :func:`_guard_shared_entry_coverage` 的 docstring 说明（兜底=越界/声明门禁）。
+    """
+    try:
+        from orchd.gitops import list_tracked_changes
+
+        return list(list_tracked_changes(project_root) or [])
+    except Exception:
+        return []
+
+
+def _guard_shared_entry_coverage(
+    project_root: Path,
+    task_def: dict[str, Any],
+    task_id: str,
+    files_to_edit: list[str],
+    degraded_guards: list[dict[str, Any]] | None = None,
+) -> None:
+    """共享入口改动的 verify 覆盖门禁（E039，task-shared-entry-verify-gate）。
+
+    两条判定规则，同一错误码（救济路径一致：补 verify_command 后重试），由 details.rule 区分：
+
+    - ``registry``：任务分支**实际改动** ∩ 登记表（:mod:`orchd.shared_entries` 的
+      ``SHARED_ENTRY_TESTS``）非空时，登记表为该入口指定的既有测试文件必须全部出现在
+      ``verify_command`` 的 pytest 目标里；
+    - ``global_shared_file``（形态 A，task-global-shared-file-verify-rule）：改动
+      ``GLOBAL_SHARED_FILES`` 里的**全局共享文件**（如 ``tests/conftest.py``，影响面无法
+      枚举）时，pytest 目标中至少要有**一个基线既有**（本任务动手前已存在于基线分支，基线
+      由 :func:`_resolve_baseline_ref` 解析）的测试文件——全量 pytest 禁入 verify_command，
+      形态 A 是预算约束下可实现的弱约束替代。
+
+    「实际改动」= **分支已提交 diff ∪ 工作树未提交改动**（task-shared-entry-gate-coverage-
+    hardening）。只看已提交 diff 有实测漏检：引擎直到本链路靠后阶段
+    （:func:`_commit_and_verify_integrity` → ``ensure_committed``）才 auto-commit，故
+    「提交了无关文件、把共享入口留在工作树未提交」的任务会整段逃出视野（实测同仓库
+    ``task_branch_files=['other.py']`` 而 ``list_tracked_changes=['orchd/cli/__init__.py']``）。
+
+    为什么这里 fail-open（同族其它守卫多为 fail-closed）：本门禁防「漏跑既有测试」，而
+    「未触及入口」与「改动清单取不到」在 best-effort 的
+    :func:`orchd.worktree.task_branch_files` 下不可区分——取不到就阻断会把 flat
+    布局等正常任务卡死。故取不到改动清单时退化为用声明的 ``files_to_edit`` 判定（声明
+    通常覆盖实际改动），两者皆空则放行；形态 A 的基线 ref 全不可解析时同样跳过（fail-open），
+    但**留痕不静默**（task-e039-escape-hatch-bypass-fix，pass6 Q-2）：记 ``degraded_guards``
+    （E030 / not_applicable）。该 fail-open 的兜底前提=越界 / 声明门禁自身 fail-closed，锁定
+    用例见 ``tests/test_done.py::TestDoneGuardFailClosed``。
+
+    空 ``verify_command``（task-e039-gate-self-injury-fix，pass5 N-4）：不静默放行——改动
+    命中受管入口时记 ``degraded_guards``（E030 / not_applicable），把「门禁没在守」变成可
+    检索事实；仍不阻断（存量 / 纯文档任务可能本就没有 verify_command）。
+    """
+    verify_cmd = str(task_def.get("verify_command") or "")
+    changed: list[str] = []
+    if project_root:
+        from orchd.worktree import task_branch_files
+
+        try:
+            changed = list(task_branch_files(Path(project_root), task_id))
+        except Exception:
+            # diff 基建故障（如 git 子进程异常）⇒ 退化为声明判定（fail-open）：
+            # 「取不到 diff」与「未触及入口」不可区分，且该故障场景下越界/声明门禁
+            # 自身会 fail-closed 阻断 done（见 TestDoneGuardFailClosed），本门禁不得
+            # 抢先抛出与门禁语义无关的裸异常。
+            changed = []
+        else:
+            # 未提交改动同样计入（见 docstring 实测漏检）；取失败时不影响已提交部分。
+            changed += _uncommitted_changes(Path(project_root))
+    changed = changed or list(files_to_edit or [])
+    if not verify_cmd:
+        # 空 verify ⇒ 覆盖门禁无从判定。**不得静默放行**（pass5 N-4）：若改动确实命中受管
+        # 入口（登记表 / 全局共享文件），记结构化降级（E030 / not_applicable）供审计与
+        # doctor 按码检索；不阻断——存量与纯文档任务可能本就没有 verify_command，阻断会卡死
+        # 正常流转（缺 verify_command 的代码类任务已在注册期被 validate 阻断）。
+        managed = set(SHARED_ENTRY_TESTS) | set(GLOBAL_SHARED_FILES)
+        touched = sorted({str(p).replace("\\", "/") for p in changed} & managed)
+        if touched:
+            record_degraded_guard(
+                degraded_guards,
+                guard_name="shared_entry_coverage",
+                status=GUARD_STATUS_NOT_APPLICABLE,
+                reason="verify_command 为空 ⇒ 共享入口覆盖门禁无从判定",
+                context={"task_id": task_id, "touched": touched},
+                # 提示只描述动作，不写 amend 旗标串：补登命令的单一生成源是 guide.py
+                # （禁止手写 amend 命令串，见 task-amend-decl-patch-channel）。
+                hint="该任务缺少 verify_command，覆盖门禁无从判定；补齐自检命令后重试 done",
+            )
+        return
+
+    gaps = missing_shared_entry_tests(changed, verify_cmd)
+    rule = "registry"
+    if not gaps:
+        # 形态 A 需要读 git 基线（基线分支上是否存在目标文件）⇒ 无 project_root 时无法判定，
+        # 按 fail-open 跳过（口径见 docstring）；基线 ref 不可解析时由谓词侧留痕。
+        baseline_gaps = (
+            missing_baseline_test_coverage(
+                changed,
+                verify_cmd,
+                _baseline_test_predicate(Path(project_root), degraded_guards),
+            )
+            if project_root
+            else None
+        )
+        if baseline_gaps is None:
+            return
+        if not baseline_gaps:
+            return
+        gaps, rule = baseline_gaps, "global_shared_file"
+
+    missing = []
+    for gap in gaps:
+        required = gap.get("required_test")
+        token = (
+            f"{gap['shared_entry']} → {required}"
+            if required
+            else f"{gap['shared_entry']} → 至少一个基线既有测试"
+        )
+        if token not in missing:
+            missing.append(token)
+    # hint 里的补登命令由 guide 单一生成（禁止手写 amend 命令串）；主工作树路径失败时
+    # 退化为不带 cd 前缀的形态（amend 本就只能在主工作树执行，提示仍可读）。
+    from orchd.guide import amend_mainwt_command, amend_patch_cmd
+
+    placeholder = "<把缺失的登记测试加入 pytest 目标后的命令>"
+    patch_cmd = amend_patch_cmd(task_id, verify=placeholder)
+    if project_root:
+        try:
+            from orchd.gitops import main_worktree_root
+
+            patch_cmd = amend_mainwt_command(
+                task_id, main_worktree_root(Path(project_root)), verify=placeholder
+            )
+        except Exception:  # noqa: BLE001 - hint 构造 best-effort，不掩盖门禁的阻断
+            patch_cmd = amend_patch_cmd(task_id, verify=placeholder)
+
+    if rule == "registry":
+        message = "shared_entry_verify_gap: verify_command 未覆盖共享入口的登记测试"
+        hint = (
+            "共享入口被改动时，其既有断言必须随任务一起跑（否则静默变红入库）；"
+            f"缺失 {', '.join(missing)}；补登命令 {patch_cmd}"
+        )
+    else:
+        message = "shared_entry_verify_gap: 全局共享文件改动未覆盖任一基线既有测试"
+        hint = (
+            "全局共享文件影响面无法枚举（改它会改变其它测试文件的行为），故要求在 pytest "
+            "目标中至少包含一个基线既有（本任务动手前已存在于基线分支）的测试文件——"
+            "全量 pytest 禁入 verify_command，形态 A 是预算约束下的弱约束替代；"
+            f"缺失 {', '.join(missing)}；补登命令 {patch_cmd}"
+        )
+    raise OrchdError(
+        ErrorCode.E039,
+        message,
+        [{
+            "task_id": task_id,
+            "rule": rule,
+            "gaps": gaps,
+            "verify_command": verify_cmd,
+            "hint": hint,
+        }],
+    )
+
+
+def _baseline_test_predicate(
+    project_root: Path, degraded_guards: list[dict[str, Any]] | None = None
+) -> BaselineTestProbe:
+    """构造「文件在基线分支中已存在」的判定谓词（形态 A 用）。
+
+    用 ``git ls-tree --name-only <基线 ref> -- <path>`` 的**输出**而非退出码判定：输出非空 ⇒
+    基线既有；输出空 ⇒ 非基线（本任务新建，退出码仍为 0）；rc≠0（非 git 仓库 / ref 不可
+    解析 / git 不可用）⇒ ``None``（不可判定，调用方 fail-open 跳过）。
+
+    兼容「修改既有测试文件」：只要该文件在基线上存在即计为基线既有——形态 A 排除的只有
+    「本任务新建的文件」，不是「本任务改过的文件」。
+
+    基线 ref 全不可解析（``origin/HEAD`` / ``main`` / ``master`` 均失败）时**留痕不静默**
+    （task-e039-escape-hatch-bypass-fix，pass6 Q-2）：记 ``degraded_guards``（E030 /
+    not_applicable）后返回恒 ``None`` 的谓词（调用方按既有 fail-open 口径跳过）。
+    """
+    ref = _resolve_baseline_ref(project_root)
+    if ref is None:
+        record_degraded_guard(
+            degraded_guards,
+            guard_name="shared_entry_coverage",
+            status=GUARD_STATUS_NOT_APPLICABLE,
+            reason="形态 A 基线 ref 不可解析（origin/HEAD / main / master 均失败）",
+            context={"guard_rule": "global_shared_file", "project_root": str(project_root)},
+            hint="形态 A 覆盖判定被跳过；确认仓库默认分支名或补 fetch 远端引用后重试 done",
+        )
+        return lambda path: None
+
+    def is_baseline(path: str) -> bool | None:
+        try:
+            proc = subprocess.run(
+                ["git", "ls-tree", "--name-only", ref, "--", path],
+                cwd=str(project_root),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        return bool(proc.stdout.strip())
+
+    return is_baseline
 
 
 def _probe_task_branch(workdir: str, task_id: str) -> bool:
@@ -600,18 +877,45 @@ def _commit_and_verify_integrity(
     commit_files = list(dict.fromkeys([*files_to_edit, *task_def.get("exempt_files", [])]))
     commit_result = _done_auto_commit(project_root, commit_files, commit_message)
 
-    _guard_declared_diff(project_root, task_id, files_to_edit, degraded_guards)
-    _guard_zero_residual(project_root, task_id, files_to_edit, degraded_guards)
-    _guard_out_of_scope(project_root, task_def, task_id, degraded_guards)
+    # task-commit-timeout-failure-surface AC4：自动提交硬失败（commit_timeout /
+    # commit_failed）时，后续干净守卫抛的 E017 附引擎提交诊断（reason/message），
+    # hint 明示「自动提交失败」，不再仅呈现裸 dirty_workspace 语义。
+    try:
+        _guard_declared_diff(project_root, task_id, files_to_edit, degraded_guards)
+        _guard_zero_residual(project_root, task_id, files_to_edit, degraded_guards)
+        _guard_out_of_scope(project_root, task_def, task_id, degraded_guards)
 
-    if project_root:
-        _guard_clean_workspace(
-            project_root,
-            command="done",
-            orchd_dir=store.orchd_dir,
-            agent_id=agent_id,
-            degraded=degraded_guards,
+        if project_root:
+            _guard_clean_workspace(
+                project_root,
+                command="done",
+                orchd_dir=store.orchd_dir,
+                agent_id=agent_id,
+                degraded=degraded_guards,
+            )
+    except OrchdError as exc:
+        hard_failed = bool(
+            commit_result
+            and commit_result.get("reason") in ("commit_timeout", "commit_failed")
         )
+        if hard_failed and exc.code is ErrorCode.E017:
+            base_detail = exc.details[0] if exc.details else {}
+            raise OrchdError(
+                ErrorCode.E017,
+                exc.message,
+                [{
+                    **base_detail,
+                    "auto_commit_reason": commit_result.get("reason"),
+                    "auto_commit_message": commit_result.get("message"),
+                    "auto_commit_timeout_seconds": commit_result.get("timeout_seconds"),
+                    "hint": (
+                        "自动提交失败（"
+                        + str(commit_result.get("reason"))
+                        + "），工作区改动未落盘；请检查 git 提交错误后重试 done"
+                    ),
+                }],
+            )
+        raise
 
     return commit_result
 

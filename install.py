@@ -9,7 +9,9 @@
 - 资源根 = 本脚本所在目录的父目录（orchd-core 源码根）；
 - 安装器自身不依赖 orchd 引擎，也不依赖 .orchd/，可跨平台（Windows/macOS/Linux）运行；
 - 首次安装：完整组装 .orchd/（vendored 引擎 + schema/templates/rules/docs + SKILL +
-  零根入口 + 打包配置 + shared/proposals 工作区骨架），清 __pycache__；
+  零根入口 + 打包配置 + shared/proposals/IDEAS.md 工作区骨架 + 宿主根 ROADMAP.md），
+  并按布局生成 .orchd/.gitignore 忽略契约（flat / container 等价），清 __pycache__；
+  注意 ROADMAP.md 落宿主项目根（唯一源，不在 .orchd/）；
 - 已存在时：无 --update/--force → 非零退出并明确提示；--update 就地升级（保留宿主
   shared/、_master.json、IDEAS/ROADMAP、ledger/checkpoint、session 锁）；
   --force 覆盖安装（重建 .orchd/，覆盖全部）；
@@ -38,7 +40,8 @@ from pathlib import Path
 _SELF_DIR = Path(__file__).resolve().parent
 RESOURCE_ROOT = _SELF_DIR if (_SELF_DIR / "orchd").is_dir() else _SELF_DIR.parent
 
-# 组装进 .orchd/ 的内容清单（与 scripts/sync_orchd_core.sh / scripts/verify_release_self_contained.py 对齐）
+# 组装进 .orchd/ 的内容清单
+# （与 scripts/sync_orchd_core.sh / scripts/verify_release_self_contained.py 对齐）
 ENGINE_DIR = RESOURCE_ROOT / "orchd"
 RESOURCE_DIRS = [("schema", "schema"), ("templates", "templates"), ("skill/rules", "rules")]
 RESOURCE_FILES = [("docs", "decomposition-guide.md")]
@@ -51,18 +54,57 @@ SKILL_CANDIDATES = [
 ]
 LAUNCHER_CANDIDATES = [RESOURCE_ROOT / ".orchd" / "__main__.py", RESOURCE_ROOT / "__main__.py"]
 
-# 宿主用户数据（--update 时保留，不覆盖）
+# 宿主用户数据（--update 时 .orchd/ 内保留，不覆盖）
+# 注：ROADMAP.md 已落宿主项目根（不在 .orchd/），故 .orchd/ 用户数据集合不再含它。
 _USER_PATHS = {
-    "shared", "proposals", "_master.json", "IDEAS.md", "ROADMAP.md",
+    "shared", "proposals", "_master.json", "IDEAS.md",
     "IDEAS-archive.md", "_ledger.jsonl", "_checkpoint.json", ".session.lock",
 }
+
+# .orchd/.gitignore 契约（task-installer-layout-placement）：安装器按宿主布局生成。
+# 源码根 .gitignore 的规则按「本文件位于 git 根」编写（.orchd/* + 豁免集），被
+# PACKAGING_FILES 原样拷入 .orchd/ 后，模式相对 .orchd/ 解析 → `.orchd/*` 变成
+# `.orchd/.orchd/*` 全部失效（container 布局下 .orchd/ROADMAP.md 被 roadmap-land
+# 误提交入库即此因，IDEAS/ROADMAP/SKILL 的忽略契约整体断裂）。
+# 故安装后覆写为**布局无关的相对规则**：忽略 .orchd/ 直接条目（/*），豁免需入库的
+# 工作区文档与共享上下文。实测（git 2.x / flat + container 双布局）：ROADMAP 与
+# 运行时被忽略，IDEAS / SKILL / shared / rules / _master.json / __main__.py 可入库。
+_ORCHD_GITIGNORE = """\
+# orchd 安装器生成（task-installer-layout-placement）：模式一律相对 .orchd/ 解析，
+# 与宿主布局（flat / container）无关——勿按「位于 git 根」的写法改写。
+# 契约：IDEAS / SKILL / shared / _master.json / rules 入库；ROADMAP 与运行时不入库。
+/*
+!/_master.json
+!/shared/
+!/IDEAS.md
+!/IDEAS-archive.md
+!/SKILL.md
+!/__main__.py
+!/rules/
+"""
+
+# 工作区文档模板（安装即就位，免去宿主人工补建；已存在则不动，保护宿主内容）
+_IDEAS_TEMPLATE = """\
+# IDEAS
+
+> 灵感池：讨论产生的灵感先由 `orchd idea propose` 记入 study（论证中），
+> 人工 `orchd idea confirm` 后才进入摄入队列（pending）。
+"""
+
+_ROADMAP_TEMPLATE = """\
+# ROADMAP
+
+> 未来版本规划（宿主资产，纳入 git；ROADMAP 唯一源 = 宿主项目根，引擎不读 .orchd/ 内副本）：
+> 新版本先 `orchd roadmap-land` 落地为 IDEAS pending 条目，再走摄入注册为任务。
+"""
 
 _MODE_LABEL = {"install": "安装", "update": "升级", "force": "覆盖安装"}
 
 # AGENTS.md 入口指针（安装器维护）：供"不扫隐藏目录、无 orchd skill"的
 # 新 agent 在宿主根直接发现引擎入口 .orchd/SKILL.md。
 _AGENTS_MARKER = "<!-- orchd: agent 入口指针"
-_AGENTS_POINTER = """<!-- orchd: agent 入口指针（由 orchd 安装器维护；如需自定义请保留该标记以免重复追加） -->
+_AGENTS_POINTER = (
+    """<!-- orchd: agent 入口指针（由 orchd 安装器维护；如需自定义请保留该标记以免重复追加） -->
 # AI agents
 
 本项目使用 [orchd](https://github.com/7bder/orchd-core) 编排 AI agent 任务协作。
@@ -74,12 +116,14 @@ _AGENTS_POINTER = """<!-- orchd: agent 入口指针（由 orchd 安装器维护�
 若本目录尚无 `.orchd/`（新环境或尚未安装），可自行执行安装接入：
 
 ```bash
-git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
+git clone https://github.com/7bder/orchd-core.git"""
+    """ && python orchd-core/install.py . --agent --cleanup
 ```
 
 装好后读 `.orchd/SKILL.md` 进入工作流。
 <!-- /orchd -->
 """
+)
 
 
 def _enable_utf8_stdio() -> None:
@@ -132,7 +176,8 @@ def _assemble_assets(orchd: Path) -> None:
     # docs/ 单文档
     for sub, name in RESOURCE_FILES:
         shutil.copy2(RESOURCE_ROOT / sub / name, orchd / "docs" / name)
-    # 打包配置
+    # 打包配置（.gitignore 为源码根形态，随后由 _write_orchd_gitignore 规范为
+    # .orchd/ 相对规则——拷贝保持包一致性，覆写修正布局错位）
     for name in PACKAGING_FILES:
         shutil.copy2(RESOURCE_ROOT / name, orchd / name)
     # SKILL + 零根入口
@@ -155,7 +200,6 @@ def _install(host: Path, update: bool, force: bool) -> dict:
             # 覆盖安装：重建 .orchd/（覆盖全部，含用户数据）
             shutil.rmtree(orchd)
             _assemble_assets(orchd)
-            _mk_skeleton(orchd)
             mode = "force"
         else:
             # 就地升级：覆盖分发资产，保留宿主用户数据
@@ -163,8 +207,13 @@ def _install(host: Path, update: bool, force: bool) -> dict:
             mode = "update"
     else:
         _assemble_assets(orchd)
-        _mk_skeleton(orchd)
         mode = "install"
+
+    # 骨架与忽略契约在三种模式下统一补齐（幂等：宿主已有内容不覆盖）
+    # 注意：ROADMAP.md 落到宿主项目根（host/），IDEAS.md 仍在 .orchd/
+    # roadmap 为 ROADMAP 处置记录（旧布局迁移 / 保留 / 模板）——结构化透出，无静默分支
+    skeleton, roadmap = _mk_skeleton(orchd, host)
+    gitignore = _write_orchd_gitignore(orchd)
 
     agents_entry = _ensure_agents_entry(host)
     hooks_path = _ensure_repo_hooks(host)
@@ -176,14 +225,159 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "orchd_dir": str(orchd),
         "agents_entry": agents_entry,
         "hooks_path": hooks_path,
-        "next": "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用（与 guidance first_time 卡片 steps 顺序一致）",
+        "skeleton": skeleton,
+        "roadmap": roadmap,
+        "gitignore": gitignore,
+        "next": (
+            "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
+            "（与 guidance first_time 卡片 steps 顺序一致）"
+        ),
     }
 
 
-def _mk_skeleton(orchd: Path) -> None:
-    """创建工作区骨架（shared/ 共享上下文 + proposals/ 提案目录）。"""
+def _mk_skeleton(orchd: Path, host: Path) -> tuple[dict, dict]:
+    """创建工作区骨架（shared/ + proposals/ + 工作区文档模板），幂等不覆盖宿主内容。
+
+    task-roadmap-installer-root-placement：ROADMAP.md 由安装器直建到**宿主项目根**
+    （``host/``，ROADMAP 是宿主资产、唯一源，见
+    ``orchd/ledger.py::resolve_roadmap_path``——与布局无关，flat 即仓库根、container
+    即 ``<容器>/main/``）；IDEAS.md 仍建在 ``.orchd/`` 工作区文档根（引擎判定不变）。
+    安装后 ``.orchd/`` 下**不生成** ROADMAP.md。已存在则不动——``--update`` 不覆盖宿主
+    已写内容（``--force`` 因重建 ``.orchd/`` 而重新生成 .orchd/ 内模板，宿主根 ROADMAP
+    同样受 ``exists`` 守护）。
+
+    task-installer-legacy-roadmap-nonmask（第三轮审查 NEW3-2）：宿主根无文件时**不再
+    无条件写空模板**——旧布局 ``.orchd/ROADMAP.md`` 存在时按 :func:`_roadmap_disposition`
+    迁移其内容（宿主真实规划不再被空模板静默遮蔽），处置结果结构化返回，无静默分支。
+
+    Returns:
+        ``(docs, roadmap)``：``docs`` 形如
+        ``{"IDEAS.md": "created"|"exists", "ROADMAP.md": <roadmap 的 status>}``；
+        ``roadmap`` 为结构化处置记录（``status``/``action``/``path``/``legacy``/``hint``），
+        由 :func:`install` 透出为返回值同名字段，供 ``--agent`` 消费。
+    """
     (orchd / "shared").mkdir(exist_ok=True)
     (orchd / "proposals").mkdir(exist_ok=True)
+    docs = {}
+    # IDEAS.md：工作区文档根（.orchd/，引擎判定不变）
+    target = orchd / "IDEAS.md"
+    if target.exists():
+        docs["IDEAS.md"] = "exists"
+    else:
+        target.write_text(_IDEAS_TEMPLATE, encoding="utf-8")
+        docs["IDEAS.md"] = "created"
+    # ROADMAP.md：宿主项目根（唯一源，不在 .orchd/）——含旧布局处置决策
+    roadmap_status, roadmap_record = _roadmap_disposition(host)
+    docs["ROADMAP.md"] = roadmap_status
+    return docs, roadmap_record
+
+
+# 旧布局 ROADMAP 副本相对宿主根的路径（唯一源在宿主根，见 orchd/ledger.py）
+_LEGACY_ROADMAP_SUBPATH = (".orchd", "ROADMAP.md")
+
+
+def _log_roadmap_disposition(record: dict) -> None:
+    """结构化 stderr 留痕（异常静默不阻断安装，与引擎侧 ``_log_legacy_roadmap`` 同型）。"""
+    try:
+        print(
+            f"orchd ▸ [roadmap] {json.dumps(record, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _roadmap_disposition(host: Path) -> tuple[str, dict]:
+    """决定宿主根 ROADMAP.md 的落位动作，并把处置过程结构化（禁静默分支）。
+
+    task-installer-legacy-roadmap-nonmask（NEW3-2）定稿口径：**迁移**，不再写空模板。
+    修复前 = 宿主根无文件时无条件写 :data:`_ROADMAP_TEMPLATE`；而旧布局
+    ``.orchd/ROADMAP.md`` 可能是宿主真实规划，且 ``resolve_roadmap_path`` 不读旧位置
+    （唯一源 = 宿主项目根）→ 真实规划被空模板**静默遮蔽**；叠加引擎侧旧判据
+    （``legacy.exists() and not root.exists()``）被根文件存在性抑制，连留痕都会消失。
+
+    分支（全部结构化返回 + 留痕，无静默路径）：
+    - 宿主根已有文件 → ``exists``：内容零改动；旧副本仍在则额外标 ``legacy_copy_present``
+      并留痕（不静默放过残留副本）；
+    - 宿主根无文件 + 有旧副本 → ``migrated_from_legacy``：**字节级原样搬运**（不改写、
+      不合并、不做模板化），宿主规划零丢失；
+    - 宿主根无文件 + 旧副本不可读 → ``skipped_legacy_present``：**宁可不写也不遮蔽**，
+      报错并要求人工确认；
+    - 宿主根无文件 + 无旧副本 → ``created``：沿用模板（全新宿主，行为不变）。
+
+    Returns:
+        ``(status, record)``：status ∈ {``created``, ``migrated_from_legacy``,
+        ``exists``, ``skipped_legacy_present``}。
+    """
+    target = host / "ROADMAP.md"
+    legacy = host.joinpath(*_LEGACY_ROADMAP_SUBPATH)
+    has_legacy = legacy.is_file()
+    record: dict = {
+        "path": str(target),
+        "legacy": str(legacy) if has_legacy else None,
+    }
+    if target.exists():
+        record["status"] = "exists"
+        record["action"] = "kept_host_content"
+        if has_legacy:
+            # 不覆盖宿主根（既有语义），但残留旧副本必须可见（AC2：禁静默）
+            record["action"] = "legacy_copy_present"
+            record["hint"] = (
+                "宿主根 ROADMAP.md 为唯一源、未被覆盖；.orchd/ROADMAP.md 为旧布局副本，"
+                "确认根文件内容完整后可删除该副本"
+            )
+            _log_roadmap_disposition(record)
+        return "exists", record
+    if not has_legacy:
+        target.write_text(_ROADMAP_TEMPLATE, encoding="utf-8")
+        record["status"] = "created"
+        record["action"] = "template_written"
+        return "created", record
+    try:
+        payload = legacy.read_bytes()
+    except OSError as exc:
+        record["status"] = "skipped_legacy_present"
+        record["action"] = "legacy_unreadable"
+        record["error"] = str(exc)
+        record["hint"] = (
+            "旧布局 .orchd/ROADMAP.md 不可读：不写空模板（避免遮蔽宿主规划），"
+            "请人工确认其内容后移到宿主项目根"
+        )
+        _log_roadmap_disposition(record)
+        return "skipped_legacy_present", record
+    # 字节级搬运：不做模板化改写 / 换行归一 / 内容合并，宿主规划原样成为唯一源
+    target.write_bytes(payload)
+    record["status"] = "migrated_from_legacy"
+    record["action"] = "migrated_to_host_root"
+    record["bytes"] = len(payload)
+    record["hint"] = (
+        "旧布局 ROADMAP 已按字节搬为唯一源（内容零改写）；请确认后 "
+        "git add ROADMAP.md 入库（ROADMAP 属宿主资产）"
+    )
+    _log_roadmap_disposition(record)
+    return "migrated_from_legacy", record
+
+
+def _write_orchd_gitignore(orchd: Path) -> str:
+    """把 .orchd/.gitignore 规范为**布局无关的相对规则**（幂等）。
+
+    源码根 .gitignore 由 :data:`PACKAGING_FILES` 拷入 .orchd/（包一致性：发行源同步
+    与 release 冒烟均按该文件存在校验），但其规则按「位于 git 根」编写，在 .orchd/
+    内解析全部失效（错位契约）。此处覆写为相对规则，使同一套契约在 flat 与
+    container 两种布局下等价生效——不改写宿主自有的 git 根 .gitignore（零侵入）。
+
+    Returns:
+        ``"written"`` 本次写入；``"exists"`` 已为规范形态（幂等不重写）。
+    """
+    target = orchd / ".gitignore"
+    if target.exists():
+        try:
+            if target.read_text(encoding="utf-8") == _ORCHD_GITIGNORE:
+                return "exists"
+        except OSError:
+            pass
+    target.write_text(_ORCHD_GITIGNORE, encoding="utf-8")
+    return "written"
 
 
 def _ensure_agents_entry(host: Path) -> str:

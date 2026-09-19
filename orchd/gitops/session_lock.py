@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,15 @@ _SESSION_LOCK_FILENAME = ".session.lock"
 _SESSION_GATE_FILENAME = ".session.gate.lock"
 
 
+# 门锁不可得时的「有界重试」预算（task-session-gate-timeout-fail-closed）：
+# 单次 acquire 仍沿用既有 10s 超时语义（不改门锁自身预算），仅在其上叠加退避重试，
+# 用于吸收瞬时争用（正常争用的持锁窗口是毫秒级「检查 + 写入」）；重试耗尽即
+# fail-closed 拒绝本次锁获取。退避为 0 时仅在多次尝试间不留额外等待（测试友好）。
+_SESSION_GATE_TIMEOUT_S = 10.0
+_SESSION_GATE_ATTEMPTS = 3
+_SESSION_GATE_BACKOFF_S = 0.25
+
+
 _SESSION_LOCK_REGISTRY: dict[str, Any] = {}
 
 
@@ -27,15 +39,136 @@ _SESSION_LOCK_TIMEOUT_MIN = 60
 _SESSION_LOCK_FLOCK_MARKER = "flock_active"
 
 
+def _log_session_lock_degrade(action: str, payload: dict[str, Any]) -> None:
+    """会话锁降级留痕（``orchd ▸ [session-lock]``，best-effort，R2-7）。
+
+    stderr 是留痕通道（stdout 恒为 JSON 机器契约，见 conventions.md「命令输出通道
+    契约」）；任何异常静默跳过，不阻断取锁主流程。不被 ``ORCHD_QUIET`` 抑制：
+    与 worktree ``[回收]`` 这类常规噪声不同，**会话锁失效意味着并发保护降级**
+    （R2-7 的原缺陷正是获取失败零留痕、调用方误以为已持锁），必须可追溯。
+
+    Args:
+        action: 动作名（``gate_unavailable`` / ``acquire_failed``）。
+        payload: 结构化条目（reason / error / gate_acquired / hint…）。
+    """
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        record = {"action": action, **payload}
+        print(
+            f"orchd ▸ [session-lock] {json.dumps(record, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
+def _lock_state(acquire_result: dict[str, Any], gate_acquired: bool) -> dict[str, Any]:
+    """把 :func:`session_lock_acquire` 结果收口为 :func:`ensure_session_lock` 的返回态。
+
+    R2-7：``acquired=False``（flock / IO 失败）时必须**返回真实持锁态**并留痕，
+    不得让调用方误以为已持锁（并发保护静默降级）。
+
+    Args:
+        acquire_result: ``session_lock_acquire`` 的结构化结果（唯一真源，不重算）。
+        gate_acquired: 本次「检查 + 写入」是否真的被门锁串行化。
+
+    Returns:
+        以 acquire 结果为基础 + ``gate_acquired``；未持锁时追加 ``degraded``/``hint``
+        并落 stderr 留痕。
+    """
+    state = dict(acquire_result)
+    state["gate_acquired"] = gate_acquired
+    if not acquire_result.get("acquired"):
+        state["degraded"] = True
+        state["hint"] = (
+            "会话锁标记写入失败（best-effort 降级）：本会话**未持锁**，"
+            "并发保护已失效；请排查锁目录可写性 / 文件占用后重跑"
+        )
+        _log_session_lock_degrade("acquire_failed", state)
+    return state
+
+
+def _acquire_session_gate(gate: Any) -> dict[str, Any]:
+    """有界重试（退避）获取会话门锁，返回结构化结果（永不抛异常）。
+
+    门锁失败的旧处置只留痕便继续「检查 + 写入」，恰重开了门锁本欲关闭的
+    check-then-act 竞态（task-session-gate-timeout-fail-closed）：并发下两个
+    session 可同时通过检查、各自写锁标记（后写覆盖先写），即 E019 双取。
+    故改为**有界重试**——退避重试 ``_SESSION_GATE_ATTEMPTS`` 次仍不可得即返回
+    ``acquired=False``，由 :func:`ensure_session_lock` 收口为拒绝态（fail-closed）。
+
+    Args:
+        gate: 已构造的 ``ExclusiveFileLock``（``.session.gate.lock``）。
+
+    Returns:
+        ``{"acquired": True, "attempts": <int>}``；或
+        ``{"acquired": False, "attempts": <int>, "error": <str>}``
+        （``error`` 为最后一次失败摘要；门锁 IO 故障 ``OSError`` 同样按「不可得」
+        处置，不抛异常穿透调用方）。
+    """
+    last_error = ""
+    for attempt in range(1, _SESSION_GATE_ATTEMPTS + 1):
+        if attempt > 1 and _SESSION_GATE_BACKOFF_S > 0:
+            time.sleep(_SESSION_GATE_BACKOFF_S * (attempt - 1))
+        try:
+            gate.acquire(blocking=True, timeout_s=_SESSION_GATE_TIMEOUT_S)
+        except (OrchdError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        return {"acquired": True, "attempts": attempt}
+    return {
+        "acquired": False,
+        "attempts": _SESSION_GATE_ATTEMPTS,
+        "error": last_error,
+    }
+
+
+def _gate_unavailable_state(gate_result: dict[str, Any]) -> dict[str, Any] | None:
+    """门锁不可得的 fail-closed 收口态：拒绝本次锁获取（含 stderr 留痕）。
+
+    ``reason="gate_timeout"`` + ``degraded=True`` 声明「本会话未持锁、本次写命令
+    未经串行化保护」，``exit_type="await-external"`` 指引调用方等待持锁者释放后
+    重试（而非降级续跑）。**本次「检查 + 写入」整体被放弃**，锁标记文件不被创建 /
+    覆盖——这正是与旧 best-effort 续跑的本质差别。
+
+    返回 ``None`` 仅作测试负控（模拟「拒绝收口」被移除的修复前形态：调用方退回
+    非串行 check + 写入），生产路径恒返回拒绝态。
+    """
+    state: dict[str, Any] = {
+        "acquired": False,
+        "reason": "gate_timeout",
+        "error": gate_result.get("error") or "gate_unavailable",
+        "degraded": True,
+        "gate_acquired": False,
+        "attempts": gate_result.get("attempts"),
+        "retriable": True,
+        "exit_type": "await-external",
+        "hint": (
+            "会话门锁不可得（E012 超时，有界重试已耗尽）：本次「检查 + 写入」按 "
+            "fail-closed 拒绝执行，本会话**未持锁**、并发保护未生效；请等待持锁者"
+            "释放后重试同一命令（僵死持有者用 "
+            "python .orchd/__main__.py watchdog --timeout 0 排查释放）"
+        ),
+    }
+    _log_session_lock_degrade("gate_unavailable", {"guard": "session_gate", **state})
+    return state
+
+
 def ensure_session_lock(
     orchd_dir: Path,
     agent_id: str,
     branch: str | None = None,
     session_id: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     """确保当前 session 可写入：门锁串行化"检查+获取"，被其他 session 持有则 E019。
 
-    best-effort：门锁 / 锁获取失败（IO 错误）不抛异常，静默降级。
+    best-effort：门锁 / 锁获取失败（IO 错误）不抛异常；但 **R2-7 起降级不再静默**——
+    失败时写结构化 stderr 留痕（``orchd ▸ [session-lock]``）并返回「未持锁」真实态，
+    调用方不得据返回值假定已持锁（此前两处 ``session_lock_acquire`` 的返回值被忽略，
+    写锁失败时并发保护静默降级）。
 
     与旧"check-then-act"区别：旧实现先 :func:`session_lock_check` 再
     :func:`session_lock_acquire`（覆盖写），两个并发 session 都可通过检查并同时
@@ -43,8 +176,36 @@ def ensure_session_lock(
     串行化整个"检查 + 写入"——一次仅一个进程能通过检查并写锁标记，其余读到该标记后
     据 session 归属判 E019 或幂等复用（刷新覆盖写）。
 
+    门锁不可得的 fail-closed（task-session-gate-timeout-fail-closed）：门锁获取走
+    :func:`_acquire_session_gate` 有界重试，重试耗尽即**拒绝本次锁获取**——不再执行
+    非串行的「检查 + 写入」：旧 best-effort 续跑在并发下可让两个 session 同时通过
+    检查并各自写标记（后写覆盖先写），正是门锁本欲消除的 E019 双取竞态；拒绝是唯一
+    安全出口（瞬时争用由重试预算吸收，正常路径零回归）。
+
     Session Identity Layer：同 ``agent_id`` 但不同 ``session_id`` 视为另一个
     session（即使指纹相同），防止同 agent 多会话互踩/误释放锁。
+
+    Returns:
+        本会话的持锁真实态（以 :func:`session_lock_acquire` 结果为真源，永不抛异常
+        之外的路径）：
+        - ``{"acquired": True, "reused": <bool>, "path": <str>, "gate_acquired": <bool>}``
+          已持锁（``reused=True`` 表示同 session 刷新覆盖写）；
+        - ``{"acquired": False, "reason": "flock_contended" | "lock_dir_unwritable" |
+          "lock_write_failed", "error": <str>, "degraded": True, "gate_acquired": <bool>,
+          "hint": <str>}`` 锁标记写入失败——**本会话未持锁**，并发保护已降级（调用方
+          须自行决定是否继续；``orchd/gitops/guard.py`` 当前为 best-effort 继续并把
+          降级并入响应 ``degraded_guards``）。``reason`` 为分类后的失败原因
+          （task-session-lock-degrade-observability AC1），此前统一为 ``io_error``。
+        - ``{"acquired": False, "reason": "gate_timeout", "error": <str>,
+          "degraded": True, "gate_acquired": False, "attempts": <int>,
+          "retriable": True, "exit_type": "await-external", "hint": <str>}``
+          门锁有界重试耗尽（E012 超时 / 门锁 IO 故障）——**fail-closed 拒绝**：本次
+          「检查 + 写入」整体未执行、锁标记未写入、本会话未持锁
+          （task-session-gate-timeout-fail-closed）；调用方按 ``exit_type`` 等待
+          持锁者释放后重试同一命令。
+        - ``gate_acquired`` 反映「检查 + 写入」是否真被门锁串行化（fail-closed 收口后
+          正常路径恒为 ``True``；``False`` 仅在「拒绝收口被移除」的回退形态出现，
+          届时另出一条 ``gate_unavailable`` stderr 留痕）。
     """
     if session_id is None:
         from orchd.ledger import resolve_session_identity
@@ -66,22 +227,26 @@ def ensure_session_lock(
 
     # 门锁：串行化后续"检查 + 写入"，消除 check-then-act 竞态。
     gate = ExclusiveFileLock(_get_session_gate_path(orchd_dir))
-    acquired_gate = False
-    try:
-        gate.acquire(blocking=True, timeout_s=10.0)
-        acquired_gate = True
-    except OrchdError:
-        # 门锁获取失败（超时/被占）：静默降级，仅凭当前标记判定（best-effort）
-        acquired_gate = False
+    gate_result = _acquire_session_gate(gate)
+    acquired_gate = bool(gate_result.get("acquired"))
+    if not acquired_gate:
+        # 门锁不可得 → fail-closed（task-session-gate-timeout-fail-closed）：有界重试
+        # 耗尽即**拒绝本次锁获取**，绝不退回非串行「检查 + 写入」——旧 best-effort
+        # 续跑在并发下会让多个 session 同时通过检查并各自写标记（E019 双取竞态）。
+        blocked = _gate_unavailable_state(gate_result)
+        if blocked is not None:
+            return blocked
     try:
         check = session_lock_check(orchd_dir)
         if check.get("locked"):
             holder = check.get("agent_id", "unknown")
             holder_session = check.get("session_id") or ""
             if holder == agent_id and (not holder_session or holder_session == session_id):
-                # 本 session 已持锁：刷新覆盖写（幂等复用）
-                session_lock_acquire(orchd_dir, agent_id, branch, session_id=session_id)
-                return
+                # 本 session 已持锁：刷新覆盖写（幂等复用）；返回值不再被忽略（R2-7）
+                lock_result = session_lock_acquire(
+                    orchd_dir, agent_id, branch, session_id=session_id
+                )
+                return _lock_state(lock_result, acquired_gate)
             raise OrchdError(
                 ErrorCode.E019,
                 f"workspace_busy: 工作区被 '{holder}' 占用（分支 {check.get('branch', 'N/A')}，"
@@ -96,8 +261,11 @@ def ensure_session_lock(
                     "hint": "等待该 session 结束，或使用 watchdog --timeout 0 强制释放僵死锁",
                 }],
             )
-        # 未被持有 / 损坏 / 超时（可覆盖）：直接写锁标记
-        session_lock_acquire(orchd_dir, agent_id, branch, session_id=session_id)
+        # 未被持有 / 损坏 / 超时（可覆盖）：直接写锁标记；返回值不再被忽略（R2-7）
+        lock_result = session_lock_acquire(
+            orchd_dir, agent_id, branch, session_id=session_id
+        )
+        return _lock_state(lock_result, acquired_gate)
     finally:
         if acquired_gate:
             gate.release()
@@ -209,7 +377,26 @@ def _acquire_and_write_session_lock(
     lock_path: Path,
     lock_data: dict[str, Any],
 ) -> dict[str, Any]:
-    """执行 flock 获取 + JSON 写入 + 注册表登记，返回结构化结果。"""
+    """执行 flock 获取 + JSON 写入 + 注册表登记，返回结构化结果。
+
+    task-session-lock-degrade-observability AC1：失败原因**分类**。此前三类语义
+    完全不同的失败统一标 ``reason="io_error"``，调用方与响应无法区分「正常并发
+    争用」与「真实环境故障」，也无法据此决定是否收紧为 fail-closed：
+
+    - ``flock_contended`` —— 非阻塞 flock 被其他进程持有（``ExclusiveFileLock.acquire``
+      抛 E012）。**正常并发语义**（等价 E019 workspace_busy），不是环境故障；
+      若按 ``acquired=False`` 直接 fail-closed，此类正常碰撞会被误伤成硬失败。
+    - ``lock_dir_unwritable`` —— 锁目录创建失败（EROFS / EACCES / 磁盘满等），
+      持久性环境故障。
+    - ``lock_write_failed`` —— 锁文件打开 / JSON 写入失败（文件占用、杀软扫描、
+      权限等），环境故障。
+
+    ``error`` 摘要字段三种情况下都保留（原文透传，便于排查）。
+
+    Returns:
+        ``acquired=True``（新锁或 ``reused=True`` 刷新），或 ``acquired=False``
+        并带分类后的 ``reason`` 与 ``error``。
+    """
     import json
 
     from orchd.lockfile import ExclusiveFileLock
@@ -217,6 +404,9 @@ def _acquire_and_write_session_lock(
     try:
         # worktree 维度锁可能落在 ORCHD_HOME 重定向根下，父目录未必存在
         lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, IOError) as exc:
+        return {"acquired": False, "reason": "lock_dir_unwritable", "error": str(exc)}
+    try:
         # 本进程已持同一锁：复用 fd（同 session 刷新覆盖写，可重入）
         existing = _SESSION_LOCK_REGISTRY.get(str(lock_path))
         if existing is not None:
@@ -228,16 +418,18 @@ def _acquire_and_write_session_lock(
         try:
             flock.acquire(blocking=False, timeout_s=0.5)
         except OrchdError as exc:
+            # E012 = 非阻塞获取失败（锁被其他进程持有）→ 并发争用，非环境故障
             return {
                 "acquired": False,
-                "reason": "io_error",
+                "reason": "flock_contended",
                 "error": f"flock acquire failed: {exc}",
             }
         flock.write_text(json.dumps(lock_data, ensure_ascii=False))
-        _SESSION_LOCK_REGISTRY[str(lock_path)] = flock
-        return {"acquired": True, "path": str(lock_path)}
     except (OSError, IOError) as exc:
-        return {"acquired": False, "reason": "io_error", "error": str(exc)}
+        # 锁文件打开 / 写入失败（含 Windows 文件占用、权限、磁盘故障）
+        return {"acquired": False, "reason": "lock_write_failed", "error": str(exc)}
+    _SESSION_LOCK_REGISTRY[str(lock_path)] = flock
+    return {"acquired": True, "path": str(lock_path)}
 
 
 def session_lock_acquire(
@@ -259,8 +451,9 @@ def session_lock_acquire(
         session_id: 当前 session ID；缺省时从环境解析。
 
     Returns:
-        结构化结果，永不抛异常：acquired=True（新锁或 reused=True 刷新），
-        或 acquired=False reason=io_error。
+        结构化结果，永不抛异常：acquired=True（新锁或 reused=True 刷新），或
+        acquired=False 且 reason ∈ {flock_contended, lock_dir_unwritable,
+        lock_write_failed}（分类见 :func:`_acquire_and_write_session_lock`）。
     """
     lock_path, lock_data = _prepare_session_lock_payload(
         orchd_dir, agent_id, branch, session_id
@@ -388,6 +581,34 @@ def _probe_session_lock_os_active(lock_path: Path) -> dict[str, Any]:
     return {"stale": True, "active": False}
 
 
+def _linked_worktree_names(main_root: Path) -> set[str] | None:
+    """git 登记的 worktree 目录名集合（best-effort；``None`` = 探测失败）。
+
+    review W-17：flat 布局不存在「任务 worktree 在主工作树父目录」这一约定，
+    活跃性判定改以 ``git worktree list --porcelain`` 的登记名为准（布局无关，
+    且绝不指向仓库父目录）。非 git / git 不可用 / 非零退出 → ``None``，
+    调用方保守跳过删除。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(main_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    names: set[str] = set()
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            names.add(Path(line[len("worktree "):].strip()).name)
+    return names
+
+
 def reclaim_orphan_session_locks(
     orchd_dir: Path,
     project_root: Path | None = None,
@@ -400,9 +621,18 @@ def reclaim_orphan_session_locks(
     扫描并识别可回收孤儿：
 
     - 解析文件名中的 worktree 名（``.session-<wt>.lock`` / ``.session-gate-<wt>.lock``）；
-    - 该 worktree 目录（``<task_wt_root>/<wt>``）**仍存在** → 活跃锁，跳过；
+    - 该 worktree **仍存活** → 活跃锁，跳过；
     - 被 live flock 持有（其他进程存活持锁）→ 跳过（防 flock-unlink 竞态）；
     - 否则视为孤儿可回收 → 删除，记入 ``cleaned``。
+
+    活跃性判据按布局解析（review W-17）：
+    - container → 布局解析出的 ``task_wt_root``（``<容器>``）下是否存在同名目录；
+    - flat → 以 ``git worktree list --porcelain`` 的登记名为准（**绝不**使用
+      ``main_root.parent``：那是仓库父目录，会指向无关目录并误判/误删活跃锁）；
+      git 探测失败 → 保守跳过（不删）。
+
+    另：``.session-*.lock`` 通配也会命中门锁（``.session-gate-<wt>.lock``），
+    故门锁只由专用 pattern 处理一次（W-17，避免同一文件被访问两次）。
 
     主 worktree 锁（``.session.lock`` / ``.session.gate.lock``，无 worktree 后缀）不在
     匹配范围，永不触碰；与 ``worktree._cleanup_stale_session_locks``（task- 前缀 + watchdog
@@ -418,33 +648,62 @@ def reclaim_orphan_session_locks(
     """
     store_root = _resolve_store_root(orchd_dir)
     main_root = Path(project_root).resolve() if project_root else Path(orchd_dir).parent
-    task_wt_root = main_root.parent
-    cleaned: list[str] = []
+
+    # 快路径：无候选锁 → 不触发布局解析 / git 调用（session 路径零额外开销）。
+    candidates: list[Path] = []
     try:
         for pattern in (".session-*.lock", ".session-gate-*.lock"):
             for p in sorted(store_root.glob(pattern)):
-                name = p.name
-                if name.startswith(".session-gate-"):
-                    wt = name[len(".session-gate-"):-len(".lock")]
-                elif name.startswith(".session-"):
-                    wt = name[len(".session-"):-len(".lock")]
-                else:
-                    continue
-                if not wt:
-                    continue
-                # worktree 目录仍存在 → 活跃，跳过
-                if (task_wt_root / wt).exists():
-                    continue
-                # 他人仍持活锁 → 不删（flock-unlink 竞态，与 _cleanup_stale_session_locks 一致）
-                if _probe_session_lock_os_active(p).get("active"):
-                    continue
-                try:
-                    _safe_delete(p, orchd_dir)
-                    cleaned.append(name)
-                except OSError:
-                    pass
+                if pattern == ".session-*.lock" and p.name.startswith(".session-gate-"):
+                    continue  # 门锁由专用 pattern 处理一次（W-17）
+                candidates.append(p)
     except OSError:
-        pass
+        return {"cleaned": []}
+    if not candidates:
+        return {"cleaned": []}
+
+    try:
+        from orchd.worktree import detect_layout
+
+        layout = detect_layout(main_root)
+    except Exception:
+        layout = {}
+    if layout.get("layout") == "container" and layout.get("task_wt_root"):
+        task_wt_root: Path | None = Path(layout["task_wt_root"])
+        live_names: set[str] | None = None
+    else:
+        task_wt_root = None
+        live_names = _linked_worktree_names(main_root)
+
+    def _worktree_alive(wt: str) -> bool:
+        """worktree 名是否仍存活；无法判定时保守返回 True（不删）。"""
+        if task_wt_root is not None:
+            return (task_wt_root / wt).exists()
+        if live_names is None:
+            return True  # git 探测失败 → 保守跳过
+        return wt in live_names
+
+    cleaned: list[str] = []
+    for p in candidates:
+        name = p.name
+        if name.startswith(".session-gate-"):
+            wt = name[len(".session-gate-"):-len(".lock")]
+        elif name.startswith(".session-"):
+            wt = name[len(".session-"):-len(".lock")]
+        else:
+            continue
+        if not wt:
+            continue
+        if _worktree_alive(wt):
+            continue
+        # 他人仍持活锁 → 不删（flock-unlink 竞态，与 _cleanup_stale_session_locks 一致）
+        if _probe_session_lock_os_active(p).get("active"):
+            continue
+        try:
+            _safe_delete(p, orchd_dir)
+            cleaned.append(name)
+        except OSError:
+            pass
     return {"cleaned": cleaned}
 
 

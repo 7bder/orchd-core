@@ -28,7 +28,7 @@
 - **禁止手动 git 写操作**：不得执行 `git checkout / branch / reset / stash / merge / push` 等。git 操作只允许引擎自动执行（claim 建分支、code APPROVED merge、done/amend 自动提交）。唯一豁免：任务分支上的 `git commit`。
 - **禁止破坏性 git 操作**：`git reset --hard`、`git clean -fdx`、`git branch -D`、`git push --force` 一律禁止。
 - **禁止修改范围外文件**：只读 `files_to_read`、只写 `files_to_edit`，不得触碰 `.git/` 内部结构。
-- **禁止绕过身份**：一个 session 只允许一个身份。自审默认仅提示（`self_review_notice` 标注，不阻断）；`config.enforce_self_review_block=true` 时 E016 硬阻断；单会话自托管确需自审时须在 review comments 显式披露。
+- **禁止绕过身份**：一个 session 只允许一个身份；自审默认**仅提示**（`self_review_notice` 标注，不阻断），线上版可设 `config.enforce_self_review_block=true` 恢复 E016 硬阻断；引擎语义 / 门禁 / 错误码 / 状态机类任务建议换独立会话审查，自审时必附三项披露（首句披露 / 证伪探针 / 回归证据）。
 - **禁止未提交即中断**：改动文件后必须提交（或明确报告原因）才能结束 session。
 - **禁止绕过 claim**：任务必须经 `claim` 由引擎建分支，禁止手动 `git branch/checkout` 创建任务分支。
 - **禁止手改 .orchd 运行时文件**：`_ledger.jsonl`、`_checkpoint.json`、`mod-*/spec.json` 由引擎维护，一律不得手改。

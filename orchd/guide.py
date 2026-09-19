@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -145,7 +146,8 @@ def amend_mainwt_command(task, main_wt, files=None, exempt=None, verify=None,
 # 信息瘦身口径（owner 已确认）：单视角 + 5 键 / 红线上限 1 条 / hint 单行。
 # 全命令分三级注入，避免"每条命令灌全量、三层重复"的信息超载。
 _T0_CMDS = frozenset({"status", "doctor", "help", "version", "session-status",
-                      "session-current", "session", "pool", "validate"})
+                      "session-current", "session", "pool", "validate",
+                      "context-digest"})
 _T1_CMDS = frozenset({"retract", "force-status"})
 
 
@@ -304,6 +306,59 @@ def attach_read_versions(
         if isinstance(sub, dict):
             out[key] = attach_read_versions(sub, base_dir)
     return out
+
+
+# 必读面内容哈希（task-context-digest-command）：session-doc-digest 的引擎侧最小闭环。
+# 覆盖面单一真源：显式文件清单 + rules/*.md 目录枚举（sorted）。只读输出，
+# 无时间戳 / pid / mtime 等易变字段，同一输入字节稳定。
+CONTEXT_DIGEST_FILES = (
+    ".orchd/SKILL.md",
+    "AGENTS.md",
+    ".orchd/shared/conventions.md",
+    ".orchd/shared/architecture.md",
+)
+
+
+def _digest_one(path: Path, rel: str) -> dict[str, Any]:
+    """单个必读面文件的内容哈希记录（best-effort：缺失/异常标 exists=false，不抛异常）。"""
+    try:
+        data = path.read_bytes()
+    except (OSError, ValueError):
+        return {"path": rel, "sha256": "", "bytes": 0, "exists": False}
+    return {"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data), "exists": True}
+
+
+def context_digest(project_root: str | os.PathLike[str] | None) -> dict[str, Any]:
+    """必读面文件的内容哈希与字节数（纯函数，只读，task-context-digest-command）。
+
+    与 :func:`attach_read_versions` 同层（best-effort 容错风格），但判据是内容
+    sha256 而非 mtime/size（checkout/clone 改 mtime 而内容相同、size 相同内容
+    不同时 mtime/size 均误判）。
+
+    Returns:
+        ``{"files": [...], "digest": <hex>, "root": <str>}``：
+        files 每项 ``{"path", "sha256", "bytes", "exists"}``（path 为相对项目根
+        的正斜杠路径，按 path 升序；缺失文件 exists=false、sha256 为空串）；
+        digest 为已存在文件 ``path:sha256`` 行拼接的 sha256（聚合指纹）；
+        root 为解析用项目根（调用方传入原值，跨调用稳定）。
+    """
+    root = Path(project_root) if project_root is not None else Path.cwd()
+    entries: list[dict[str, Any]] = [_digest_one(root / rel, rel) for rel in CONTEXT_DIGEST_FILES]
+    try:
+        rules_dir = root / ".orchd" / "rules"
+        entries.extend(
+            _digest_one(rules_dir / p.name, ".orchd/rules/" + p.name)
+            for p in sorted(rules_dir.glob("*.md"))
+            if p.is_file()
+        )
+    except OSError:
+        pass
+    entries.sort(key=lambda e: e["path"])
+    agg = hashlib.sha256(
+        "\n".join(f"{e['path']}:{e['sha256']}" for e in entries if e["exists"]).encode("utf-8")
+    ).hexdigest()
+    return {"files": entries, "digest": agg, "root": str(root)}
 
 
 def _summarize(
@@ -1003,6 +1058,11 @@ def _merge_hint(
       超限时优先牺牲可裁剪的 transition 上下文，红线要点保持完整可见）。
     """
     hint_bits: list[str] = []
+    # 顺序契约（task-output-order-determinism AC4）：hint 恒定段恒在易变段之前。
+    # 稳定段 = base_hint（step 说明/首次引导）+ 红线段（静态纪律摘要）；
+    # 易变段 = transition hint（含 task_id/实测命令）+ degraded（运行期路径细节）。
+    # 该顺序保证：宿主按前缀缓存时，同一输入的前缀块命中不受易变尾部扰动；
+    # 预算超限时 _truncate 自末尾截断，首先牺牲易变段，稳定段要点保持完整。
     base_hint = guidance.get("hint")
     if base_hint:
         hint_bits.append(base_hint)
@@ -1335,9 +1395,12 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     ("E031", "ROADMAP 规划章节未落地 IDEAS：章节 {chapter} 需先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS pending 后再 intake", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
     ("E032", "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
     ("E033", "会话身份缺失：先 session start 注入 ORCHD_SESSION_ID", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
-    ("E034", "撤认归属守卫：仅事件作者 {owner} 或 admin 可撤回 {task_id}，当前 {caller} 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 3600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
+    ("E034", "撤认归属守卫：仅事件作者 {owner} 或 admin 可撤回 {task_id}，当前 {caller} 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
     ("E035", "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
     ("E036", "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
+    ("E037", "verify_command 引用路径未声明且不存在：将路径加入 files_to_edit/exempt_files，或改指向实际存在的文件（声明口径一致性）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit <path>", "suggest", "exec-command"),
+    ("E038", "brief 声明的 files_to_edit 数量口径与实际声明不一致：对齐 brief 文案与声明集合（非拆分建议，warning 不阻断）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --brief <对齐后文案>", "suggest", "continue"),
+    ("E039", f"共享入口改动未覆盖登记的既有测试：{{missing}} 必须出现在 verify_command 的 pytest 目标里（否则既有断言静默变红），用 {amend_patch_cmd('{task_id}', verify='<补入登记测试后的命令>')} 补登后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<补入登记测试后的命令>"), "suggest", "exec-command"),
 )
 # 显式豁免集：允许裸弱出口的码（默认空集，加入需逐一说理注释）
 ALLOWED_WEAK: frozenset[str] = frozenset()
@@ -1383,6 +1446,11 @@ ERROR_CODE_CHANNELS: dict[str, frozenset[str]] = {
     "E026": frozenset({"B"}),       # unexempted_test_coupling: spec ValidationError (warning)
     "E028": frozenset({"B", "C"}),  # dry_run_assertion_mismatch: spec ValidationError + cli手工dict
     "E029": frozenset({"B"}),       # granularity_overflow: spec ValidationError (warning)
+    "E037": frozenset({"B"}),       # verify_reference_drift: spec ValidationError (blocking)
+    "E038": frozenset({"B"}),       # brief_decl_count_mismatch: spec ValidationError (warning)
+    # ── 通道 A 补登记（task-shared-entry-verify-gate）──
+    "E039": frozenset({"A"}),       # shared_entry_verify_gap: done 前置挂载点 raise ×1
+                                    # （onboard/lifecycle/core.py _guard_shared_entry_coverage）
     # ── 通道 C（手工dict）──
     "E021": frozenset({"C"}),       # identity_mismatch: cli手工dict (warning)
     "E030": frozenset({"C"}),       # runtime_file_integrity: gitops/ledger warn dict (warning)
@@ -1413,7 +1481,8 @@ ERROR_GUIDANCE: dict[str, dict[str, Any]] = {
 _FALLBACK_RECOVERY = "遇到错误：立即停止并报告，不自行猜测处置"
 _FALLBACK_COMMAND = f"{_ENTRY_CMD} status --text"
 
-_VERIFY_DOMAIN = frozenset({"E014", "E022", "E023", "E024", "E026", "E027", "E028"})
+_VERIFY_DOMAIN = frozenset({"E014", "E022", "E023", "E024", "E026", "E027", "E028",
+                            "E037", "E039"})
 _GIT_DOMAIN = frozenset({"E010", "E015", "E017", "E018", "E019", "E020"})
 _INTAKE_DOMAIN = frozenset({"E001", "E002", "E003", "E004", "E005", "E006", "E025", "E029"})
 _FALLBACK_READ_BY_DOMAIN: dict[str, tuple[str, ...]] = {

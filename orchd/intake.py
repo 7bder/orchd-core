@@ -188,6 +188,7 @@ def intake_commit(
         intake_lock_acquire,
         intake_lock_release,
         resolve_agent_id,
+        resolve_roadmap_path,
     )
 
     project_root = Path(project_root)
@@ -217,7 +218,10 @@ def intake_commit(
         # 消除新任务注册后 _master.json 残留未提交态、agent 需人工 git commit 的摩擦。
         paths = [
             str(workspace_root / "IDEAS.md"),
-            str(workspace_root / "ROADMAP.md"),
+            # task-roadmap-root-resolution：ROADMAP 走独立定位（宿主根优先）——
+            # 归根后的根版 ROADMAP.md 同样纳入摄入产物提交范围；被 gitignore
+            # 忽略时由 commit 层按既有 roadmap-untracked 逻辑剔除（不 fatal）。
+            str(resolve_roadmap_path(project_root)),
             str(_resolve_lock_orchd_dir(project_root) / "_master.json"),
         ]
         commit_message = message or "chore(intake): orchd intake — commit intake products"
@@ -291,7 +295,7 @@ def roadmap_land(
         get_default_branch,
         list_tracked_changes,
     )
-    from orchd.ledger import resolve_workspace_root
+    from orchd.ledger import resolve_roadmap_path, resolve_workspace_root
     from orchd.ledger import (
         intake_lock_acquire,
         intake_lock_release,
@@ -325,9 +329,13 @@ def roadmap_land(
                 ),
             }
 
-    # 2) 定位 ROADMAP 规划章节（.orchd 布局 / 根布局）
+    # 2) 定位 ROADMAP 规划章节（宿主根优先、.orchd/ 回退）
+    # task-roadmap-root-resolution：ROADMAP 走独立定位 helper，不再由工作区文档根
+    # 拼出——.orchd/ 下存在 IDEAS / SKILL 会把工作区根锁在 .orchd/，宿主根 ROADMAP
+    # 会被漏判为 roadmap_missing（与 validate 系定位分裂）。IDEAS 仍走工作区文档根
+    # （捆绑判定语义零回归）。
     ws = resolve_workspace_root(project_root)
-    roadmap = ws / "ROADMAP.md"
+    roadmap = resolve_roadmap_path(project_root)
     if not roadmap.exists():
         return {"landed": False, "reason": "roadmap_missing", "hint": f"缺 {roadmap}"}
     sections = _parse_roadmap_sections(roadmap.read_text(encoding="utf-8"))
@@ -495,6 +503,9 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
     """灵感写入 IDEAS 写入门禁：追加 status: study 条目（idea-write-gate，propose）。
 
     执行权：agent 可执行（记录论证中的灵感，待用户 confirm/drop 裁决）。
+    并发：IDEAS.md 的「读-改-写」（锁内读 → 查重 → 追加）整体在 ``.intake.lock``
+    持有范围内完成，与其它准入写者（amend / intake / roadmap-land / idea confirm）
+    互斥（task-intake-atomic-lock-consistent AC1）。
 
     Args:
         project_root: 仓库根目录。
@@ -521,41 +532,45 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         # guard 返回 committed 键，转换为该动作的键（proposed），保留 reason 与明细
         return {"proposed": False, **{k: v for k, v in guard_err.items() if k != "committed"}}
 
-    ws = resolve_workspace_root(project_root)
-    ideas = ws / "IDEAS.md"
-    text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
-    if _find_idea_entry(text, title) is not None:
-        return {
-            "proposed": False,
-            "reason": "duplicate_title",
-            "title": title,
-            "hint": f"IDEAS.md 已存在标题为 '{title}' 的条目",
-        }
-
-    # 显式 id 强校验（fail-closed）：- id: 是 E025 溯源校验与自动归档的权威锚点。
-    # 缺 id 的条目后续必然失败（amend 报 E025 source 引用不存在）且永不自动归档，
-    # 故在此早失败，而非让问题推迟到注册阶段才暴露（对齐引擎硬约束取向）。
-    idea_id = _parse_title_id(title)
-    if not idea_id:
-        return {
-            "proposed": False,
-            "reason": "missing_idea_id",
-            "title": title,
-            "hint": (
-                "标题须含显式 id，写法：`<标题>（id: <slug>）`；"
-                "slug 仅允许字母 / 数字 / 连字符 / 下划线，且以字母或数字开头。"
-                "例：`引擎硬化整改（id: audit-engine-hardening）`。"
-                "原因：- id: 是 E025 溯源校验与自动归档的权威锚点，缺 id 的条目"
-                "既无法被 source 引用（amend 必报 E025），也永不自动归档。"
-            ),
-        }
-
     import datetime
 
-    # 写入 IDEAS.md —— 受准入写锁串行（task-admission-lock-engine：D 项）
+    # 读-改-写整体纳入准入写锁（task-intake-atomic-lock-consistent AC1）：此前查重用的
+    # IDEAS.md 文本在取锁**之前**读取，锁内又用这份旧 existing 回写——两个并发 propose
+    # 都读到旧文本时，后写者以旧文本覆盖前者条目（TOCTOU 丢写）。现在
+    # 取锁 → 锁内新读 → 查重 → 写，全程持锁（对齐 roadmap_land 的「锁内新读」语义）。
     orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
+        ws = resolve_workspace_root(project_root)
+        ideas = ws / "IDEAS.md"
+        text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
+        if _find_idea_entry(text, title) is not None:
+            return {
+                "proposed": False,
+                "reason": "duplicate_title",
+                "title": title,
+                "hint": f"IDEAS.md 已存在标题为 '{title}' 的条目",
+            }
+
+        # 显式 id 强校验（fail-closed）：- id: 是 E025 溯源校验与自动归档的权威锚点。
+        # 缺 id 的条目后续必然失败（amend 报 E025 source 引用不存在）且永不自动归档，
+        # 故在此早失败，而非让问题推迟到注册阶段才暴露（对齐引擎硬约束取向）。
+        # 判定顺序保持「重复标题」在前（与既有优先级一致，零回归）。
+        idea_id = _parse_title_id(title)
+        if not idea_id:
+            return {
+                "proposed": False,
+                "reason": "missing_idea_id",
+                "title": title,
+                "hint": (
+                    "标题须含显式 id，写法：`<标题>（id: <slug>）`；"
+                    "slug 仅允许字母 / 数字 / 连字符 / 下划线，且以字母或数字开头。"
+                    "例：`引擎硬化整改（id: audit-engine-hardening）`。"
+                    "原因：- id: 是 E025 溯源校验与自动归档的权威锚点，缺 id 的条目"
+                    "既无法被 source 引用（amend 必报 E025），也永不自动归档。"
+                ),
+            }
+
         date = datetime.date.today().isoformat()
         entry = (
             f"## {date} {title}\n"
@@ -630,42 +645,45 @@ def _idea_transition(
         # guard 返回 committed 键，转换为该动作的过去式键，保留 reason 与明细
         return {key: False, **{k: v for k, v in guard_err.items() if k != "committed"}}
 
-    ws = resolve_workspace_root(project_root)
-    ideas = ws / "IDEAS.md"
-    if not ideas.exists():
-        return {key: False, "reason": "not_found", "title": title}
-    text = ideas.read_text(encoding="utf-8")
-    entry = _find_idea_entry(text, title)
-    if entry is None:
-        import difflib
-        all_headers = _list_idea_headers(text)
-        candidates = difflib.get_close_matches(title, all_headers, n=3, cutoff=0.3)
-        return {
-            key: False,
-            "reason": "not_found",
-            "title": title,
-            "hint": (
-                "标题须含「（id: <slug>）」后缀（propose 写入的完整标题格式为 "
-                "「YYYY-MM-DD <标题>（id: <slug>）」）。可传完整标题、去日期前缀标题，"
-                "或裸 slug（<slug> 与条目内 - id: 字段精确相等）。查看完整标题："
-                "python .orchd/__main__.py ideas list，或直接读 .orchd/IDEAS.md。"
-            ),
-            "candidates": candidates,
-        }
-    if entry["status"] != "study":
-        return {
-            key: False,
-            "reason": "not_study",
-            "title": title,
-            "current_status": entry["status"],
-            "hint": f"仅 status: study 条目可 {action}（当前 '{entry['status']}'）",
-        }
-
-    lines = entry["lines"]
-    # 改写状态 + 提交 —— 受准入写锁串行（task-admission-lock-engine：D 项）
+    # 读-改-写整体纳入准入写锁（task-intake-atomic-lock-consistent AC1）：此前条目定位
+    # 与状态校验用锁外读到的 text，锁内再按该 text 的**行区间**改写——锁外读与锁内写之间
+    # 若有并发写者追加/改写条目，行区间错位会覆盖并发改动（TOCTOU）。现在
+    # 取锁 → 锁内新读 → 定位/校验 → 改写，全程持锁。
     orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
+        ws = resolve_workspace_root(project_root)
+        ideas = ws / "IDEAS.md"
+        if not ideas.exists():
+            return {key: False, "reason": "not_found", "title": title}
+        text = ideas.read_text(encoding="utf-8")
+        entry = _find_idea_entry(text, title)
+        if entry is None:
+            import difflib
+            all_headers = _list_idea_headers(text)
+            candidates = difflib.get_close_matches(title, all_headers, n=3, cutoff=0.3)
+            return {
+                key: False,
+                "reason": "not_found",
+                "title": title,
+                "hint": (
+                    "标题须含「（id: <slug>）」后缀（propose 写入的完整标题格式为 "
+                    "「YYYY-MM-DD <标题>（id: <slug>）」）。可传完整标题、去日期前缀标题，"
+                    "或裸 slug（<slug> 与条目内 - id: 字段精确相等）。查看完整标题："
+                    "python .orchd/__main__.py ideas list，或直接读 .orchd/IDEAS.md。"
+                ),
+                "candidates": candidates,
+            }
+        if entry["status"] != "study":
+            return {
+                key: False,
+                "reason": "not_study",
+                "title": title,
+                "current_status": entry["status"],
+                "hint": f"仅 status: study 条目可 {action}（当前 '{entry['status']}'）",
+            }
+
+        lines = entry["lines"]
         new_lines: list[str] = []
         replaced = False
         for ln in lines:

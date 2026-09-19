@@ -142,6 +142,19 @@ def _cmd_roadmap_land(args) -> dict:
     return roadmap_land(orchd_dir.parent, args.version)
 
 
+def _cmd_context_digest(args) -> dict:
+    """输出必读面内容哈希与字节数（task-context-digest-command，只读 T0 命令）。
+
+    CLI 参数: 无（项目根由 .orchd/ 定位）。
+    返回: 必读面 digest 字典（files[] 每项 path/sha256/bytes/exists + 聚合
+    digest + root；无时间戳/pid/mtime 等易变字段，同一工作区重复调用字节稳定）。
+    """
+    from orchd.guide import context_digest
+
+    orchd_dir = _find_orchd_dir()
+    return context_digest(orchd_dir.parent)
+
+
 def register(sub) -> None:
     """注册 misc 模块的子命令。"""
     # layout-migrate（task-14-worktree-layout）：flat → container 迁移
@@ -160,11 +173,15 @@ def register(sub) -> None:
     p.set_defaults(func=_cmd_full_regression)
 
     # intake（2026-08-14 intake-commit-enforcement）
-    p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md；ROADMAP.md 不纳入 git，自动跳过）并校验状态合法性")
+    p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md + 宿主根 ROADMAP.md + .orchd/_master.json）并校验状态合法性；被 gitignore 忽略的路径由 commit 层剔除")
     p.set_defaults(func=_cmd_intake)
 
     # roadmap-land（2026-08-15 intake-dual-path）：ROADMAP 规划章节 → IDEAS pending 落地
     p = sub.add_parser("roadmap-land", help="为 ROADMAP 规划章节生成 IDEAS pending 落地条目")
     p.add_argument("version", help="规划章节版本（如 1.3，匹配 ROADMAP ## 版本 章节头）")
     p.set_defaults(func=_cmd_roadmap_land)
+
+    # context-digest（task-context-digest-command）：必读面内容哈希只读命令
+    p = sub.add_parser("context-digest", help="输出必读面内容哈希与字节数（未变即跳过重读的机械判据）")
+    p.set_defaults(func=_cmd_context_digest)
 

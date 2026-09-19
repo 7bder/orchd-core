@@ -21,10 +21,15 @@
   1. 查 ledger 断点（用 python 替代 grep|tail，跨平台无 POSIX 工具依赖）：`python -c "import pathlib; ls=[l for l in pathlib.Path('.orchd/_ledger.jsonl').read_text(encoding='utf-8').splitlines() if '<task_id>' in l]; print(chr(10).join(ls[-10:]))"`——确认实现进行到哪一步（已提交？已 done？）
   2. **清理僵死锁**：`.orchd/.session.lock` 超 60min → 按 L2 watchdog 语义释放（`python .orchd/__main__.py watchdog --timeout 0` 或 Python 删除）；`.git/index.lock` 无 git 进程 → 直接删
   3. **确认实现完整性**：检查 task 分支是否有已提交实现（`git log task/{id}`）；工作区未提交改动若属于该任务 files_to_edit → 提交到 task 分支（不丢实现）
-  4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）
+  4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）。**前提（E034 撤认归属守卫）**：跨 agent 撤认他人事件仅当目标认领已超时（僵尸）时放行——`CLAIMED` 超时阈值 `claim_stale_timeout_s()`（默认 **600s**，`ORCHD_CLAIM_STALE_SECS` 可覆盖）、`REVIEW_CLAIMED` 超时阈值 `review_stale_timeout_s()`（`ORCHD_REVIEW_STALE_SECS` 可覆盖）；**未超时撤认他人 CLAIMED 会被 E034 拒绝**（仅事件作者本人或 admin 可撤），此时应等待其退出或走 `force-status` 控制面，不得重试硬撤。另注意：`retract` 默认 `disposition=abandon` 触发 **300s 认领冷却**（`_RETRACT_COOLDOWN_S`），冷却期内重新 `claim` 被拒，需加 `--force` 绕过；`disposition=retry` / `handoff` 不触发冷却。
   5. **重新 claim**：`python .orchd/__main__.py claim --task <id> --confirm`（身份由引擎自动识别当前会话指纹；或按用户指示）
   6. **继续**：从 ledger 断点继续（已实现 → done；未完成 → 补实现）
 - **禁忌**：不得跳过 retract 直接 done（E007 agent 不匹配）；不得丢弃原 agent 的已提交实现（先确认再接管）
+
+## 双布局（container / flat）
+- **container（默认，多 worktree 并行）**：仓库根为容器，**主工作树在 `main/` 子目录**（带 `(main)` 标记），任务 worktree 为容器根的 `task-<id>/` 独立目录；账本运行时在 `<容器>/.orchd-runtime/`（可 `ORCHD_HOME` 重定向）。**agent 只在任务 worktree 内工作，绝不触碰 main**——merge 由引擎在主工作树执行。
+- **flat（单 worktree）**：无 `main/` 子目录，工作树即仓库根；账本运行时在 `.orchd/`。任务认领 / done / review 行为与 container 完全一致（零回归）。
+- **定位主工作树**：`git worktree list` 中带 `(main)` 标记的路径；或从任务 worktree 路径上溯到项目根下的 `main/` 目录（见 rules/git.md「持任务 amend 补登」三步流程）。
 
 ## 工作优先级（按序找活，做完一件再做下一件）
 1. **清审查积压**：`python .orchd/__main__.py status` 存在 in_review 且审查未被认领 → 以当前会话指纹领取
@@ -51,7 +56,7 @@
 - **返工增量读（A5，2026-09-13，读取纪律）**：rework（被 CHANGES_REQUESTED 打回）后重领实现时，**优先消费 claim 响应已附带的 `review_comments` 与变更文件（git diff），不重读全部 `files_to_read`**——claim 响应已含上轮审查意见与实现基线，重读全文既耗时又偏离返工焦点；仅在 `review_comments` / `previous_changes` 缺失或需确认具体上下文时，才按 `files_to_read` 定向补读。
 - **失败处理**：claim 失败 CLI exits non-zero with `{"error": {code: E008-E011, ...}}`；**停止并报告失败原因，不自行重试**（不把 task id 加 `--exclude` 后回 request 重试——引擎分配为准，无候选/失败即停，等待用户下一条指令）。
 - **审查期实现者冻结（R1-b，2026-08-07）**：任务进入 review（REVIEW_CLAIMED）后，任务分支上的 commit 被 L3 hook 拒绝（E017）——审查基线保护；需补提交时先让 reviewer retract 审查。
-- **`claim --type` 取值域**（task-session-start-token-handoff）：审查认领时 `--type` 实际取值为 `review` / `spec` / `code`。`spec` = 规格审查阶段（验收标准/边界/设计），`code` = 代码审查阶段（实现质量/测试/越界），`review` = 统一审查（两阶段合并为一次，缺省）。guide.py 生成 `claim --task X --type {phase}` 时 phase 取自任务 `review_phase` 字段，缺省 `unified` → 对应 `--type review`。实现任务认领不传 `--type`（默认识别为实现）。
+- **`claim --type` 取值域**（task-session-start-token-handoff）：审查认领时 `--type` 实际取值为 `spec` / `code`（**不含 `review`**）。`spec` = 规格审查阶段（验收标准/边界/设计），`code` = 代码审查阶段（实现质量/测试/越界），`unified` 单阶段模式下**省略** `--type`（guide.py 生成 `claim --task X --type {phase}` 时 phase 取自任务 `review_phase` 字段；unified 分支不附加该参数，与 `_review_step_guidance` 口径一致）。实现任务认领不传 `--type`（默认识别为实现）。
 
 ## 身份约定（会话级指纹）
 
@@ -66,4 +71,4 @@ agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈�
 - **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，造成任务归属混淆、E011 单任务忙度冲突、E016 自审纠缠。发现同指纹并行时应先核对宿主注入粒度并切换到正确的会话级标识，不得通过伪造 agent ID 绕过身份校验。
 - **E021 豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021 `identity_mismatch` warning。
 - **指纹 vs 具名身份**：宿主受管自动化会话用指纹作身份锚定；具名 agent 身份（如 `marvis-1`、`workbuddy-1`）用于人工可追溯场景。
-- **自审降级**：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。
+- **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者——引擎当前**无分级实现**（只有全局 `enforce_self_review_block` 开关，默认仅提示、不硬阻断），故本判据写成建议而非禁令；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。

@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError, to_json_response
-from orchd.lockfile import ExclusiveFileLock, _depth_registry, read_locked_text
+from orchd.lockfile import ExclusiveFileLock, _depth_registry, _flock_op, read_locked_text
 
 # checkpoint 字段 schema 版本（P2-10 / ROADMAP 1.4.1 引擎性能）：
 # update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
@@ -44,7 +44,12 @@ from orchd.lockfile import ExclusiveFileLock, _depth_registry, read_locked_text
 # checkpoint 缺该字段且自愈永不触发 → E030 持续告警；bump 至 2 触发一次自愈。
 # v3（2026-08-28，W-2）：新增 review_claimed_at（僵尸审查认领判定）后 bump，
 # 触发一次 replay_full 自愈，避免旧 checkpoint 缺该字段自我传播 → E030。
-_CHECKPOINT_SCHEMA_VERSION = 3
+# v4（2026-09-15，停服升级）：新增 review_self_review——自审事实落账到 REVIEW_CLAIMED /
+# REVIEW_SUBMITTED 事件的 is_self_review 字段与派生状态，事后可直接回查，不再依赖
+# DONE.agent_id == REVIEW_CLAIMED.agent_id 的启发式推导。属 conventions.md「安全边界」
+# 第 2 条（事件格式与 _apply_event 语义）改动，按约定人工停服升级、不走自托管任务管线。
+# 同样 bump 触发一次 replay_full 自愈，避免旧 checkpoint 缺该字段。
+_CHECKPOINT_SCHEMA_VERSION = 4
 
 
 # ------------------------------------------------------------------
@@ -162,8 +167,14 @@ class TaskState:
         review_phase:       当前审核阶段类型（如 ``"spec"`` 或 ``"code"``），无审核时为 None。
         review_claimed_by:  认领该审核的 reviewer agent ID，未认领时为 None。
         review_claimed_at:  审查认领发生的 ISO 时间戳（源自 REVIEW_CLAIMED 事件的
-                             timestamp）。用于僵尸审查认领判定（W-2）：in_review 且
+                            timestamp）。用于僵尸审查认领判定（W-2）：in_review 且
                             认领超时未见提交 → 可接管。未认领/已提交时为 None。
+        review_self_review: 本次审查是否为自审（实现者与审查者同一身份），源自
+                            REVIEW_CLAIMED / REVIEW_SUBMITTED 事件的 ``is_self_review``
+                            字段（v4，2026-09-15 停服升级）。把「自审」事实落账到事件与
+                            派生状态后，事后审计直接读账本即可判定，不再依赖
+                            ``DONE.agent_id == REVIEW_CLAIMED.agent_id`` 的启发式推导。
+                            非自审时为 False（快照省略）。
         merge_warning:      代码审查通过后 git merge 未执行（环境异常/best-effort 降级），
                             标记完成但 merge 未落地，audit-merge 需告警。仅 completed 有值。
     """
@@ -176,13 +187,15 @@ class TaskState:
     review_claimed_by: str | None = None
     review_claimed_session: str | None = None
     review_claimed_at: str | None = None
+    review_self_review: bool = False
     merge_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """将任务状态序列化为字典，用于写入 checkpoint JSON。
 
         为保持 checkpoint 紧凑，值为 ``None`` 的可选字段（``claimed_by``、
-        ``review_phase``、``review_claimed_by``、``merge_warning``）会被省略。
+        ``review_phase``、``review_claimed_by``、``merge_warning``）会被省略；
+        ``review_self_review``（bool）仅在为 ``True`` 时写入。
         始终包含 ``status`` 和 ``attempt_count``。
         """
         d: dict[str, Any] = {"status": self.status, "attempt_count": self.attempt_count}
@@ -198,6 +211,8 @@ class TaskState:
             d["review_claimed_session"] = self.review_claimed_session
         if self.review_claimed_at:
             d["review_claimed_at"] = self.review_claimed_at
+        if self.review_self_review:
+            d["review_self_review"] = True
         if self.merge_warning:
             d["merge_warning"] = self.merge_warning
         return d
@@ -218,6 +233,7 @@ class TaskState:
             review_claimed_by=d.get("review_claimed_by"),
             review_claimed_session=d.get("review_claimed_session"),
             review_claimed_at=d.get("review_claimed_at"),
+            review_self_review=bool(d.get("review_self_review", False)),
             merge_warning=d.get("merge_warning"),
         )
 
@@ -283,8 +299,94 @@ def stale_review_claims(
 
 
 def generate_event_id() -> str:
-    """生成事件 ID：evt-{uuid4-hex-8}。"""
-    return f"evt-{uuid.uuid4().hex[:8]}"
+    """生成事件 ID：``evt-{uuid4-hex-16}``（64 bit 熵，L-9）。
+
+    历史形态为 ``evt-{8hex}``（仅 32 bit）：当前账本规模下生日碰撞概率约
+    0.12%、万级约 1%，碰撞事件会被 ``orchd sync`` 的 event_id 去重**静默丢弃**，
+    或被 RETRACT 误撤他人事件。加宽到 64 bit 后同规模碰撞概率可忽略。
+
+    兼容性：旧 8hex 事件原样读取，去重与引用仍按字符串相等（不重写历史）；
+    新旧混存安全，但**跨设备需同时升级**才能实质消除碰撞。
+    """
+    return f"evt-{uuid.uuid4().hex[:16]}"
+
+
+# 原子替换的 Windows 有界重试参数（L-8）
+_ATOMIC_REPLACE_RETRIES = 5
+_ATOMIC_REPLACE_BACKOFF_S = 0.05
+
+
+def _is_transient_replace_error(exc: OSError) -> bool:
+    """是否属「目标文件被短暂占用」类可重试错误（Windows WinError 5 / 32）。"""
+    if isinstance(exc, PermissionError):
+        return True
+    return getattr(exc, "winerror", None) in (5, 32)
+
+
+def _fsync_dir(path: Path) -> None:
+    """best-effort fsync 目录项（Windows 下不可用 → 静默忽略 OSError）。"""
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _atomic_replace(
+    tmp_path: Path,
+    target_path: Path,
+    *,
+    retries: int = _ATOMIC_REPLACE_RETRIES,
+    backoff_s: float = _ATOMIC_REPLACE_BACKOFF_S,
+) -> None:
+    """原子替换 ``target_path`` ← ``tmp_path``，Windows 句柄争用有界重试（L-8）。
+
+    Windows 下目标文件被短暂持有句柄（并行的 orchd 只读命令正在读、杀软扫描、
+    索引器）时 ``os.replace`` 抛 ``PermissionError``（WinError 5/32）。旧实现
+    无重试：一次争用即让「事件已 append、但 checkpoint 未更新」的中间态以
+    E999 逃逸（命令失败、状态错配）。此处退避重试有限次，耗尽后抛结构化
+    E007（invalid_state，通道 A 已登记且为错误级；同模块既有 git_sync_failed
+    先例），**不无限重试、不静默吞掉**。
+
+    Args:
+        tmp_path: 已写完并 fsync 的临时文件。
+        target_path: 目标运行时文件（ledger / checkpoint）。
+        retries: 最大尝试次数（>=1）。
+        backoff_s: 线性退避基数（秒）。
+
+    Raises:
+        OrchdError: E007，重试耗尽仍未成功（含最后异常与占用提示）。
+    """
+    attempts = max(1, retries)
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(str(tmp_path), str(target_path))
+            return
+        except OSError as exc:
+            if not _is_transient_replace_error(exc):
+                raise
+            last_exc = exc
+            if attempt + 1 < attempts:
+                time.sleep(backoff_s * (attempt + 1))
+    raise OrchdError(
+        ErrorCode.E007,
+        "atomic_replace_failed: 目标运行时文件被占用，重试耗尽",
+        [
+            {
+                "tmp": str(tmp_path),
+                "target": str(target_path),
+                "retries": attempts,
+                "error": f"{type(last_exc).__name__}: {last_exc}",
+                "hint": "关闭持有该文件的进程（编辑器 / 杀软扫描 / 并行的 orchd 只读命令）后重试",
+            }
+        ],
+    )
 
 
 @dataclass
@@ -445,9 +547,16 @@ def resolve_review_mode(orchd_dir: Path) -> str:
     缺省 two_phase 保证观察期兼容：旧项目 / 测试 / 老事件均不受影响，
     显式配置 ``project.review_mode: "unified"`` 才启用单阶段链路。
     best-effort：master 缺失/解析失败返回 ``"two_phase"``（不抛异常）。
+
+    master 路径经 ``orchd.worktree.resolve_master_path_from_dir`` 单一真源解析
+    （本地优先 → canonical 主工作树回退）：container 容器根视角读到 canonical
+    权威配置，不再裸读本地副本静默回落。函数内惰性导入（ledger 不在顶层依赖
+    worktree，避免循环）。
     """
     try:
-        master_path = Path(orchd_dir) / "_master.json"
+        from orchd.worktree import resolve_master_path_from_dir
+
+        master_path = resolve_master_path_from_dir(orchd_dir)
         if not master_path.exists():
             return "two_phase"
         import json as _json
@@ -538,6 +647,53 @@ def _parse_session_ts(value: Any) -> datetime | None:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts
+
+
+def parse_event_time(value: Any) -> datetime:
+    """把事件 ``timestamp`` 解析为 aware 绝对时刻（L-2 归并排序第一元）。
+
+    兼容两类形态（不重写历史事件）：
+
+    - 旧事件：本地时区 + 秒精度（``2026-09-01T10:00:00+08:00``）；
+    - 新事件：UTC + 微秒（``2026-09-15T05:40:12.123456+00:00``）。
+
+    无法解析（缺失 / 非字符串 / 格式非法）→ 返回 ``datetime.min``（UTC aware），
+    使其稳定地排在最前且不抛异常（归并是 best-effort 路径，一条脏事件不应中断
+    整个合并）。naive 时间戳（无 offset 的历史脏数据）按 UTC 解释，避免依赖
+    本机时区导致两台设备得到不同的序。
+    """
+    parsed = _parse_session_ts(value)
+    if parsed is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def event_sort_key(ev: dict[str, Any]) -> tuple[datetime, str, str]:
+    """跨设备归并排序键（L-2，用户裁决 A）：``(绝对时刻, 写入方标识, event_id)``。
+
+    第二元取 ``session_id``（缺失回退 ``agent_id``）：事件格式内没有设备 id，
+    以事件里真实存在、稳定、跨设备一致的**写入方标识**作平局键（不新增事件字段，
+    无 §9.1 事件格式变更；口径差异已在任务变更描述 / 设计文档 / 审查意见留痕）。
+
+    第三元 ``event_id`` **仅对亚秒精度事件启用**：秒精度旧事件第三元留空，依赖
+    Python 稳定排序保留其输入顺序（= 该写入方的追加顺序，各设备一致）。依据（实测）：
+    当前账本 3289 事件全为秒精度，757 组共享 ``(timestamp, writer)``（覆盖 1595
+    事件，48%），其中 382 组「按 event_id 排序会打乱追加序」（样例：
+    ``DONE evt-6e320a0a`` → ``REVIEW_READY evt-13cfb06f`` 会被倒置），无条件启用
+    第三元将复现 2026-09-10 已修的同秒乱序实锤。新事件因 ``now_iso`` 的进程内严格
+    单调保证不会同秒并列，第三元仅作跨写入方同瞬间的确定性兜底。
+
+    Returns:
+        ``(aware 绝对时刻, 写入方标识, event_id 或 "")``。
+    """
+    raw = ev.get("timestamp")
+    raw_str = raw if isinstance(raw, str) else ""
+    fine_precision = "." in raw_str
+    return (
+        parse_event_time(raw),
+        str(ev.get("session_id") or ev.get("agent_id") or ""),
+        str(ev.get("event_id") or "") if fine_precision else "",
+    )
 
 
 def is_session_expired(data: dict[str, Any], now: datetime | None = None) -> bool:
@@ -796,6 +952,97 @@ def resolve_workspace_root(project_root: Path) -> Path:
     return orchd_dir
 
 
+_ROADMAP_DOC = "ROADMAP.md"
+
+
+def resolve_roadmap_path(project_root: Path) -> Path:
+    """定位 ROADMAP.md——**唯一源 = 宿主项目根**，与布局无关，无回退候选。
+
+    task-roadmap-single-source（用户裁定 2026-09-17）：ROADMAP 是**宿主资产**不是
+    引擎产物，唯一源是宿主项目根 ``ROADMAP.md``（flat 布局即仓库根，container 布局
+    为 canonical 主工作树 ``<容器>/main/``）；``.orchd/ROADMAP.md`` 不应存在，本函数
+    **不读它**（旧布局残留时仅 stderr 留痕提示归根，见 :func:`_log_legacy_roadmap`）。
+
+    演进：task-roadmap-root-resolution 曾实现为「宿主根优先 + .orchd/ 回退」，回退
+    分支等于给引擎产物留后门（同一份文档有两个可能位置），与裁定冲突，故此处去掉。
+
+    本 helper 仍是 ROADMAP 定位的**唯一真源**：roadmap-land / intake_commit /
+    E025 溯源 / roadmap_landing_warnings / 任务 worktree 同步统一复用。
+
+    与 :func:`resolve_workspace_root` 的分工：后者按 IDEAS / SKILL / ROADMAP 三份文档
+    的捆绑判定返回**工作区文档根**（IDEAS / SKILL / 归档继续复用，语义零回归）；
+    ROADMAP 的路径一律走本函数，不再由工作区文档根拼出。
+
+    Args:
+        project_root: 起点目录（任务 worktree 亦可，内部先 canonical 化）。
+
+    Returns:
+        宿主项目根的 ROADMAP.md 路径；**不保证存在**——消费点按需判 ``exists()``。
+    """
+    from orchd.worktree import resolve_canonical_project_root
+
+    root = Path(resolve_canonical_project_root(Path(project_root)))
+    root_doc = root / _ROADMAP_DOC
+    legacy = root / ".orchd" / _ROADMAP_DOC
+    # 旧布局残留（.orchd/ROADMAP.md）可观测：不读、不搬，仅留痕提示宿主处置。
+    # 不自动搬家的原因：ROADMAP 是宿主资产，移动与提交归属由宿主决定
+    # （一次性迁移点由安装器代搬，见 release/install.py::_roadmap_disposition）。
+    # 判据按**内容**而非「根文件是否存在」（task-installer-legacy-roadmap-nonmask AC2）：
+    # 旧判据 `legacy.exists() and not root.exists()` 会被空模板落根抑制 → 遮蔽反而更静默。
+    if legacy.exists() and _legacy_roadmap_actionable(legacy, root_doc):
+        _log_legacy_roadmap(root, legacy, root_doc=root_doc)
+    return root_doc
+
+
+def _legacy_roadmap_actionable(legacy: Path, root_doc: Path) -> bool:
+    """旧布局副本是否仍需宿主处置：唯一源缺失，或两份内容已不一致。
+
+    内容一致（安装器迁移后的稳态）视为「已处置」→ 不再重复告警，避免引擎热路径噪声；
+    任何读取异常按「需处置」返回（宁可多报，不可静默）。CRLF/LF 差异不算分歧。
+    """
+    if not root_doc.exists():
+        return True
+    try:
+        legacy_bytes = legacy.read_bytes()
+        root_bytes = root_doc.read_bytes()
+    except OSError:
+        return True
+    if legacy_bytes == root_bytes:
+        return False
+    return legacy_bytes.replace(b"\r\n", b"\n") != root_bytes.replace(b"\r\n", b"\n")
+
+
+def _log_legacy_roadmap(root: Path, legacy: Path, *, root_doc: Path | None = None) -> None:
+    """旧布局 ``.orchd/ROADMAP.md`` 留痕（禁静默）：ROADMAP 唯一源已改为宿主项目根。
+
+    触发判据见 :func:`_legacy_roadmap_actionable`：唯一源缺失（``root_missing``）或与
+    副本内容不一致（``content_diverges``）；``reason`` 区分可操作场景
+    （task-installer-legacy-roadmap-nonmask AC2：不再被「宿主根已有文件」抑制）。
+
+    与 ``worktree._log_recycle`` 同型：结构化 JSON 单行写 stderr，任何异常静默不阻断
+    主流程。宿主据此把文件移到项目根（安装器在一次性迁移点代做），或删除已确认的旧副本。
+    """
+    try:
+        target = root_doc if root_doc is not None else (root / _ROADMAP_DOC)
+        reason = "root_missing" if not target.exists() else "content_diverges"
+        record = {
+            "action": "legacy_orchd_roadmap_ignored",
+            "reason": reason,
+            "expected": str(target),
+            "legacy": str(legacy),
+            "hint": (
+                "ROADMAP 唯一源为宿主项目根：请把该文件移到项目根后重试"
+                if reason == "root_missing"
+                else "唯一源已就绪，.orchd/ROADMAP.md 为旧布局副本且内容已不一致："
+                     "确认无待迁移内容后删除该副本"
+            ),
+        }
+        print(f"orchd ▸ [roadmap] {json.dumps(record, ensure_ascii=False)}",
+              file=sys.stderr)
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------
 # 准入/公共文件锁（task-intake-file-lock）
 # 锁维度盘点（task-audit-lock-residue-reclaim AC1）：intake 准入写锁
@@ -850,6 +1097,82 @@ def intake_lock_path(orchd_dir: Path) -> Path:
     return resolve_store_dir(orchd_dir) / _INTAKE_LOCK_FILENAME
 
 
+def _reclaim_stale_lock_atomically(
+    lock_path: Path, timeout_s: float
+) -> dict[str, Any]:
+    """以原子序清理陈旧准入锁标记（L-7），返回 ``{"status": ...}``。
+
+    序列：``open → 非阻塞 flock → 经该 fd 重读确认仍陈旧 → unlink（持锁删除）
+    → 释放``。要点：
+
+    - **拿不到 flock 即让位**（返回 ``status="held"``）：首判据与本次 flock 之间
+      他人可能刚获取活锁，此时绝不删除（旧实现 check→read→unlink 三步非原子，
+      会删掉活锁造成 unlink-alias：文件消失、别人新建同名文件 → 双方同时持锁）；
+    - **持锁重读**：以本 fd 独占时的内容为准，读到的是「此刻没有其它写者」的标记；
+    - **持锁删除**：POSIX 下 flock 持有者删除自身锁文件是原子的（无 unlink-alias）；
+    - **Windows 回退**：本进程句柄占用时 ``unlink`` 被系统拒绝（无 FILE_SHARE_DELETE），
+      故在释放句柄后重试一次——该平台「他人持锁 = 其打开句柄存在 = 删除被系统拒绝」，
+      删除动作由 OS 保证不会误删活锁（无需额外复检）。
+
+    Returns:
+        ``{"status": "held"|"fresh"|"unreadable"|"cleaned"|"cleanup_failed"}``；
+        ``cleaned`` 附带 ``age_s`` 与 ``cleanup_result``（含是否真正删除文件）。
+    """
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR)
+    except OSError:
+        return {"status": "unreadable"}
+    owned = False
+    stale_age: float | None = None
+    removed = False
+    try:
+        try:
+            _flock_op(fd, "lock_nb")
+            owned = True
+        except (OSError, IOError):
+            return {"status": "held"}
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 65536).decode("utf-8", errors="replace")
+        except OSError:
+            return {"status": "unreadable"}
+        try:
+            data = json.loads(raw)
+            ts = float(data.get("timestamp", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {"status": "unreadable"}
+        age = time.time() - ts
+        if age < timeout_s or not data.get("agent_id"):
+            return {"status": "fresh"}
+        stale_age = age
+        try:
+            lock_path.unlink()
+            removed = not lock_path.exists()
+        except OSError:
+            removed = False  # Windows：本进程句柄占用 → 走 finally 内回退
+    finally:
+        if owned:
+            try:
+                _flock_op(fd, "unlock")
+            except (OSError, IOError):
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if owned and stale_age is not None and not removed:
+            try:
+                lock_path.unlink()
+                removed = not lock_path.exists()
+            except OSError:
+                removed = False
+    return {
+        "status": "cleaned" if removed else "cleanup_failed",
+        "age_s": round(stale_age, 1) if stale_age is not None else None,
+        "cleanup_result": {"cleared": removed, "path": str(lock_path)},
+    }
+
+
 def intake_lock_check(
     orchd_dir: Path, timeout_s: float = _INTAKE_LOCK_TIMEOUT
 ) -> dict[str, Any]:
@@ -867,6 +1190,8 @@ def intake_lock_check(
         "cleanup_result"}`` 未被持有且残留超时标记已被自动清除。
         ``{"locked": True, "agent_id", "timestamp", "age_s"}`` 被持有，诊断标记可读。
         ``{"locked": True, "reason": "no_marker"}`` 被持有但标记不可读。
+        ``{"locked": True, "reason": "held"}`` 首判据未持有、但清理前复核发现被
+        并发获取（原子清理让位，不删除活锁；L-7）。
     """
     lock_path = intake_lock_path(orchd_dir)
     probe = ExclusiveFileLock(lock_path).check()
@@ -891,31 +1216,24 @@ def intake_lock_check(
             }
         except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
             return {"locked": True, "reason": "no_marker"}
-    # 未被持有：无 live flock → 残留标记不再参与互斥。若残留标记已超时
-    # （task-audit-lock-residue-reclaim AC3），**自动清除**陈旧标记并返回未锁，
-    # 不再让陈旧标记产生 reason="timeout" 误导（watchdog 曾据此误报 stale_marker）。
-    # 删除前已由上面的 ExclusiveFileLock.check() 确认无 live flock 持有；与
-    # intake_lock_clear 一致，仅当无持有才 unlink（防 unlink-alias 竞态）。
+    # 未被持有（probe 已确认无 live flock）：清理陈旧标记必须是**原子序**（L-7），
+    # 见 _reclaim_stale_lock_atomically：拿不到 flock 即让位（返回 locked=True/held），
+    # 绝不删除他人刚获取的活锁；确认陈旧才持锁删除（Windows 走释放句柄后的 OS 保护回退）。
+    if not lock_path.exists():
+        return {"locked": False}
     try:
-        if lock_path.exists():
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-            ts = float(data.get("timestamp", 0))
-            age = time.time() - ts
-            if age >= timeout_s and data.get("agent_id"):
-                cleared = False
-                try:
-                    lock_path.unlink()
-                    cleared = not lock_path.exists()
-                except OSError:
-                    cleared = False
-                return {
-                    "locked": False,
-                    "reason": "timeout_cleaned",
-                    "age_s": round(age, 1),
-                    "cleanup_result": {"cleared": cleared, "path": str(lock_path)},
-                }
-    except (OSError, IOError, json.JSONDecodeError, ValueError, TypeError):
-        pass
+        outcome = _reclaim_stale_lock_atomically(lock_path, timeout_s)
+    except (OSError, IOError, ValueError, TypeError):
+        return {"locked": False}
+    if outcome.get("status") == "held":
+        return {"locked": True, "reason": "held"}
+    if outcome.get("status") == "cleaned":
+        return {
+            "locked": False,
+            "reason": "timeout_cleaned",
+            "age_s": outcome.get("age_s"),
+            "cleanup_result": outcome.get("cleanup_result"),
+        }
     return {"locked": False}
 
 
@@ -995,12 +1313,47 @@ def intake_lock_acquire(
             "path": str(canonical), "_lock": lock}
 
 
+def _mark_intake_lock_released(
+    lock_path: Path | None, lock: dict[str, Any]
+) -> None:
+    """把准入锁标记改写为「已释放」（best-effort，绝不抛错）。
+
+    task-intake-lock-released-marker（2026-09-15）：释放 flock 后写入
+    ``{"agent_id", "released": true, "released_at", "timestamp", "path"}``，
+    使 ``doctor._detect_residual_intake_locks`` 与卫生门禁一眼可判「已释放」，
+    不再按「无 live flock 且 age >= 120s」报超时残留（消除常驻假红）。
+
+    仍**不删除文件**——保住既有反 unlink-alias 设计（文件永久保留、flock 为唯一
+    互斥权威）；重写失败静默降级：下一次准入写会用新鲜标记覆盖，功能不受影响。
+    """
+    if lock_path is None:
+        return
+    payload = {
+        "agent_id": lock.get("agent_id") or "unknown",
+        "released": True,
+        "released_at": datetime.now(timezone.utc).isoformat(),
+        "timestamp": str(time.time()),
+        "path": str(lock_path),
+    }
+    try:
+        Path(lock_path).write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except (OSError, IOError, TypeError, ValueError):
+        pass
+
+
 def intake_lock_release(lock: dict[str, Any]) -> None:
     """释放准入锁（ExclusiveFileLock 原语释放）。
 
     进程内可重入：仅当引用计数归零才真正 flock 释放（与 :func:`intake_lock_acquire`
     的嵌套获取配对）。**不 unlink 锁文件**：文件永久保留，flock 释放后由
     :func:`intake_lock_check` 判为未持有——避免 unlink-alias / 删后误判持锁。
+
+    已释放标记（task-intake-lock-released-marker）：flock 释放后经
+    :func:`_mark_intake_lock_released` 把标记改写为 ``released: true``，使残留检测
+    与卫生门禁不再把「正常释放后留下的诊断标记」判为需人工处置的超时残留。
+    互斥语义零变化：flock 仍是唯一互斥权威，标记仅为诊断/留档。
     """
     lk = lock.get("_lock")
     if lk is None:
@@ -1019,6 +1372,7 @@ def intake_lock_release(lock: dict[str, Any]) -> None:
             lk.release()
         except (OSError, IOError):
             pass
+        _mark_intake_lock_released(canonical, lock)
         return
     entry["refcount"] -= 1
     if entry["refcount"] <= 0:
@@ -1027,6 +1381,7 @@ def intake_lock_release(lock: dict[str, Any]) -> None:
         except (OSError, IOError):
             pass
         _intake_lock_registry.pop(canonical, None)
+        _mark_intake_lock_released(canonical, lock)
 
 
 def reclaim_orphan_intake_locks(orchd_dir: Path) -> dict[str, Any]:
@@ -1102,14 +1457,23 @@ class StorageBackend(ABC):
         """以 append 模式写一条事件到 ledger（追加 + fsync）。"""
 
     @abstractmethod
-    def read_events(self, from_line: int = 1) -> list[dict[str, Any]]:
-        """读取 ledger 事件（从 ``from_line`` 起，1-based 行号）。
+    def read_events(
+        self, from_line: int = 1, to_line: int | None = None
+    ) -> list[dict[str, Any]]:
+        """读取 ledger 事件（``from_line`` / ``to_line`` 为 1-based **物理行号**）。
 
         容错语义：末行损坏跳过 + warning，中间行损坏降级跳过 + E030 warning
         （task-audit-ledger-write-atomicity AC4，不再抛 E002 中断引擎）。
         ``from_line`` 必须在文件层先跳过前 ``from_line-1`` 行再解析——保证
         checkpoint 之前（已被快照覆盖）的损坏行不会被解析（B-1 修复，
         恢复增量 replay 的容错语义）。
+
+        ``to_line``（L-11）：只解析到第 ``to_line`` 物理行（含）。checkpoint 的
+        ``ledger_line`` 是物理行号，撕裂/损坏行会让「解析事件序号」与「物理行号」
+        错位——按序号切片会多带一条事件，进而把引擎自身的撕裂行误报成篡改。
+
+        损坏行同时以结构化条目收集到 ``self.corrupt_lines``（每次调用重置），
+        供 :meth:`Store.check_integrity` 汇总进 integrity_warnings / guidance（L-12）。
         """
 
     @abstractmethod
@@ -1178,19 +1542,32 @@ class FilesystemBackend(StorageBackend):
         finally:
             os.close(fd)
 
-    def read_events(self, from_line: int = 1) -> list[dict[str, Any]]:
-        """读取 ledger 事件（从 ``from_line`` 起，1-based 行号）。
+    def read_events(
+        self, from_line: int = 1, to_line: int | None = None
+    ) -> list[dict[str, Any]]:
+        """读取 ledger 事件（``from_line`` / ``to_line`` 均为 1-based **物理行号**）。
 
         ``from_line`` 语义：在文件层先跳过前 ``from_line-1`` 行，再解析剩余行。
         这样 checkpoint 之前（已被快照覆盖）的损坏行不会被解析——B-1 修复，
         恢复增量 replay 的容错语义（重构前 ``_read_ledger_lines`` 直接在文件层
         跳过，不解析被跳过的行）。
 
+        ``to_line``（L-11，task-ledger-replay-visibility）：只解析到第 ``to_line``
+        **物理行**（含）。checkpoint.ledger_line 是物理行号，撕裂/损坏行会让
+        「解析事件序号」与「物理行号」错位——按序号切片（``read_events()[:n]``）
+        会多带一条事件，导致 check_integrity 把引擎自身的撕裂行误报成「疑似被篡改」。
+
+        损坏行（L-12）：除 ``warnings.warn``（向后兼容）外，同时把结构化条目
+        追加到 ``self.corrupt_lines``（每次调用重置），供
+        :meth:`Store.check_integrity` 汇总进 integrity_warnings / guidance——
+        agent 因此可见「丢了哪些事件」，不再只有 stderr 之外的沉默。
+
         容错规则（task-audit-ledger-write-atomicity AC4）：
         - 最后一行 JSON 解析失败 → 跳过 + warning（可能写入未完成）
         - 中间行解析失败 → warning（E030 语义）+ 跳过，不再硬抛 E002 中断引擎；
           撕裂行（并发 append 被中断）因此降级为可读，数据可继续恢复
         """
+        self.corrupt_lines = []
         if not self.ledger_path.exists():
             return []
         events: list[dict[str, Any]] = []
@@ -1199,7 +1576,10 @@ class FilesystemBackend(StorageBackend):
             raw_lines = f.readlines()
         # 文件层跳过前 from_line-1 行：被跳过的行不参与解析（含损坏行）
         start = max(0, from_line - 1)
-        for i in range(start, len(raw_lines)):
+        stop = len(raw_lines) if to_line is None else max(
+            start, min(to_line, len(raw_lines))
+        )
+        for i in range(start, stop):
             stripped = raw_lines[i].strip()
             if not stripped:
                 continue
@@ -1223,6 +1603,21 @@ class FilesystemBackend(StorageBackend):
                         f"已跳过（可能为并发写入撕裂行，引擎降级继续）: {stripped[:80]}",
                         stacklevel=2,
                     )
+                # 结构化留痕（L-12）：不因 warn 无法被程序化消费而静默
+                self.corrupt_lines.append({
+                    "code": ErrorCode.E030.name,
+                    "severity": "warning",
+                    "message": (
+                        f"ledger 第 {i + 1} 行（物理行号）JSON 解析失败，该行事件"
+                        "已被跳过（replay 派生状态缺少这条事件）"
+                    ),
+                    "line": i + 1,
+                    "path": str(self.ledger_path),
+                    "kind": (
+                        "truncated_last_line" if is_last else "torn_middle_line"
+                    ),
+                    "snippet": stripped[:80],
+                })
         return events
 
     def event_count(self) -> int:
@@ -1249,17 +1644,12 @@ class FilesystemBackend(StorageBackend):
             f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(str(tmp_path), str(self.checkpoint_path))
+        # 原子替换（L-8）：Windows 句柄争用有界重试，耗尽抛结构化 E007
+        # （不再让「事件已 append、checkpoint 未更新」以 E999 逃逸）
+        _atomic_replace(tmp_path, self.checkpoint_path)
         # fsync 父目录，确保持久化目录项（与 append_event 对齐；Windows 下
         # 目录 fsync 不可用，best-effort 忽略）
-        try:
-            dir_fd = os.open(str(self.checkpoint_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        _fsync_dir(self.checkpoint_path.parent)
 
     def acquire_lock(self) -> None:
         """获取排他文件锁（ExclusiveFileLock 原语，阻塞等待 + 超时）。
@@ -1451,16 +1841,14 @@ class Store:
         自动加锁前先查进程级锁登记（_depth_registry）：同进程其他 Store 实例
         （如 container 布局 review 合并流 merge_lock）已持同路径锁时不重复
         flock——同一进程双 fd 对同一区域加锁会自锁死（E012），须复用已持锁。
+
+        锁序（L-5 修正）：**先加锁 → 锁内 replay+validate → 写事件**。旧实现把
+        ``replay()`` 与 ``validate_transition`` 放在加锁之前，未持锁调用方存在
+        check-then-act 窗口：两个进程各自基于陈旧状态通过校验后串行落盘，后者
+        写入的是非法跃迁（校验形同虚设）。
         """
         task_id = event.get("task_id", "")
         target = _event_target_status(event)
-        if task_id and target:
-            current = self.replay().get(task_id)
-            validate_transition(
-                event.get("type", ""),
-                current.status if current else "pending",
-                target,
-            )
         held = (
             self.backend._file_lock._fd is not None
             or str(self.lock_path.resolve()) in _depth_registry
@@ -1468,6 +1856,15 @@ class Store:
         if not held:
             self.acquire_lock()
         try:
+            # 锁内校验：replay 读到的与本临界区落盘的是同一状态，校验与写入之间
+            # 不再有其它写者（校验失败抛 E007 由 finally 释放锁）。
+            if task_id and target:
+                current = self.replay().get(task_id)
+                validate_transition(
+                    event.get("type", ""),
+                    current.status if current else "pending",
+                    target,
+                )
             self.backend.append_event(event)
         finally:
             if not held:
@@ -1497,6 +1894,7 @@ class Store:
         """
         checkpoint_line, tasks, retracted = self._load_checkpoint()
         events = self._read_ledger_lines(from_line=checkpoint_line + 1)
+        self._replay_violations = []
         self._apply_events(events, tasks, retracted)
         return tasks
 
@@ -1505,6 +1903,7 @@ class Store:
         tasks: dict[str, TaskState] = {}
         retracted: set[str] = set()
         events = self._read_ledger_lines(from_line=1)
+        self._replay_violations = []
         self._apply_events(events, tasks, retracted)
         return tasks
 
@@ -1557,10 +1956,17 @@ class Store:
         state-machine-dedup 合并去重后统一走 :meth:`_apply_events`）——前缀重放只
         关心前 ``n`` 条事件的派生结果，若 RETRACT 触发全量重建会越过前缀边界读到
         ``n`` 之后的事件，破坏前缀语义。
+
+        L-11（2026-09-15）：``n`` 是**物理行号**（checkpoint.ledger_line 的口径），
+        故按物理行切片而非 ``read_events()[:n]``（解析事件序号）——撕裂/损坏行会让
+        两者错位（少一行事件 ⇒ 序号 n 对应物理行 n+1），旧实现因此多带一条事件，
+        派生结果与 checkpoint 快照不符，把引擎自身的撕裂行误报成「疑似被篡改」。
         """
-        events = self.backend.read_events()[:n]
+        events = self.backend.read_events(from_line=1, to_line=n)
         tasks: dict[str, TaskState] = {}
         retracted: set[str] = set()
+        # 前缀重放是独立观测：重置违规收集，避免与调用方先前的全量 replay 混淆
+        self._replay_violations = []
         # 与 _rebuild_after_retract 一致：先完整收集前缀内的 RETRACT 目标，
         # 再应用非撤回事件，避免被撤回事件「复活」。
         for ev in events:
@@ -1584,6 +1990,10 @@ class Store:
         合法操作（对齐 §3 判据 3 降级路径）。告警用 ``code=E030``，不抛异常。
         """
         warnings_list: list[dict[str, Any]] = []
+        # L-12：先把「损坏行」结构化告警收集到位（read_events 观测到的撕裂 / 非法
+        # JSON 行）——无论后续 checkpoint 分支如何提前返回，agent 都能看到
+        # 「replay 丢了哪些事件」。仅告警、不阻断、不影响派生结果。
+        warnings_list.extend(self._corrupt_line_warnings())
         checkpoint = self.backend.load_checkpoint()
         if checkpoint is None:
             # checkpoint 缺失（未写过快照 / 解析失败）→ 视为未校验到篡改
@@ -1648,16 +2058,76 @@ class Store:
             })
         return warnings_list
 
-    def _current_line_count(self) -> int:
-        """返回 ledger 当前行数：已校准则 O(1) 返回内存计数，未校准则
-        全文件数行校准一次（H4，2026-08-13）。
+    def _corrupt_line_warnings(self) -> list[dict[str, Any]]:
+        """把 read_events 观测到的损坏行转成结构化 E030 条目（L-12）。
 
-        内存计数的正确性前提：orchd 命令为短进程，写路径（append →
-        update_checkpoint）在文件锁内完成，故首次校准必发生在 append
-        之后（校准值即含已追加行），此后 append 逐行 +1 保持同步。
+        若账本尚未被本 backend 读过（``corrupt_lines`` 未初始化），先读一次以采集
+        观测（诊断路径，代价可接受）。
+
+        task-detection-fail-closed-doctor-ledger（INV-4a）：采集失败**不再降级为空
+        列表**——空列表语义是「未观测到损坏行」，与「采集本身失败」同形，会让
+        :meth:`check_integrity` 在账本不可读时报告「无篡改迹象」（假阴性）。改为产出
+        一条带 ``detection_unavailable=True`` 的 E030 告警：走既有 warning 通道
+        （不新增错误码），且遵守 :meth:`check_integrity` 的「仅告警、不阻断」契约
+        （**不改变退出码**，可见性由条目自身承担）——与 doctor 通道（unavailable 项
+        计入 repo_ok=False）强度不同，但两者都不再静默。
         """
-        if self._line_count is None:
+        try:
+            if getattr(self.backend, "corrupt_lines", None) is None:
+                self.backend.read_events()
+            entries = [
+                _attach_structured_guidance(dict(raw), self.orchd_dir)
+                for raw in list(self.backend.corrupt_lines or [])
+            ]
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            return [_attach_structured_guidance({
+                "code": ErrorCode.E030.name,
+                "severity": "warning",
+                "message": (
+                    f"账本损坏行检测不可用（{reason}）——结果不可信（可能漏报），"
+                    "需人工核对账本完整性（不自动修复）"
+                ),
+                "path": str(self.ledger_path),
+                "detection_unavailable": True,
+                "reason": reason,
+            }, self.orchd_dir)]
+        return entries
+
+    def _current_line_count(self) -> int:
+        """返回 ledger 当前行数（H4 缓存 + L-13 锁内校准契约）。
+
+        - 已校准 → O(1) 返回内存计数；写路径在账本锁内 append 后 ``+1`` 保持同步，
+          故同一进程内计数始终与自身写动作一致。
+        - **未校准 → 首次校准优先在账本锁内**取物理行数快照（L-13）：与并发 append
+          互斥，避免「读到落后半拍的行数」被长期缓存后又被增量写入沿用。
+        - 锁不可得（并发写持有）→ 退化为锁外计数，并按**显式契约**标注：
+          结果为**有界可重试**——ledger 为 append-only、行数单调不减，滞后只影响
+          展示与 checkpoint ``ledger_line``（偏小即多读几行增量，replay 结果不变），
+          **绝不作为删除 / 覆盖 / 篡改判据**。
+        """
+        if self._line_count is not None:
+            return self._line_count
+        held = (
+            self.backend._file_lock._fd is not None
+            or str(self.lock_path.resolve()) in _depth_registry
+        )
+        if held:
             self._line_count = self._count_ledger_lines()
+            return self._line_count
+        try:
+            # 非阻塞尝试（只读路径不得因并发写而阻塞）
+            self.backend._file_lock.acquire(blocking=False)
+        except OrchdError:
+            self._line_count = self._count_ledger_lines()
+            return self._line_count
+        try:
+            self._line_count = self._count_ledger_lines()
+        finally:
+            try:
+                self.backend._file_lock.release()
+            except (OSError, IOError):
+                pass
         return self._line_count
 
     def _read_ledger_lines(self, from_line: int) -> list[dict[str, Any]]:
@@ -1752,6 +2222,74 @@ class Store:
                     retracted.add(target_eid)
         self._apply_events(all_events, tasks, retracted, handle_retract=False)
 
+    @property
+    def replay_violations(self) -> list[dict[str, Any]]:
+        """最近一次 replay 收集到的序列级软校验违规（L-3，只读观测）。
+
+        与 :meth:`check_integrity` 的区别：这里记录的是**语义可疑但派生状态照旧
+        应用**的序列（如跨设备双认领），不构成篡改判定，也不新增 E030 误报；
+        消费方是 sync 合并响应（结构化字段 / warnings）。
+        """
+        return list(getattr(self, "_replay_violations", []) or [])
+
+    def _record_soft_violation(
+        self, event: dict[str, Any], ts: TaskState
+    ) -> None:
+        """replay 期序列级不变量软校验（L-3）：只记录，绝不阻断 / 不改派生状态。
+
+        判据比写入期白矩阵更严（白矩阵允许 self-transition，如两条 CLAIMED 依次
+        到来都合法；但**序列级**看这是跨设备双认领的迹象）。检测项：
+
+        - ``double_claim``：同一任务在 ``claimed`` 状态下又来一条 CLAIMED
+          （中间没有任何终态/审查事件）；
+        - ``done_without_active_claim``：非 ``claimed`` 状态下出现 DONE；
+        - ``review_without_done``：非 ``done`` / ``in_review`` 状态下出现审查类事件；
+        - ``terminal_reentry``：终态（completed / cancelled）后再次出现推进类事件。
+        """
+        etype = event.get("type", "")
+        status = ts.status
+        invariant: str | None = None
+        reason = ""
+        if status in ("completed", "cancelled") and etype in (
+            "CLAIMED", "DONE", "REVIEW_READY", "REVIEW_SUBMITTED",
+        ):
+            # 终态后推进优先判定（比「缺活跃认领」更精确：终态本身就是最强判据）
+            invariant = "terminal_reentry"
+            reason = f"任务已 {status} 却再次出现 {etype}（终态后推进）"
+        elif etype == "CLAIMED" and status == "claimed":
+            invariant = "double_claim"
+            reason = (
+                "同一任务在 claimed 状态下再次 CLAIMED（中间无终态/审查事件）——"
+                "典型成因为跨设备双认领或事件顺序被合并打乱"
+            )
+        elif etype == "DONE" and status != "claimed":
+            invariant = "done_without_active_claim"
+            reason = f"任务处于 {status} 状态却出现 DONE（无活跃认领）"
+        elif etype in ("REVIEW_READY", "REVIEW_CLAIMED", "REVIEW_SUBMITTED") and \
+                status not in ("done", "in_review"):
+            invariant = "review_without_done"
+            reason = f"任务处于 {status} 状态却出现 {etype}（未经 DONE/进入审查）"
+        if invariant is None:
+            return
+        violations = getattr(self, "_replay_violations", None)
+        if violations is None:
+            violations = []
+            self._replay_violations = violations
+        violations.append({
+            "code": "replay_violation",
+            "invariant": invariant,
+            "task_id": event.get("task_id", ""),
+            "event_id": event.get("event_id", ""),
+            "event_type": etype,
+            "observed_status": status,
+            "message": reason,
+            "hint": (
+                "replay 序列级软校验：事件已被照常应用（派生状态与改动前一致），"
+                "此处仅上报以暴露跨设备并发的语义冲突；硬性拒绝/隔离需跨设备裁决"
+                "通道（另案）。"
+            ),
+        })
+
     def _apply_event(self, event: dict[str, Any], ts: TaskState) -> None:
         """应用单个非 RETRACT 事件到任务状态（原地修改 ``ts``）。
 
@@ -1768,7 +2306,12 @@ class Store:
         RETRACT 由调用方 :meth:`_apply_events` 在进入本方法前拦截（活跃路径触发
         全量重建、重建路径仅记录），此处只处理状态跃迁事件。跃迁合法性由白矩阵
         （:func:`validate_transition`）在写入时校验。
+
+        L-3（2026-09-15）：入口先做**序列级软校验**（:meth:`_record_soft_violation`）
+        ——只观测收集、不阻断也不改变下方派生结果，供 sync 合并响应暴露
+        「跨设备双认领」类语义冲突。
         """
+        self._record_soft_violation(event, ts)
         etype = event.get("type", "")
         if etype == "CLAIMED":
             ts.status = "claimed"
@@ -1778,6 +2321,7 @@ class Store:
             ts.review_claimed_by = None
             ts.review_claimed_session = None
             ts.review_claimed_at = None
+            ts.review_self_review = False
 
         elif etype == "DONE":
             ts.status = "done"
@@ -1789,11 +2333,17 @@ class Store:
             ts.review_claimed_by = None
             ts.review_claimed_session = None
             ts.review_claimed_at = None
+            # v4：新一轮审查开始，自审标记随上一轮清零（事实由历史事件承载）
+            ts.review_self_review = False
 
         elif etype == "REVIEW_CLAIMED":
             ts.review_claimed_by = event.get("agent_id")
             ts.review_claimed_session = event.get("session_id")
             ts.review_claimed_at = event.get("timestamp")
+            # v4（2026-09-15 停服升级）：自审事实落账——事件缺失该字段的历史数据
+            # 视为非自审（False），需回查历史时仍可用 DONE/REVIEW_CLAIMED 的
+            # agent_id 相等性启发式推导，二者不冲突。
+            ts.review_self_review = bool(event.get("is_self_review"))
 
         elif etype == "REVIEW_SUBMITTED":
             verdict = event.get("verdict", "")
@@ -1809,6 +2359,12 @@ class Store:
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
                     ts.review_claimed_at = None
+                    # v4（2026-09-15 停服升级）：自审标记不随审查字段清空——completed
+                    # 之后仍需能回查「本次完成系自审通过」；用 or 语义合并，使历史事件
+                    # （无 is_self_review 字段）不清掉 REVIEW_CLAIMED 已落的值。
+                    ts.review_self_review = ts.review_self_review or bool(
+                        event.get("is_self_review")
+                    )
                     # B1（2026-08-13 full-audit-v2）：merge 降级标记随事件持久化，
                     # completed 但 merge 未落地时保留 merge_warning 供 audit-merge 告警
                     ts.merge_warning = event.get("merge_warning")
@@ -1828,6 +2384,9 @@ class Store:
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
                 ts.review_claimed_at = None
+                # v4：审查被打回 → 回退 pending，本轮自审标记随回退清零
+                # （事实仍由历史 REVIEW_SUBMITTED 事件承载，缺口不回退）
+                ts.review_self_review = False
 
         elif etype == "FORCE_STATUS":
             # 强制状态覆盖：根据 target_status 重置关联字段，
@@ -1841,6 +2400,7 @@ class Store:
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
                 ts.review_claimed_at = None
+                ts.review_self_review = False
                 ts.claimed_by = None
                 ts.claimed_session = None
             elif target == "claimed":
@@ -1855,6 +2415,7 @@ class Store:
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
                 ts.review_claimed_at = None
+                ts.review_self_review = False
             elif target == "completed":
                 # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
                 # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
@@ -1862,6 +2423,9 @@ class Store:
                 ts.review_claimed_by = None
                 ts.review_claimed_session = None
                 ts.review_claimed_at = None
+                # v4：人工强制完成无审查事件来源，自审标记一并清零（避免残留
+                # 上一轮的 True 被误读为「本次完成系自审通过」）
+                ts.review_self_review = False
 
     # ------------------------------------------------------------------
     # Checkpoint

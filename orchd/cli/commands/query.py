@@ -267,6 +267,7 @@ def _cmd_watchdog(args):
     CLI 参数: args.timeout（超时分钟数，默认 60）。
     返回: 巡检结果字典；若存在僵死任务则以 ``(result, 1)`` 元组返回以设置非零 exit code。
     """
+
     from orchd.cli import _load_tasks
     from orchd.ledger import Store
     from orchd.report import watchdog
@@ -276,6 +277,7 @@ def _cmd_watchdog(args):
     result = watchdog(
         store, tasks, timeout_min=args.timeout, project_root=orchd_dir.parent,
         agent_id=_resolve_agent_id(orchd_dir), takeover=args.takeover,
+        full=getattr(args, "full", False),
     )
     if result["stuck_count"] > 0:
         return result, 1
@@ -311,6 +313,8 @@ def register(sub) -> None:
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--takeover", action="store_true",
                    help="对 stale_claims 中确认会话已失效的任务执行 force-status 回退 pending（best-effort）")
+    p.add_argument("--full", action="store_true",
+                   help="输出全量明细（默认聚合视图 total/truncated/top，--full 回退全量数组）")
     p.set_defaults(func=_cmd_watchdog)
 
     # doctor

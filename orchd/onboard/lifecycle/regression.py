@@ -21,15 +21,21 @@ from orchd.gitops_ops import (
 )
 from orchd.ledger import Store
 from orchd.subproc import run_shell
+from orchd.worktree import resolve_master_path as _master_path
 
 # 模块级常量：迁移自 orchd/onboard.py（原行号 123）
-_FULL_REGRESSION_TIMEOUT = 300
+# task-release-gate-blocking（2026-09-19）：300 → 600s。依据 = 全量实测
+# 251.8 / 273.9 / 322.3 / 351.5s（同一套件多 worker 下波动约 ±20%），300s 会被随机打爆
+# （超时表现为「假红」，比慢更伤门禁可信度）；600s ≈ 最差观测的 1.7x，且与 amend 预算通道
+# 的上界一致（>10 分钟视为阻塞过久）。耗时另落盘（见 _record_done_run），便于「该抬上限 or
+# 该优化」用数据判断而非等超时。
+_FULL_REGRESSION_TIMEOUT = 600
 
 
 def _full_regression_enabled(store: Store) -> bool:
     """config.full_regression_on_done 是否显式开启（缺省/读失败 → False）。"""
     try:
-        _mp = store.orchd_dir / "_master.json"
+        _mp = _master_path(store)
         if _mp.exists():
             import json as _json17
             _master_cfg = _json17.loads(_mp.read_text(encoding="utf-8"))
@@ -72,15 +78,29 @@ def _maybe_full_regression(
         reg_result = run_shell(reg_cmd, str(project_root), _FULL_REGRESSION_TIMEOUT)
         reg_elapsed = round(time.monotonic() - reg_started, 1)
         if reg_result.returncode == 0:
+            _record_done_run(store, {
+                "status": "passed",
+                "elapsed_seconds": reg_elapsed,
+                "timeout": _FULL_REGRESSION_TIMEOUT,
+            })
             return {
                 "ok": True,
+                "status": "passed",
                 "elapsed_seconds": reg_elapsed,
                 "output_summary": _verify_output_summary(reg_result.stdout, reg_result.stderr),
             }
+        _record_done_run(store, {
+            "status": "failed",
+            "elapsed_seconds": reg_elapsed,
+            "timeout": _FULL_REGRESSION_TIMEOUT,
+            "returncode": reg_result.returncode,
+        })
         return {
             "ok": False,
+            "status": "failed",
             "code": "full_regression",
             "severity": "warning",
+            "elapsed_seconds": reg_elapsed,
             "message": (
                 f"full_regression_failed: exit code {reg_result.returncode} "
                 f"after {reg_elapsed}s"
@@ -97,10 +117,17 @@ def _maybe_full_regression(
         partial_out = _decode_subprocess_output(
             (exc.stdout or b"")[:300] if hasattr(exc, "stdout") else b""
         )
+        _record_done_run(store, {
+            "status": "timeout",
+            "elapsed_seconds": reg_elapsed,
+            "timeout": _FULL_REGRESSION_TIMEOUT,
+        })
         return {
             "ok": False,
+            "status": "timeout",
             "code": "full_regression",
             "severity": "warning",
+            "elapsed_seconds": reg_elapsed,
             "message": (
                 f"full_regression_timeout: after {reg_elapsed}s "
                 f"(timeout={_FULL_REGRESSION_TIMEOUT}s)"
@@ -112,6 +139,36 @@ def _maybe_full_regression(
                 "partial_stdout": partial_out,
             },
         }
+
+
+def _record_done_run(store: Store, payload: dict[str, Any]) -> None:
+    """把本次 done 侧全量回归的观察值并入 ``.orchd/_full_regression.json``（best-effort）。
+
+    为什么落盘（task-release-gate-blocking AC3）：套件在长，预算是否还够需要**机器信号**——
+    每次记录 ``status`` / ``elapsed_seconds`` / ``timeout``，才能在「该抬上限 or 该优化速度」
+    时用数据判断，而不是等超时随机假红。只追加 ``last_done_run`` 字段，不动该文件的既有字段
+    （``last_pass_commit`` / ``passed_at`` 由 ``full-regression`` 命令维护）。任何失败都不抛出：
+    记录耗时不得影响 done 主流程。
+    """
+    try:
+        import json as _json
+
+        path = _master_path(store).parent / "_full_regression.json"
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = _json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except ValueError:
+                data = {}
+        record = dict(payload)
+        record["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        data["last_done_run"] = record
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _has_engine_files(files_to_edit: list[str]) -> bool:

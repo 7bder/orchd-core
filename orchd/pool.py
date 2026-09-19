@@ -26,11 +26,20 @@ _IMPORTANCE_WEIGHT = {"critical": 4, "high": 3, "normal": 2, "low": 1}
 # 迁移期双留旧路径保证兼容。
 _SHARED_CORE_PACKAGES = ("gitops", "onboard", "cli")
 _SHARED_CORE_MODULES = frozenset({
-    "orchd/gitops_ops.py", "orchd/errors.py", "orchd/spec.py", "orchd/pool.py",
-    "orchd/review.py", "orchd/worktree.py", "orchd/ledger.py", "orchd/split.py",
-    "orchd/intake.py", "orchd/report.py",
+    "orchd/gitops_ops.py",
+    "orchd/errors.py",
+    "orchd/spec.py",
+    "orchd/pool.py",
+    "orchd/review.py",
+    "orchd/worktree.py",
+    "orchd/ledger.py",
+    "orchd/split.py",
+    "orchd/intake.py",
+    "orchd/report.py",
     # 迁移期双留旧路径（拆包前 hard-coded 兼容）
-    "orchd/gitops.py", "orchd/onboard.py", "orchd/cli.py",
+    "orchd/gitops.py",
+    "orchd/onboard.py",
+    "orchd/cli.py",
 })
 
 
@@ -61,9 +70,8 @@ def _scan_core_files() -> frozenset[str]:
 SHARED_CORE_FILES = _scan_core_files()
 
 
-def derive_importance(
-    blocked_downstream_count: int, thresholds: dict[str, Any] | None = None
-) -> str:
+def derive_importance(blocked_downstream_count: int,
+                      thresholds: dict[str, Any] | None = None) -> str:
     """按下游阻塞数自动推导 importance。
 
     阈值可配置（_master.json ``config.importance``），默认：
@@ -205,8 +213,7 @@ def build_pool(
                 task=task,
                 blocked_downstream_count=blocked_counts.get(tid, 0),
                 rework=bool(ts and ts.attempt_count > 0),
-            )
-        )
+            ))
 
     return candidates
 
@@ -229,13 +236,17 @@ def sort_candidates(
     """
     if sort_key == "importance":
         return sorted(
-            candidates, key=lambda c: _importance_key(c, importance_thresholds),
+            candidates,
+            key=lambda c: _importance_key(c, importance_thresholds),
             reverse=True,
         )
     elif sort_key == "downstream":
-        return sorted(candidates, key=lambda c: c.blocked_downstream_count, reverse=True)
+        return sorted(candidates,
+                      key=lambda c: c.blocked_downstream_count,
+                      reverse=True)
     elif sort_key == "hours":
-        return sorted(candidates, key=lambda c: c.task.get("estimated_hours", 0))
+        return sorted(candidates,
+                      key=lambda c: c.task.get("estimated_hours", 0))
     else:
         # 默认复合排序：rework（返工全局优先，与 guide.py rework_first 对齐）
         # → importance desc → blocked_downstream desc → estimated_hours asc。
@@ -270,7 +281,8 @@ def _is_path_covered(declared: str, target: str) -> bool:
     return False
 
 
-def _prefix_overlap(files_a: list[str] | set[str], files_b: list[str] | set[str]) -> list[str]:
+def _prefix_overlap(files_a: list[str] | set[str],
+                    files_b: list[str] | set[str]) -> list[str]:
     """目录式声明感知的文件重叠计算（task-decl-dir-match-conflict）。
 
     精确集合交集对目录式声明（orchd/cli/）永不命中（目录名 ≠ 文件名）。
@@ -322,11 +334,13 @@ def detect_file_conflict(
         return []
 
     if claimed_files is None:
-        claimed_files = _build_claimed_files(state, tasks, include_pending=include_pending)
+        claimed_files = _build_claimed_files(state,
+                                             tasks,
+                                             include_pending=include_pending)
 
     conflicts: list[Conflict] = []
     target_id = target_task.get("id", "")
-    for tid, (files, claimed_by) in claimed_files.items():
+    for tid, (files, claimed_by) in sorted(claimed_files.items()):
         if tid == target_id:
             continue
         overlap = _prefix_overlap(target_files, files)
@@ -337,14 +351,12 @@ def detect_file_conflict(
                     files=overlap,
                     claimed_by=claimed_by,
                     is_shared_core=bool(set(overlap) & SHARED_CORE_FILES),
-                )
-            )
+                ))
     return conflicts
 
 
-def get_dependency_closure(
-    task_id: str, tasks: list[dict[str, Any]]
-) -> set[str]:
+def get_dependency_closure(task_id: str, tasks: list[dict[str,
+                                                          Any]]) -> set[str]:
     """返回目标任务的全图依赖传递闭包（祖先 + 子孙）。
 
     依赖相关的任务对按依赖顺序执行（build_pool / claim 的 E008 依赖放行保证
@@ -372,15 +384,17 @@ def get_dependency_closure(
     result |= seen
     # 向下（子孙）遍历：谁直接或间接依赖 task_id
     seen_desc: set[str] = set()
-    stack = [tid for tid, t in task_map.items() if task_id in t.get("depends_on", [])]
+    stack = [
+        tid for tid, t in task_map.items()
+        if task_id in t.get("depends_on", [])
+    ]
     while stack:
         cur = stack.pop()
         if cur in seen_desc or cur not in task_map:
             continue
         seen_desc.add(cur)
-        stack.extend(
-            tid for tid, t in task_map.items() if cur in t.get("depends_on", [])
-        )
+        stack.extend(tid for tid, t in task_map.items()
+                     if cur in t.get("depends_on", []))
     result |= seen_desc
     return result
 
@@ -390,9 +404,8 @@ def get_dependency_closure(
 # ------------------------------------------------------------------
 
 
-def _importance_key(
-    c: Candidate, thresholds: dict[str, Any] | None = None
-) -> int:
+def _importance_key(c: Candidate,
+                    thresholds: dict[str, Any] | None = None) -> int:
     """将候选任务映射为重要性整数权重，用于排序比较。
 
     内部调用 effective_importance() 获取任务的生效重要性标签，
@@ -400,13 +413,12 @@ def _importance_key(
     未识别的标签默认返回 2（normal）。
     """
     return _IMPORTANCE_WEIGHT.get(
-        effective_importance(c.task, c.blocked_downstream_count, thresholds), 2
-    )
+        effective_importance(c.task, c.blocked_downstream_count, thresholds),
+        2)
 
 
-def compute_downstream_blocked(
-    tasks: list[dict[str, Any]], state: dict[str, TaskState]
-) -> dict[str, int]:
+def compute_downstream_blocked(tasks: list[dict[str, Any]],
+                               state: dict[str, TaskState]) -> dict[str, int]:
     """统计每个任务被多少 pending 任务的 depends_on 引用。"""
     counts: dict[str, int] = {}
     for task in tasks:
@@ -473,8 +485,8 @@ def _build_claimed_files(
             tid = task_def.get("id", "")
             if tid in result:
                 continue
-            ts = state.get(tid)
-            s = ts.status if ts else "pending"
+            task_state: TaskState | None = state.get(tid)
+            s = task_state.status if task_state else "pending"
             if s == "pending":
                 result[tid] = (task_def.get("files_to_edit", []), "pending")
     return result

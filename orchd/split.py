@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from orchd.ledger import Store, resolve_store_dir
 from orchd.spec import (
     Master,
     detect_dir_or_glob_declarations,
+    filter_terminal_quality_warnings,
     is_code_task,
     validate_quality,
     validate_references,
@@ -68,7 +70,6 @@ _INTAKE_PRODUCT_FILES = frozenset({
     "IDEAS.md",
     ".orchd/IDEAS.md",
     "ROADMAP.md",
-    ".orchd/ROADMAP.md",
 })
 
 
@@ -80,6 +81,10 @@ _AMEND_ATTACHABLE_FIELDS = frozenset({
     # Bug #20c（2026-08-27）：files_to_edit / files_to_read 加入白名单，
     # claimed 状态可修正无效路径（无需 force-status 回退 pending）。
     "files_to_edit", "files_to_read",
+    # task-amend-additional-sources-field：additional_sources 属附加信息（溯源/
+    # 归档匹配，不改变任务作用域），claimed/终态均可补登——存量孤儿条目补挂到
+    # 已完成任务的合法 CLI 通道（此前直接编辑 _master.json 违反 no-direct-edit）。
+    "additional_sources",
 })
 _CLAIMED_WHITELIST_FIELDS = tuple(_AMEND_ATTACHABLE_FIELDS)
 
@@ -309,6 +314,30 @@ def _terminal_rejection_hint(task_id: str, fields: set[str], status: str) -> str
     )
 
 
+def _log_amend_guard_degrade(entry: dict[str, Any]) -> None:
+    """amend 准入守卫降级留痕（``orchd ▸ [amend-guard]``，best-effort，R2-4）。
+
+    stderr 是留痕通道（stdout 恒为 JSON 机器契约，见 conventions.md「命令输出通道
+    契约」）；任何异常静默跳过，不阻断 amend 主流程。不被 ``ORCHD_QUIET`` 抑制：
+    与 worktree ``[回收]`` 这类常规噪声不同，准入守卫失效属安全相关降级决策，
+    必须可追溯（R2-4 的原缺陷正是零留痕）。
+
+    Args:
+        entry: 结构化降级条目（guard / severity / status / reason / error / hint）。
+    """
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        print(
+            f"orchd ▸ [amend-guard] {json.dumps(entry, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
 def amend(
     orchd_dir: Path,
     master: Master,
@@ -347,7 +376,10 @@ def amend(
         reason: 修订理由（``revise_terminal`` 非空时必填、非空白，写入审计事件）。
 
     Returns:
-        变更摘要（含 ``terminal_spec_revisions``：本次文本修订的 fields 与 rationale）。
+        变更摘要（含 ``terminal_spec_revisions``：本次文本修订的 fields 与 rationale；
+        以及条件字段 ``degraded_guards``：准入锁 / HEAD 漂移检测 best-effort 降级时
+        非空，逐条给出 guard / reason / error / hint，供 agent 判断「本次未经准入锁
+        保护」而非误读为「已确认无并发注册」）。
     """
     orchd_dir = Path(orchd_dir)
     tasks = master.tasks
@@ -418,8 +450,15 @@ def amend(
     # task-intake-file-lock（AC1/AC3）：准入写锁 + 提交前 HEAD 推进检测。
     # 准入写（改 _master.json / IDEAS.md / ROADMAP.md）受独立 .intake.lock 串行，
     # 不复用账本锁（避免一次 amend 阻塞并行 claim/done）；HEAD 漂移检测发现
-    # base 被并行推进则拒绝注册（git 层 TOCTOU）。两者 best-effort。
+    # base 被并行推进则拒绝注册（git 层 TOCTOU）。
+    # R2-4（task-split-guard-no-silent-swallow）：两者仍是 best-effort（失败不阻断
+    # amend），但**降级必须可见**——原 `except Exception: pass` 把「锁没拿到 / 检测
+    # 本身坏了」与「确实无并发」混为一谈且零留痕。现在：异常被捕获时显式释放并把
+    # intake_lock 置 None（明确降级为无锁准入），同时产出结构化留痕（stderr +
+    # 响应 degraded_guards），与 session_lock.py 的 best-effort 降级语义对齐但可见。
     intake_lock: dict[str, Any] | None = None
+    degraded_guards: list[dict[str, Any]] = []
+    guard_stage = "intake_lock_acquire"
     try:
         from orchd.gitops import head_drift_check
         from orchd.ledger import intake_lock_acquire, intake_lock_release
@@ -429,6 +468,7 @@ def amend(
 
             intake_lock = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
         # 提交前 HEAD 推进检测：main 被并行推进则拒绝（AC3）
+        guard_stage = "head_drift_check"
         drift = head_drift_check(project_root, ref="HEAD", base_ref=default_branch)
         if drift.get("drift"):
             if intake_lock is not None:
@@ -442,9 +482,29 @@ def amend(
             )
     except OrchdError:
         raise
-    except Exception:
-        # 准入锁/HEAD 检测属 best-effort：失败不阻断 amend 本身
-        pass
+    except Exception as exc:
+        # best-effort 降级：不阻断 amend，但显式释放 + 置 None + 结构化留痕。
+        guard_entry: dict[str, Any] = {
+            "guard": guard_stage,
+            "severity": "warning",
+            "status": "degraded",
+            "reason": "guard_exception",
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": (
+                "准入锁 / HEAD 漂移检测未能执行（best-effort 降级）：本次 amend 在"
+                "无准入锁保护下继续，不可据此断言无并发注册；请排查后重跑"
+            ),
+        }
+        degraded_guards.append(guard_entry)
+        if intake_lock is not None:
+            try:
+                from orchd.ledger import intake_lock_release as _release_intake_lock
+
+                _release_intake_lock(intake_lock)
+            except Exception:
+                pass
+            intake_lock = None
+        _log_amend_guard_degrade(guard_entry)
 
     store.acquire_lock()
     try:
@@ -767,7 +827,12 @@ def amend(
             new_task_set = set(new_tasks)
             violations = validate_source(master, project_root=orchd_dir.parent)
             for v in violations:
-                m = re.match(r"\$\.tasks\[(\d+)\]\.source$", v.path)
+                # task-split-additional-sources-gate：主 source 与附加引用同等
+                # 硬门（此前正则仅匹配 `.source` 结尾，新任务附加引用非法被静默
+                # 跳过；validate 告警仍在，只丢 amend 硬阻断）。
+                m = re.match(
+                    r"\$\.tasks\[(\d+)\]\.(?:source|additional_sources\[\d+\])$",
+                    v.path)
                 if not m:
                     continue
                 idx = int(m.group(1))
@@ -819,6 +884,21 @@ def amend(
                         [entry | {"blocking": True}],
                     )
             quality_warnings.append(entry)
+
+        # 终态任务质量告警豁免（task-amend-quality-warning-terminal-filter，单一真源）：
+        # E022 阻断已在上方先行（过滤前生效，语义零变化）；此处只过滤质量类可见性
+        # 告警（E023/E026/E027/E029），判据本身零变化。state 为本锁内 replay，
+        # 新注册任务不在其中（非终态，不被过滤）。
+        try:
+            _terminal_ids = {
+                tid for tid, ts in state.items()
+                if ts.status in ("completed", "cancelled")
+            }
+        except Exception:
+            _terminal_ids = None
+        quality_warnings, _exempted_terminal_warnings = filter_terminal_quality_warnings(
+            quality_warnings, master.tasks, _terminal_ids
+        )
 
         # task-decl-dir-notation-guard（AC3）：声明形态门禁——对本次新增或声明
         # 变更的任务检出目录式/通配符声明 → E003 拒绝注册。存量未变更任务不触发
@@ -875,6 +955,27 @@ def amend(
                             ),
                         })
 
+        # task-decl-withdraw-channel：与上方「声明了但不存在的路径」对称的反向提示——
+        # exempt_files 中路径**已存在**说明豁免已失效（该文件不再需要豁免），而豁免
+        # 此前只增不删、只能长期常驻（幽灵豁免）。此处只告警不阻断（维护窗口可随时
+        # 撤回），并给出可执行的撤回命令；同样只对本次新增/变更任务生效。
+        for task in tasks:
+            tid = task.get("id", "")
+            if tid not in _changed_ids:
+                continue
+            for fp in task.get("exempt_files", []) or []:
+                if (project_root / fp).exists():
+                    conflict_warnings.append({
+                        "task_id": tid,
+                        "type": "exempt_files_path_exists",
+                        "file": fp,
+                        "message": (
+                            f"exempt_files 声明的路径 '{fp}' 已存在于磁盘：豁免已失效"
+                            f"（该文件无需再豁免）。可执行 "
+                            f"`orchd amend --task {tid} --remove-exempt-files {fp}` 撤回该声明。"
+                        ),
+                    })
+
         # 重新生成所有 snapshot（目录名 = module_id）
         for module in modules:
             mod_id = _validate_module_id(module.get("id", ""))
@@ -925,7 +1026,7 @@ def amend(
         except Exception:
             pass
 
-    return {
+    result: dict[str, Any] = {
         "amended": True,
         "new_tasks": new_tasks,
         "updated_tasks": updated_tasks,
@@ -936,10 +1037,15 @@ def amend(
         "unchanged_tasks": unchanged_tasks,
         "removed_tasks": removed_tasks,
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
+        "exempted_terminal_warnings": _exempted_terminal_warnings,
         "conflict_warnings": conflict_warnings,
         "sources_missing": sources_missing,
         "sources_invalid": sources_invalid,
     }
+    # R2-4：准入守卫降级不静默——非空时并入响应（无降级则维持既有字段集合）
+    if degraded_guards:
+        result["degraded_guards"] = degraded_guards
+    return result
 
 
 def classify_dry_run_failure(

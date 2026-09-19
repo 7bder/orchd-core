@@ -342,6 +342,23 @@ def _filter_conflicts(
     return kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count
 
 
+def _none_ready_message(cooldown_excluded: list[dict[str, Any]] | None) -> str:
+    """``none_ready`` 分支文案（task-request-cooldown-surface）。
+
+    无冷却剔除时沿用既有文案（零回归）；存在冷却剔除时点名「数量 + 任务 id +
+    可重试语义」，避免把「候选都因 retract 冷却被剔除」误报成
+    「所有任务已完成或被阻塞」，与 conflict_excluded / excluded_self_review
+    等剔除类字段的留痕口径一致。
+    """
+    if not cooldown_excluded:
+        return "所有任务已完成或被阻塞"
+    ids = ", ".join(str(entry.get("task_id", "")) for entry in cooldown_excluded)
+    return (
+        f"当前无就绪候选：{len(cooldown_excluded)} 个任务处于 retract 认领冷却期"
+        f"（{ids}），冷却结束（自 retract 起 {_RETRACT_COOLDOWN_S}s）后可重试"
+    )
+
+
 def _route_by_role(
     store: Store,
     tasks: list[dict[str, Any]],
@@ -355,6 +372,7 @@ def _route_by_role(
     excluded_self_review: list[dict[str, Any]],
     capabilities: list[str] | None = None,
     exclude: list[str] | None = None,
+    cooldown_excluded: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not candidates:
         # 四分支语义恢复（43e2f72~1 之前行为）：按 guard_unavailable > conflict_excluded > capability_mismatch > none_ready 优先级
@@ -428,7 +446,7 @@ def _route_by_role(
                             if dep_s not in ("completed", "cancelled"):
                                 blocked_count += 1
                                 break
-                result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+                result = {"candidate": None, "message": _none_ready_message(cooldown_excluded), "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         else:
             reason = "none_ready"
             mismatched = []
@@ -444,11 +462,14 @@ def _route_by_role(
                         if dep_s not in ("completed", "cancelled"):
                             blocked_count += 1
                             break
-            result = {"candidate": None, "message": "所有任务已完成或被阻塞", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
+            result = {"candidate": None, "message": _none_ready_message(cooldown_excluded), "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         if excluded_self_review:
             result["excluded_self_review"] = excluded_self_review
         if degraded_guards:
             result["degraded_guards"] = degraded_guards
+        # 剔除须留痕（task-request-cooldown-surface）：有冷却剔除才补字段，空列表维持既有字段集合
+        if cooldown_excluded:
+            result["cooldown_excluded"] = cooldown_excluded
         return result
     best = candidates[0]
     task_id = best.task.get("id", "")
@@ -493,6 +514,9 @@ def _route_by_role(
         result["excluded_self_review"] = excluded_self_review
     if degraded_guards:
         result["degraded_guards"] = degraded_guards
+    # 剔除须留痕（task-request-cooldown-surface）：命中有候选 + 另有冷却剔除时同样透出
+    if cooldown_excluded:
+        result["cooldown_excluded"] = cooldown_excluded
     return result
 
 
@@ -625,11 +649,14 @@ def request(
         # 可领取实现候选数，并给 blocked_by 归因，避免 candidate=null + pool_size=0 被读成
         # 「没活」。
         _impl_candidates = _build_candidates(state, tasks, capabilities, exclude, sort_key, importance_thresholds)
-        _impl_candidates, _ = _filter_cooldown_tasks(_impl_candidates, store)
+        _impl_candidates, _impl_cooldown_excluded = _filter_cooldown_tasks(_impl_candidates, store)
         _impl_kept, _, _, _, _ = _filter_conflicts(_impl_candidates, state, tasks, project_root, conflict_policy)
         resp: dict[str, Any] = {"candidate": None, "review_priority": rp_entry, "message": f"有 {len(review_priority)} 个待审查任务可领取", "next_action": NEXT_ACTION_REVIEW_FIRST, "pool_size": len(_impl_kept), "blocked_by": "review_priority"}
         if excluded_self_review:
             resp["excluded_self_review"] = excluded_self_review
+        # 剔除须留痕：本分支同样算过冷却剔除（此前丢弃），非空时一并透出
+        if _impl_cooldown_excluded:
+            resp["cooldown_excluded"] = _impl_cooldown_excluded
         return resp
     if max_active is not None:
         active = sum(1 for ts in state.values() if ts.status == "claimed")
@@ -640,8 +667,11 @@ def request(
     candidates, cooldown_excluded = _filter_cooldown_tasks(candidates, store)
     kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count = _filter_conflicts(candidates, state, tasks, project_root, conflict_policy)
     if not kept and guard_unavailable_count and guard_unavailable_count == len(excluded_conflicts):
-        return {"candidate": None, "message": "guard_unavailable", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": 0, "reason": "guard_unavailable", "mismatched": [], "excluded_conflicts": excluded_conflicts, "degraded_guards": degraded_guards}
+        guard_unavailable_result: dict[str, Any] = {"candidate": None, "message": "guard_unavailable", "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": 0, "reason": "guard_unavailable", "mismatched": [], "excluded_conflicts": excluded_conflicts, "degraded_guards": degraded_guards}
+        if cooldown_excluded:
+            guard_unavailable_result["cooldown_excluded"] = cooldown_excluded
+        return guard_unavailable_result
     if excluded_conflicts and not kept:
         # will be handled by _route
         pass
-    return _route_by_role(store, tasks, state, derived, kept, candidate_conflicts, excluded_conflicts, degraded_guards, guard_unavailable_count, excluded_self_review, capabilities, exclude)
+    return _route_by_role(store, tasks, state, derived, kept, candidate_conflicts, excluded_conflicts, degraded_guards, guard_unavailable_count, excluded_self_review, capabilities, exclude, cooldown_excluded=cooldown_excluded)

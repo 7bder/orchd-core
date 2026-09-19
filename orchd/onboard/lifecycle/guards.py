@@ -118,10 +118,32 @@ def _guard_declared_diff(
     reasons = {d["reason"] for d in diagnosed}
     hints = []
     if "path_not_found" in reasons:
-        hints.append(
-            "path_not_found: 文件在磁盘不存在，请修正 files_to_edit "
-            "路径或从声明中移除"
+        # task-e010-delete-parity-done-guards：删除形态与幽灵路径分流引导。
+        # 删除态（branch diff 尚无该文件、磁盘已删）→ 引导「提交删除态后保持
+        # 声明」——与 _guard_out_of_scope 的 D 感知口径对齐（_git_diff_names 无
+        # --diff-filter 含 D，删除已提交且在声明内即放行）；不再引导「从声明中
+        # 移除」（那会令删除变声明外改动，反向触发 out_of_scope E010，双向夹击）。
+        # 幽灵路径（从未存在 / 声明笔误）→ 保留原引导。
+        deleted_files = sorted(
+            d["file"] for d in diagnosed
+            if d.get("reason") == "path_not_found" and d.get("deleted") == "true"
         )
+        ghost_files = sorted(
+            d["file"] for d in diagnosed
+            if d.get("reason") == "path_not_found" and d.get("deleted") != "true"
+        )
+        if deleted_files:
+            hints.append(
+                "path_not_found(删除态): 声明文件已删除且删除态未提交——"
+                "请在任务分支提交删除态（git add -A 后 commit）并保持声明；"
+                "勿从声明中移除该文件（否则删除将变声明外改动，触发 out_of_scope"
+                f" E010）：{'; '.join(deleted_files)}"
+            )
+        if ghost_files:
+            hints.append(
+                "path_not_found: 文件在磁盘不存在，请修正 files_to_edit "
+                f"路径或从声明中移除：{'; '.join(ghost_files)}"
+            )
     if "gitignored" in reasons:
         ignored = [
             f"{d['file']} ({d['detail']})"

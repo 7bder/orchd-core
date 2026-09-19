@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Cross-agent-platform task distribution CLI: event sourcing, file locking, DAG ready-pool, two-phase review"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -16,7 +16,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -51,26 +50,31 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-# 规则集：E4/E7/E9（语法+风格核心）+ F（pyflakes 正确性）。
+# 规则集：E4/E501/E7/E9（语法+风格核心+行宽门禁）+ F（pyflakes 正确性）。
 #
-# 豁免范围（唯一三类，与下方 ignore 一一对应；不放宽任何其他规则）：
+# 豁免范围（唯一四类，与下方 ignore 及 per-file-ignores 基线一一对应；不放宽任何其他规则）：
 # - E402：模块级 import 不在文件顶部——子包聚合入口的延迟 re-export，以及引导 sys.path
 #   之后才 import 的测试文件
 # - F401：子包聚合入口 re-export 与遗留未使用 import（引擎与测试均可能命中）
 # - F541：无占位 f-string
-# 不采用 per-file-ignores 基线化——那等于放弃对应目录的 lint 门禁，与本仓库目的相反。
-# 上述三类豁免（E402 / F401 / F541）对强制范围的三处（orchd/ + scripts/ + tests/）
-# 同等生效，不按目录区分强度。
+# - E501（行宽 100）：存量债以逐文件显式 per-file-ignores 基线豁免
+#   （task-linewidth-gate-phase1，idea:line-width-debt-convergence 三阶段根治之阶段 1）。
+#   基线纪律：① 逐文件显式条目，禁止目录级/通配豁免；② 基线只减不增——新增超宽行
+#   即门禁红灯，须改行而非扩基线；③ 阶段 2 按文件分批清零，阶段 3 撤掉基线使 E501
+#   成为全仓真门禁；④ 基线条目数必须等于实测剩余超宽文件数（tests/test_linewidth_gate.py
+#   固化该断言，防基线虚胖）。上述三类豁免（E402 / F401 / F541）对强制范围的三处
+#   （orchd/ + scripts/ + tests/）同等生效，不按目录区分强度。
 #
 # 强制范围 = CI lint job 实测执行的 ruff 范围：orchd/ + scripts/ + tests/ 三处，零告警由
 # CI 强制（本地 verify 预算 120s 硬上限，重活留在 CI，见 .orchd/rules/verify.md）。
 # 本注释不承诺具体处数：数字随代码漂移，实测以 CI 为准。
 select = [
     "E4",
+    "E501",
     "E7",
     "E9",
     "F",
@@ -80,6 +84,73 @@ ignore = [
     "F401",
     "F541",
 ]
+
+# E501 行宽债基线（task-linewidth-gate-phase1）：逐文件显式，只减不增。
+# 条目数等实测口径**不在注释中记账**（本段上方「不承诺具体处数」纪律同样适用）：
+# 数字随阶段 2 收敛必然漂移，实测判据以 tests/test_linewidth_gate.py 为准
+# （该测试断言「基线条目数 == 实测剩余超宽文件数」，注释写死计数只增漂移面）。
+# 阶段 2 清零后整块删除。
+[tool.ruff.lint.per-file-ignores]
+"orchd/cli/commands/control.py" = ["E501"]
+"orchd/cli/commands/ideas.py" = ["E501"]
+"orchd/cli/commands/init.py" = ["E501"]
+"orchd/cli/commands/misc.py" = ["E501"]
+"orchd/cli/commands/query.py" = ["E501"]
+"orchd/cli/commands/session.py" = ["E501"]
+"orchd/cli/commands/workflow.py" = ["E501"]
+"orchd/cli/identity.py" = ["E501"]
+"orchd/cli/parser.py" = ["E501"]
+"orchd/doctor.py" = ["E501"]
+"orchd/errors.py" = ["E501"]
+"orchd/gitops/hook.py" = ["E501"]
+"orchd/gitops/query.py" = ["E501"]
+"orchd/guide.py" = ["E501"]
+"orchd/intake.py" = ["E501"]
+"orchd/ledger.py" = ["E501"]
+"orchd/lockfile.py" = ["E501"]
+"orchd/onboard/bootstrap.py" = ["E501"]
+"orchd/onboard/claim.py" = ["E501"]
+"orchd/onboard/control.py" = ["E501"]
+"orchd/onboard/lifecycle/guards.py" = ["E501"]
+"orchd/onboard/request.py" = ["E501"]
+"orchd/report.py" = ["E501"]
+"orchd/review.py" = ["E501"]
+"orchd/spec.py" = ["E501"]
+"orchd/worktree.py" = ["E501"]
+"scripts/verify_cross_platform.py" = ["E501"]
+"scripts/verify_install.py" = ["E501"]
+"scripts/verify_release_self_contained.py" = ["E501"]
+"tests/test_claim.py" = ["E501"]
+"tests/test_cli_control.py" = ["E501"]
+"tests/test_cli_ideas.py" = ["E501"]
+"tests/test_cli_init.py" = ["E501"]
+"tests/test_cli_misc.py" = ["E501"]
+"tests/test_cli_query.py" = ["E501"]
+"tests/test_cli_session.py" = ["E501"]
+"tests/test_cli_workflow.py" = ["E501"]
+"tests/test_concurrency.py" = ["E501"]
+"tests/test_conflict_paths.py" = ["E501"]
+"tests/test_control.py" = ["E501"]
+"tests/test_docs.py" = ["E501"]
+"tests/test_doctor.py" = ["E501"]
+"tests/test_done.py" = ["E501"]
+"tests/test_e2e.py" = ["E501"]
+"tests/test_git_guards.py" = ["E501"]
+"tests/test_gitops.py" = ["E501"]
+"tests/test_guide.py" = ["E501"]
+"tests/test_installer.py" = ["E501"]
+"tests/test_ledger.py" = ["E501"]
+"tests/test_misc.py" = ["E501"]
+"tests/test_onboard.py" = ["E501"]
+"tests/test_report.py" = ["E501"]
+"tests/test_retract_bind_cooloff.py" = ["E501"]
+"tests/test_review.py" = ["E501"]
+"tests/test_session_identity.py" = ["E501"]
+"tests/test_session_lock_acquire_respect.py" = ["E501"]
+"tests/test_spec.py" = ["E501"]
+"tests/test_split.py" = ["E501"]
+"tests/test_split_guard_fallback.py" = ["E501"]
+"tests/test_worktree.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -124,14 +195,22 @@ markers = [
 #   orchd.cli.commands.init .. 2  (__iadd__ 类型不符)
 #
 # 收紧路线（按模块移除 overrides 的顺序，由易到难）：
-#   ① orchd.ledger_sync → ② orchd.doctor → ③ orchd.pool → ④ orchd.cli._util
+#   ① orchd.ledger_sync ✅（task-quality-debt-and-ci 已移除）→ ② orchd.doctor ✅
+#   → ③ orchd.pool ✅ → ④ orchd.cli._util
 #   → ⑤ orchd.cli.skeleton → ⑥ orchd.report → ⑦ orchd.split → ⑧ orchd.review
 #   → ⑨ orchd.ledger → ⑩ orchd.worktree → ⑪ orchd.lessons → ⑫ orchd.guide
 #   → ⑬ orchd.onboard.*（最后，union-attr 多）→ ⑭ orchd.cli.commands.*
 #   （cli 层大量 untyped 回调 + 动态类型，留到最后；收紧时同步给 _cli_skeleton
 #    补 Callable 泛型或 # type: ignore 局部标注）
+#
+# 已移除的三个模块当前处于强类型检查（无 ignore_errors，task-quality-debt-and-ci）：
+#   - orchd.ledger_sync：_store_runtime_root 经 isinstance(FilesystemBackend) 收窄
+#     backend.orchd_dir（StorageBackend 接口不暴露该属性；非文件系统后端抛 RuntimeError）
+#   - orchd.doctor：_load_master_task_ids 的 set 推导改显式 isinstance(str) 过滤
+#   - orchd.pool：claimed_files 中 state.get 复用变量加显式 `TaskState | None` 注解
+# 其余 17 个 override 按上述收敛路线逐个移除，每移除一个须保证 mypy 全绿一次。
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 ignore_missing_imports = true
 disallow_untyped_defs = false
 warn_unused_ignores = false
@@ -143,10 +222,7 @@ module = "orchd.ledger"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = "orchd.ledger_sync"
-ignore_errors = true
 
-[[tool.mypy.overrides]]
 module = "orchd.guide"
 ignore_errors = true
 
@@ -159,10 +235,7 @@ module = "orchd.review"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = "orchd.pool"
-ignore_errors = true
 
-[[tool.mypy.overrides]]
 module = "orchd.lessons"
 ignore_errors = true
 
@@ -171,10 +244,7 @@ module = "orchd.worktree"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-module = "orchd.doctor"
-ignore_errors = true
 
-[[tool.mypy.overrides]]
 module = "orchd.report"
 ignore_errors = true
 

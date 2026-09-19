@@ -1,6 +1,6 @@
 # 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
 
-> TL;DR: ① 审查者不得自审（E016）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
+> TL;DR: ① 自审默认**仅提示**（`self_review_notice`；线上版 `config.enforce_self_review_block=true` 才恢复 E016 硬阻断），引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换独立会话审查（非强制，详见 [session.md](session.md) 与 `shared/conventions.md`）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
 
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
@@ -42,3 +42,22 @@ diff 命中以下任一触发条件时，审查者必须逐项核对 `shared/con
 4. **人类可见窗口（stderr 提示块）预算自洽**——`_emit_guidance` 渲染层不做硬编码总数裁剪（无 200/197 字面量），预算由 `guide.py` 的 `_BLOCK_MAX` 求和不等式单一真源管理（布局开销 + hint + command + read + cases ≤ _BLOCK_MAX），红线用语义截断（按点分割只装整点，装不下退化为「红线 N 条（见路径）」），渲染体包 try/except；命令逐字完整不被腰斩。
 
 **spec 与 code 两阶段均适用**：spec 阶段核对「新增语义是否已在词表 / 路由 / 文档中登记」的规格完备性；code 阶段核对代码与文案的实际一致（含 `--confirm`、执行位置、硬要求链路）。unified 单阶段审查同样适用。
+
+## 审查检查项：门禁 / 守门类改动必查四态（task-e039-gate-self-injury-fix，2026-09-19）
+
+diff 命中「新增或修改门禁、守卫、覆盖判定、hook、CI / pre-push 条件、verify 覆盖面规则」时，审查者与实现者都必须逐项给出**四态负例**的证据（pass5 教训：E039 门禁引入两天即被实证三洞——**新守门面本身需要被守门**）：
+
+1. **超集态**——比门禁要求更宽的合法输入不得被误判为不合规（如 verify 跑全量 / 目录级收集是登记测试的超集，必须视为已覆盖，否则「恰需宽域 verify」的任务被自己的门禁卡死）；
+2. **旁路态**——排除 / 收窄选项不得绕过判定（`--ignore` / `--deselect` / `-k` / `--ignore-glob` 指向被要求的测试时仍须判未覆盖；非 pytest 段里的路径不得算作已跑）；**形态识别必须校验位置**——同一字面量出现在**选项取值位**（`--rootdir tests/`、`--cov tests/`、`--cov=tests/`）不等于出现在目标位，否则「更宽的覆盖」会被误判为成立（本清单 R-1 打回项即此形态）；
+3. **未提交窗口**——判定输入必须覆盖「工作树未提交改动」，不得只读已提交 diff（引擎 auto-commit 在 done 靠后阶段）；
+4. **空输入**——受管输入为空（无 verify_command、无改动清单、判定不可用）时不得静默放行：要么阻断，要么记结构化降级（`degraded_guards`，E030）留痕。
+
+判定口径与单一真源：覆盖判定集中在 `orchd/shared_entries.py`（`verify_command_covers_all_tests` / `verify_command_test_targets` / `missing_*`），四态各配正负用例；`details.rule` 区分缺口性质（`registry` / `global_shared_file`）。
+
+## 审查意见回看（只读 --show，task-review-comments-readback）
+
+- `python .orchd/__main__.py review --show --task <id>` 只读回看该任务全部历史
+  审查意见（每条含 review_type / verdict / timestamp / comments），completed
+  归档任务同样可读，无意见返回空列表。
+- 与 `--verdict` 互斥（同时提供直接拒绝）；只读不写任何事件、不改任务状态、
+  不要求会话身份；`--type` 在回看模式下不作过滤。

@@ -8,7 +8,7 @@ orchd 不推理需求、不内置 LLM 调用。它只为一个项目里的多个
 
 任何平台的 agent（Claude Code / Qoder / Codex / …）只通过 `orchd` CLI 与编排系统交互，人作为最终调度器确认候选任务。
 
-**通用前置依赖**：git（克隆 orchd-core、agent 在项目内建任务分支）、Python >= 3.10（运行安装器与引擎；`jsonschema` 依赖由安装器自动装入 `.orchd/`）、网络可访问 GitHub 或 Gitee。
+**通用前置依赖**：git（克隆 orchd-core、agent 在项目内建任务分支）、Python >= 3.11（运行安装器与引擎；`jsonschema` 依赖由安装器自动装入 `.orchd/`）、网络可访问 GitHub 或 Gitee。
 
 ## 快速开始
 

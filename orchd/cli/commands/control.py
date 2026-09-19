@@ -32,6 +32,217 @@ from orchd.cli.identity import _identity_warning, _require_agent_id
 from orchd.cli.skeleton import _cli_skeleton
 
 
+def _log_decl_withdraw(
+    task_id: str,
+    withdrawn: list[dict[str, str]],
+    not_present: list[dict[str, str]],
+    branch_overlap: list[str],
+) -> None:
+    """声明撤回留痕（stderr，结构化；task-decl-withdraw-channel）。
+
+    撤回是声明域变更，必须可追溯——尤其 ``branch_overlap``：被撤回的声明仍出现在
+    该任务分支改动集中时，review 期 E010 声明完整性会反向告警。与 session/amend
+    降级留痕同风格，不受 ``ORCHD_QUIET`` 抑制；任何异常静默跳过，不影响补丁主流程。
+    """
+    import json
+    import sys
+
+    payload: dict[str, Any] = {
+        "action": "decl_withdraw",
+        "task_id": task_id,
+        "withdrawn": withdrawn,
+    }
+    if not_present:
+        payload["not_present"] = not_present
+    if branch_overlap:
+        payload["branch_overlap"] = branch_overlap
+        payload["hint"] = ("被撤回的声明仍出现在该任务分支改动集中：撤回会使 review 期 E010 "
+                           "声明完整性反向告警，请确认是否应先处理该分支再撤回")
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError, OSError):
+        pass
+    try:
+        print(
+            f"orchd ▸ [amend-decl] {json.dumps(payload, ensure_ascii=False)}",
+            file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _decl_withdraw_branch_overlap(project_root: Path, task_id: str,
+                                  paths: list[str]) -> list[str]:
+    """被撤回的声明路径中，仍出现在该任务分支改动集里的部分（best-effort）。
+
+    ``git diff --name-only <base>...task/<id>``（三点 = 自分叉点起的改动）与本批
+    撤回路径求交。非 git / 分支不存在 / git 不可用 / 探测超时 → 返回空列表（保守
+    跳过：绝不因探测失败而误报重叠）。
+    """
+    import subprocess
+
+    if not paths:
+        return []
+    branch = f"task/{task_id}"
+    try:
+        exists = subprocess.run(
+            [
+                "git", "-C",
+                str(project_root), "rev-parse", "--verify", "--quiet", branch
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+        if exists.returncode != 0:
+            return []
+        base = "main"
+        probe = subprocess.run(
+            [
+                "git", "-C",
+                str(project_root), "rev-parse", "--verify", "--quiet", base
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+        if probe.returncode != 0:
+            base = "master"
+        diff = subprocess.run(
+            [
+                "git", "-C",
+                str(project_root), "diff", "--name-only", f"{base}...{branch}"
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+        if diff.returncode != 0:
+            return []
+        changed = {ln.strip() for ln in diff.stdout.splitlines() if ln.strip()}
+        return sorted(changed & set(paths))
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+# task-verify-timeout-amend-channel：任务级 verify 预算的 CLI 通道值域。
+# schema（schema/_master.schema.json → tasks[].verify_timeout_seconds）只约束
+# ``minimum: 1``；上限 600s 为**防呆硬顶**——>10 分钟会让 done 在单点阻塞过久，且
+# 违背「verify 只跑定向档」的分级约定（见 .orchd/rules/verify.md）。schema 若新增
+# ``maximum``，以 schema 为单一真源并同步本常量：一致性由
+# tests/test_cli_control.py::TestAmendVerifyTimeout 机器断言（含引擎默认 120s 不变）。
+_VERIFY_TIMEOUT_MIN = 1
+_VERIFY_TIMEOUT_MAX = 600
+
+
+def _validate_verify_timeout_patch(task_id: str, raw: Any) -> int:
+    """校验 ``--verify-timeout-seconds`` 取值并返回 int（非法 → E007，调用方不落盘）。
+
+    值域 ``[1, 600]``：下界与 schema 同源，上界为防呆硬顶（见上方常量注释）。
+    ``bool`` 显式拒绝——``True`` 是 ``int`` 子类，落盘会写出 ``true`` 而非秒数
+    （schema 要求 integer，宁可 CLI 先拒）；非整数文本（``abc`` / ``1.5`` / 空串）
+    同样 E007。越界与非法都不写入：调用方在写文件前先走到本函数。
+    """
+    value: int | None = None
+    if not isinstance(raw, bool):
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = None
+    if value is None:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"verify_timeout_seconds 非法：须为正整数秒（收到 {raw!r}），未写入",
+            [{
+                "task_id": task_id,
+                "field": "verify_timeout_seconds",
+                "value": str(raw),
+                "expected": f"{_VERIFY_TIMEOUT_MIN}..{_VERIFY_TIMEOUT_MAX} 的整数秒",
+            }],
+        )
+    if not _VERIFY_TIMEOUT_MIN <= value <= _VERIFY_TIMEOUT_MAX:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"verify_timeout_seconds 越界：须在 {_VERIFY_TIMEOUT_MIN}..{_VERIFY_TIMEOUT_MAX} "
+            f"秒之间（收到 {value}），未写入",
+            [{
+                "task_id": task_id,
+                "field": "verify_timeout_seconds",
+                "value": value,
+                "min": _VERIFY_TIMEOUT_MIN,
+                "max": _VERIFY_TIMEOUT_MAX,
+            }],
+        )
+    return value
+
+
+def _validate_additional_sources_patch(
+    task_id: str,
+    refs: list[str],
+    project_root: Path,
+) -> None:
+    """补丁 additional_sources 引用按与 spec.validate_source 相同口径校验（E025）。
+
+    task-amend-additional-sources-field：amend --additional-sources 补登的每个引用
+    须与 source 同口径（格式 ^(idea|roadmap|debug):[a-z0-9-]+$；idea 条目存在且
+    status 为 pending；roadmap 章节存在；debug 不校验文件引用）。校验通过返回
+    None；任一引用非法 raise E025（未写入任何补丁）。
+    """
+    import re as _re
+
+    from orchd.ledger import resolve_roadmap_path, resolve_workspace_root
+    from orchd.spec import (
+        _check_idea_reference,
+        _check_roadmap_reference,
+    )
+
+    workspace_root = resolve_workspace_root(project_root)
+    for j, ref in enumerate(refs):
+        if not isinstance(ref, str) or not _re.fullmatch(
+                r"(idea|roadmap|debug):[a-z0-9-]+", ref):
+            raise OrchdError(
+                ErrorCode.E025,
+                f"amend_blocked: additional_sources[{j}] '{ref}' 格式非法"
+                "（须 ^(idea|roadmap|debug):[a-z0-9-]+$），未写入",
+                [{"task_id": task_id, "reference": ref}],
+            )
+        prefix, _, ref_id = ref.partition(":")
+        ref_id = ref_id.strip()
+        _errors: list[Any] = []
+        if prefix == "idea":
+            ideas_path = workspace_root / "IDEAS.md"
+            if not ideas_path.exists():
+                raise OrchdError(
+                    ErrorCode.E025,
+                    f"amend_blocked: 引用 {ref} 但 IDEAS.md 文件缺失（无法溯源），未写入",
+                    [{"task_id": task_id, "reference": ref}],
+                )
+            _errors = _check_idea_reference(task_id, 0, ref_id, ideas_path)
+        elif prefix == "roadmap":
+            roadmap_path = resolve_roadmap_path(project_root)
+            if not roadmap_path.exists():
+                raise OrchdError(
+                    ErrorCode.E025,
+                    f"amend_blocked: 引用 {ref} 但 ROADMAP.md 文件缺失（无法溯源），未写入",
+                    [{"task_id": task_id, "reference": ref}],
+                )
+            _errors = _check_roadmap_reference(task_id, 0, ref_id, roadmap_path)
+        else:  # debug: 前缀不校验文件引用（与 validate_source 同口径）
+            continue
+        if _errors:
+            raise OrchdError(
+                ErrorCode.E025,
+                "amend_blocked: additional_sources 引用校验未通过（未写入）",
+                [{
+                    "task_id": task_id,
+                    "reference": ref,
+                    "errors": [e.message for e in _errors],
+                }],
+            )
+
+
 @_cli_skeleton
 def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """增量更新 snapshot，依据状态约束矩阵过滤变更。
@@ -76,17 +287,19 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             f"invalid_branch: amend 仅在 default（{default_branch}）分支执行（主工作树），"
             f"当前分支 {caller_branch} 拒绝注册（红线 7）",
             [{
-                "branch": caller_branch,
-                "default": default_branch,
-                "main_worktree": str(canonical_root),
-                "hint": (
-                    f"任务分支不再允许 amend；请在主工作树 {canonical_root} 上补充/注册 "
-                    "files_to_edit 等声明后再执行。"
-                    "定位方法：git worktree list 中带 (main) 标记的路径即主工作树；"
-                    "或从任务 worktree 路径上溯到项目根下的 main/ 目录。"
-                    f'可执行命令：cd "{canonical_root}"; python .orchd/__main__.py amend '
-                    "--task <id> --files-to-edit <file>"
-                ),
+                "branch":
+                caller_branch,
+                "default":
+                default_branch,
+                "main_worktree":
+                str(canonical_root),
+                "hint":
+                (f"任务分支不再允许 amend；请在主工作树 {canonical_root} 上补充/注册 "
+                 "files_to_edit 等声明后再执行。"
+                 "定位方法：git worktree list 中带 (main) 标记的路径即主工作树；"
+                 "或从任务 worktree 路径上溯到项目根下的 main/ 目录。"
+                 f'可执行命令：cd "{canonical_root}"; python .orchd/__main__.py amend '
+                 "--task <id> --files-to-edit <file>"),
             }],
         )
 
@@ -96,6 +309,38 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         master_path = canonical_root / ".orchd" / "_master.json"
     else:
         master_path = Path(default_master)
+        # task-amend-master-path-derivation-fix：--master 外部路径 fail-fast。
+        # 此前无条件 parent.parent 推导——仓库外路径（如 C:/Temp/master_batch1.json）
+        # 会把 project_root 推成盘符根，dry-run 以错误 cwd 执行，引用仓库内文件的
+        # verify_command 必然失败并误判 E028，错误归因到未修改的存量任务。现校验
+        # --master 必须位于某仓库的 .orchd/ 下（文件存在 + 父目录名 .orchd + 再上一级
+        # 为 git 仓库根），不满足即 fail-fast（E007）：不执行 dry-run、不写 snapshot。
+        if not master_path.is_file():
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_master_missing: --master 文件不存在",
+                [{
+                    "master_path": str(master_path),
+                    "hint": ("请传入仓库内 canonical master 的路径，或先把新任务并入 "
+                             "<repo>/.orchd/_master.json 再省略 --master "
+                             "（默认解析 canonical master）触发 amend"),
+                }],
+            )
+        if (master_path.parent.name != ".orchd"
+                or not (master_path.parent.parent / ".git").is_dir()):
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_master_outside: --master 必须位于某仓库的 .orchd/ 目录下",
+                [{
+                    "master_path": str(master_path),
+                    "orchd_dir": str(master_path.parent),
+                    "project_root": str(master_path.parent.parent),
+                    "hint": ("把新任务并入 <repo>/.orchd/_master.json 后省略 --master "
+                             "（默认解析 canonical master）触发；仓库外临时 master "
+                             "无法推导合法 project_root，dry-run 会以错误 cwd 执行，"
+                             "引用仓库内文件的 verify_command 必然失败"),
+                }],
+            )
     master = load_master(master_path)
     orchd_dir = master_path.parent
     store = Store(orchd_dir)
@@ -110,44 +355,137 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         validate_terminal_revision(getattr(args, "reason", None))
 
     # task-amend-decl-patch-channel：声明域 CLI 补登（--task + --files-to-edit /
-    # --exempt-files / --verify-command）。列表类为并集追加语义（只增：CLI 表达
-    # 不了删除，删改天然落 E007 矩阵）；verify_command 为覆写。补丁先落到内存
-    # master，再走统一 amend 流程（白名单矩阵 + dry-run + 提交全复用）。
+    # --exempt-files / --verify-command）。列表类追加为并集语义；verify_command 为覆写。
+    # task-decl-withdraw-channel（本任务）：新增撤回语义 --remove-files-to-edit /
+    # --remove-exempt-files（集合差）——此前 CLI 表达不了删除，幽灵声明/幽灵豁免
+    # 永久常驻（amend 只增不删）。撤回与追加同路径视为语义冲突，fail-fast（E007）。
     patch_task = getattr(args, "task", None)
     patch_files = list(getattr(args, "files_to_edit", None) or [])
     patch_exempt = list(getattr(args, "exempt_files", None) or [])
+    patch_remove_files = list(
+        getattr(args, "remove_files_to_edit", None) or [])
+    patch_remove_exempt = list(
+        getattr(args, "remove_exempt_files", None) or [])
     patch_verify = getattr(args, "verify_command", None)
+    patch_sources = list(getattr(args, "additional_sources", None) or [])
+    # task-verify-timeout-amend-channel：任务级 verify 预算补丁（default None = 不改）。
+    patch_timeout = getattr(args, "verify_timeout_seconds", None)
     if patch_task is not None:
-        if not (patch_files or patch_exempt or patch_verify is not None):
+        if not (patch_files or patch_exempt or patch_remove_files
+                or patch_remove_exempt or patch_verify is not None
+                or patch_sources or patch_timeout is not None):
             raise OrchdError(
                 ErrorCode.E007,
                 "amend --task 需至少携带一个补丁字段",
                 [{
-                    "task_id": patch_task,
-                    "hint": "补登示例：--files-to-edit <file> / --exempt-files <file> / "
-                            "--verify-command \"<cmd>\"（列表类为并集追加，只增不删）",
+                    "task_id":
+                    patch_task,
+                    "hint":
+                    "补登示例：--files-to-edit <file> / --exempt-files <file> / "
+                    "--verify-command \"<cmd>\" / --verify-timeout-seconds <N> / "
+                    "--additional-sources <ref>；撤回示例："
+                    "--remove-files-to-edit <file> / --remove-exempt-files <file>"
+                    "（追加为并集、撤回为集合差，只增不删语义已由撤回通道补齐）",
                 }],
             )
         target = next(
-            (t for t in master.tasks if t.get("id") == patch_task), None,
+            (t for t in master.tasks if t.get("id") == patch_task),
+            None,
         )
         if target is None:
             raise OrchdError(
                 ErrorCode.E005,
                 f"task '{patch_task}' not found in master",
-                [{"task_id": patch_task,
-                  "hint": f"任务 {patch_task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
+                [{
+                    "task_id": patch_task,
+                    "hint": f"任务 {patch_task} 在 _master.json 中不存在，检查 id 拼写或注册"
+                }],
             )
-        if patch_files:
-            target["files_to_edit"] = sorted(
-                set(target.get("files_to_edit", [])) | set(patch_files)
+        # 同一路径同时追加与撤回 → 语义不明（用户意图二义）→ fail-fast，不猜测
+        _clash = sorted(set(patch_files) & set(patch_remove_files))
+        _clash_ex = sorted(set(patch_exempt) & set(patch_remove_exempt))
+        if _clash or _clash_ex:
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_decl_conflict: 同一路径不能同时追加与撤回声明",
+                [{
+                    "task_id": patch_task,
+                    "files_to_edit_clash": _clash,
+                    "exempt_files_clash": _clash_ex,
+                    "hint": "追加与撤回互斥：确认该路径应保留还是移除后，只带其中一个标志重试",
+                }],
             )
-        if patch_exempt:
-            target["exempt_files"] = sorted(
-                set(target.get("exempt_files", []) or []) | set(patch_exempt)
+        withdrawn: list[dict[str, str]] = []
+        not_present: list[dict[str, str]] = []
+        cur_files = set(target.get("files_to_edit", []))
+        cur_exempt = set(target.get("exempt_files", []) or [])
+        next_files = sorted((cur_files | set(patch_files)) -
+                            set(patch_remove_files))
+        next_exempt = sorted((cur_exempt | set(patch_exempt)) -
+                             set(patch_remove_exempt))
+        # schema 要求 files_to_edit 非空：撤回唯一声明会让任务无声明域 → fail-fast
+        #（不落盘、不留半成品；整任务作废应走 force-status/retract 而非清空声明）
+        if (patch_files or patch_remove_files) and not next_files:
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_decl_empty: files_to_edit 撤回后为空（schema 要求非空）",
+                [{
+                    "task_id":
+                    patch_task,
+                    "removed":
+                    sorted(set(patch_remove_files)),
+                    "declared_before":
+                    sorted(cur_files),
+                    "hint":
+                    "每个任务至少须保留一个 files_to_edit 声明；若整任务作废，"
+                    "请用 force-status / retract 处置，而非清空声明域",
+                }],
             )
+        if patch_files or patch_remove_files:
+            not_present += [{
+                "field": "files_to_edit",
+                "path": p
+            } for p in sorted(set(patch_remove_files) - cur_files)]
+            withdrawn += [{
+                "field": "files_to_edit",
+                "path": p
+            } for p in sorted(set(patch_remove_files) & cur_files)]
+            target["files_to_edit"] = next_files
+        if patch_exempt or patch_remove_exempt:
+            not_present += [{
+                "field": "exempt_files",
+                "path": p
+            } for p in sorted(set(patch_remove_exempt) - cur_exempt)]
+            withdrawn += [{
+                "field": "exempt_files",
+                "path": p
+            } for p in sorted(set(patch_remove_exempt) & cur_exempt)]
+            target["exempt_files"] = next_exempt
+        # task-amend-additional-sources-field：additional_sources 补登（并集追加、
+        # 只增不删，与 files_to_edit 补登一致）。写入前按 spec.validate_source
+        # 同口径校验补丁引用（_validate_additional_sources_patch），非法引用
+        # E025 报错且不写入。
+        if patch_sources:
+            _validate_additional_sources_patch(
+                patch_task, patch_sources, project_root)
+            cur_sources = set(target.get("additional_sources", []) or [])
+            target["additional_sources"] = sorted(
+                cur_sources | set(patch_sources))
         if patch_verify is not None:
             target["verify_command"] = patch_verify
+        if patch_timeout is not None:
+            # task-verify-timeout-amend-channel：任务级 verify 预算通道（默认 120s 不变）。
+            # 与 --verify-command 同属 patch 语义（可同一次调用组合生效）；claimed /
+            # done / in_review 状态均可 patch——`split._AMEND_ATTACHABLE_FIELDS`
+            # 为单一事实源，该字段已在白名单内（前置校验在写盘之前完成）。
+            target["verify_timeout_seconds"] = _validate_verify_timeout_patch(
+                patch_task, patch_timeout)
+        if withdrawn or not_present:
+            # 撤回留痕（stderr，不受 ORCHD_QUIET 抑制）：撤回若影响仍在分支 diff 中
+            # 的路径，会让 review 期 E010 声明完整性反向告警 → 显式提示而非静默
+            overlap = _decl_withdraw_branch_overlap(
+                project_root, patch_task, [w["path"] for w in withdrawn])
+            _log_decl_withdraw(patch_task, withdrawn, not_present, overlap)
         # 补丁落盘：后续 dry-run 预计算与 amend() 均以文件为准对齐；
         # amend 成功后的自动提交负责入库（与 intake 链路一致）。
         master_path.write_text(
@@ -173,8 +511,7 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         for t in snapshot.get("tasks", []):
             existing_tasks[t.get("id", "")] = t
     changed = [
-        t.get("id", "")
-        for t in master.tasks
+        t.get("id", "") for t in master.tasks
         if t.get("id", "") not in existing_tasks
         or existing_tasks.get(t.get("id", "")) != t
     ]
@@ -187,7 +524,8 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     if revise_terminal is not None:
         old_def = existing_tasks.get(revise_terminal)
         new_def = next(
-            (t for t in master.tasks if t.get("id") == revise_terminal), None,
+            (t for t in master.tasks if t.get("id") == revise_terminal),
+            None,
         )
         if (old_def is not None and new_def is not None
                 and is_text_only_spec_revision(old_def, new_def)):
@@ -207,13 +545,15 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         _dangerous = verify_command_dangerous_reasons(verify_cmd)
         if _dangerous:
             blocking_errors.append({
-                "code": ErrorCode.E027.name,
-                "task_id": tid,
-                "verify_command": verify_cmd,
-                "reasons": _dangerous,
-                "message": (
-                    "verify_command 含 shell 注入风险，dry-run 拒绝执行（E027）"
-                ),
+                "code":
+                ErrorCode.E027.name,
+                "task_id":
+                tid,
+                "verify_command":
+                verify_cmd,
+                "reasons":
+                _dangerous,
+                "message": ("verify_command 含 shell 注入风险，dry-run 拒绝执行（E027）"),
             })
             continue
         try:
@@ -223,41 +563,67 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 # E028 误判修复（task-fix-e028-dryrun-created-file）：缺失路径若属于
                 # 本任务 files_to_edit（即将创建）→ expected_pending 仅提示不阻断
                 _to_be_created = set(
-                    task_map.get(tid, {}).get("files_to_edit", []) or []
-                )
+                    task_map.get(tid, {}).get("files_to_edit", []) or [])
                 failure_class = classify_dry_run_failure(
-                    verify_cmd, proc.returncode,
+                    verify_cmd,
+                    proc.returncode,
                     _decode_subprocess_output(proc.stderr)[:500],
                     _decode_subprocess_output(proc.stdout)[:300],
                     _to_be_created,
                 )
                 if failure_class == "assertion_mismatch":
                     _msg28 = "dry-run 断言不匹配（assertion_mismatch）：verify_command 引用现有文件但断言失败/语法错误，注册已阻断（E028）"
-                    _details28 = [{"task_id": tid, "verify_command": verify_cmd, "exit_code": proc.returncode, "stderr": _decode_subprocess_output(proc.stderr)[:500]}]
-                    _resp28 = structured_error("E028", _msg28, _details28, project_root)
+                    _details28 = [{
+                        "task_id":
+                        tid,
+                        "verify_command":
+                        verify_cmd,
+                        "exit_code":
+                        proc.returncode,
+                        "project_root":
+                        str(project_root),
+                        "cwd":
+                        str(Path.cwd()),
+                        "stderr":
+                        _decode_subprocess_output(proc.stderr)[:500]
+                    }]
+                    _resp28 = structured_error("E028", _msg28, _details28,
+                                               project_root)
                     _err28 = _resp28.get("error", {})
                     _guid28 = _resp28.get("guidance")
                     blocking_errors.append({
-                        "code": _err28.get("code", "E028"),
-                        "task_id": tid,
-                        "verify_command": verify_cmd,
-                        "exit_code": proc.returncode,
-                        "stderr": _decode_subprocess_output(proc.stderr)[:500],
-                        "message": _err28.get("message", _msg28),
-                        "details": _err28.get("details", _details28),
-                        "guidance": _guid28,
-                        "severity": _err28.get("severity", "error"),
+                        "code":
+                        _err28.get("code", "E028"),
+                        "task_id":
+                        tid,
+                        "verify_command":
+                        verify_cmd,
+                        "exit_code":
+                        proc.returncode,
+                        "stderr":
+                        _decode_subprocess_output(proc.stderr)[:500],
+                        "message":
+                        _err28.get("message", _msg28),
+                        "details":
+                        _err28.get("details", _details28),
+                        "guidance":
+                        _guid28,
+                        "severity":
+                        _err28.get("severity", "error"),
                     })
             dry_run_results.append({
-                "task_id": tid,
-                "ok": proc.returncode == 0,
-                "exit_code": proc.returncode,
-                "failure_class": failure_class,
-                "stderr": _decode_subprocess_output(proc.stderr)[:500],
-                "hint": (
-                    "dry-run 仅提示不阻断注册：实现未完成时失败属预期（可忽略）；"
-                    "若断言应匹配现有文件而失败，则 verify_command 定义可能有误，建议核对"
-                ),
+                "task_id":
+                tid,
+                "ok":
+                proc.returncode == 0,
+                "exit_code":
+                proc.returncode,
+                "failure_class":
+                failure_class,
+                "stderr":
+                _decode_subprocess_output(proc.stderr)[:500],
+                "hint": ("dry-run 仅提示不阻断注册：实现未完成时失败属预期（可忽略）；"
+                         "若断言应匹配现有文件而失败，则 verify_command 定义可能有误，建议核对"),
             })
         except (subprocess.SubprocessError, OSError):
             # 运行环境异常：静默跳过，不影响 amend 主流程
@@ -282,24 +648,30 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             # grandfather：仅 changed 任务阻断，存量（未变更）命中跳过
             if tid is not None and tid in changed_set:
                 blocking_errors.append({
-                    "code": qe.code.name,
-                    "path": qe.path,
-                    "message": qe.message,
+                    "code":
+                    qe.code.name,
+                    "path":
+                    qe.path,
+                    "message":
+                    f"task '{tid}': {qe.message}",
                 })
 
     if blocking_errors:
         # dry-run 前置：此时 amend 尚未执行，snapshot/commit 均未写入，
         # 「阻断注册」与真实副作用一致（task-e028-dryrun-exit4-priority）。
         raise OrchdError(
-            ErrorCode.E028 if any(e.get("code") == "E028" for e in blocking_errors)
-            else ErrorCode.E027,
+            ErrorCode.E028 if any(
+                e.get("code") == "E028"
+                for e in blocking_errors) else ErrorCode.E027,
             "amend_blocked: verify_command 校验未通过（注册已阻断，未写入 snapshot）",
             blocking_errors,
         )
 
     # 校验通过后执行 amend（写入 snapshot + checkpoint；透传终态文本修订通道）
     result = amend(
-        orchd_dir, master, store,
+        orchd_dir,
+        master,
+        store,
         revise_terminal=revise_terminal,
         reason=getattr(args, "reason", None),
     )
@@ -325,7 +697,11 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         # roadmap 摄入改的 ROADMAP.md 此前不在范围，必然残留未提交改动
         commit = ensure_committed(
             project_root,
-            [str(master_path), str(ws_root / "IDEAS.md"), str(ws_root / "ROADMAP.md")],
+            [
+                str(master_path),
+                str(ws_root / "IDEAS.md"),
+                str(ws_root / "ROADMAP.md")
+            ],
             f"chore(intake): orchd amend — {summary}",
         )
         result["commit"] = commit
@@ -335,17 +711,15 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         # （not_a_git_repo / git_unavailable）保留 best-effort 降级（判据 3）；
         # git 可用但提交失败（commit_failed）同样告警——"注册成功但改动未入库"
         # 违背"强制提交"语义，须人工核对。
-        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+        if commit.get("performed") is False and commit.get(
+                "reason") != "no_changes":
             result["commit_warning"] = {
-                "reason": commit.get("reason"),
-                "message": (
-                    f"amend 注册成功但 commit 未执行（{commit.get('reason')}）："
-                    "摄入产物改动可能未入库"
-                ),
-                "hint": (
-                    "若为 git 环境异常，可运行 'orchd status --audit-intake' "
-                    "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"
-                ),
+                "reason":
+                commit.get("reason"),
+                "message": (f"amend 注册成功但 commit 未执行（{commit.get('reason')}）："
+                            "摄入产物改动可能未入库"),
+                "hint": ("若为 git 环境异常，可运行 'orchd status --audit-intake' "
+                         "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"),
             }
 
     if dry_run_results:
@@ -358,7 +732,6 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
 
 def _cmd_retract(args) -> dict:
     from orchd.cli import _load_tasks
-
     """撤回已提交的事件。
 
     CLI 参数: args.event（可选，事件 ID 精确撤回）或 args.task + args.event_type
@@ -377,25 +750,32 @@ def _cmd_retract(args) -> dict:
     event_type = getattr(args, "event_type", None)
 
     if not event_id and not (task_id and event_type):
-        return {"error": "retract 需要 --event <事件ID> 或 --task <任务ID> --type <事件类型>"}
+        return {
+            "error": "retract 需要 --event <事件ID> 或 --task <任务ID> --type <事件类型>"
+        }
 
     return retract(
-        store, agent_id=agent_id, target_event_id=event_id,
-        reason=args.reason, project_root=orchd_dir.parent,
-        task_id=task_id, event_type=event_type,
+        store,
+        agent_id=agent_id,
+        target_event_id=event_id,
+        reason=args.reason,
+        project_root=orchd_dir.parent,
+        task_id=task_id,
+        event_type=event_type,
     )
 
 
 def _cmd_force_status(args) -> dict:
     from orchd.cli import _load_tasks
     from orchd.cli import _maybe_archive_ideas
-
     """强制设置任务状态（用于恢复僵死任务或手动干预）。
 
     CLI 参数: args.task（必需）、args.status（必需，目标状态）、
     args.reason（必需）、args.assignee（可选，指定认领人）、
     args.force（可选，逃生口二次确认——claimed→completed / cancelled→pending）、
-    args.evidence_sha（可选，completed→pending 复活所需的 git 证据 commit SHA）。
+    args.evidence_sha（可选，completed→pending 复活所需的 git 证据 commit SHA）、
+    args.force_recycle（可选，终态回收时显式丢弃未合并的 task/<id> 分支——用
+    git branch -D，提交不可恢复；缺省拒绝删除未合并分支并留痕 branch_delete_refused）。
     agent 身份由引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），不再有 --agent。
     返回: 强制状态变更事件信息。
     """
@@ -406,10 +786,16 @@ def _cmd_force_status(args) -> dict:
     store = Store(orchd_dir)
     agent_id = _require_agent_id(orchd_dir)
     result = force_status(
-        store, agent_id=agent_id, task_id=args.task,
-        target_status=args.status, reason=args.reason, assignee=args.assignee,
-        force=args.force, project_root=orchd_dir.parent,
+        store,
+        agent_id=agent_id,
+        task_id=args.task,
+        target_status=args.status,
+        reason=args.reason,
+        assignee=args.assignee,
+        force=args.force,
+        project_root=orchd_dir.parent,
         evidence_sha=args.evidence_sha,
+        force_recycle=getattr(args, "force_recycle", False),
     )
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
     if result.get("new_status") == "cancelled":
@@ -419,7 +805,6 @@ def _cmd_force_status(args) -> dict:
 
 def _cmd_merge_ack(args) -> dict:
     from orchd.cli import _load_tasks
-
     """merge_warning 人工销账：登记 .orchd/merge-acks.json（task-merge-warning-ack）。
 
     CLI 参数: args.task（必需，已人工确认的 task_id）、args.reason（必需，确认原因）。
@@ -438,31 +823,72 @@ def register(sub) -> None:
     # amend
     p = sub.add_parser("amend", help="增量更新 snapshot")
     p.add_argument("--master", default=".orchd/_master.json")
-    p.add_argument("--task", default=None,
-                   help="声明域补登：目标任务 id（需至少再带一个补丁字段）")
-    p.add_argument("--files-to-edit", nargs="*", action="extend", default=None,
+    p.add_argument("--task", default=None, help="声明域补登：目标任务 id（需至少再带一个补丁字段）")
+    p.add_argument("--files-to-edit",
+                   nargs="*",
+                   action="extend",
+                   default=None,
                    help="补登 files_to_edit（并集追加，只增不删；支持重复标志累加）")
-    p.add_argument("--exempt-files", nargs="*", action="extend", default=None,
+    p.add_argument("--exempt-files",
+                   nargs="*",
+                   action="extend",
+                   default=None,
                    help="补登 exempt_files（并集追加，只增不删；支持重复标志累加）")
-    p.add_argument("--verify-command", default=None,
-                   help="覆写 verify_command")
-    p.add_argument("--revise-terminal", default=None, dest="revise_terminal",
+    p.add_argument("--remove-files-to-edit",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="remove_files_to_edit",
+                   help="撤回 files_to_edit 声明（集合差；撤回不存在的路径为幂等 no-op 并留痕）")
+    p.add_argument("--remove-exempt-files",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="remove_exempt_files",
+                   help="撤回 exempt_files 声明（集合差；同上）")
+    p.add_argument("--verify-command", default=None, help="覆写 verify_command")
+    p.add_argument(
+        "--verify-timeout-seconds",
+        default=None,
+        dest="verify_timeout_seconds",
+        help="覆写任务级 verify 预算（秒，正整数 1..600；缺省 120s 不变）。仅当"
+        "verify_command 含 hook 密集用例、在引擎 Git Bash 通道下耗时被放大而必然"
+        "打爆默认预算时使用；须在任务 notes/交付说明写明实测理由与数据")
+    p.add_argument("--additional-sources",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   help="补登 additional_sources（并集追加，只增不删；支持重复标志累加；"
+                   "逐条按与 source 相同口径校验：格式合法 + idea 条目存在且 pending）")
+    p.add_argument("--revise-terminal",
+                   default=None,
+                   dest="revise_terminal",
                    help="终态任务规格文本修订：目标 task_id（须为 completed/cancelled，"
-                        "需配 --reason；仅放行 acceptance_criteria / brief / name / "
-                        "deliverables，写 AMEND 审计事件并同步快照）")
-    p.add_argument("--reason", default=None,
+                   "需配 --reason；仅放行 acceptance_criteria / brief / name / "
+                   "deliverables，写 AMEND 审计事件并同步快照）")
+    p.add_argument("--reason",
+                   default=None,
                    help="修订理由（--revise-terminal 必填、非空；写入 AMEND 审计事件）")
     p.set_defaults(func=_cmd_amend)
 
     # retract
     p = sub.add_parser("retract", help="撤回事件")
-    p.add_argument("--event", required=False, default=None,
+    p.add_argument("--event",
+                   required=False,
+                   default=None,
                    help="事件 ID（精确撤回）；与 --task + --type 二选一")
-    p.add_argument("--task", required=False, default=None,
+    p.add_argument("--task",
+                   required=False,
+                   default=None,
                    help="任务 ID（配合 --type 自动定位最近匹配事件）")
-    p.add_argument("--type", required=False, default=None, dest="event_type",
-                   choices=["CLAIMED", "DONE", "REVIEW_CLAIMED", "REVIEW_SUBMITTED",
-                            "REVIEW_READY", "AMEND", "MERGE_WARNING"],
+    p.add_argument("--type",
+                   required=False,
+                   default=None,
+                   dest="event_type",
+                   choices=[
+                       "CLAIMED", "DONE", "REVIEW_CLAIMED", "REVIEW_SUBMITTED",
+                       "REVIEW_READY", "AMEND", "MERGE_WARNING"
+                   ],
                    help="事件类型（配合 --task 自动定位最近匹配事件）")
     p.add_argument("--reason", required=True)
     p.set_defaults(func=_cmd_retract)
@@ -473,9 +899,15 @@ def register(sub) -> None:
     p.add_argument("--status", required=True)
     p.add_argument("--reason", required=True)
     p.add_argument("--assignee")
-    p.add_argument("--force", action="store_true",
+    p.add_argument("--force",
+                   action="store_true",
                    help="显式确认走逃生口（claimed→completed / cancelled→pending）")
-    p.add_argument("--evidence-sha", default=None,
+    p.add_argument("--force-recycle",
+                   action="store_true",
+                   help="终态回收时显式丢弃未合并的 task/<id> 分支（git branch -D，"
+                   "提交不可恢复）；缺省拒绝删除未合并分支并留痕 branch_delete_refused")
+    p.add_argument("--evidence-sha",
+                   default=None,
                    help="复活已完成任务的 git 证据 commit SHA（仅 completed→pending 时需要）")
     p.set_defaults(func=_cmd_force_status)
 
@@ -484,4 +916,3 @@ def register(sub) -> None:
     p.add_argument("--task", required=True, help="已人工确认的 task_id")
     p.add_argument("--reason", required=True, help="确认原因（必填）")
     p.set_defaults(func=_cmd_merge_ack)
-

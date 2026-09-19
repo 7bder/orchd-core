@@ -5,12 +5,9 @@
 返回成功（depth+1），所有实例 release 到 0 才真正释放 flock；跨进程仍互斥。
 
 设计要点：
-- mode A（flock）：acquire 成功 ⇔ 本进程真持锁，无 check-then-act 窗口。
+- flock 为唯一互斥权威：acquire 成功 ⇔ 本进程真持锁，无 check-then-act 窗口。
   flock 由内核托管：fd 关闭（进程退出/崩溃）时内核自动释放，不会遗留僵死锁。
-- mode B（降级）：文件系统被探测为无法验证 flock 时，退化为「探测即告警/降级」，
-  输出明确告警，不伪装成有效锁。
-- probe_lock_support 在目标路径执行一次 flock 探测，判定本地文件系统是否支持
-  可靠的排他 flock；不支持时调用方应降级使用或放弃。
+  仅覆盖本地文件系统；共享盘（NFS / SMB）不在当前支持范围，不宣称任何降级能力。
 - _depth_registry 是路径级全局表：path -> (fd, total_depth)。
   每个实例维护 self._depth（本实例引用计数），total_depth 是所有实例之和。
   跨实例 acquire 共享同一 fd，跨实例 release 到 total_depth=0 才真正释放。
@@ -22,7 +19,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -231,10 +227,17 @@ class ExclusiveFileLock:
     def check(self) -> dict[str, Any]:
         """检查锁状态（不阻塞）。
 
+        fail-closed（task-lock-probe-fail-closed）：探测过程异常（os.open 抛
+        OSError，如权限不足 / 路径瞬断）时**保守视为可能持有**，返回
+        ``{"held": True, "by_current_process": False, "uncertain": True}``，
+        调用方据 ``held`` 跳过删除/接管，不再误判为未持有。
+
         Returns:
             ``{"held": True, "by_current_process": bool, "depth": int}``
             当前进程任一实例持锁时 by_current_process=True。
-            ``{"held": False}`` 未被持有。
+            ``{"held": False}`` 未被持有（文件不存在或非阻塞获取成功）。
+            ``{"held": True, "by_current_process": False, "uncertain": True}``
+            探测异常，保守视为持有。
         """
         key = str(self._lock_path.resolve())
 
@@ -257,8 +260,15 @@ class ExclusiveFileLock:
             except (OSError, IOError):
                 os.close(fd)
                 return {"held": True, "by_current_process": False}
-        except OSError:
-            return {"held": False}
+        except OSError as exc:
+            # fail-closed：探测路径异常无法判定 → 保守视为可能持有，
+            # 调用方跳过删除/接管（绝不误判为未持有）。
+            return {
+                "held": True,
+                "by_current_process": False,
+                "uncertain": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     def clear(self) -> None:
         """强制清理（best-effort）：释放 flock、close fd、清理登记。
@@ -296,63 +306,3 @@ def read_locked_text(lock_path: Path | str, encoding: str = "utf-8") -> str | No
         chunks.append(chunk)
     os.lseek(fd, 0, os.SEEK_SET)
     return b"".join(chunks).decode(encoding)
-
-
-def probe_lock_support(target_dir: Path | str) -> dict[str, Any]:
-    """探测目标目录所在文件系统是否支持可靠的排他 flock。
-
-    在同一目录创建临时文件、flock、再用第二个 fd 探测是否真被持有：
-    - 第二 fd 非阻塞获取失败 → flock 可靠，返回 ``{"mode": "flock"}``。
-    - 第二 fd 获取成功 → flock 不可靠（内核未真正互斥），返回
-      ``{"mode": "degraded", "warning": "..."}``，调用方应降级。
-
-    Args:
-        target_dir: 目标目录（通常与后续锁文件同目录）。
-
-    Returns:
-        ``{"mode": "flock"}`` 或 ``{"mode": "degraded", "warning": str}``。
-    """
-    target_dir = Path(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(
-        dir=str(target_dir), prefix=".probe_lock_", suffix=".tmp", delete=False
-    )
-    tmp_path = Path(tmp.name)
-    tmp.close()  # 关闭句柄；delete=False 保证文件保留，Windows 下才能 unlink
-    fd1 = os.open(str(tmp_path), os.O_CREAT | os.O_RDWR)
-    try:
-        # fd1 获取排他 flock
-        try:
-            _flock_op(fd1, "lock_nb")
-        except (OSError, IOError):
-            return {"mode": "flock"}
-
-        # fd2 尝试非阻塞获取：应失败（fd1 持有中）
-        fd2 = os.open(str(tmp_path), os.O_RDWR)
-        try:
-            _flock_op(fd2, "lock_nb")
-            # 获取成功 → flock 未真正互斥 → 降级
-            _flock_op(fd2, "unlock")
-            os.close(fd2)
-            return {
-                "mode": "degraded",
-                "warning": (
-                    f"文件系统 {target_dir} 的 flock 不可靠（内核未真正互斥）。"
-                    "锁原语已降级为「探测即告警/降级」：不要依赖它保护并发写。"
-                ),
-            }
-        except (OSError, IOError):
-            os.close(fd2)
-            return {"mode": "flock"}
-    except OSError as e:
-        return {"mode": "degraded", "warning": f"flock 探测异常：{e}"}
-    finally:
-        try:
-            _flock_op(fd1, "unlock")
-        except (OSError, IOError):
-            pass
-        try:
-            os.close(fd1)
-        except OSError:
-            pass
-        tmp_path.unlink(missing_ok=True)

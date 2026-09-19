@@ -42,6 +42,7 @@ from orchd.review import (
     extract_last_done as _extract_last_done,
     extract_review_comments as _extract_review_comments,
     find_last_done_event as _find_last_done_event,
+    is_self_review_author as _is_self_review_author,
 )
 from orchd.worktree import (
     _task_wt_name,
@@ -380,9 +381,11 @@ def _claim_write_event(
             if ts and ts.claimed_by == agent_id and ts.review_claimed_by and ts.review_claimed_by != agent_id:
                 raise OrchdError(ErrorCode.E011, "review_hijack", [{"task_id": task_id}])
             done_author, _ = _extract_last_done(store, task_id, derived)
-            done_event = _find_last_done_event(store, task_id, derived)
-            done_session = done_event.get("session_id") if done_event else None
-            is_self = bool(done_author and ((done_session == session_id and done_author == agent_id) if done_session and session_id else done_author == agent_id))
+            # v4（2026-09-15 停服升级）：判定收敛到 is_self_review_author（单一事实源），
+            # 与原内联三元表达式严格等价——行为不变，仅消除三处私有副本的漂移风险。
+            is_self = _is_self_review_author(
+                _find_last_done_event(store, task_id, derived), agent_id, session_id
+            )
             if is_self and enforce_self_review_block:
                 raise OrchdError(ErrorCode.E016, "self_review", [{"task_id": task_id, "done_by": done_author}])
             if is_self:
@@ -462,7 +465,15 @@ def _claim_write_event(
             bs = None
             if project_root:
                 bs = task_branch_head(project_root, task_id) or get_head_commit(project_root)
-            event = _make_event(task_id, agent_id, "REVIEW_CLAIMED", review_type=rp, baseline_sha=bs) if rp else _make_event(task_id, agent_id, "REVIEW_CLAIMED", baseline_sha=bs)
+            # v4（2026-09-15 停服升级）：自审事实随 REVIEW_CLAIMED 落账；派生状态
+            # TaskState.review_self_review 由 _apply_event 写入，事后可回查。
+            extra: dict[str, Any] = {
+                "baseline_sha": bs,
+                "is_self_review": is_self_review,
+            }
+            if rp:
+                extra["review_type"] = rp
+            event = _make_event(task_id, agent_id, "REVIEW_CLAIMED", **extra)
         else:
             event = _make_event(task_id, agent_id, "CLAIMED", role=role, files_claimed=files_claimed)
         store.append_event(event)
@@ -526,6 +537,48 @@ def _reconcile_mergeability(
     }
 
 
+def _build_self_review_notice(
+    done_by: str | None,
+    enforce_self_review_block: bool,
+) -> dict[str, Any]:
+    """构造自审提示（task-self-review-disclosure-and-log-channel，AC1/AC2）。
+
+    历史实现是占位符（``message="self_review"`` / ``hint="enforce flag"``）：
+    agent 收到后既不知道「正在审自己的实现」，也不知道既有约定的披露义务
+    （只写在 rules/review.md 与 conventions.md 文本里，引擎响应从未表达）；
+    且 ``enforce_self_review_block`` 硬编码 False——enforce=True 时
+    :func:`_claim_write_event` 已先抛 E016 早退，恒假字段零信息量。
+
+    实体化后文案含两项可执行信息（审查者据此可直接行动）：
+
+    - **判定依据**：DONE 实现指纹 == 当前 session（同指纹即判自审）；
+    - **披露要求**：继续审查须在 review comments 首句披露自审，或改由另一
+      会话（换指纹）/他人审查。
+
+    Args:
+        done_by: 最后一次 DONE 事件的 agent_id（实现者指纹）。
+        enforce_self_review_block: 引擎自审阻断开关的**真实取值**（不再硬编码）。
+
+    Returns:
+        claim 响应的 ``self_review_notice`` 字段值。
+    """
+    who = done_by or "<unknown>"
+    return {
+        "message": (
+            "自审：本任务最后一次 DONE 由当前会话提交"
+            f"（判定依据：DONE 实现指纹 {who} == 当前 session），"
+            "你正在审查自己的实现"
+        ),
+        "hint": (
+            "继续审查须在 review comments 首句披露自审"
+            f"（写明「本审查为自审，实现者 = 审查者 = {who}」）；"
+            "更稳妥的做法是换一个会话（换指纹）或交由他人审查"
+        ),
+        "done_by": done_by,
+        "enforce_self_review_block": enforce_self_review_block,
+    }
+
+
 def _claim_review_branch(
     store: Store,
     task_id: str,
@@ -538,6 +591,7 @@ def _claim_review_branch(
     event: dict[str, Any],
     degraded_guards: list[dict[str, Any]],
     shared: dict[str, Any] | None = None,
+    enforce_self_review_block: bool = False,
 ) -> dict[str, Any] | None:
     if role != "reviewer":
         return None
@@ -563,7 +617,9 @@ def _claim_review_branch(
     result = {"claimed": True, "task_id": task_id, "review_type": review_phase, "files_to_review": files_to_review, "acceptance_criteria": task_def.get("acceptance_criteria", []), "changes_description": changes_description, "review_comments": _extract_review_comments(store, task_id, derived), "event_id": event["event_id"]}
     if is_self_review:
         _done_by = done_event.get("agent_id") if done_event else None
-        result["self_review_notice"] = {"message": "self_review", "hint": "enforce flag", "done_by": _done_by, "enforce_self_review_block": False}
+        result["self_review_notice"] = _build_self_review_notice(
+            _done_by, enforce_self_review_block
+        )
     if done_event and done_event.get("verify"):
         result["verify"] = done_event["verify"]
     # task-review-completion-guidance（AC3）：reviewer 可粘贴的定向重跑命令模板，
@@ -634,7 +690,7 @@ def claim(
         worktree_path, degraded_warning = _claim_setup_worktree(project_root, task_id, task_def, store, degraded_guards)
     review_phase = (store.replay().get(task_id).review_phase if store.replay().get(task_id) else None)
     if role == "reviewer":
-        rb = _claim_review_branch(store, task_id, task_def, project_root, role, derived, review_phase, is_self_review, event, degraded_guards, shared)
+        rb = _claim_review_branch(store, task_id, task_def, project_root, role, derived, review_phase, is_self_review, event, degraded_guards, shared, enforce_self_review_block=enforce_self_review_block)
         if rb is not None:
             return rb
     files_to_read = list(task_def.get("files_to_read", []))

@@ -27,7 +27,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # 仅类型标注：本模块为叶子，运行时不依赖 ledger（防循环）
+    from orchd.ledger import Store
 
 # 布局标记相对路径（位于 <主工作树>/.orchd/ 下）
 _LAYOUT_MARKER = ".layout.json"
@@ -78,33 +81,51 @@ _LEDGER_RUNTIME_FILES = (
 )
 
 
-def _move_ledger_runtime_files(orchd_dir: Path, runtime_root: Path) -> list[str]:
+def _move_ledger_runtime_files(
+    orchd_dir: Path, runtime_root: Path
+) -> tuple[list[str], list[dict[str, Any]]]:
     """把运行时账本文件从 ``<main>/.orchd/`` 搬到 ``<runtime>/``（best-effort）。
 
     迁移 flat→container 后，``resolve_store_dir`` 默认读 ``<容器>/.orchd-runtime/``，
     若历史账本仍留在 ``main/.orchd/``，引擎将看不到既有任务状态。此函数把
     ledger / checkpoint / 锁 / session-worktrees / mod-* 搬到 runtime 根，
-    保证迁移一次成功后任务历史立即可见。任一文件缺失/搬移失败静默跳过。
+    保证迁移一次成功后任务历史立即可见。缺失的条目跳过，搬移失败记入
+    ``errors`` 交由调用方回滚/上报（W-11 起不再静默跳过）。
 
     Returns:
-        已搬移的文件/目录名清单（相对名）。
+        ``(moved, errors)``：已搬移的文件/目录名清单（相对名），以及搬移失败项
+        （``{"name", "error"}``）——W-11 起失败不再静默吞掉，由调用方决定回滚/上报。
     """
     moved: list[str] = []
+    errors: list[dict[str, Any]] = []
+    _intake_lock_name = _intake_lock_filename()
     for name in _LEDGER_RUNTIME_FILES:
+        if name == _intake_lock_name:
+            # W-11：迁移全程持 .intake.lock（串行化准入写）——**不搬移持锁文件本身**
+            # （Windows 上搬移被本进程句柄占用的文件会失败；且搬走后旧 fd 与新路径
+            # 语义分裂）。下次准入写会在新 canonical 路径自动重建该锁。
+            continue
         src = orchd_dir / name
         if src.exists():
             try:
                 shutil.move(str(src), str(runtime_root / name))
                 moved.append(name)
-            except OSError:
-                pass
+            except OSError as exc:
+                # W-11：搬移失败不再静默——记入 errors 供调用方回滚与上报
+                errors.append({
+                    "name": name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
     for p in sorted(orchd_dir.glob("mod-*")):
         try:
             shutil.move(str(p), str(runtime_root / p.name))
             moved.append(p.name)
-        except OSError:
-            pass
-    return moved
+        except OSError as exc:
+            errors.append({
+                "name": p.name,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    return moved, errors
 
 
 _GIT_TIMEOUT = 10
@@ -164,7 +185,22 @@ def _git_toplevel(project_root: Path) -> Path | None:
     """best-effort 定位 git 主工作树根（git rev-parse --show-toplevel）。
 
     非 git 仓库 / git 不可用 / 异常返回 None（调用方降级）。
+
+    按次缓存（task-gitops-probe-cache）：缓存键与
+    ``orchd.gitops.query`` 同源（目录形态 + .git/HEAD 快照），toplevel 只与
+    仓库归属有关、键不变则答案不变。函数内惰性导入（worktree 不在顶层依赖
+    gitops，避免循环）。确定性失败（非零退出/空输出）同样缓存；
+    抛异常路径永不缓存（task-probe-cache-negative-results）。
     """
+    try:
+        from orchd.gitops.query import _PROBE_CACHE, _probe_cache_key
+    except Exception:
+        _PROBE_CACHE = None  # type: ignore[assignment]
+        _probe_cache_key = None  # type: ignore[assignment]
+    key = _probe_cache_key(project_root) if _probe_cache_key is not None else None
+    ckey = ("toplevel", key) if key is not None else None
+    if _PROBE_CACHE is not None and ckey is not None and ckey in _PROBE_CACHE:
+        return _PROBE_CACHE[ckey]
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -174,13 +210,77 @@ def _git_toplevel(project_root: Path) -> Path | None:
             errors="replace",
             timeout=_GIT_TIMEOUT,
         )
+        value: Path | None = None
         if proc.returncode == 0:
             out = proc.stdout.strip()
             if out:
-                return Path(out)
+                value = Path(out)
+        if _PROBE_CACHE is not None and ckey is not None:
+            _PROBE_CACHE[ckey] = value
+        return value
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return None
+
+
+def _git_common_dir(project_root: Path) -> Path | None:
+    """定位仓库共享 git 目录（``git rev-parse --git-common-dir``，绝对路径）。
+
+    review W-1 / R-16：残留目录判定需要「曾由 git 登记为本仓库 worktree」的证据，
+    证据落点即 ``<common-dir>/worktrees/<name>``。linked worktree 与主工作树返回
+    同一 common dir；非 git / git 不可用 / 解析失败 → None（调用方保守降级）。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    git_dir = Path(proc.stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = (Path(project_root) / git_dir).resolve()
+    return git_dir
+
+
+def _is_git_tracked_path(path: Path) -> bool:
+    """路径是否被其所属 git 仓库跟踪（junk 清理前的安全校验，review W-15）。
+
+    判定序：以路径本身（目录）或父目录（文件）为 cwd 定位最近 git 仓库根
+    （``--show-toplevel``），再以 ``git ls-files --error-unmatch -- <相对路径>``
+    判定是否被跟踪。非 git / 路径不在仓库内 → False（不构成「被跟踪」，允许清理）。
+
+    探测异常（git 不可用 / 超时）→ True：保守判为「可能被跟踪」而跳过删除。
+    这样 ``_cleanup_container_root_junk`` 的 docstring 承诺「绝不触碰被跟踪文件」
+    才有实现支撑（此前只有承诺、无校验）。
+    """
+    try:
+        path = Path(path)
+        probe = path if path.is_dir() else path.parent
+        root = _git_toplevel(probe)
+        if root is None:
+            return False
+        rel = path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", str(rel).replace(os.sep, "/")],
+            cwd=str(root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return True
+    return proc.returncode == 0
 
 
 def _auto_detect_layout(git_root: Path | None, project_root: Path) -> str:
@@ -364,6 +464,72 @@ def resolve_canonical_project_root(project_root: Path) -> Path:
         return project_root
 
 
+def resolve_master_path(store: Store) -> Path:
+    """解析 master 单一真源路径：本地副本优先，缺失回退 canonical 主工作树。
+
+    根因锚点（task-master-single-copy）：container 布局下任务 worktree 已抑制
+    本地 ``.orchd/_master.json`` 副本，凡裸读 ``store.orchd_dir/_master.json``
+    且只判 ``exists()`` 的代码会静默按「文件不存在」降级（配置 / 检测形同失效）。
+    本函数是 master 路径解析的**唯一**实现（task-master-path-single-source），
+    供既有三处消费点复用：
+
+    - ``orchd/onboard/lifecycle/regression.py``（``_full_regression_enabled``）；
+    - ``orchd/onboard/_config.py``（``_load_config_blocked``）；
+    - ``orchd/doctor.py``（``_detect_ghost_tasks``，container 下曾因本地副本
+      缺失而静默空返回）。
+
+    解析语义：本地 ``store.orchd_dir/_master.json`` 存在则直接返回（flat 布局
+    canonical == 本地，主工作树调用亦命中本地 → 行为零回归）；缺失时经
+    :func:`resolve_canonical_project_root` 归位主工作树（唯一权威）取其
+    ``.orchd/_master.json``。本函数不判定文件存在性、不抛异常（canonical
+    解析失败时 best-effort 回退 project_root 自身），存在性由调用方判定。
+
+    规则底座 = :func:`resolve_master_path_from_dir`（本函数仅为 store 版薄适配层）；
+    只持有目录的消费点（``lessons.load_lessons_config`` /
+    ``gitops_ops._read_task_verify_command``，task-master-path-resolver-convergence）
+    复用底座，不再裸拼 ``.orchd/_master.json``。
+
+    Args:
+        store: 账本存储对象（仅使用 ``orchd_dir`` 属性，duck typing）。
+
+    Returns:
+        解析出的 ``_master.json`` 路径（不一定存在，由调用方判定）。
+    """
+    local = Path(store.orchd_dir) / "_master.json"
+    if local.exists():
+        return local
+    canonical = resolve_canonical_project_root(Path(store.orchd_dir).parent)
+    return Path(canonical) / ".orchd" / "_master.json"
+
+
+def resolve_master_path_from_dir(orchd_dir: Path | str) -> Path:
+    """``resolve_master_path`` 的**路径级底座**：master 单一真源的唯一解析规则。
+
+    规则（与 store 版逐字同源，本地优先 → canonical 主工作树回退）：
+    本地 ``<orchd_dir>/_master.json`` 存在则返回之；否则经
+    :func:`resolve_canonical_project_root` 归位 canonical 主工作树，取
+    ``<canonical>/.orchd/_master.json``。不判存在性、不抛异常。
+
+    存在意义（task-master-path-resolver-convergence）：此前只持有目录的消费点各自
+    裸拼 ``<orchd_dir>/_master.json``，在 container 布局（任务 worktree 的副本被
+    sparse-checkout 抑制）下 `exists()` 为假 → **静默回落默认值**：
+    ``lessons.load_lessons_config`` 忽略 master 里的 lessons 段（review_timeout 回落
+    60 分钟）、``gitops_ops._read_task_verify_command`` 取不到 verify_command（union
+    合并降级为逐文件 pytest）。收敛到本函数后，「master 读路径」只有一处规则。
+
+    Args:
+        orchd_dir: ``.orchd`` 目录（不是项目根；调用方需自行拼 ``.orchd``）。
+
+    Returns:
+        解析出的 ``_master.json`` 路径（不一定存在，由调用方判定）。
+    """
+    local = Path(orchd_dir) / "_master.json"
+    if local.exists():
+        return local
+    canonical = resolve_canonical_project_root(Path(orchd_dir).parent)
+    return Path(canonical) / ".orchd" / "_master.json"
+
+
 def _default_master(main_worktree: Path) -> dict[str, Any]:
     """生成 container 新项目的默认 master（通过 schema 的最小合法项目）。"""
     return {
@@ -479,8 +645,120 @@ def bootstrap_container(project_root: Path, master_path: Path) -> dict[str, Any]
     return result
 
 
+def _rollback_layout_migration(
+    project_root: Path,
+    main_dir: Path,
+    runtime: Path,
+    moved: list[str],
+    ledger_moved: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """回滚半迁移状态（W-11）：账本文件移回 → 删标记 → ``.orchd`` 逐条移回 →
+    其余条目移回 → 清空目录。
+
+    ``.orchd`` 必须**逐条**移回（不能目录级 move：目标 ``project_root/.orchd``
+    已存在且仍持有 .intake.lock，Windows 下目录级 move 会失败/冲突）。
+
+    返回**回滚失败项** ``[{"item", "error"}]``：迁移/回滚过程中的 OSError 一律上报
+    调用方（旧实现 ``except OSError: pass`` 静默吞掉，留下无人知晓的半迁移残留）。
+    """
+    errors: list[dict[str, Any]] = []
+    new_orchd = main_dir / ".orchd"
+    orig_orchd = project_root / ".orchd"
+    for name in list(ledger_moved or []):
+        src = runtime / name
+        if not src.exists():
+            continue
+        try:
+            shutil.move(str(src), str(new_orchd / name))
+        except OSError as exc:
+            errors.append({"item": f"ledger:{name}",
+                           "error": f"{type(exc).__name__}: {exc}"})
+    try:
+        marker = marker_path(new_orchd)
+        if marker.exists():
+            marker.unlink()
+    except OSError as exc:
+        errors.append({"item": "marker", "error": f"{type(exc).__name__}: {exc}"})
+    if new_orchd.is_dir():
+        orig_orchd.mkdir(parents=True, exist_ok=True)
+        for sub in sorted(new_orchd.iterdir()):
+            dst = orig_orchd / sub.name
+            if dst.exists():
+                continue  # 原位置已有同名条目（.intake.lock 等）→ 保留原物
+            try:
+                shutil.move(str(sub), str(dst))
+            except OSError as exc:
+                errors.append({"item": f".orchd/{sub.name}",
+                               "error": f"{type(exc).__name__}: {exc}"})
+    for name in list(moved):
+        if name == ".orchd":
+            continue
+        src = main_dir / name
+        if not src.exists():
+            continue
+        try:
+            shutil.move(str(src), str(project_root / name))
+        except OSError as exc:
+            errors.append({"item": name, "error": f"{type(exc).__name__}: {exc}"})
+    for d in (new_orchd, main_dir, runtime):
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError as exc:
+            errors.append({"item": f"rmdir:{d.name}",
+                           "error": f"{type(exc).__name__}: {exc}"})
+    return errors
+
+
+def _intake_lock_filename() -> str:
+    """准入锁文件名（单一事实源：``orchd.ledger._INTAKE_LOCK_FILENAME``）。"""
+    try:
+        from orchd.ledger import _INTAKE_LOCK_FILENAME
+
+        return _INTAKE_LOCK_FILENAME
+    except Exception:
+        return ".intake.lock"
+
+
 def layout_migrate(project_root: Path) -> dict[str, Any]:
-    """flat → container 迁移：内容整体移入 ``main/``，保留 git 历史、可回滚（AC4）。
+    """flat → container 迁移**入口**（W-11：全程持 ``.intake.lock`` 串行化）。
+
+    与并发 amend / intake 写（同一把 ``.intake.lock``）互斥：迁移会搬移
+    ``.orchd`` 运行时文件并写布局标记，无锁并发会留下「锁根与账本根分裂」的
+    半迁移态。取锁失败即拒绝迁移（**不做无锁迁移**），返回结构化原因。
+
+    Args:
+        project_root: flat 主工作树根。
+
+    Returns:
+        迁移实现 :func:`_layout_migrate_impl` 的结果；取锁失败时为
+        ``{"migrated": False, "reason": "intake_lock_unavailable", ...}``。
+    """
+    from orchd.ledger import intake_lock_acquire, intake_lock_release
+
+    project_root = Path(project_root).resolve()
+    try:
+        lock = intake_lock_acquire(project_root / ".orchd", "layout-migrate")
+    except Exception as exc:
+        return {
+            "migrated": False,
+            "reason": "intake_lock_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": "准入锁不可得（并发准入写进行中或锁损坏），稍后重试",
+        }
+    try:
+        return _layout_migrate_impl(project_root)
+    finally:
+        try:
+            intake_lock_release(lock)
+        except Exception:
+            pass
+
+
+def _layout_migrate_impl(project_root: Path) -> dict[str, Any]:
+    """迁移实现（调用方须已持 ``.intake.lock``，见 :func:`layout_migrate`）。
+
+    flat → container 迁移：内容整体移入 ``main/``，保留 git 历史、可回滚（AC4）。
 
     前置校验（AC4）：工作区干净（无已跟踪改动）、无活跃 linked worktree 冲突。
     迁移过程 best-effort：任一步骤失败则尝试把已移动条目移回（可回滚，不破坏
@@ -531,7 +809,13 @@ def layout_migrate(project_root: Path) -> dict[str, Any]:
             errors="replace",
             timeout=_GIT_TIMEOUT,
         )
-        if proc.returncode == 0 and proc.stdout.count("worktree ") > 1:
+        # W-16：按**行前缀**计数（``worktree <path>`` 块头），不再用子串
+        # ``count("worktree ")``——``locked`` / ``prunable`` 行或路径里含该子串
+        # 都会被误计，导致有 linked worktree 时判「无」或反之。
+        if proc.returncode == 0 and len([
+            ln for ln in (proc.stdout or "").splitlines()
+            if ln.startswith("worktree ")
+        ]) > 1:
             return {
                 "migrated": False,
                 "reason": "active_worktrees",
@@ -563,30 +847,68 @@ def layout_migrate(project_root: Path) -> dict[str, Any]:
             if entry.name in _TOOL_DIR_NAMES:
                 # P2-8：工具目录/venv 留在原地，不搬入 main/（环境专属，非项目源码）
                 continue
+            if entry.name == ".orchd":
+                # W-11：迁移全程持有 .orchd/.intake.lock，Windows 下**目录级 move 会
+                # 因锁住的文件失败（WinError 33）** → 逐条搬移并跳过持锁文件本身
+                # （锁在新 canonical 路径由下次准入写重建；旧文件留待 doctor 收敛）。
+                dst_orchd = main_dir / ".orchd"
+                dst_orchd.mkdir(parents=True, exist_ok=True)
+                for sub in sorted(entry.iterdir()):
+                    if sub.name == _intake_lock_filename():
+                        continue
+                    shutil.move(str(sub), str(dst_orchd / sub.name))
+                moved.append(entry.name)
+                continue
             dst = main_dir / entry.name
             shutil.move(str(entry), str(dst))
             moved.append(str(entry.name))
-    except Exception:
-        # 可回滚：把已移动条目移回（best-effort，不破坏原仓库）
-        for name in moved:
-            src = main_dir / name
-            if src.exists():
-                try:
-                    shutil.move(str(src), str(project_root / name))
-                except OSError:
-                    pass
+    except Exception as exc:
+        # 可回滚：把已移动条目移回（best-effort，不破坏原仓库）。
+        # W-11：回滚过程中的 OSError **不再静默**（记入 rollback_errors 上报）。
+        rollback_errors = _rollback_layout_migration(
+            project_root, main_dir, runtime, moved
+        )
         return {
             "migrated": False,
             "reason": "move_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "rollback_errors": rollback_errors,
             "hint": "迁移中断，已尝试回滚；请检查残留后重试",
         }
 
     # 共享账本 runtime 根 + 布局标记
     orchd_dir = main_dir / ".orchd"
-    write_layout(orchd_dir, "container", main_dir)
-
-    # 运行时账本搬到共享 runtime 根（容器布局默认账本根），master 目录文件保留
-    ledger_moved = _move_ledger_runtime_files(orchd_dir, runtime)
+    # W-11：搬移已成功后的写操作（写布局标记 / 移账本）任一失败 → **完整回滚**，
+    # 避免「main/ 已就位但锁根/账本根分裂」的半迁移态（旧实现不回滚且吞 OSError）。
+    try:
+        write_layout(orchd_dir, "container", main_dir)
+        ledger_moved, ledger_errors = _move_ledger_runtime_files(orchd_dir, runtime)
+    except Exception as exc:
+        rollback_errors = _rollback_layout_migration(
+            project_root, main_dir, runtime, moved
+        )
+        return {
+            "migrated": False,
+            "reason": "post_move_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "rolled_back": list(moved),
+            "rollback_errors": rollback_errors,
+            "hint": "搬移完成后写标记/移账本失败，已回滚到 flat 布局；请检查残留后重试",
+        }
+    if ledger_errors:
+        # 账本搬移部分失败 = 账本根分裂（部分在 main/.orchd、部分在 runtime）→
+        # 同样回滚（含已写布局标记），并把失败项结构化上报（不静默）。
+        rollback_errors = _rollback_layout_migration(
+            project_root, main_dir, runtime, moved, ledger_moved
+        )
+        return {
+            "migrated": False,
+            "reason": "ledger_move_failed",
+            "errors": ledger_errors,
+            "rolled_back": list(moved),
+            "rollback_errors": rollback_errors,
+            "hint": "运行时账本搬移不完整，已回滚以保持锁根与账本根一致；请修复后重试",
+        }
 
     result = {
         "migrated": True,
@@ -735,23 +1057,81 @@ def bindings_path(store_root: Path) -> Path:
 
 
 def load_bindings(store_root: Path) -> dict[str, Any]:
-    """读取任务↔worktree 绑定映射；缺失/损坏返回空 dict。"""
+    """读取任务↔worktree 绑定映射。
+
+    三态区分（W-2 / R-22，禁止把损坏当空表）：
+    - **文件不存在** → 返回 ``{}``（正常初次，调用方可安全覆写）；
+    - **文件存在但 JSON 解析失败 / 非 dict 结构** → 抛 ``OrchdError(E002)``，
+      调用方**不得**把它当作空绑定表继续覆写（否则一次坏绑定吞掉所有活跃绑定）；
+    - **解析正常** → 返回 ``data``。
+
+    抛出 E002 而非静默返回空 dict，是让 ``bind_task_wt`` / ``unbind_task_wt`` 等
+    写路径在损坏时走到"保留原文件 + 备份损坏副本 + 告警 + 不覆写"，而非整表覆写。
+    只读调用方（``resolve_task_root`` / prune）自行 catch E002 后按保守语义处理。
+    """
+    path = bindings_path(store_root)
+    if not path.is_file():
+        return {}
+    from orchd.errors import ErrorCode, OrchdError
+
     try:
-        data = json.loads(bindings_path(store_root).read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (OSError, ValueError, TypeError):
-        pass
-    return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise OrchdError(
+            ErrorCode.E002,
+            f"任务↔worktree 绑定文件损坏（{path}）：{exc}",
+            [{"path": str(path), "message": str(exc)}],
+        ) from exc
+    if not isinstance(data, dict):
+        raise OrchdError(
+            ErrorCode.E002,
+            f"任务↔worktree 绑定文件结构非法（非 dict）：{path}",
+            [{"path": str(path), "kind": type(data).__name__}],
+        )
+    return data
 
 
 def _save_bindings(store_root: Path, data: dict[str, Any]) -> None:
-    """原子写入绑定映射（tmp + os.replace）。"""
+    """原子写入绑定映射（tmp + os.replace）。
+
+    W-2 / R-22：写失败（磁盘满 / IO 错误）不得静默 —— 原文件保持不变（原子
+    替换失败即不改动原文件），并清理残留 tmp，向上抛 ``OSError`` 由调用方告警。
+    绝不用坏结果整表覆写成功绑定表。
+    """
     path = bindings_path(store_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _backup_corrupt_bindings(store_root: Path, path: Path, cause: Exception) -> Path:
+    """损坏绑定文件的隔离备份（保留原件，另存可排查副本，幂等）。
+
+    W-2 / R-22：损坏发生时**绝不用空表覆写**成功绑定表。把损坏原件复制为
+    ``<name>.corrupt-<ts>`` 副本归档（原件保持不动供继续排查），返回副本路径。
+    若文件已损坏到无法读取（IO 层），仅备份保留；copy 失败也吞掉（告警以
+    ``OrchdError.details`` 承载，不因备份失败升级为中断）。
+    """
+    from datetime import datetime as _dt
+
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    corrupt = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        shutil.copy2(path, corrupt)
+    except OSError:
+        # 备份失败不阻断主告警链；cause 已在抛出的 OrchdError 承载
+        pass
+    return corrupt
 
 
 def bind_task_wt(store_root: Path, task_id: str, worktree_path: Path) -> dict[str, Any]:
@@ -764,13 +1144,26 @@ def bind_task_wt(store_root: Path, task_id: str, worktree_path: Path) -> dict[st
 
     Returns:
         ``{"bound": True, "task_id": <str>, "worktree": <str>}``
+
+    Raises:
+        ``OrchdError(E002)``：绑定文件已损坏时**中断且不覆写**（保留原件 +
+        备份损坏副本 + 结构化告警），防止一次坏绑定吞掉其它活跃任务绑定。
     """
+    from orchd.errors import ErrorCode, OrchdError
     from orchd.ledger import Store
 
     store = Store(store_root)
     store.acquire_lock()
     try:
-        data = load_bindings(store_root)
+        try:
+            data = load_bindings(store_root)
+        except OrchdError as exc:
+            corrupt = _backup_corrupt_bindings(store_root, bindings_path(store_root), exc)
+            raise OrchdError(
+                ErrorCode.E002,
+                f"绑定文件损坏，中止绑定 {task_id} 以避免覆写其它活跃绑定：{exc.message}",
+                [{"corrupt_backup": str(corrupt), "path": str(bindings_path(store_root))}],
+            ) from exc
         data[task_id] = {
             "worktree": str(Path(worktree_path).resolve()),
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -793,14 +1186,27 @@ def unbind_task_wt(
 
     Returns:
         ``{"unbound": True, "task_id": <str>}``（无绑定也返回 unbound=True，幂等）。
+
+    Raises:
+        ``OrchdError(E002)``：绑定文件已损坏时中断（备份损坏副本 + 告警），
+        不尝试在不可解析的表基础上 pop+覆写（避免制造二次损坏）。
     """
+    from orchd.errors import ErrorCode, OrchdError
     from orchd.ledger import Store
 
     store = Store(store_root)
     if not lock_held:
         store.acquire_lock()
     try:
-        data = load_bindings(store_root)
+        try:
+            data = load_bindings(store_root)
+        except OrchdError as exc:
+            corrupt = _backup_corrupt_bindings(store_root, bindings_path(store_root), exc)
+            raise OrchdError(
+                ErrorCode.E002,
+                f"绑定文件损坏，中止解绑 {task_id}：{exc.message}",
+                [{"corrupt_backup": str(corrupt), "path": str(bindings_path(store_root))}],
+            ) from exc
         data.pop(task_id, None)
         _save_bindings(store_root, data)
     finally:
@@ -812,14 +1218,50 @@ def unbind_task_wt(
 def resolve_task_root(store_root: Path, task_id: str) -> Path | None:
     """从绑定解析任务的 worktree 根；无绑定返回 None。
 
+    W-9 / R-36：登记路径做 ``is_dir()`` 校验（当前环境有效性）。跨环境（沙箱→
+    本机 / 拷贝 runtime 根）迁移后登记路径可能指向本机不存在的目录 —— 直接返回
+    会让 ``guard_task_root`` E018 指向不存在目录、agent 死循环。失效登记：
+    1) 返回 None（调用方守旧语义，当作未绑定）；2) **自动解绑**该任务（best-effort，
+       解绑失败**不阻断**返回值 —— 见下方兜底注释）；3) 落一条引擎回收留痕
+       （``_log_recycle`` 的 ``unbind_stale_binding`` 动作，stderr ``[回收]`` +
+       recycle_log），并注明失效登记与实际解绑结果。
+
     Returns:
-        ``Path``：绑定 worktree 绝对路径；或 None（未绑定）。
+        ``Path``：绑定且当前环境有效的 worktree 绝对路径；或 None（未绑定 /
+        登记路径失效已解绑 / 绑定文件损坏）。
     """
-    data = load_bindings(store_root)
+    from orchd.errors import ErrorCode, OrchdError
+
+    try:
+        data = load_bindings(store_root)
+    except OrchdError:
+        # 损坏时不冒险自动解绑（_backup+告警 在 bind/unbind 入口处理，这里只读降级）
+        return None
     entry = data.get(task_id)
     if not entry or not entry.get("worktree"):
         return None
-    return Path(entry["worktree"])
+    bound = Path(entry["worktree"])
+    if not bound.is_dir():
+        # 失效登记：留痕 + 自动解绑 + 返回 None（不把失效路径交给 guard 死循环）。
+        # 两处兜底都必须是 **宽 except**：本路径是 guard 读路径，且 _save_bindings
+        # 现在会 re-raise OSError（只读/权限/磁盘满）——只 catch OrchdError 会让
+        # 读路径抛裸 OSError 落 E999（返工整改：与「解绑失败不阻断返回值」契约对齐）。
+        try:
+            _log_recycle([{
+                "action": "unbind_stale_binding",
+                "task_id": task_id,
+                "target": str(bound),
+                "reason": "登记 worktree 路径在本环境不存在（is_dir=False），自动解绑",
+                "actor": _recycle_actor(),
+            }])
+        except Exception:
+            pass
+        try:
+            unbind_task_wt(store_root, task_id, lock_held=False)
+        except Exception:
+            pass
+        return None
+    return bound
 
 
 def resolve_task_branch(store_root: Path, task_id: str) -> str | None:
@@ -862,7 +1304,9 @@ def guard_task_root(
     bound = resolve_task_root(store_root, task_id)
     if bound is None:
         return {"guarded": True, "bound_root": None}
-    if Path(project_root).resolve() != bound.resolve():
+    if os.path.normcase(str(Path(project_root).resolve())) != os.path.normcase(
+        str(bound.resolve())
+    ):
         raise OrchdError(
             ErrorCode.E018,
             f"wrong_worktree: {command} 目标目录（{project_root}）与任务 {task_id} 的 "
@@ -887,10 +1331,12 @@ def _propagate_container_marker(task_wt: Path, main_wt: Path) -> None:
     自识别 container 布局 → 共享账本根（``<容器>/.orchd-runtime/``）生效。
     失败静默降级（仍可经 ORCHD_HOME 指向共享账本根）。
 
-    task-workspace-docs-isolation：同步工作区规划文档 ROADMAP.md（gitignore
-    不入库 → 任务 worktree 缺副本，roadmap_landing_warnings 读本地缺失被跳过，
-    与 main 行为不一致）。best-effort 从 main 拷贝，缺失静默跳过；ROADMAP.md
-    未跟踪，拷贝不产生未提交改动（不触发 E017）。
+    task-workspace-docs-isolation：同步工作区规划文档 ROADMAP.md（宿主资产、唯一源
+    在宿主项目根；任务 worktree 缺副本 → roadmap_landing_warnings 读本地缺失被跳过，
+    与 main 行为不一致）。best-effort 从宿主项目根拷贝（源经
+    ``ledger.resolve_roadmap_path`` 定位，目标为任务 worktree 的同一相对位置）；
+    源缺失时留痕跳过（不静默）；ROADMAP.md 未跟踪时拷贝不产生未提交改动（不触发
+    E017）。
     """
     try:
         orchd = task_wt / ".orchd"
@@ -899,11 +1345,24 @@ def _propagate_container_marker(task_wt: Path, main_wt: Path) -> None:
     except Exception:
         pass
     try:
-        src = main_wt / ".orchd" / "ROADMAP.md"
+        # task-roadmap-root-resolution：ROADMAP 同步源随归根（宿主根优先、
+        # .orchd/ 回退）而变——统一走 resolve_roadmap_path，目标保持与源相对
+        # canonical 主工作树的**同一相对位置**（根版 → 任务 worktree 根，
+        # .orchd/ 版 → 任务 worktree .orchd/）。跳过时留痕（不静默）。
+        from orchd.ledger import resolve_roadmap_path
+
+        src = resolve_roadmap_path(main_wt)
         if src.exists():
-            shutil.copy2(str(src), str(task_wt / ".orchd" / "ROADMAP.md"))
-    except OSError:
-        pass
+            dst = task_wt / src.relative_to(Path(main_wt))
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+    except (OSError, ValueError) as exc:
+        # best-effort：同步失败不影响 worktree 可用性，但须留痕（禁静默跳过）
+        print(
+            "orchd ▸ [worktree] {\"action\": \"roadmap_sync_skipped\", "
+            f"\"error\": \"{exc}\"}}",
+            file=sys.stderr,
+        )
 
 
 # _master.json 副本抑制（task-master-single-copy）：container 任务 worktree 不再
@@ -915,7 +1374,13 @@ _MASTER_IGNORE_PATTERNS = ["/*", "!/.orchd/", "/.orchd/*", "!/.orchd/_master.jso
 
 
 def _git_minor_version() -> int:
-    """解析 git 次版本号（如 2.25 → 25）；解析失败返回 0（按不可用处理）。"""
+    """解析 git 版本为 ``major*100 + minor``（如 2.25 → 225、3.0 → 300）。
+
+    W-14（2026-09-15）：旧实现只返回次版本号（``2.25 → 25``），丢主版本号 ——
+    git 3.x 时 ``3.0 → 0`` 会把 ``version >= 25`` 判为**假**，静默关闭
+    sparse-checkout（能力探测方向反了）。改口径后比较须用 ``>= 225``。
+    解析失败返回 0（按不可用处理）。
+    """
     try:
         out = subprocess.run(
             ["git", "--version"],
@@ -925,7 +1390,9 @@ def _git_minor_version() -> int:
             timeout=10,
         ).stdout or ""
         m = re.search(r"(\d+)\.(\d+)", out)
-        return int(m.group(2)) if m else 0
+        if not m:
+            return 0
+        return int(m.group(1)) * 100 + int(m.group(2))
     except Exception:
         return 0
 
@@ -944,7 +1411,7 @@ def _suppress_task_master_copy(wt_path: Path) -> dict[str, Any]:
         （``ok=False, method="none"``，由调用方以 degraded 透出）。
     """
     version = _git_minor_version()
-    if version >= 25:
+    if version >= 225:  # W-14：口径 major*100+minor（2.25 → 225；git 3.0 → 300）
         init = subprocess.run(
             ["git", "sparse-checkout", "init", "--no-cone", str(wt_path)],
             capture_output=True,
@@ -1053,6 +1520,19 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
     try:
         if (wt_path / ".git").exists():
             # 已存在且是 worktree → 幂等复用（补写布局标记 + 抑制副本）
+            # W-4（2026-09-15）：复用路径**必须同样过创建期不变量校验**——「见 .git
+            # 即判幂等」会把半检出（HEAD 无法解析）/ 元数据丢失 / 检出其它分支的目录
+            # 当作有效 worktree 绑定，agent 随后在错误分支或残缺检出上作业（静默）。
+            verify = _verify_task_wt(wt_path, branch)
+            if not verify["ok"]:
+                _cleanup_stale_task_wt(project_root, wt_path)
+                return {
+                    "worktree": project_root,
+                    "separate": False,
+                    "created": False,
+                    "degraded": True,
+                    "reason": f"复用路径校验失败：{verify['reason']}",
+                }
             _propagate_container_marker(wt_path, project_root)
             result = {"worktree": wt_path, "separate": True, "created": False}
             result.update(_master_suppression_entry(wt_path))
@@ -1134,6 +1614,20 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             "degraded": True,
             "reason": reason,
         }
+    except subprocess.TimeoutExpired as exc:
+        # W-5（2026-09-15）：超时被杀（SubprocessError 子类）走的是通用 except，
+        # 旧实现**不清理**半创建目录/git 注册（对比 returncode≠0 路径会清）→
+        # 残留半成品既污染 doctor/worktree list，又可能被后续复用路径当有效工作区。
+        _cleanup_stale_task_wt(project_root, wt_path)
+        return {
+            "worktree": project_root,
+            "separate": False,
+            "created": False,
+            "degraded": True,
+            "reason": (
+                f"git worktree add 超时（{exc}）：已清理半成品目录并降级主工作树"
+            ),
+        }
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
         return {
             "worktree": project_root,
@@ -1193,12 +1687,78 @@ def _restore_main_head(project_root: Path, before: str) -> bool:
         return False
 
 
+def _worktree_registered_paths(project_root: Path) -> set[str] | None:
+    """`git worktree list --porcelain` 登记路径集合（normcase 归一化）。
+
+    返回 None 表示 git 不可用/解析失败（调用方保守降级：视为有效、不删）。
+    按行前缀解析（W-16 口径），路径经 resolve + normcase 归一化。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(project_root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for ln in (proc.stdout or "").splitlines():
+        if not ln.startswith("worktree "):
+            continue
+        p = ln[len("worktree "):].strip()
+        if p:
+            try:
+                paths.add(os.path.normcase(str(Path(p).resolve())))
+            except OSError:
+                paths.add(os.path.normcase(p))
+    return paths
+
+
+def _is_effective_worktree(project_root: Path, wt_path: Path) -> bool:
+    """判定是否为有效 worktree（doctor/worktree 单一真源）。
+
+    有效 ⇔ git 登记含该路径 **且** `git rev-parse --verify HEAD` 可解析。
+    任一 git 探测失败 → 保守返回 True（视为有效，绝不误删）。
+    无 `.git` 标记 → 返回 False（由调用方按无标记残留路径处理）。
+    """
+    if not (wt_path / ".git").exists():
+        return False
+    registered = _worktree_registered_paths(project_root)
+    if registered is None:
+        return True
+    try:
+        key = os.path.normcase(str(wt_path.resolve()))
+    except OSError:
+        return True
+    if key not in registered:
+        return False
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(wt_path),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return True
+    return head.returncode == 0 and bool((head.stdout or "").strip())
+
+
 def _cleanup_stale_task_wt(project_root: Path, wt_path: Path) -> None:
     """best-effort 清理 worktree add 失败残留的半成品元数据（孤儿 worktree）。
 
     - ``git worktree prune``：移除指向已消失目录的失效 git 注册（安全）。
-    - 残留目录仅在其**非有效 worktree**（无 ``.git`` 标记）时删除，有标记
-      视为有效 worktree 绝不误删（与 remove_task_wt 的 P0-19 残留清理同构）。
+    - 残留目录仅在其**非有效 worktree**时删除：无 ``.git`` 标记的沿旧路径；
+      有 ``.git`` 标记的按 :func:`_is_effective_worktree` 判定——登记失效或
+      HEAD 不可解析的半检出可回收，有效 worktree 绝不误删（与 doctor 残留
+      判定同源）。
     任何失败静默跳过，不阻断降级主流程。
     """
     try:
@@ -1212,7 +1772,9 @@ def _cleanup_stale_task_wt(project_root: Path, wt_path: Path) -> None:
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
-    if not wt_path.exists() or (wt_path / ".git").exists():
+    if not wt_path.exists():
+        return
+    if (wt_path / ".git").exists() and _is_effective_worktree(project_root, wt_path):
         return
     try:
         wt_path.rmdir()
@@ -1264,6 +1826,25 @@ def _recycle_actor() -> str:
     return os.environ.get("ORCHD_SESSION_ID") or "<unknown>"
 
 
+# ``ORCHD_QUIET`` 的真值集合（环境变量宽松解析；未设置 / 空 / 其他值一律不抑制）
+_QUIET_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _recycle_quiet() -> bool:
+    """回收留痕是否被 ``ORCHD_QUIET`` 抑制（缺省 False = 不抑制）。
+
+    宿主把 orchd 包进「stderr 非空即失败」的外壳时（典型：PowerShell 把
+    stderr 行包装成 ``NativeCommandError``，见 conventions.md「命令输出通道
+    契约」），可用 ``ORCHD_QUIET=1`` 关闭 ``[回收]`` 留痕。**缺省行为与引入
+    开关前逐字节一致**——未设置 / 空值 / 非真值一律不抑制，审计契约不因加
+    开关而弱化；抑制仅作用于本留痕，不影响 stdout 的 JSON 契约。
+
+    Returns:
+        True = 抑制留痕（不写 stderr）；False = 照常留痕。
+    """
+    return os.environ.get("ORCHD_QUIET", "").strip().lower() in _QUIET_TRUTHY
+
+
 def _log_recycle(records: list[dict[str, Any]]) -> None:
     """把删除决策/动作记录打印到 stderr（``orchd ▸ [回收]`` 前缀，best-effort）。
 
@@ -1271,8 +1852,20 @@ def _log_recycle(records: list[dict[str, Any]]) -> None:
     分支 / 目录的删除动作与「拒绝删除」决策都必须留痕，杜绝 best-effort 静默
     删除无法追溯。单条记录为结构化 dict（action / target / reason / evidence /
     actor），JSON 序列化输出。失败静默跳过，不阻断主流程。
+
+    ``ORCHD_QUIET=1`` 时整体跳过（见 :func:`_recycle_quiet`），抑制判定在
+    任何输出之前——不触发 W-13 的 stderr UTF-8 reconfigure，零副作用。
     """
+    if _recycle_quiet():
+        return
     try:
+        # W-13：Windows 控制台 stderr 常为 gbk，审计留痕含中文/箭头/路径时会被
+        # 乱码或直接抛 UnicodeEncodeError（留痕不可读＝审计失效）→ 输出前把
+        # stderr 切到 UTF-8（幂等；不支持 reconfigure 的载体静默跳过）。
+        try:
+            sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError, OSError):
+            pass
         for rec in records:
             print(f"orchd ▸ [回收] {json.dumps(rec, ensure_ascii=False)}", file=sys.stderr)
     except Exception:
@@ -1280,28 +1873,69 @@ def _log_recycle(records: list[dict[str, Any]]) -> None:
 
 
 def _task_status_for_recycle(store_root: Path, task_id: str) -> str | None:
-    """best-effort 读取任务当前状态（删除保护断言与决策打点共用）。
+    """读取任务当前状态（删除保护断言与决策打点共用）。
 
-    经 ``orchd.ledger.Store.replay()`` 只读查询；store_root 不可用 / 读取异常
-    返回 None（best-effort，不阻断删除——in_review 保护仅在能**确认** in_review
-    时生效，避免账本异常导致回收被永久卡死）。
+    三态（W-10，2026-09-15：禁用 fail-open）：
+
+    - **有记录** → 返回状态字符串（``in_review`` 等），调用方据此决定是否保护；
+    - **确认无记录**（任务不在 replay 派生结果中）→ 返回 ``None``，可安全回收；
+    - **读取失败**（store_root 不可用 / replay 异常）→ 抛 ``OrchdError(E030)``，
+      由调用方显式处置（拒绝回收 + 留痕，可 force_recycle 覆盖）。旧实现在此处
+      返回 None，与「确认无记录」不可区分 → 账本瞬时不可读时 in_review 保护
+      **静默失效**，正在审查的任务 worktree 可能被回收。
     """
-    try:
-        from orchd.ledger import Store
+    from orchd.errors import ErrorCode, OrchdError
+    from orchd.ledger import Store
 
+    try:
         ts = Store(store_root).replay().get(task_id)
-        return ts.status if ts else None
-    except Exception:
-        return None
+    except Exception as exc:
+        raise OrchdError(
+            ErrorCode.E030,
+            f"任务状态读取失败，无法确认回收保护（{store_root}）：{exc}",
+            [{
+                "task_id": task_id,
+                "store_root": str(store_root),
+                "hint": (
+                    "账本不可读时不再按「无记录」放行回收；请修复账本后重试，"
+                    "或显式 force-recycle 覆盖保护"
+                ),
+            }],
+        ) from exc
+    return ts.status if ts else None
 
 
 def remove_task_wt(
     project_root: Path, task_id: str, store_root: Path, *, lock_held: bool = False,
+    force_recycle: bool = False,
 ) -> dict[str, Any]:
     """终态回收：git worktree remove + 删 task/{id} 分支 + 解绑（best-effort 幂等）。
 
     ``lock_held=True``：调用方已在同一共享账本根持有 ``.lock``（同进程），解绑时
     复用该锁、不再重复 flock（见 :func:`unbind_task_wt`），规避同进程双 fd E012 死锁。
+
+    分支删除安全闸（review W-3 / R-17，AGENTS.md 红线）：
+    - 默认只用安全 ``git branch -d``（拒绝删除未合并分支），**绝不再无条件 ``-D``**；
+    - 删除前以 ``git rev-list --count main..task/<id>`` 取未合并提交数：非零即拒绝删除，
+      计数与拒绝原因记入 ``recycle_log``（``action=branch_delete_refused``）并在返回值
+      中给出 ``branch_delete_refused``；
+    - 仅当调用方显式传 ``force_recycle=True``（CLI 侧对应 ``--force-recycle``）时，
+      才对未合并分支升级 ``-D``；计数为 0 时仍走 ``-d``（无需强删）。
+
+    worktree 移除安全闸（review W-6）：非 ``--force`` 移除失败时，仅当 stderr 表明
+    「contains modified or untracked files」才升级 ``--force``（终态回收允许丢弃脏
+    工作区并记 ``discarded_uncommitted``）；句柄占用 / 权限 / 未知原因一律不升级，
+    失败原因写入 ``recycle_log`` 与 ``residual``（可读、不静默）。
+
+    稳定 cwd 闸（review W-7）：``stable_wt`` 必须是与待回收 worktree **不同**且真实
+    存在的主工作树根（``main_worktree_root`` 探测失败会回退 ``project_root``，容器
+    布局下那往往就是待删的 worktree 本身）；不满足即拒绝执行删除动作（``reason=
+    unstable_main_worktree``）。回收前的 ``os.chdir`` 自愈在移除阶段 ``finally`` 中
+    恢复调用方原 cwd（原 cwd 已被本次回收删除时保持 ``stable_wt``，不落进失效目录）。
+
+    幽灵登记收敛（review W-8）：worktree 目录本就不存在时，仍执行 ``git worktree
+    prune`` 清理陈旧登记（否则 ``task/*`` 分支被残留 worktree 登记占用而无法删除，
+    永久泄漏），结果记入 ``recycle_log`` 的 ``registry_pruned``。
 
     in_review 保护断言（2026-08-30 复盘 §1）：任务状态为 in_review 时拒绝删除。
     in_review 是审查等待期（任务可能 idle 数小时），恰是分支误删高危窗口；正常
@@ -1325,8 +1959,30 @@ def remove_task_wt(
     actor = _recycle_actor()
     recycle_log: list[dict[str, Any]] = []
 
-    # in_review 保护断言（只读查询，确认命中才拒绝；查不到状态不阻断）
-    status = _task_status_for_recycle(store_root, task_id)
+    # in_review 保护断言（只读查询，确认命中才拒绝）。W-10：账本读取失败**不再
+    # 静默放行**（旧实现返回 None 会让保护在账本瞬时不可读时失效）→ 拒绝回收并
+    # 留痕，只有显式 force_recycle 才覆盖。
+    try:
+        status = _task_status_for_recycle(store_root, task_id)
+    except Exception as exc:
+        if not force_recycle:
+            record = {
+                "action": "blocked",
+                "reason": "status_unreadable",
+                "task_id": task_id,
+                "target": str(wt_path),
+                "error": str(exc)[:300],
+                "actor": actor,
+            }
+            recycle_log.append(record)
+            _log_recycle(recycle_log)
+            return {
+                "removed": False,
+                "unbound": False,
+                "reason": "status_unreadable",
+                "recycle_log": recycle_log,
+            }
+        status = None
     if status == "in_review":
         record = {
             "action": "blocked",
@@ -1346,6 +2002,38 @@ def remove_task_wt(
             "recycle_log": recycle_log,
         }
 
+    # W-7 / R-35：stable_wt 必须是与待回收 worktree 不同的真实主工作树根。
+    # main_worktree_root 在 git 探测失败时回退 project_root——容器布局下
+    # project_root 往往就是待删的任务 worktree 本身；此时继续执行会让
+    # git worktree remove / 分支删除带着失效 cwd 冒进（旧实现静默如此）。
+    # 此处 fail-safe：拒绝执行删除动作并留痕（宁可留残留交 doctor 处置）。
+    _stable_resolved: Path | None = None
+    try:
+        _stable_resolved = Path(stable_wt).resolve() if stable_wt else None
+    except OSError:
+        _stable_resolved = None
+    _wt_resolved_for_guard = wt_path.resolve()
+    if (
+        _stable_resolved is None
+        or _stable_resolved == _wt_resolved_for_guard
+        or not _stable_resolved.is_dir()
+    ):
+        recycle_log.append({
+            "action": "blocked",
+            "reason": "unstable_main_worktree",
+            "task_id": task_id,
+            "target": str(wt_path),
+            "stable_worktree": str(_stable_resolved) if _stable_resolved else None,
+            "actor": actor,
+        })
+        _log_recycle(recycle_log)
+        return {
+            "removed": False,
+            "unbound": False,
+            "reason": "unstable_main_worktree",
+            "recycle_log": recycle_log,
+        }
+
     removed = False
     discarded_uncommitted = False
     wt_existed = (wt_path / ".git").exists()
@@ -1353,13 +2041,19 @@ def remove_task_wt(
     # 位于待回收 worktree 内。Windows 下进程 cwd 会锁定目录，导致 git worktree
     # remove 失败（已知原因却不自愈）。若命中则 os.chdir 到主工作树（stable_wt），
     # 释放目录锁后再执行 remove；幂等：cwd 不在 worktree 内时零操作。
+    # W-7：os.chdir 是进程级副作用——记录调用方原 cwd，移除阶段 finally 恢复。
     cwd_self_healed = False
+    _original_cwd: Path | None = None
     try:
         _cur_cwd = Path.cwd().resolve()
+        _original_cwd = _cur_cwd
         _wt_resolved = wt_path.resolve()
+        # 与 guard_task_root 同口径（task-worktree-residual-self-heal）：双侧
+        # normcase，Windows 路径大小写不一致时不再漏判自愈。
         _cwd_inside = (
-            _cur_cwd == _wt_resolved
-            or str(_cur_cwd).startswith(str(_wt_resolved) + os.sep)
+            os.path.normcase(str(_cur_cwd)) == os.path.normcase(str(_wt_resolved))
+            or str(os.path.normcase(str(_cur_cwd))).startswith(
+                str(os.path.normcase(str(_wt_resolved))) + os.sep)
         )
     except OSError:
         _cwd_inside = False
@@ -1377,10 +2071,11 @@ def remove_task_wt(
             "to": str(stable_wt),
             "actor": actor,
         })
+    remove_error: str | None = None
+    registry_pruned: bool | None = None
     try:
         if wt_existed:
-            # P2-9：先无 --force 移除（仅干净 worktree 可移，避免丢弃未提交改动）；
-            # 脏 worktree 才回退 --force（终态回收 best-effort），并记 discarded 告警。
+            # P2-9：先无 --force 移除（仅干净 worktree 可移，避免丢弃未提交改动）。
             proc = subprocess.run(
                 ["git", "worktree", "remove", str(wt_path)],
                 cwd=str(stable_wt),
@@ -1390,21 +2085,52 @@ def remove_task_wt(
                 timeout=30,
             )
             if proc.returncode != 0:
-                proc = subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(wt_path)],
-                    cwd=str(stable_wt),
+                # W-6 / R-35：只有失败原因确为「工作区脏」才升级 --force；句柄占用 /
+                # 权限 / 未知原因一律不升级（旧实现无条件升级：真脏时静默销毁未提交
+                # 改动，句柄占用时白跑一遍 --force 且掩盖真实原因）。
+                _err = (proc.stderr or "").lower()
+                if "modified or untracked" in _err:
+                    proc = subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(wt_path)],
+                        cwd=str(stable_wt),
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                    )
+                    discarded_uncommitted = proc.returncode == 0
+                else:
+                    remove_error = (proc.stderr or proc.stdout or "").strip()[:300]
+            removed = proc.returncode == 0
+        else:
+            # W-8 / R-35：目录本就不存在时仍收敛 git 登记——陈旧登记会占用
+            # task/* 分支名导致分支无法删除（幽灵登记 → 分支永久泄漏）。
+            try:
+                pr = subprocess.run(
+                    ["git", "-C", str(stable_wt), "worktree", "prune"],
                     capture_output=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=30,
+                    timeout=_GIT_TIMEOUT,
                 )
-                discarded_uncommitted = proc.returncode == 0
-            removed = proc.returncode == 0
-        else:
+                registry_pruned = pr.returncode == 0
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                registry_pruned = False
             removed = True  # 独立 worktree 本就不存在 → 视为已回收
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        remove_error = f"{type(exc).__name__}: {exc}"[:300]
         removed = False
-    recycle_log.append({
+    finally:
+        # W-7：os.chdir 是进程级副作用，移除阶段结束即恢复调用方原 cwd。原 cwd 已被
+        # 本次回收删除（常见情形）时保持 stable_wt，避免把进程放进失效目录；后续
+        # git 调用一律显式 -C stable_wt，不依赖进程 cwd。
+        if cwd_self_healed and _original_cwd is not None:
+            try:
+                if _original_cwd.is_dir():
+                    os.chdir(str(_original_cwd))
+            except OSError:
+                pass
+    _remove_record: dict[str, Any] = {
         "action": "worktree_remove" if wt_existed else "worktree_absent",
         "task_id": task_id,
         "target": str(wt_path),
@@ -1412,7 +2138,12 @@ def remove_task_wt(
         "discarded_uncommitted": discarded_uncommitted,
         "status": status,
         "actor": actor,
-    })
+    }
+    if remove_error:
+        _remove_record["error"] = remove_error
+    if registry_pruned is not None:
+        _remove_record["registry_pruned"] = registry_pruned
+    recycle_log.append(_remove_record)
     # P0-19：Windows 下 git worktree remove 可能删除内容但残留空目录
     # （文件句柄 / .lock / 杀毒扫描导致目录删除不完整）。best-effort 清理残留。
     residual_cleaned = False
@@ -1436,38 +2167,119 @@ def remove_task_wt(
             "target": str(wt_path),
             "actor": actor,
         })
-    # 删任务分支（best-effort，未合并时 -d/-D 失败不阻断）
+    # 删任务分支（best-effort）——W-3 / R-17（AGENTS.md 红线：不得用 -D 销毁未合并提交）：
+    # ① 先取未合并提交数（git rev-list --count main..task/<id>）；② 非零 → 拒绝删除并
+    # 留痕，除非调用方显式 force_recycle；③ 否则用安全 -d；④ 分支已不存在视为幂等成功。
     # 以主工作树为稳定 cwd（git -C）：worktree 已回收时 task/{id} 不再被占用可删除；
     # project_root（任务 worktree）可能已被 git worktree remove 删除，不能作为 cwd。
     branch_deleted = False
+    branch_refused: dict[str, Any] | None = None
+    unmerged_count: int | None = None
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(stable_wt), "branch", "-D", f"task/{task_id}"],
+        count_proc = subprocess.run(
+            ["git", "-C", str(stable_wt), "rev-list", "--count", f"main..task/{task_id}"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=_GIT_TIMEOUT,
         )
-        branch_deleted = proc.returncode == 0
+        if count_proc.returncode == 0:
+            _raw_count = (count_proc.stdout or "").strip()
+            if _raw_count.isdigit():
+                unmerged_count = int(_raw_count)
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        branch_deleted = False
-    recycle_log.append({
-        "action": "branch_delete",
-        "task_id": task_id,
-        "branch": f"task/{task_id}",
-        "deleted": branch_deleted,
-        "actor": actor,
-    })
-    unbound = unbind_task_wt(store_root, task_id, lock_held=lock_held)
-    recycle_log.append({
-        "action": "unbind",
-        "task_id": task_id,
-        "unbound": unbound.get("unbound", False),
-        "actor": actor,
-    })
+        unmerged_count = None
+
+    if unmerged_count and unmerged_count > 0 and not force_recycle:
+        branch_refused = {
+            "branch": f"task/{task_id}",
+            "unmerged_commits": unmerged_count,
+            "reason": "unmerged_branch_protected",
+            "hint": "该分支未被主分支包含；确需丢弃请显式 force_recycle（CLI: --force-recycle）",
+        }
+        recycle_log.append({
+            "action": "branch_delete_refused",
+            "task_id": task_id,
+            "branch": f"task/{task_id}",
+            "unmerged_commits": unmerged_count,
+            "reason": "unmerged_branch_protected",
+            "actor": actor,
+        })
+    else:
+        _branch_flag = "-D" if (force_recycle and unmerged_count) else "-d"
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(stable_wt), "branch", _branch_flag, f"task/{task_id}"],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_GIT_TIMEOUT,
+            )
+            branch_deleted = proc.returncode == 0
+            if not branch_deleted:
+                _berr = (proc.stderr or "").lower()
+                if (
+                    "not found" in _berr
+                    or "doesn't exist" in _berr
+                    or "does not exist" in _berr
+                ):
+                    branch_deleted = True  # 幂等：分支已不存在（如 merge 流程已删）
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            branch_deleted = False
+        recycle_log.append({
+            "action": "branch_delete",
+            "task_id": task_id,
+            "branch": f"task/{task_id}",
+            "mode": _branch_flag,
+            "unmerged_commits": unmerged_count,
+            "deleted": branch_deleted,
+            "actor": actor,
+        })
+    unbind_error: str | None = None
+    try:
+        unbound = unbind_task_wt(store_root, task_id, lock_held=lock_held)
+    except Exception as exc:
+        # best-effort（task-unbind-recycle-audit-best-effort）：解绑抛 E002
+        # （绑定损坏）或锁失败时不再向上传播——异常转 warning 并继续执行，
+        # 保证本次 worktree / 分支动作的 recycle_log 仍落盘、不丢失留痕。
+        code = getattr(getattr(exc, "code", None), "name", type(exc).__name__)
+        unbind_error = f"{code}: {exc}"[:300]
+        unbound = {
+            "unbound": False,
+            "task_id": task_id,
+            "unbind_error": unbind_error,
+        }
+        recycle_log.append({
+            "action": "unbind_failed",
+            "task_id": task_id,
+            "unbound": False,
+            "error": unbind_error,
+            "actor": actor,
+        })
+    else:
+        recycle_log.append({
+            "action": "unbind",
+            "task_id": task_id,
+            "unbound": unbound.get("unbound", False),
+            "actor": actor,
+        })
     _log_recycle(recycle_log)
-    result = {"removed": removed, "unbound": unbound.get("unbound", False),
-              "recycle_log": recycle_log}
+    result: dict[str, Any] = {
+        "removed": removed,
+        "unbound": unbound.get("unbound", False),
+        "branch_deleted": branch_deleted,
+        "recycle_log": recycle_log,
+    }
+    if unbind_error is not None:
+        result["unbind_error"] = unbind_error
+        result["warnings"] = [{
+            "code": "unbind_failed",
+            "task_id": task_id,
+            "error": unbind_error,
+        }]
+    if branch_refused:
+        # W-3：未合并分支被拒绝删除 —— 显式回传（含未合并提交数与逃生开关指引）
+        result["branch_delete_refused"] = branch_refused
     if discarded_uncommitted:
         result["discarded_uncommitted"] = True
     if residual_cleaned:
@@ -1517,6 +2329,11 @@ def _cleanup_stale_session_locks(store_root: Path, task_wt_root: Path) -> list[s
         for pattern in (".session-*.lock", ".session-gate-*.lock"):
             for p in sorted(store_root.glob(pattern)):
                 name = p.name
+                if pattern == ".session-*.lock" and name.startswith(".session-gate-"):
+                    # review W-17：``.session-*.lock`` 通配也会命中门锁
+                    # （``.session-gate-<wt>.lock``），门锁交由专用 pattern 处理，
+                    # 避免同一文件在一轮回收里被访问两次。
+                    continue
                 if name.startswith(".session-gate-"):
                     wt = name[len(".session-gate-"):-len(".lock")]
                 elif name.startswith(".session-"):
@@ -1559,7 +2376,10 @@ def _cleanup_container_root_junk(task_wt_root: Path) -> list[str]:
 
     task-workspace-docs-isolation：测试/缓存杂项（``.pytest-tmp`` /
     ``.pytest_cache`` 等）可能落在容器根（main/ 之外）。复用 ``_is_junk_entry``
-    保守名单，绝不触碰 .git / .orchd / 工具目录 / 被跟踪文件。
+    保守名单，**清理前逐条做 ``git ls-files`` tracked 校验**（review W-15：
+    此前 docstring 承诺「绝不触碰被跟踪文件」但无校验，可删仓库跟踪的
+    ``htmlcov/``）——被跟踪路径跳过；所属仓库不可判定 / 探测异常同样跳过
+    （保守）。绝不触碰 .git / .orchd / 工具目录 / 被跟踪文件。
 
     Returns:
         已清理的条目名清单。
@@ -1569,6 +2389,8 @@ def _cleanup_container_root_junk(task_wt_root: Path) -> list[str]:
         for entry in sorted(task_wt_root.iterdir()):
             if not _is_junk_entry(entry.name):
                 continue
+            if _is_git_tracked_path(entry):
+                continue  # W-15：被 git 跟踪 → 绝不触碰（含 in-cone 的 htmlcov/）
             try:
                 if entry.is_dir():
                     removed = _rmtree_force(entry)
@@ -1596,48 +2418,121 @@ def prune_orphans(
     - 绑定任务已不在 master / 无对应活跃任务 → remove + 解绑；
     - 文件系统残留 task-* 空目录（P0-19，Windows git worktree remove 不完整）→ 清理。
 
-    删除决策审计（2026-08-30 复盘 §1）：每次判定「可清理」前输出决策上下文
-    （task_id / status / has_active_binding / git 登记 / 判定依据），删除动作由
-    ``remove_task_wt`` 内部再记 recycle_log，杜绝 best-effort 静默删除无痕。
+    安全边界（review W-1 / W-12 / W-15 / R-16 / R-23）：
+    - **布局门**：仅 container 布局存在独立任务 worktree。flat 下 ``detect_layout``
+      把 ``task_wt_root`` 解析为**仓库父目录**，扫它会越界删除父目录下无关的
+      ``task-*`` 目录与 ``htmlcov`` 等杂项 —— flat 直接早返回：零扫描、零删除
+      （判据与 ``doctor.py`` 的 ``layout != "container"`` 门一致）。
+    - **持锁 + 新鲜状态**：全部破坏性动作（worktree 回收 / 目录删除）在
+      ``Store.acquire_lock()`` 内执行；每个 task_id 处理前重新 ``replay()`` 取新鲜
+      状态，消除「入口陈旧快照判定 → 并发重新 claim → 按陈旧 completed 强删」的
+      TOCTOU 窗口。新鲜账本中查不到该任务时回退调用方快照（保持既有调用契约；
+      凡新鲜账本有记录，一律以记录为准）。
+    - **残留证据**：``task-*`` 目录仅在存在「曾由 git 登记为本仓库 worktree」证据
+      （``<git-common-dir>/worktrees/<name>``）时才判为残留；``rmdir`` 失败
+      **禁止**升级 ``rmtree``，改为留痕保留（交 doctor / 人工处置）。
+
+    删除决策审计（2026-08-30 复盘 §1）：每次判定「可清理」或「拒绝清理」前输出
+    决策上下文（task_id / status / status_source / has_active_binding / git 登记 /
+    判定依据），删除动作由 ``remove_task_wt`` 内部再记 recycle_log，杜绝 best-effort
+    静默删除无痕。
 
     Returns:
         ``{"pruned": [<str>], "orphans_found": int, "residual_cleaned": [<str>],
         "decisions": [<dict>]}``；decisions 为本次全部删除/拒绝决策记录。
+        flat 布局 / 锁不可用等「未执行」场景额外返回 ``skipped``（不静默）。
     """
     from orchd.gitops import _has_linked_worktrees
 
     project_root = Path(project_root).resolve()
-    bindings = load_bindings(store_root)
+
+    # 布局门（W-1 / R-16）：flat 无任务 worktree 概念，且 task_wt_root 会解析为
+    # 仓库父目录 —— 扫描/删除即越界操作他人目录，直接早返回。
+    try:
+        layout = detect_layout(project_root)
+    except Exception:
+        return {"pruned": [], "orphans_found": 0, "skipped": "layout_unresolved"}
+    if layout.get("layout") != "container":
+        return {"pruned": [], "orphans_found": 0, "skipped": "flat_layout"}
+    task_wt_root = Path(layout["task_wt_root"])
+
+    try:
+        from orchd.errors import OrchdError
+
+        bindings = load_bindings(store_root)
+    except OrchdError:
+        # 绑定表损坏：信息不全时保守跳过本轮 prune（不基于空表误删 worktree）
+        return {"pruned": [], "orphans_found": 0, "skipped": "bindings_corrupt"}
     pruned: list[str] = []
     residual_cleaned: list[str] = []
     decisions: list[dict[str, Any]] = []
     actor = _recycle_actor()
 
-    # 既有绑定任务清理（需要 git 层 linked worktrees 存在才执行 git worktree remove）
-    if _has_linked_worktrees(project_root):
-        for task_id, entry in list(bindings.items()):
-            ts = state.get(task_id)
-            status = ts.status if ts else "pending"
-            if status in ("completed", "cancelled"):
-                # 终态：回收 worktree + 解绑（删除动作由 remove_task_wt 记 recycle_log）
-                decisions.append({
-                    "action": "recycle",
-                    "task_id": task_id,
-                    "kind": "terminal_binding",
-                    "status": status,
-                    "bound_worktree": (entry or {}).get("worktree"),
-                    "actor": actor,
-                })
-                _log_recycle(decisions[-1:])
-                result = remove_task_wt(project_root, task_id, store_root)
-                if result.get("removed"):
-                    pruned.append(task_id)
-
-    # P0-19：扫描文件系统残留 task-* 目录（git 不登记但目录仍存在）。
-    # 不依赖 _has_linked_worktrees——Windows 下 git worktree remove 成功但目录残留。
+    # 破坏性段落持账本锁（W-12 / R-23）：加锁后才判定、才删除。
     try:
-        layout = detect_layout(project_root)
-        task_wt_root = layout["task_wt_root"]
+        from orchd.ledger import Store
+
+        store = Store(store_root)
+        store.acquire_lock()
+    except Exception as exc:
+        # 锁不可用（超时 / 后端异常）→ 放弃本轮破坏性清理（best-effort，不抛）
+        _log_recycle([{
+            "action": "skip",
+            "kind": "prune_orphans",
+            "reason": "store_lock_unavailable",
+            "error": str(exc),
+            "actor": actor,
+        }])
+        return {"pruned": [], "orphans_found": 0, "skipped": "store_lock_unavailable"}
+
+    def _fresh_status(task_id: str) -> tuple[str | None, str]:
+        """锁内重新 replay 取新鲜状态，返回 ``(status, status_source)``。
+
+        新鲜账本有该任务记录 → 以记录为准（``fresh_replay``，修正陈旧快照）；
+        无记录 → 回退调用方入口快照（``entry_snapshot_fallback``，保持既有调用
+        契约）；两者皆无 → ``(None, "absent")``，调用方按「非终态」保守处理。
+        """
+        try:
+            fresh = store.replay()
+        except Exception:
+            fresh = {}
+        ts = fresh.get(task_id)
+        if ts is not None:
+            return ts.status, "fresh_replay"
+        snapshot = state.get(task_id)
+        if snapshot is not None:
+            return snapshot.status, "entry_snapshot_fallback"
+        return None, "absent"
+
+    try:
+        # 既有绑定任务清理（需要 git 层 linked worktrees 存在才执行 git worktree remove）
+        if _has_linked_worktrees(project_root):
+            for task_id, entry in list(bindings.items()):
+                status, status_source = _fresh_status(task_id)
+                effective = status or "pending"
+                if effective in ("completed", "cancelled"):
+                    # 终态：回收 worktree + 解绑（删除动作由 remove_task_wt 记 recycle_log）
+                    decisions.append({
+                        "action": "recycle",
+                        "task_id": task_id,
+                        "kind": "terminal_binding",
+                        "status": effective,
+                        "status_source": status_source,
+                        "bound_worktree": (entry or {}).get("worktree"),
+                        "actor": actor,
+                    })
+                    _log_recycle(decisions[-1:])
+                    # lock_held=True：复用本函数已持有的账本锁（避免同进程双 fd E012）
+                    result = remove_task_wt(
+                        project_root, task_id, store_root, lock_held=True,
+                    )
+                    if result.get("removed"):
+                        pruned.append(task_id)
+
+        # P0-19：扫描文件系统残留 task-* 目录（git 不登记但目录仍存在）。
+        # 不依赖 _has_linked_worktrees——Windows 下 git worktree remove 成功但目录残留。
+        common_dir = _git_common_dir(project_root)
+        registry = (common_dir / "worktrees") if common_dir is not None else None
         if task_wt_root.exists():
             for entry in sorted(task_wt_root.iterdir()):
                 if (not entry.is_dir()
@@ -1650,36 +2545,57 @@ def prune_orphans(
                 has_active_binding = False
                 for cid in candidate_ids:
                     if cid in bindings:
-                        ts = state.get(cid)
-                        status = ts.status if ts else "pending"
-                        if status not in ("completed", "cancelled"):
+                        status, status_source = _fresh_status(cid)
+                        if (status or "pending") not in ("completed", "cancelled"):
                             has_active_binding = True
                         break
                 if has_active_binding:
                     continue
-                # 无活跃绑定 → 尝试清理残留目录
-                if not (entry / ".git").exists():
+                if (entry / ".git").exists():
+                    continue
+                # W-1 / R-16：残留证据 —— 仅「曾由 git 登记为本仓库 worktree」的目录
+                # 才可能是 remove 不完整的残留；无证据 = 他人/无关目录，保留并留痕。
+                registered = registry is not None and (registry / entry.name).exists()
+                if not registered:
                     decisions.append({
-                        "action": "clean",
+                        "action": "keep",
                         "target": entry.name,
                         "kind": "residual_dir",
+                        "reason": "no_git_registry_evidence",
                         "has_active_binding": False,
                         "git_registered": False,
                         "actor": actor,
                     })
                     _log_recycle(decisions[-1:])
-                    try:
-                        entry.rmdir()  # 仅空目录
-                        residual_cleaned.append(entry.name)
-                    except OSError:
-                        try:
-                            shutil.rmtree(str(entry), ignore_errors=True)
-                            if not entry.exists():
-                                residual_cleaned.append(entry.name)
-                        except Exception:
-                            pass
-    except Exception:
-        pass
+                    continue
+                decisions.append({
+                    "action": "clean",
+                    "target": entry.name,
+                    "kind": "residual_dir",
+                    "has_active_binding": False,
+                    "git_registered": True,
+                    "actor": actor,
+                })
+                _log_recycle(decisions[-1:])
+                try:
+                    entry.rmdir()  # 仅空目录（R-16：失败禁止升级 rmtree）
+                    residual_cleaned.append(entry.name)
+                except OSError as exc:
+                    decisions.append({
+                        "action": "keep",
+                        "target": entry.name,
+                        "kind": "residual_dir",
+                        "reason": "not_empty_or_locked",
+                        "error": str(exc),
+                        "git_registered": True,
+                        "actor": actor,
+                    })
+                    _log_recycle(decisions[-1:])
+    finally:
+        try:
+            store.release_lock()
+        except Exception:
+            pass
 
     # task-workspace-docs-isolation：容器级卫生清理（best-effort）——
     # ① worktree 已不存在的会话锁残留；② 容器根可再生杂项；③ 系统 temp 中
@@ -1688,8 +2604,7 @@ def prune_orphans(
     junk_cleaned: list[str] = []
     trash_residue_cleaned: list[str] = []
     try:
-        layout = detect_layout(project_root)
-        task_wt_root = layout["task_wt_root"]
+        # task_wt_root 已在布局门处解析（container 布局），此处不再重复 detect_layout
         if task_wt_root.exists():
             stale_locks_cleaned = _cleanup_stale_session_locks(store_root, task_wt_root)
             junk_cleaned = _cleanup_container_root_junk(task_wt_root)
@@ -1839,10 +2754,42 @@ def diagnose_missing_branch_files(
         for fp in missing:
             full = pr / fp
             if not full.exists():
+                # task-e010-delete-parity-done-guards：区分「删除态未提交」与幽灵
+                # 路径。两者 reason 均保持 path_not_found（未提交的声明内删除仍报
+                # path_not_found，防「删了不提交」漏网），但 hint 引导不同——删除态
+                # 应「提交删除态后保持声明」（与 _guard_out_of_scope 的 D 感知口径
+                # 对齐；勿移除声明，否则删除变声明外改动触发 out_of_scope E010）；
+                # 幽灵路径才是「修正路径或从声明中移除」。deleted 标记仅供
+                # _guard_declared_diff 组装 hint 使用，不进事件 details。
+                deleted_flag = "false"
+                try:
+                    st = subprocess.run(
+                        ["git", "status", "--short", "--", fp],
+                        cwd=str(pr),
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=10,
+                    )
+                    # 删除态：status 短格式的 XY 位含 D（staged 'D ' / unstaged ' D'）；
+                    # XY 与路径间有空格分隔，strip 后首位即 X/Y 状态位，不会误匹配路径名。
+                    if st.returncode == 0 and any(
+                        ln.strip().startswith("D")
+                        for ln in st.stdout.splitlines() if ln.strip()
+                    ):
+                        deleted_flag = "true"
+                except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                    pass  # 探测失败按非删除态处理（维持原 hint，不放大阻断面）
+                detail = (
+                    f"路径 {fp} 在磁盘不存在（检测到未提交的删除态）"
+                    if deleted_flag == "true"
+                    else f"路径 {fp} 在磁盘不存在"
+                )
                 results.append({
                     "file": fp,
                     "reason": "path_not_found",
-                    "detail": f"路径 {fp} 在磁盘不存在",
+                    "detail": detail,
+                    "deleted": deleted_flag,
                 })
                 continue
             # git check-ignore：退出码 0 = 被忽略，1 = 未被忽略
