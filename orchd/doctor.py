@@ -117,16 +117,20 @@ _SESSION_TTL_SECONDS = 1800  # 30 分钟
 # 分两类：源码资产（与位置无关恒保护）与运行时状态（canonical 账本根保护、
 # legacy 位置可清——container 布局下 main/.orchd 的 flat 遗留属于可清残留，
 # 见 _detect_legacy_flat_residues）。
+# 源码资产：与位置无关恒保护。_full_regression.json 是发版元数据产物（full-regression
+# 命令与 sync_orchd_core.sh 恒读写 <源码仓库>/.orchd/_full_regression.json，不论布局），
+# 归 _SOURCE_ASSETS 而非 _RUNTIME_STATE_FILES，避免 container 布局下被
+# _detect_legacy_flat_residues 误判为 flat 遗留而搬走（task-doctor-full-regression-alignment）。
 _SOURCE_ASSETS = frozenset({
     "_master.json",
     "IDEAS.md",
     "IDEAS-archive.md",
     "ROADMAP.md",
+    "_full_regression.json",
 })
 _RUNTIME_STATE_FILES = frozenset({
     "_ledger.jsonl",
     "_checkpoint.json",
-    "_full_regression.json",
     "session-worktrees.json",
     "merge-acks.json",
 })

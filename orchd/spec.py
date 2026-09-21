@@ -263,36 +263,19 @@ class Master:
 
 
 def load_master(path: Path | str) -> Master:
-    """加载 _master.json。
+    """加载 _master.json（经注册表抽象层，默认文件后端）。
 
-    文件必须以 UTF-8 编码读取；若编码不兼容将触发 E002 错误。
+    保留本入口以兼容既有调用点；实现委托 :func:`orchd.registry.load_registry`，
+    切换后端（file / 未来 sqlite）不改调用语义。文件读取与 E001/E002 语义由
+    文件后端（``orchd.registry.FileRegistryBackend``）保证。
 
     Raises:
-        OrchdError E001: 文件不存在。
-        OrchdError E002: JSON 解析失败（含编码错误）。
+        OrchdError E001: 文件不存在（由文件后端保证）。
+        OrchdError E002: JSON 解析失败（含编码错误，由文件后端保证）。
     """
-    path = Path(path)
-    if not path.exists():
-        raise OrchdError(
-            ErrorCode.E001,
-            f"file not found: {path}",
-            [{
-                "path": str(path),
-                "message": "目标文件不存在"
-            }],
-        )
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise OrchdError(
-            ErrorCode.E002,
-            f"invalid JSON in {path}: {exc}",
-            [{
-                "path": str(path),
-                "message": str(exc)
-            }],
-        ) from exc
-    return Master(raw=raw, source_path=path)
+    from orchd.registry import load_registry
+
+    return load_registry(path)
 
 
 def validate_structure(master: Master) -> list[ValidationError]:
@@ -890,11 +873,12 @@ def filter_terminal_quality_warnings(
 
 
 def _validate_additional_sources(
-    t: dict,
+    t: dict[str, Any],
     i: int,
     tid: str,
-    workspace_root,
-    project_root,
+    workspace_root: Path,
+    project_root: Path,
+    terminal_ids: frozenset[str] = frozenset(),
 ) -> list["ValidationError"]:
     """additional_sources 独立遍历（task-additional-sources-standalone-validation）。
 
@@ -905,12 +889,21 @@ def _validate_additional_sources(
     独立性：由调用方置于主 source 短路（无 source / 非 str / 终态任务 /
     source 格式非法）**之前**执行，故四类短路路径下附加引用仍被逐条校验。
     本函数自身不做任何短路（含终态任务亦校验）。
+
+    终态豁免（task-additional-sources-terminal-exempt）：``tid`` 在终态集合时，
+    跳过**存在性**检查（条目在场 + pending / 章节头命中）——归档机制会把已完结
+    条目搬走，存在性失败属正常生命周期而非引用非法（与主 source 的 P2-2 豁免
+    同理）。类型 / 格式检查恒执行（新卡防丢与补挂卫生不受影响）；工作区文件
+    缺失照常报错（环境问题，非归档所致）。终态补挂新引用仅验格式（已知窄边界，
+    见 review 记录）。
     """
     import re as _re
 
     # spec.py 依赖方向为 errors.py，此处惰性导入 ledger 纯路径 helper
     # （与 validate_source 同模式，无循环依赖：ledger 不导入 spec）。
     from orchd.ledger import resolve_roadmap_path
+
+    terminal = tid in (terminal_ids or frozenset())
 
     errors: list["ValidationError"] = []
     additional = t.get("additional_sources")
@@ -943,6 +936,8 @@ def _validate_additional_sources(
                         message=f"task '{tid}' additional_sources 引用 IDEAS.md 但文件缺失",
                     ))
                     continue
+                if terminal:
+                    continue
                 for se in _check_idea_reference(tid, i, aref, ideas_path):
                     se.path = base_path
                     errors.append(se)
@@ -954,6 +949,8 @@ def _validate_additional_sources(
                         path=base_path,
                         message=f"task '{tid}' additional_sources 引用 ROADMAP.md 但文件缺失",
                     ))
+                    continue
+                if terminal:
                     continue
                 for se in _check_roadmap_reference(tid, i, aref, rpath):
                     se.path = base_path
@@ -1006,23 +1003,27 @@ def validate_source(
     # ideas-archive 归档机制会把已完结的 IDEAS 条目移入 IDEAS-archive.md，终态任务的
     # source 条目必然已被归档，全量调用（未来巡检/接入）不应报 E025 误报。
     # 惰性加载 ledger 状态；拿不到（无 ledger / replay 异常）时保持全量校验（不豁免）。
-    terminal_ids: set[str] = set()
+    terminal_ids: frozenset[str] = frozenset()
     try:
         from orchd.ledger import Store
         store = Store(workspace_root)
+        _terminal: set[str] = set()
         for _tid, _ts in store.replay().items():
             if _ts.status in ("completed", "cancelled"):
-                terminal_ids.add(_tid)
+                _terminal.add(_tid)
+        terminal_ids = frozenset(_terminal)
     except Exception:
-        terminal_ids = set()
+        terminal_ids = frozenset()
 
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
         # task-additional-sources-standalone-validation：附加引用独立遍历——
         # 先于主 source 的全部短路（无 source / 非 str / 终态 / 格式非法）执行，
-        # 四类路径下仍逐条校验（E025 形同虚设的旁路消除）。
+        # 四类路径下仍逐条校验（E025 形同虚设的旁路消除）。终态集合透传供存在性
+        # 豁免（归档搬走的存量引用，见本函数 docstring）。
         errors.extend(
-            _validate_additional_sources(t, i, tid, workspace_root, project_root))
+            _validate_additional_sources(t, i, tid, workspace_root, project_root,
+                                         terminal_ids))
         source = t.get("source")
         if not source or not isinstance(source, str):
             continue

@@ -103,3 +103,6 @@ $null
 # core.hooksPath 指向 .githooks 后，claim 期安装的 L3 pre-commit hook 落进被跟踪的
 # .githooks/ 目录；该运行时产物须忽略，避免活跃 claim 期 git status 常显未跟踪。
 .githooks/pre-commit
+# 同上（task-ref-tx-hook）：reference-transaction 强制层 hook 同为 claim 期运行时
+# 产物，保持生效期间亦须忽略，否则 git status 常显未跟踪。
+.githooks/reference-transaction

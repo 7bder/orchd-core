@@ -96,7 +96,7 @@ ignore = [
 "orchd/cli/commands/init.py" = ["E501"]
 "orchd/cli/commands/misc.py" = ["E501"]
 "orchd/cli/commands/query.py" = ["E501"]
-"orchd/cli/commands/session.py" = ["E501"]
+
 "orchd/cli/commands/workflow.py" = ["E501"]
 "orchd/cli/identity.py" = ["E501"]
 "orchd/cli/parser.py" = ["E501"]

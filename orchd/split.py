@@ -338,12 +338,37 @@ def _log_amend_guard_degrade(entry: dict[str, Any]) -> None:
         pass
 
 
+def _git_head_sha(project_root: Path | None) -> str | None:
+    """best-effort 取 HEAD SHA；非 git / 异常 → None（调用方跳过 CAS）。
+
+    供 amend 的乐观并发校验（task-concurrent-amend-lost-update）与调用方读时
+    快照共用。空串按 None 处理。
+    """
+    if project_root is None:
+        return None
+    try:
+        import subprocess as _sp
+
+        proc = _sp.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=10,
+        )
+    except (_sp.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() or None
+
+
 def amend(
     orchd_dir: Path,
     master: Master,
     store: Store,
     revise_terminal: str | None = None,
     reason: str | None = None,
+    expected_head: str | None = None,
+    release_lock: bool = True,
 ) -> dict[str, Any]:
     """增量更新 snapshot：按状态约束矩阵过滤变更。
 
@@ -380,6 +405,15 @@ def amend(
         以及条件字段 ``degraded_guards``：准入锁 / HEAD 漂移检测 best-effort 降级时
         非空，逐条给出 guard / reason / error / hint，供 agent 判断「本次未经准入锁
         保护」而非误读为「已确认无并发注册」）。
+        ``release_lock=False`` 时另含 ``_intake_lock``（调用方提交后释放；仅内部
+        通道使用，调用方须在返回响应前 pop 掉，不外泄）。
+
+    并发语义（task-concurrent-amend-lost-update）：``expected_head`` 为调用方读
+    master 时的 HEAD。持锁后比对，不一致 → E007 ``stale_base`` fail-closed（重试
+    即重读最新 base，自然收敛）。读与 dry-run（数十秒）发生在锁外，仅靠准入锁
+    串行化不够——两 amend 可先后读同一 base 再先后写，后写者静默覆盖（丢失更新）；
+    ``head_drift_check`` 判的是工作区相对自分支，不覆盖此形，故独立比对。
+    ``expected_head=None``（老调用 / 非 git）→ 跳过比对。
     """
     orchd_dir = Path(orchd_dir)
     tasks = master.tasks
@@ -509,6 +543,19 @@ def amend(
     store.acquire_lock()
     try:
         state = store.replay()
+
+        # task-concurrent-amend-lost-update：乐观并发（CAS）——持锁后第一件事。
+        # expected_head 为调用方读 master 时的 HEAD；不一致说明读后有并行提交，
+        # 此时写入必覆盖他人内容 → E007 stale_base 拒绝（未写任何内容，可直接重试）。
+        if expected_head is not None and intake_lock is not None:
+            _head_now = _git_head_sha(project_root)
+            if _head_now is not None and _head_now != expected_head:
+                raise OrchdError(
+                    ErrorCode.E007,
+                    "stale_base: main 已被并行推进，本次 amend 未写入任何内容——"
+                    "请直接重试 amend（将重读最新 base 重放变更）",
+                    [{"expected_head": expected_head, "head_now": _head_now}],
+                )
 
         # task-terminal-spec-revision-channel：修订开关前置校验——先于任何写入，
         # 不合规立即 E007/E005（不写事件、不改快照、不落任何副作用）。
@@ -650,6 +697,11 @@ def amend(
                                     "claimed task files_to_edit 只增不删："
                                     f"禁止删除已声明文件 {sorted(removed)}，"
                                     "仅允许添加遗漏连带文件"
+                                ),
+                                "hint": (
+                                    "出路（task-amend-patch-write-after-validate）："
+                                    "确需删声明请 retract --disposition retry（免认领冷却）"
+                                    "退回 pending 后 amend，再 claim（无需 --force）"
                                 ),
                             })
                             continue
@@ -1016,11 +1068,21 @@ def amend(
                     ),
                 ))
             store.update_checkpoint(store.replay())
+    except Exception:
+        # 调用方持有模式（release_lock=False）异常亦释放——调用方永无对象可放，
+        # 不释放即进程内泄漏；默认模式沿旧行为（异常即泄漏，进程退出回收）。
+        if intake_lock is not None and not release_lock:
+            try:
+                intake_lock_release(intake_lock)
+            except Exception:
+                pass
+        raise
     finally:
         store.release_lock()
 
-    # task-intake-file-lock：finally 释放准入写锁（异常路径也释放，防残留卡死后续准入）
-    if intake_lock is not None:
+    # task-intake-file-lock：成功路径释放准入写锁；release_lock=False 时跳过释放
+    # （所有权移交调用方，锁对象经下方 result["_intake_lock"] 透出，调用方提交后释放）。
+    if intake_lock is not None and release_lock:
         try:
             intake_lock_release(intake_lock)
         except Exception:
@@ -1045,6 +1107,9 @@ def amend(
     # R2-4：准入守卫降级不静默——非空时并入响应（无降级则维持既有字段集合）
     if degraded_guards:
         result["degraded_guards"] = degraded_guards
+    # task-concurrent-amend-lost-update：调用方持有模式透出锁对象（写+提交原子化）。
+    if intake_lock is not None and not release_lock:
+        result["_intake_lock"] = intake_lock
     return result
 
 

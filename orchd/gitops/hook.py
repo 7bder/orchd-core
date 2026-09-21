@@ -23,6 +23,12 @@ _HOOK_SHEBANG = "#!/bin/sh"
 # 归属标记只扫首部 N 行（生成物标记在第 2 行）：避免把正文里偶然提到标记串的
 # 宿主 hook 误判为本引擎生成物。
 _HOOK_MARKER_SCAN_LINES = 5
+# 强制层 hook（task-ref-tx-hook）：git reference-transaction，红线 #1/#2 的**强制**拦截
+# ——代理（orchd git <args>）为便捷层，被绕过时由本 hook 在引用事务边界兜底。
+_REF_TX_HOOK_FILENAME = "reference-transaction"
+# 专属标记：归属判定仍复用 _HOOK_MARKER（owner-aware 语义与 pre-commit 一致），本标记
+# 供回读自检与人工辨识「这是强制层而非提交层」。
+_REF_TX_HOOK_MARKER = "# orchd ref-transaction hook (red line #1/#2 enforcement)"
 # 仓库自带 hooks 目录（随 clone 检出，内含 pre-push 发版同步保护等仓库级 hook）。
 # 只有 core.hooksPath 指向它才会生效——该配置是**本地仓库配置**，不随 clone 传播。
 _REPO_HOOKS_DIR = ".githooks"
@@ -334,6 +340,131 @@ def _log_hook_skip(action: str, payload: dict[str, Any]) -> None:
         pass
 
 
+def _get_ref_tx_hook_path(project_root: Path) -> Path:
+    """reference-transaction hook 路径（与 pre-commit 同 hooks 目录、同 hooksPath 语义）。"""
+    return _get_hooks_dir(project_root) / _REF_TX_HOOK_FILENAME
+
+
+def ref_tx_hook_content() -> str:
+    """生成强制层 hook 脚本（shell shim → ``python -m orchd.gitops.ref_tx_hook``）。
+
+    与 pre-commit hook 同约定：纯 LF、含 shebang 与 orchd 归属标记（首部 5 行内）——
+    故复用 :func:`_validate_hook_content` 的形态自检与 :func:`_is_orchd_hook` 的
+    owner-aware 判定（宿主自有 reference-transaction hook 一律不覆盖 / 不删除）。
+
+    引擎定位（宿主布局事实：宿主项目自带 ``.orchd/`` 引擎副本，`python .orchd/__main__.py`）：
+    ① ``$ORCHD_SRC_DIR``（显式；CI / 外置安装）→ ② ``<git toplevel>/.orchd``（宿主自带）
+    → ③ ``import orchd``（源码仓库内运行）。三者皆不可用时打印诊断并放行（**禁止静默**，
+    且不阻断宿主 git 操作——与 pre-commit 的解释器缺失处置同族）。
+    """
+    py_code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from orchd.gitops.ref_tx_hook import main; "
+        'sys.exit(main(["reference-transaction"] + sys.argv[2:]))'
+    )
+    module_rel = "orchd/gitops/ref_tx_hook.py"
+    py_probe = "python / python3 / py"
+    no_py = f"[orchd ref-tx] 未找到可用 python 解释器（{py_probe}）"
+    no_engine = (
+        "[orchd ref-tx] 未定位到 orchd 引擎（ORCHD_SRC_DIR / <toplevel>/.orchd / "
+        "<toplevel> 均不含引擎源码）"
+    )
+    return (
+        f"{_HOOK_SHEBANG}\n"
+        f"{_HOOK_MARKER}\n"
+        f"{_REF_TX_HOOK_MARKER}\n"
+        "# 红线 #1/#2 强制层：引用事务 prepared 阶段拦截（绕过代理直连 git 同样被拒）。\n"
+        "# 逃生口：ORCHD_ALLOW_REF_TX=1（人工修复 / 仓库迁移）。\n"
+        "set -u\n"
+        "\n"
+        'ORCHD_PY=""\n'
+        "for _CAND in python python3 py; do\n"
+        '    if command -v "$_CAND" >/dev/null 2>&1; then\n'
+        '        ORCHD_PY="$_CAND"\n'
+        "        break\n"
+        "    fi\n"
+        "done\n"
+        'if [ -z "$ORCHD_PY" ]; then\n'
+        f'    echo "{no_py} → 强制层未生效（禁止静默）" >&2\n'
+        "    exit 0\n"
+        "fi\n"
+        "\n"
+        "# 引擎定位（纯文件判定，不做 import 探针——探针成功但实际导入失败会导致\n"
+        "# 「意外 fail-closed」：hook 报错退出，git 事务被中止，宿主提交被无故阻断）。\n"
+        'ORCHD_SRC=""\n'
+        f'if [ -n "${{ORCHD_SRC_DIR:-}}" ] && [ -f "$ORCHD_SRC_DIR/{module_rel}" ]; then\n'
+        '    ORCHD_SRC="$ORCHD_SRC_DIR"\n'
+        "else\n"
+        '    _ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")\n'
+        f'    if [ -n "$_ROOT" ] && [ -f "$_ROOT/.orchd/{module_rel}" ]; then\n'
+        '        ORCHD_SRC="$_ROOT/.orchd"\n'
+        f'    elif [ -n "$_ROOT" ] && [ -f "$_ROOT/{module_rel}" ]; then\n'
+        '        ORCHD_SRC="$_ROOT"\n'
+        "    fi\n"
+        "fi\n"
+        'if [ -n "$ORCHD_SRC" ]; then\n'
+        f"    exec \"$ORCHD_PY\" -c '{py_code}' \"$ORCHD_SRC\" \"$@\"\n"
+        "fi\n"
+        f'echo "{no_engine} → 强制层未生效（禁止静默）" >&2\n'
+        "exit 0\n"
+    )
+
+
+def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
+    """安装强制层 hook（best-effort；owner-aware：宿主自有同名 hook 不覆盖）。
+
+    与 pre-commit 共用同一 hooks 目录 / hooksPath 解析与形态自检，但不共用文件：
+    pre-commit 管「提交范围（E020）」，reference-transaction 管「引用事务（红线 #1/#2）」。
+    """
+    path = _get_ref_tx_hook_path(project_root)
+    if path.exists() and not _is_orchd_hook(path):
+        result = {
+            "installed": False, "reason": "foreign_hook_present", "path": str(path),
+            "hint": (
+                f"{path} 已存在且不含 orchd 标记头——判定为宿主自有 hook，未覆盖；"
+                "如需红线强制层生效请手动在该 hook 中调用 orchd 校验"
+            ),
+        }
+        _log_hook_skip("install_ref_tx_skipped_foreign_hook", result)
+        return result
+    content = ref_tx_hook_content()
+    check = _validate_hook_content(content)
+    if not check["ok"]:
+        result = {"installed": False, "reason": "invalid_generated_hook",
+                  "path": str(path), "error": check.get("error", "生成物自检未通过")}
+        _log_hook_skip("install_ref_tx_rejected_invalid_content", result)
+        return result
+    try:
+        _write_hook_file(path, content)
+    except (OSError, IOError) as exc:
+        return {"installed": False, "reason": "io_error", "path": str(path),
+                "error": str(exc)}
+    try:
+        written = path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return {"installed": False, "reason": "io_error", "path": str(path),
+                "error": str(exc)}
+    if _REF_TX_HOOK_MARKER not in written or not _validate_hook_content(written)["ok"]:
+        return {"installed": False, "reason": "invalid_written_hook", "path": str(path)}
+    return {"installed": True, "path": str(path)}
+
+
+def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:
+    """删除强制层 hook（best-effort；owner-aware：只删本引擎生成物）。"""
+    path = _get_ref_tx_hook_path(project_root)
+    if not path.exists():
+        return {"uninstalled": True, "reason": "not_exists", "path": str(path)}
+    if not _is_orchd_hook(path):
+        return {"uninstalled": False, "reason": "foreign_hook_present", "path": str(path),
+                "hint": "不含 orchd 标记头，判定为宿主自有 hook，未删除"}
+    try:
+        _safe_delete(path, project_root)
+        return {"uninstalled": True, "reason": "removed", "path": str(path)}
+    except (OSError, IOError) as exc:
+        return {"uninstalled": False, "reason": "io_error", "path": str(path),
+                "error": str(exc)}
+
+
 def hook_install(
     project_root: Path,
     task_id: str,
@@ -417,6 +548,12 @@ def hook_install(
     hooks_dir = _get_hooks_dir(project_root)
     if not (project_root / ".git").exists():
         return {"installed": False, "reason": "not_a_git_repo"}
+
+    # 强制层（task-ref-tx-hook）：与 pre-commit 同时安装——pre-commit 管「提交范围
+    # （E020）」，reference-transaction 管「引用事务（红线 #1/#2 强制拦截）」。两者
+    # 独立文件、独立 owner-aware 判定。安装时机放在 pre-commit 校验/写盘**之后**：
+    # 提交层生成物不合格时整轮安装即失败，此时不应额外落盘强制层文件（保持
+    # 「拒绝即不写任何文件」的既有语义，见 test_hook_content_guard）。
 
     exempt = exempt_files or []
 
@@ -828,7 +965,10 @@ exit 0
         }
         _log_hook_skip("install_rejected_written_content", result)
         return result
-    return {"installed": True, "path": str(hook_path), "hooks_path": hooks_path}
+    # 提交层写盘成功后才安装强制层（拒绝路径不落盘任何文件）
+    ref_tx = _install_ref_tx_hook(project_root)
+    return {"installed": True, "path": str(hook_path), "hooks_path": hooks_path,
+            "ref_tx_hook": ref_tx}
 
 
 def hook_uninstall(project_root: Path) -> dict[str, Any]:
@@ -847,9 +987,11 @@ def hook_uninstall(project_root: Path) -> dict[str, Any]:
             - ``{"uninstalled": False, "reason": "io_error", "error": <str>}``
               删除失败（best-effort 降级）。
     """
+    # 强制层与提交层同生命周期卸载（各自 owner-aware，互不波及宿主文件）
+    ref_tx = _uninstall_ref_tx_hook(project_root)
     hook_path = _get_hook_path(project_root)
     if not hook_path.exists():
-        return {"uninstalled": True, "reason": "not_exists"}
+        return {"uninstalled": True, "reason": "not_exists", "ref_tx_hook": ref_tx}
     # R2-3 owner-aware：只删除本引擎生成物（含 orchd 标记头）。宿主自有 hook
     # （husky / lint-staged / 手写）一律不动，返回不删原因。
     if not _is_orchd_hook(hook_path):
@@ -865,6 +1007,7 @@ def hook_uninstall(project_root: Path) -> dict[str, Any]:
         return result
     try:
         _safe_delete(hook_path, project_root)
-        return {"uninstalled": True, "reason": "removed"}
+        return {"uninstalled": True, "reason": "removed", "ref_tx_hook": ref_tx}
     except (OSError, IOError) as exc:
-        return {"uninstalled": False, "reason": "io_error", "error": str(exc)}
+        return {"uninstalled": False, "reason": "io_error", "error": str(exc),
+                "ref_tx_hook": ref_tx}

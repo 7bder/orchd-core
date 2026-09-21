@@ -243,6 +243,81 @@ def _validate_additional_sources_patch(
             )
 
 
+def _apply_register_proposals(master, register_path: str) -> None:
+    """task-amend-register-channel：读提案 JSON（单任务对象或任务数组）追加到 master。
+
+    注册契约（proposals/ schema 单一来源）：提案须为单个任务对象或任务数组。
+    非法提案 fail-fast（调用方在写盘前抛出 → canonical 零修改）：
+      ① 文件不存在 / ② JSON 解析失败 / ③ 提案为整份 master（疑似基于过期 canonical，
+      缺已有任务）/ ④ 缺必填字段 / ⑤ 重复 id。坏 source 由后续 amend() 的 E025 口径拒绝。
+    """
+    import json as _json
+
+    proposal_file = Path(register_path)
+    if not proposal_file.is_file():
+        raise OrchdError(
+            ErrorCode.E007,
+            "register_proposal_missing: 提案文件不存在",
+            [{
+                "register": str(proposal_file),
+                "hint": "传入 proposals/<id>.json（单任务对象）路径",
+            }],
+        )
+    try:
+        data = _json.loads(proposal_file.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise OrchdError(
+            ErrorCode.E002,
+            f"register_proposal_invalid_json: {exc}",
+            [{"register": str(proposal_file)}],
+        )
+    if isinstance(data, dict) and "tasks" in data:
+        raise OrchdError(
+            ErrorCode.E007,
+            "register_proposal_is_master: 提案应为单个任务对象或任务数组，收到整份 master"
+            "（疑似基于过期 canonical，缺已有任务）",
+            [{
+                "register": str(proposal_file),
+                "hint": "请把单任务定义写入 proposals/<id>.json 后重试",
+            }],
+        )
+    proposals = data if isinstance(data, list) else [data]
+    existing = {t.get("id") for t in master.tasks}
+    required = (
+        "id", "name", "brief", "module", "depends_on", "estimated_hours",
+        "difficulty", "requires", "acceptance_criteria", "files_to_edit", "source",
+    )
+    for prop in proposals:
+        if not isinstance(prop, dict):
+            raise OrchdError(
+                ErrorCode.E007,
+                "register_proposal_bad_type: 提案项须为任务对象",
+                [{"register": str(proposal_file)}],
+            )
+        missing = [f for f in required if f not in prop]
+        if missing:
+            raise OrchdError(
+                ErrorCode.E007,
+                "register_proposal_missing_fields: 提案缺必填字段",
+                [{
+                    "register": str(proposal_file),
+                    "missing": missing,
+                }],
+            )
+        tid = prop.get("id")
+        if tid in existing:
+            raise OrchdError(
+                ErrorCode.E007,
+                f"register_proposal_dup_id: 任务 id 已存在: {tid}",
+                [{
+                    "register": str(proposal_file),
+                    "id": tid,
+                }],
+            )
+        master.raw.setdefault("tasks", []).append(prop)
+        existing.add(tid)
+
+
 @_cli_skeleton
 def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """增量更新 snapshot，依据状态约束矩阵过滤变更。
@@ -260,6 +335,7 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     from orchd.onboard import _decode_subprocess_output
     from orchd.spec import load_master
     from orchd.split import (
+        _git_head_sha,
         amend,
         is_text_only_spec_revision,
         validate_terminal_revision,
@@ -303,8 +379,14 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             }],
         )
 
+    # task-amend-register-channel：显式注册通道 —— --register <proposal.json> 恒以
+    # canonical master 为写目标（忽略 --master，避免把注册写进临时/异仓 master）。
+    register_path = getattr(args, "register", None)
     default_master = getattr(args, "master", None)
-    if default_master in (None, "", ".orchd/_master.json"):
+    if register_path is not None:
+        canonical_root = resolve_canonical_project_root(Path.cwd())
+        master_path = canonical_root / ".orchd" / "_master.json"
+    elif default_master in (None, "", ".orchd/_master.json"):
         canonical_root = resolve_canonical_project_root(Path.cwd())
         master_path = canonical_root / ".orchd" / "_master.json"
     else:
@@ -345,6 +427,16 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     orchd_dir = master_path.parent
     store = Store(orchd_dir)
     project_root = orchd_dir.parent
+
+    # task-concurrent-amend-lost-update：读时 HEAD 快照（乐观并发 CAS 基准）。
+    # 后续 dry-run（数十秒）与提案应用均在锁外；split.amend 持锁后比对，不一致
+    # 即 E007 stale_base 拒绝（未写任何内容，可直接重试）。非 git → None 跳过。
+    read_head = _git_head_sha(project_root)
+
+    # task-amend-register-channel：读提案并追加新任务（非法提案 fail-fast，
+    # canonical 零修改——此处仅改内存 master，写盘在后续 amend() 校验通过后）。
+    if register_path is not None:
+        _apply_register_proposals(master, register_path)
 
     # task-terminal-spec-revision-channel：终态规格文本修订通道（--revise-terminal）。
     # --reason 非空硬校验前移到此处（任何写入 / dry-run 之前 fail-fast）；终态性校验
@@ -486,12 +578,10 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             overlap = _decl_withdraw_branch_overlap(
                 project_root, patch_task, [w["path"] for w in withdrawn])
             _log_decl_withdraw(patch_task, withdrawn, not_present, overlap)
-        # 补丁落盘：后续 dry-run 预计算与 amend() 均以文件为准对齐；
-        # amend 成功后的自动提交负责入库（与 intake 链路一致）。
-        master_path.write_text(
-            _json.dumps(master.raw, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        # task-amend-patch-write-after-validate：此处仅改内存 master，不落盘。
+        # 后续 dry-run 预计算与 amend() 均以内存对象为准（无任何回读文件），落盘
+        # 推迟到 amend() 成功之后——失败路径（E007/E025/E028）不留脏 master，
+        # 杜绝"失败 amend 污染声明域并致后续 amend 死锁"。
 
     # task-e028-dryrun-exit4-priority：dry-run 前置到写入/提交之前。
     # 原实现先 amend()（写 snapshot + amend 自动 commit）再 dry-run，E028 阻断时
@@ -667,66 +757,127 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             blocking_errors,
         )
 
-    # 校验通过后执行 amend（写入 snapshot + checkpoint；透传终态文本修订通道）
-    result = amend(
-        orchd_dir,
-        master,
-        store,
-        revise_terminal=revise_terminal,
-        reason=getattr(args, "reason", None),
-    )
-
-    # 成功后 best-effort 自动提交（锁外、不阻塞状态机，语义对齐 merged:false）
-    summary = ", ".join(changed) if changed else "snapshot refresh"
-
-    # 分支校验：intake/amend 约定只在 main 执行，非 main 时降级为不提交，
-    # 避免 master+IDEAS.md 被误提交进任务分支（污染待 merge 内容）
-    current_branch = get_current_branch(project_root)
-    default_branch = get_default_branch(project_root) or "main"
-    if current_branch is not None and current_branch != default_branch:
-        result["commit"] = {
-            "performed": False,
-            "reason": "not_on_main",
-            "branch": current_branch,
-        }
-    else:
-        # AC3（task-12-engine-path-abstraction）：IDEAS.md 走统一工作区根 helper
-        # （默认 .orchd/，兼容旧根路径）；commit 路径与 ensure_committed 期望一致。
-        ws_root = resolve_workspace_root(project_root)
-        # intake-commit-enforcement（2026-08-14）：提交范围含 ROADMAP.md——
-        # roadmap 摄入改的 ROADMAP.md 此前不在范围，必然残留未提交改动
-        commit = ensure_committed(
-            project_root,
-            [
-                str(master_path),
-                str(ws_root / "IDEAS.md"),
-                str(ws_root / "ROADMAP.md")
-            ],
-            f"chore(intake): orchd amend — {summary}",
+    # 校验通过后执行 amend（写入 snapshot + checkpoint；透传终态文本修订通道）。
+    # task-concurrent-amend-lost-update：release_lock=False 使准入写锁穿越
+    # master 写盘 + 自动提交（写+提交原子化），提交后在 finally 释放；amend 内
+    # CAS（expected_head=读时 HEAD）已在持锁后校验，未漂移才走到这里。
+    # amend() 内抛异常 → 锁由其内部 except 释放，此处 held_lock 保持 None。
+    held_lock: dict[str, Any] | None = None
+    try:
+        result = amend(
+            orchd_dir,
+            master,
+            store,
+            revise_terminal=revise_terminal,
+            reason=getattr(args, "reason", None),
+            expected_head=read_head,
+            release_lock=False,
         )
-        result["commit"] = commit
-        # intake-commit-enforcement（2026-08-14）：commit 降级可审计化（对齐
-        # merge_warning 先例）——注册成功后 commit 未执行（非 no_changes）不再
-        # 静默：写入 commit_warning 供 status --audit-intake 巡检。git 环境不可用
-        # （not_a_git_repo / git_unavailable）保留 best-effort 降级（判据 3）；
-        # git 可用但提交失败（commit_failed）同样告警——"注册成功但改动未入库"
-        # 违背"强制提交"语义，须人工核对。
-        if commit.get("performed") is False and commit.get(
-                "reason") != "no_changes":
-            result["commit_warning"] = {
-                "reason":
-                commit.get("reason"),
-                "message": (f"amend 注册成功但 commit 未执行（{commit.get('reason')}）："
-                            "摄入产物改动可能未入库"),
-                "hint": ("若为 git 环境异常，可运行 'orchd status --audit-intake' "
-                         "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"),
+        if isinstance(result, dict):
+            held_lock = result.pop("_intake_lock", None)
+
+        # task-amend-patch-write-after-validate：--task 补丁落盘点（--register 路径见
+        # 热修复 1b5cdef）。amend() 成功返回才写 master：此前任何失败（E007/E025/E028）
+        # 均在写盘前抛出，canonical 零修改；与 1b5cdef 同格式（无尾换行）。
+        # （锁仍持有中：写盘纳入原子区。）
+        if patch_task is not None:
+            master_path.write_text(
+                _json.dumps(master.raw, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        # task-amend-register-channel-hotfix（2026-09-21）：--register 路径内存追加后落盘。
+        # split.amend() 只重写快照不写 master（写盘仅 --task 分支 577 行），缺此行则注册
+        # 仅存于内存/快照、canonical master 丢失（新任务幽灵化；下次快照重生成连快照痕迹
+        # 一并消失，响应却报 amended:true）。位置：blocking_errors/dry-run 阻断之后、
+        # amend() 成功之后——失败路径不落盘；与 577 行同格式（无尾换行）。
+        if register_path is not None:
+            master_path.write_text(
+                _json.dumps(master.raw, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        # 成功后 best-effort 自动提交（锁内、不阻塞状态机，语义对齐 merged:false）
+        summary = ", ".join(changed) if changed else "snapshot refresh"
+
+        # 分支校验：intake/amend 约定只在 main 执行，非 main 时降级为不提交，
+        # 避免 master+IDEAS.md 被误提交进任务分支（污染待 merge 内容）
+        current_branch = get_current_branch(project_root)
+        default_branch = get_default_branch(project_root) or "main"
+        if current_branch is not None and current_branch != default_branch:
+            result["commit"] = {
+                "performed": False,
+                "reason": "not_on_main",
+                "branch": current_branch,
             }
+        else:
+            # AC3（task-12-engine-path-abstraction）：IDEAS.md 走统一工作区根 helper
+            # （默认 .orchd/，兼容旧根路径）；commit 路径与 ensure_committed 期望一致。
+            ws_root = resolve_workspace_root(project_root)
+            # intake-commit-enforcement（2026-08-14）：提交范围含 ROADMAP.md——
+            # roadmap 摄入改的 ROADMAP.md 此前不在范围，必然残留未提交改动
+            commit = ensure_committed(
+                project_root,
+                [
+                    str(master_path),
+                    str(ws_root / "IDEAS.md"),
+                    str(ws_root / "ROADMAP.md")
+                ],
+                f"chore(intake): orchd amend — {summary}",
+            )
+            result["commit"] = commit
+            # intake-commit-enforcement（2026-08-14）：commit 降级可审计化（对齐
+            # merge_warning 先例）——注册成功后 commit 未执行（非 no_changes）不再
+            # 静默：写入 commit_warning 供 status --audit-intake 巡检。git 环境不可用
+            # （not_a_git_repo / git_unavailable）保留 best-effort 降级（判据 3）；
+            # git 可用但提交失败（commit_failed）同样告警——"注册成功但改动未入库"
+            # 违背"强制提交"语义，须人工核对。
+            if commit.get("performed") is False and commit.get(
+                    "reason") != "no_changes":
+                result["commit_warning"] = {
+                    "reason":
+                    commit.get("reason"),
+                    "message": (f"amend 注册成功但 commit 未执行（{commit.get('reason')}）："
+                                "摄入产物改动可能未入库"),
+                    "hint": ("若为 git 环境异常，可运行 'orchd status --audit-intake' "
+                             "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"),
+                }
+    finally:
+        # 写+提交原子区出口：无论提交成败释放准入写锁（amend 内异常路径已自释，
+        # 此处 held_lock 为 None，不重复释放）。
+        if held_lock is not None:
+            try:
+                from orchd.ledger import intake_lock_release as _release_intake_lock
+
+                _release_intake_lock(held_lock)
+            except Exception:
+                pass
 
     if dry_run_results:
         result["verify_dry_run"] = dry_run_results
     if dry_run_skipped:
         # 透明化：本次跳过 dry-run 的任务（纯文本修订，verify_command 未变）
         result["verify_dry_run_skipped"] = dry_run_skipped
+
+    # task-amend-register-channel：注册语义显式化——
+    # ① --register：恒写 canonical，registered=true（一条龙注册）。
+    # ② amend --master 指向非 canonical：仅写该 master 所在 orchd_dir，不落当前
+    #    canonical → registered=false + 明确 hint（不再用 amended:true 暗示已注册）。
+    if register_path is not None:
+        result["registered"] = True
+    else:
+        # task-master-path-residual-convergence：经单一真源取 canonical master
+        # （对 canonical orchd_dir 自身解析恒等，无裸拼；AST 门禁零新增）。
+        from orchd.worktree import resolve_master_path_from_dir
+
+        canonical_master = resolve_master_path_from_dir(
+            resolve_canonical_project_root(project_root) / ".orchd")
+        if master_path.resolve() != canonical_master.resolve():
+            result["registered"] = False
+            result["hint"] = (
+                "amend --master 指向非 canonical master：本次仅写该 master 所在 orchd_dir，"
+                "未写入当前 canonical。如需注册，请把任务并入 canonical .orchd/_master.json "
+                "后重跑裸 amend，或用 `amend --register <proposal.json>` 显式注册。")
     return result
 
 
@@ -762,6 +913,7 @@ def _cmd_retract(args) -> dict:
         project_root=orchd_dir.parent,
         task_id=task_id,
         event_type=event_type,
+        disposition=getattr(args, "disposition", None) or "abandon",
     )
 
 
@@ -823,6 +975,11 @@ def register(sub) -> None:
     # amend
     p = sub.add_parser("amend", help="增量更新 snapshot")
     p.add_argument("--master", default=".orchd/_master.json")
+    p.add_argument("--register",
+                   default=None,
+                   metavar="PROPOSAL",
+                   help=("显式注册通道：读提案 JSON（单任务对象或任务数组），经 canonical 全套校验"
+                         "（结构/E025/质量/dry-run）后追加并一条龙注册；恒以 canonical master 为写目标"))
     p.add_argument("--task", default=None, help="声明域补登：目标任务 id（需至少再带一个补丁字段）")
     p.add_argument("--files-to-edit",
                    nargs="*",
@@ -891,6 +1048,10 @@ def register(sub) -> None:
                    ],
                    help="事件类型（配合 --task 自动定位最近匹配事件）")
     p.add_argument("--reason", required=True)
+    p.add_argument("--disposition", required=False, default=None,
+                   choices=["abandon", "retry", "handoff"],
+                   help="撤认处置：abandon（默认，触发300s认领冷却）/ retry（临时撤回后重试，"
+                        "免冷却，AC 修正环用它）/ handoff（移交他人，免冷却）")
     p.set_defaults(func=_cmd_retract)
 
     # force-status

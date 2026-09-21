@@ -8,6 +8,7 @@
 
 1. **认领任务**：`python .orchd/__main__.py request` 获取候选 → 确认能力匹配 → `python .orchd/__main__.py claim --task {id}`（会话指纹身份由宿主注入自动派生，无需指定 --agent/--role）
    - **若 `request` 返回无候选（`candidate=None` / `next_action=exit`）**：立即停止，不尝试 `claim`、不重试 `request`、不 `--auto-claim`；向用户报告并等待下一条指令（引擎分配为准）。
+   - **审查优先（自动执行时为硬默认，2026-09-20 用户裁定）**：若 `request` 返回 `next_action=review_first` / `review_priority`，**必须先领审查并做完（claim review → `review` 提交结论 → 尚有 code 阶段则到 merged）再回来领实现**；池内存在可领审查时**不得用 `claim --task <pending-id>` 点名摘实现任务**（点名只按任务状态分流、不查审查积压，即绕过该闸门）。仅当审查**确实无人可领**（`reviewers` 名单不含本指纹 / 已被他指纹认领 / 本会话 E011 busy）时才可领实现。
 2. **阅读上下文（按digest跳过，2026-09-13 读取纪律）**：按 files_to_read 列表读取文件（must_read 必读，reference 参考）；**claim 响应已含任务定义全文与 review_comments/previous_changes，无需再读 master.json**；规则文件（.orchd/rules/**、SKILL.md、templates/**）按 A1 判据：先 `python .orchd/__main__.py context-digest` 取sha256比对，哈希一致即跳过、仅重读变化项；>64KB 大文件用 grep/offset+limit 定位读（读取纪律 A1/A2/A3 详见 .orchd/SKILL.md）
 3. **实现**：修改 files_to_edit 中列出的文件，交付功能代码 + 测试代码
 4. **自验**：执行 verify_command 确认通过

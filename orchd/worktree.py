@@ -613,15 +613,22 @@ def bootstrap_container(project_root: Path, master_path: Path) -> dict[str, Any]
             created.append(str(master_file.relative_to(project_root)))
 
         # git init（best-effort；已是 git 仓库则跳过）
+        # A0c：**无 git 环境不得阻断 init**——接入门槛降到「有目录即可」。
+        # 无 git 可执行文件时 subprocess 抛 FileNotFoundError（旧实现未捕获 → init 整体失败，
+        # 这正是「无 git 就进不来」的根因）；此处静默跳过，改由无 git 模式（快照目录 +
+        # 文件锁）承接，布局标记照写。
         if not (main_dir / ".git").exists():
-            subprocess.run(
-                ["git", "init", "-q"],
-                cwd=str(main_dir),
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_GIT_TIMEOUT,
-            )
+            try:
+                subprocess.run(
+                    ["git", "init", "-q"],
+                    cwd=str(main_dir),
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=_GIT_TIMEOUT,
+                )
+            except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                pass
 
         # 共享账本 runtime 根
         runtime = project_root / _RUNTIME_DIR
@@ -1321,6 +1328,144 @@ def guard_task_root(
     return {"guarded": True, "bound_root": str(bound)}
 
 
+def _propagate_vendored_engine(main_wt: Path, task_wt: Path) -> dict[str, Any]:
+    """把主工作树 vendored 引擎同步进任务 worktree（best-effort，永不抛异常）。
+
+    背景（task-worktree-vendored-engine-propagate，2026-09-21 实测）：宿主项目
+    的引擎唯一副本是安装器组装的 ``.orchd/orchd/``，而安装器 ``.orchd/.gitignore``
+    （``/*`` + 豁免集，不含 ``orchd/``）使其不入库；``git worktree add`` 只带已跟踪
+    文件 → 新 worktree 内 ``python .orchd/__main__.py`` 因 ``import orchd`` 失败
+    （ModuleNotFoundError → E999），引擎在 worktree 内跑不动自己。
+
+    语义（与 ROADMAP 拷贝先例同口径，见 _propagate_container_marker 内同步段）：
+    - 目标已含引擎（``__init__.py`` 存在：已跟踪入库或此前已同步）→ 跳过；
+    - 主工作树有 vendored 源 → 整目录拷贝（排除 ``__pycache__``），不入库；
+    - 主工作树无源（自托管仓：根 ``orchd/`` 已跟踪，worktree 自带分支引擎）→ 无动作。
+    拷贝物恒为 untracked（安装器忽略契约；宿主若自行跟踪则目标已存在走跳过分支），
+    故不产生已跟踪改动、不触发 E017。
+
+    Returns:
+        ``{"ok": bool, "method": "copied"|"exists"|"not_needed", "reason": str|None}``；
+        拷贝失败 → ``{"ok": False, ...}``（调用方以 degraded 透出，禁止静默）。
+    """
+    try:
+        src = Path(main_wt) / ".orchd" / "orchd"
+        dst = Path(task_wt) / ".orchd" / "orchd"
+        if (dst / "__init__.py").is_file():
+            return {"ok": True, "method": "exists", "reason": None}
+        if not (src / "__init__.py").is_file():
+            return {"ok": True, "method": "not_needed",
+                    "reason": "主工作树无 vendored 引擎（自托管布局，根 orchd/ 已跟踪）"}
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            str(src), str(dst),
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        return {"ok": True, "method": "copied", "reason": None}
+    except (OSError, shutil.Error) as exc:
+        return {"ok": False, "method": "copy_failed", "reason": str(exc)[:200]}
+
+
+def _task_branch_divergence(
+    project_root: Path, branch: str, base: str
+) -> dict[str, int] | None:
+    """任务分支相对主分支的超前/落后计数（best-effort，测不到返回 None）。
+
+    - ``ahead``：分支独有提交数（``base..branch``）；
+    - ``behind``：主分支独有提交数（``branch..base``）。
+    任一 git 调用失败 → None（调用方按"无法判定"处理，不阻断复用）。
+    """
+    try:
+        ahead = subprocess.run(
+            ["git", "rev-list", "--count", f"{base}..{branch}"],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        behind = subprocess.run(
+            ["git", "rev-list", "--count", f"{branch}..{base}"],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        if ahead.returncode != 0 or behind.returncode != 0:
+            return None
+        return {"ahead": int(ahead.stdout.strip()), "behind": int(behind.stdout.strip())}
+    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def _recreate_task_wt_from_base(
+    project_root: Path, wt_path: Path, branch: str, base: str
+) -> bool:
+    """纯陈旧分支的安全重建（仅调用方确认 ahead == 0 后调用）。
+
+    ``git worktree remove --force`` + ``git branch -d``（安全删除：ahead == 0
+    意味着分支 tip 已合入 base，``-d`` 必成功；用 ``-d`` 不用 ``-D``，语义即断言）。
+    任一步失败 → False（调用方回退复用 + degraded 留痕，禁止半截状态）。
+    """
+    try:
+        rm = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt_path)],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        if rm.returncode != 0:
+            return False
+        delete = subprocess.run(
+            ["git", "branch", "-d", branch],
+            cwd=str(project_root), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        return delete.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
+
+
+def _check_stale_baseline(
+    project_root: Path, branch: str, wt_path: Path
+) -> dict[str, Any] | None:
+    """复用路径的基线新鲜度判定（task-claim-stale-baseline-gate）。
+
+    Returns:
+        - ``None``：新鲜（behind == 0）或无法判定（base 未知 / git 异常）——
+          调用方照常复用；
+        - ``{"action": "reuse", "warning": {...}}``：分叉且含独有提交——调用方挂
+          ``stale_baseline_warning`` 后复用；
+        - ``{"action": "recreate", "base": str, "behind": int}``：纯陈旧指针——
+          调用方安全重建后落创建流。
+
+    ``wt_path`` 仅作签名对称（未来可校验 worktree 实指分支），当前未使用。
+    """
+    try:
+        from orchd.gitops import get_default_branch
+
+        base = get_default_branch(project_root)
+    except Exception:
+        return None
+    if not base:
+        return None
+    div = _task_branch_divergence(project_root, branch, base)
+    if div is None or div["behind"] == 0:
+        return None
+    if div["ahead"] > 0:
+        return {
+            "action": "reuse",
+            "warning": {
+                "behind": div["behind"],
+                "ahead": div["ahead"],
+                "branch": branch,
+                "base": base,
+                "hint": (
+                    f"任务分支 {branch} 落后 {base} {div['behind']} 提交、"
+                    f"含独有提交 {div['ahead']} 个：已复用陈旧基线（实现数据在分支上，"
+                    "引擎不自动重建）。判据：git rev-list --count HEAD..main。建议先用 "
+                    "`git log --oneline HEAD..main -- <改动文件>` 确认 main 侧进展，"
+                    "必要时在任务 worktree 内 merge main 同步基线后再实现。"
+                ),
+            },
+        }
+    return {"action": "recreate", "base": base, "behind": div["behind"]}
+
+
 def _propagate_container_marker(task_wt: Path, main_wt: Path) -> None:
     """把 container 布局标记写入任务 worktree 的 ``.orchd/``（best-effort）。
 
@@ -1478,6 +1623,27 @@ def _master_suppression_entry(wt_path: Path) -> dict[str, Any]:
     }
 
 
+def _merge_vendored_engine_entry(
+    result: dict[str, Any], main_wt: Path, wt_path: Path
+) -> None:
+    """把 vendored 引擎同步段并入 ``ensure_task_wt`` 结果（就地）。
+
+    ``degraded`` 取或、原因串拼接——禁止吞掉 ``_master_suppression_entry`` 的抑制
+    告警（两段共用 ``degraded`` / ``degraded_reason`` 键，直接 update 会互吞）。
+    同步失败（源存在但拷不过去）才置 degraded；``exists`` / ``not_needed`` /
+    ``copied`` 仅留 ``vendored_engine`` 明细段。
+    """
+    prop = _propagate_vendored_engine(main_wt, wt_path)
+    result["vendored_engine"] = prop
+    if prop.get("ok") is False:
+        result["degraded"] = True
+        reason = (
+            f"vendored 引擎同步失败（{prop.get('method')}）：{prop.get('reason')}"
+        )
+        prev = result.get("degraded_reason")
+        result["degraded_reason"] = f"{prev}；{reason}" if prev else reason
+
+
 def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
     """创建/复用任务 worktree（best-effort，幂等）。
 
@@ -1536,7 +1702,55 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             _propagate_container_marker(wt_path, project_root)
             result = {"worktree": wt_path, "separate": True, "created": False}
             result.update(_master_suppression_entry(wt_path))
-            return result
+            _merge_vendored_engine_entry(result, project_root, wt_path)
+            # 陈旧基线门禁（task-claim-stale-baseline-gate）：复用路径须验分支相对
+            # 主分支的新鲜度。retract 只解绑不清分支（见 onboard/control.py），重领
+            # 会静默复用落后基线（2026-09-21 实测落后 10 提交还浑然不觉）。
+            # - behind == 0 → 新鲜，照常复用；
+            # - behind > 0 且 ahead == 0 → 纯陈旧指针（无独有提交）：安全重建——
+            #   worktree 移除 + 分支安全删除（-d，已合入必成功）后**落到下方创建流**
+            #   从当前 base 重建；重建失败则回退复用 + degraded 留痕；
+            # - behind > 0 且 ahead > 0 → 含独有实现：**禁止自动重建**（删分支即丢
+            #   数据），挂 stale_baseline_warning 告警后复用，处置权交 agent；
+            # - 测不到（base 未知 / git 异常）→ 维持旧行为（无门禁），不静默降级以外的
+            #   任何假设（门禁按"有判据才生效"，见函数 docstring）。
+            stale = _check_stale_baseline(project_root, branch, wt_path)
+            if stale is None or stale.get("action") == "reuse":
+                if stale is not None:
+                    result["stale_baseline_warning"] = stale["warning"]
+                    print(
+                        "orchd ▸ [worktree] {\"action\": \"stale_baseline_reused\", "
+                        f"\"task_branch\": \"{branch}\", "
+                        f"\"behind\": {stale['warning']['behind']}, "
+                        f"\"ahead\": {stale['warning']['ahead']}" + "}",
+                        file=sys.stderr,
+                    )
+                return result
+            if _recreate_task_wt_from_base(
+                project_root, wt_path, branch, stale["base"]
+            ):
+                print(
+                    "orchd ▸ [worktree] {\"action\": \"stale_baseline_recreated\", "
+                    f"\"task_branch\": \"{branch}\", "
+                    f"\"behind\": {stale['behind']}" + "}",
+                    file=sys.stderr,
+                )
+                # 落到下方创建流：从当前 base 重建（created: True 即为重建证据，
+                # 与首建同形，辅以本 stderr 留痕区分）。
+            else:
+                result["degraded"] = True
+                prev = result.get("degraded_reason")
+                _reason = (
+                    "陈旧基线重建失败（worktree 移除或分支安全删除未成功）："
+                    "已回退复用陈旧分支，见 stale_baseline_warning"
+                )
+                result["degraded_reason"] = f"{prev}；{_reason}" if prev else _reason
+                result["stale_baseline_warning"] = {
+                    "behind": stale["behind"], "ahead": 0,
+                    "branch": branch, "base": stale["base"],
+                    "hint": _reason,
+                }
+                return result
         # 创建期不变量硬化（W-4，复盘 P1 孤儿分支修复）：任务分支必须从**主分支**
         # fork（`git worktree add -b task/<id> <path> <main>`），杜绝因主工作树当
         # 前检出的非 main 分支而生成孤儿/悬空分支。base 解析失败（无 main/master）
@@ -1597,6 +1811,7 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             _propagate_container_marker(wt_path, project_root)
             result = {"worktree": wt_path, "separate": True, "created": True}
             result.update(_master_suppression_entry(wt_path))
+            _merge_vendored_engine_entry(result, project_root, wt_path)
             return result
         # worktree add 失败（如分支已在别处 checkout）→ best-effort 降级主工作树，
         # 但降级原因显式记录（供 claim 告警 / 后续排查，禁止静默降级）。
@@ -1905,6 +2120,23 @@ def _task_status_for_recycle(store_root: Path, task_id: str) -> str | None:
     return ts.status if ts else None
 
 
+def _classify_remove_failure(err_text: str | None, engine_cwd_inside: bool) -> str | None:
+    """worktree 移除失败归因（task-review-submit-mainwt-guidance）。
+
+    ``Permission denied`` 且引擎自身 cwd 当时不在待删目录内 → 持有者极可能是
+    调用方 shell 的 cwd（协议要求认领/审查在任务分支执行，review 提交时调用方
+    常仍站在任务目录内，Windows 下删 cwd 确定性失败）→ ``cwd_held_by_caller``。
+    引擎自身曾在目录内（已自愈仍失败）则归外部句柄（杀毒/索引），返回 None
+    走通用失败通道。
+
+    Returns:
+        ``"cwd_held_by_caller"`` 或 None（通用失败）。
+    """
+    if "permission denied" in (err_text or "").lower() and not engine_cwd_inside:
+        return "cwd_held_by_caller"
+    return None
+
+
 def remove_task_wt(
     project_root: Path, task_id: str, store_root: Path, *, lock_held: bool = False,
     force_recycle: bool = False,
@@ -2072,6 +2304,7 @@ def remove_task_wt(
             "actor": actor,
         })
     remove_error: str | None = None
+    _remove_reason: str | None = None
     registry_pruned: bool | None = None
     try:
         if wt_existed:
@@ -2101,6 +2334,8 @@ def remove_task_wt(
                     discarded_uncommitted = proc.returncode == 0
                 else:
                     remove_error = (proc.stderr or proc.stdout or "").strip()[:300]
+                    _remove_reason = _classify_remove_failure(
+                        proc.stderr or proc.stdout or "", _cwd_inside)
             removed = proc.returncode == 0
         else:
             # W-8 / R-35：目录本就不存在时仍收敛 git 登记——陈旧登记会占用
@@ -2120,6 +2355,8 @@ def remove_task_wt(
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
         remove_error = f"{type(exc).__name__}: {exc}"[:300]
         removed = False
+        if isinstance(exc, PermissionError):
+            _remove_reason = _classify_remove_failure(str(exc), _cwd_inside)
     finally:
         # W-7：os.chdir 是进程级副作用，移除阶段结束即恢复调用方原 cwd。原 cwd 已被
         # 本次回收删除（常见情形）时保持 stable_wt，避免把进程放进失效目录；后续
@@ -2141,6 +2378,8 @@ def remove_task_wt(
     }
     if remove_error:
         _remove_record["error"] = remove_error
+    if _remove_reason:
+        _remove_record["reason"] = _remove_reason
     if registry_pruned is not None:
         _remove_record["registry_pruned"] = registry_pruned
     recycle_log.append(_remove_record)
@@ -2295,10 +2534,15 @@ def remove_task_wt(
             "removed": removed,
             "residual_cleaned": residual_cleaned,
             "reason": (
-                "git worktree remove 未成功（常见于调用方 cwd 位于该 worktree 内，"
-                "或 Windows 文件句柄占用）"
-                if not removed
-                else "worktree 已注销但目录仍存在（残留空壳，Windows 句柄/杀毒扫描常见）"
+                "调用方 shell 的 cwd 仍位于待删目录，git worktree remove 被句柄占用拒绝"
+                "（切出目录后重试，或等下次引擎调用自动回收）"
+                if _remove_reason == "cwd_held_by_caller"
+                else (
+                    "git worktree remove 未成功（常见于调用方 cwd 位于该 worktree 内，"
+                    "或 Windows 文件句柄占用）"
+                    if not removed
+                    else "worktree 已注销但目录仍存在（残留空壳，Windows 句柄/杀毒扫描常见）"
+                )
             ),
             "hint": (
                 "退出该目录后重试回收；或运行 python .orchd/__main__.py doctor "

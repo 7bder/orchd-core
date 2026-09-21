@@ -176,6 +176,10 @@ def build_pool(
     # 预计算 blocked_downstream_count
     blocked_counts = compute_downstream_blocked(tasks, state)
 
+    # 能力集合提到循环外（task-pool-build-sort）：原实现在每个任务内重算
+    # ``set(capabilities)`` ⇒ O(T×C)；此处只建一次。
+    caps_set = set(capabilities) if capabilities is not None else None
+
     candidates: list[Candidate] = []
     for task in tasks:
         tid = task.get("id", "")
@@ -191,7 +195,7 @@ def build_pool(
             continue
 
         # 依赖放行：所有 depends_on 的任务必须 completed 或 cancelled
-        deps = task.get("depends_on", [])
+        deps = task.get("depends_on") or []
         deps_satisfied = True
         for dep_id in deps:
             dep_ts = state.get(dep_id)
@@ -202,10 +206,10 @@ def build_pool(
         if not deps_satisfied:
             continue
 
-        # 能力过滤
-        if capabilities is not None:
-            requires = set(task.get("requires", []))
-            if not requires.issubset(set(capabilities)):
+        # 能力过滤（空 requires 直接放行，免去集合构造）
+        if caps_set is not None:
+            requires = task.get("requires") or []
+            if requires and not set(requires).issubset(caps_set):
                 continue
 
         candidates.append(
@@ -355,46 +359,73 @@ def detect_file_conflict(
     return conflicts
 
 
-def get_dependency_closure(task_id: str, tasks: list[dict[str,
-                                                          Any]]) -> set[str]:
+def build_dependency_index(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """构建依赖索引：``{"map": {tid: task}, "children": {tid: [直接依赖它的 tid]}}``。
+
+    为什么要显式构建（task-pool-build-sort）：:func:`get_dependency_closure` 在
+    ``request`` 的**候选循环里逐个调用**。原实现每次调用都重建 task_map，且**子孙
+    遍历的每一步都对全表扫描一次**（``[tid for tid, t in task_map.items() if cur in
+    t["depends_on"]]``）⇒ 单次 O(T²)、整体 O(候选数 × T²)，任务量增长即失控。
+    本函数把「反向邻接」一次性建好，调用方**提到循环外**复用。
+
+    纯数据构建：无状态、不缓存、不依赖 git / 账本（符合性能冻结令「只做提/并/删」）。
+    """
+    task_map = {t.get("id", ""): t for t in tasks}
+    children: dict[str, list[str]] = {}
+    for tid, task in task_map.items():
+        for dep in (task.get("depends_on") or []):
+            children.setdefault(str(dep), []).append(tid)
+    return {"map": task_map, "children": children}
+
+
+def get_dependency_closure(
+    task_id: str,
+    tasks: list[dict[str, Any]],
+    index: dict[str, Any] | None = None,
+) -> set[str]:
     """返回目标任务的全图依赖传递闭包（祖先 + 子孙）。
 
     依赖相关的任务对按依赖顺序执行（build_pool / claim 的 E008 依赖放行保证
     不会并行领取），files_to_edit 共享不构成并发写冲突。request 依赖感知强制
     过滤用它判定"与 pending 依赖任务冲突"是否应放行。
 
+    复杂度：祖先 + 子孙各遍历一次可达集，**单次 O(T + E)**（原实现为 O(T²)——
+    子孙遍历每步全表扫描）。``index`` 为 :func:`build_dependency_index` 的产物，
+    供按候选逐个求闭包的调用点提到循环外复用；缺省时按 ``tasks`` 现场构建
+    （语义一致，零回归）。
+
     Args:
         task_id: 目标任务 ID。
         tasks: 所有任务定义（_master.json 的 tasks[]）。
+        index: 可选的预构建依赖索引（见 :func:`build_dependency_index`）。
 
     Returns:
         与 task_id 存在直接或传递依赖关系的全部 task_id 集合（不含自身）。
     """
-    task_map = {t.get("id", ""): t for t in tasks}
+    idx = index if index is not None else build_dependency_index(tasks)
+    task_map: dict[str, Any] = idx["map"]
+    children: dict[str, list[str]] = idx["children"]
+
     result: set[str] = set()
     # 向上（祖先）遍历
     seen: set[str] = set()
-    stack = list(task_map.get(task_id, {}).get("depends_on", []))
+    stack = list(task_map.get(task_id, {}).get("depends_on") or [])
     while stack:
         cur = stack.pop()
         if cur in seen or cur not in task_map:
             continue
         seen.add(cur)
-        stack.extend(task_map[cur].get("depends_on", []))
+        stack.extend(task_map[cur].get("depends_on") or [])
     result |= seen
-    # 向下（子孙）遍历：谁直接或间接依赖 task_id
+    # 向下（子孙）遍历：走反向邻接，O(出边) —— 不再每步全表扫描
     seen_desc: set[str] = set()
-    stack = [
-        tid for tid, t in task_map.items()
-        if task_id in t.get("depends_on", [])
-    ]
+    stack = list(children.get(str(task_id), ()))
     while stack:
         cur = stack.pop()
-        if cur in seen_desc or cur not in task_map:
+        if cur in seen_desc:
             continue
         seen_desc.add(cur)
-        stack.extend(tid for tid, t in task_map.items()
-                     if cur in t.get("depends_on", []))
+        stack.extend(children.get(cur, ()))
     result |= seen_desc
     return result
 

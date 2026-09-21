@@ -174,8 +174,10 @@ def _session_collision_warning(
 ) -> dict[str, Any] | None:
     """只读检测当前会话指纹的「并行会话碰撞」，返回 ``session_collision_warning`` 或 None。
 
-    host 注入项目级会话码（全项目同一 ``ORCHD_SESSION_ID``）时，所有并行对话派生出
-    **同一指纹**，引擎会把它们静默识别为同一身份、归属错乱。本函数仅只读 replay
+    两种成因按 reason 区分归因（task-e035-hint-split）：自审（reviewer session ==
+    实现者 session）首要成因是同一会话既实现又审查，按自审处置（comments 披露
+    或换会话）；并行活跃任务首要成因才是 host 项目级会话码注入（全项目同一
+    ``ORCHD_SESSION_ID`` 使并行对话派生同一指纹）。本函数仅只读 replay
     ledger，**不修改身份机制（resolve_agent_id 不变）、不落状态（不写 ledger/checkpoint）、
     不阻断命令**，只在命中时附加只读告警，提示 host 注入粒度违约。
 
@@ -221,9 +223,11 @@ def _session_collision_warning(
                 reason="self_implementation_review",
                 colliding_tasks=[review_task_id],
                 hint=(
-                    "当前会话与任务实现者 session 相同，疑似审查自己实现：host 注入的"
-                    "会话码可能为项目级（全项目同指纹/session），导致并行对话被识别为同一身份。"
-                    "请换一个独立会话（新对话 / 重新 session start 注入唯一会话码）担任 reviewer，或核对归属。"
+                    "当前会话与任务实现者 session 相同，疑似审查自己实现：请先按自审"
+                    "处置——在 review comments 首句披露自审（写明实现者 = 审查者），"
+                    "或换一个独立会话（新对话 / 重新 session start 注入唯一会话码）"
+                    "担任 reviewer；仅当各对话确已使用独立会话码但仍派生同指纹时，"
+                    "再按 host 会话码项目级注入排查。"
                 ),
             )
 

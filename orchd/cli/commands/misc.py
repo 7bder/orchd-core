@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import tempfile
@@ -106,6 +107,9 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         "last_pass_commit": head,
         "elapsed_seconds": reg_elapsed,
         "note": f"已写入 {orchd_dir / '_full_regression.json'}",
+        # task-milestone-check-gate：本次记录是 M1（单机内核冻结）B 组判据的输入，
+        # 刷新后可直接查门禁（避免"刷了记录却不知道下一步判什么"）。
+        "milestone_gate": "python .orchd/__main__.py milestone-check freeze",
     }, 0
 
 def _cmd_layout_migrate(args) -> dict:
@@ -155,6 +159,26 @@ def _cmd_context_digest(args) -> dict:
     return context_digest(orchd_dir.parent)
 
 
+def _cmd_git(args) -> dict:
+    """git 写操作代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截。
+
+    CLI 参数: args.git_args（``argparse.REMAINDER``，git 参数原样透传）。
+    返回: 代理载荷——只读子命令透传执行；任务分支 ``commit`` 放行；无 git 模式
+          降级（``commit`` 推进 committed 快照，其余 no-op）。
+    异常: 写操作被拒 → E007（红线 #1/#2）；``commit`` 不在任务分支 → E018。
+    """
+    from orchd.gitops.proxy import run_git_proxy
+    from orchd.ledger import resolve_agent_id
+
+    orchd_dir = _find_orchd_dir()
+    return run_git_proxy(
+        list(getattr(args, "git_args", None) or []),
+        project_root=orchd_dir.parent,
+        orchd_dir=orchd_dir,
+        agent_id=resolve_agent_id(orchd_dir),
+    )
+
+
 def register(sub) -> None:
     """注册 misc 模块的子命令。"""
     # layout-migrate（task-14-worktree-layout）：flat → container 迁移
@@ -184,4 +208,19 @@ def register(sub) -> None:
     # context-digest（task-context-digest-command）：必读面内容哈希只读命令
     p = sub.add_parser("context-digest", help="输出必读面内容哈希与字节数（未变即跳过重读的机械判据）")
     p.set_defaults(func=_cmd_context_digest)
+
+    # git 代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截
+    p = sub.add_parser(
+        "git",
+        help=(
+            "git 写操作代理：只读透传 / 任务分支 commit 放行 / 其余写操作按红线 #1/#2 "
+            "结构化拒绝（无 git 模式降级 no-op）"
+        ),
+    )
+    p.add_argument(
+        "git_args",
+        nargs=argparse.REMAINDER,
+        help="git 参数原样透传，如 status / log --oneline -5 / commit -m 'msg'",
+    )
+    p.set_defaults(func=_cmd_git)
 

@@ -90,13 +90,20 @@ def _cmd_session_end(args) -> dict:
     dirty_files = list_tracked_changes(project_root) or []
     forced = bool(getattr(args, "force", False))
     if dirty_files and not forced:
+        from orchd.gitops.guard import commit_hint_for_branch
+        try:
+            from orchd.gitops import get_current_branch
+            _branch = get_current_branch(project_root)
+        except Exception:
+            _branch = None
         raise OrchdError(
             ErrorCode.E017,
             "dirty_workspace_at_session_end: 工作区存在未提交的已跟踪文件改动，拒绝结束会话",
             [{
                 "dirty_files": dirty_files,
-                "hint": "请先提交上述改动（git add + git commit）后再 session end；"
-                       "如确需携带未提交改动结束，请使用 --force 显式放行（--force-reason 注明原因，审计可查）",
+                "hint": (commit_hint_for_branch(_branch)
+                         + "；如确需携带未提交改动结束，请使用 --force 显式放行"
+                           "（--force-reason 注明原因，审计可查）"),
             }],
         )
     force_bypass = None

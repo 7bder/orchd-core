@@ -9,8 +9,8 @@
 """
 
 from __future__ import annotations
-
 import subprocess
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from orchd.pool import (
     Candidate,
     INFLIGHT_MARKER,
     _build_claimed_files,
+    build_dependency_index,
     build_pool,
     detect_file_conflict,
     effective_importance,
@@ -270,29 +271,73 @@ def _filter_conflicts(
     claimed_files = _build_claimed_files(
         state, tasks, include_pending=True, inflight_files=inflight_files
     )
+    # 依赖索引一次构建（与候选数 N 无关）：闭包原实现单次 O(T²)（子孙遍历每步全表扫描），
+    # 且在每个候选循环里被反复调用 ⇒ 整体 O(候选数 × T²)（task-pool-build-sort 实测：
+    # 任务量增长时 request 的主要热点）。此处提到循环外，单次闭包降为 O(T + E)。
+    dep_index = build_dependency_index(tasks)
+    # 工作区可用性一次探测（task-pool-build-sort）：原实现把它放在**每个候选**的守卫里
+    # ⇒ 每候选一次 git 子进程（实测 n=200 时 173 次 spawn、占本路径绝大部分耗时）。
+    # 探测是循环不变量，故提到循环外；失败/不适用时按原语义逐候选记 guard_unavailable
+    # 并跳过（决策语义不变，降级留痕由「每候选一条」收敛为「一轮一条」）。
+    actual_probe: dict[str, Any] | None = None
+    actual_probe_failed = False
+    if project_root is not None:
+        def _probe_workspace() -> Any:
+            st = check_workspace_state(project_root)
+            if st.get("state") == "error":
+                raise RuntimeError(st.get("error") or st.get("reason"))
+            if not st.get("available"):
+                raise NotApplicableError(st.get("reason") or "unavailable")
+            return st
+
+        try:
+            actual_probe = run_guard(
+                _probe_workspace, guard_name="actual_changes_conflict",
+                on_error=GUARD_FAIL_CLOSED, fallback=None,
+                context={"command": "request"}, hint="conflict precheck",
+                degraded=degraded_guards)
+        except OrchdError as e:
+            if e.code is not ErrorCode.E030:
+                raise
+            actual_probe_failed = True
+
     for cand in candidates:
         conflicts = detect_file_conflict(state, tasks, cand.task, include_pending=True, claimed_files=claimed_files)
         # actual_changes_conflict 返回 list[dict]（与上方 conflicts 的 list[Conflict] dataclass
         # 不同源）；显式注解避免 mypy 沿控制流把本变量误并为 dataclass 列表（纯类型层修正）。
         actual_conflicts: list[dict[str, Any]] = []
         if project_root is not None:
-            def _guard() -> Any:
-                st = check_workspace_state(project_root)
-                if st.get("state") == "error":
-                    raise RuntimeError(st.get("error") or st.get("reason"))
-                if not st.get("available"):
-                    raise NotApplicableError(st.get("reason") or "unavailable")
-                from orchd.worktree import actual_changes_conflict
-                return actual_changes_conflict(project_root, state, tasks, cand.task)
-            try:
-                actual_conflicts = run_guard(_guard, guard_name="actual_changes_conflict", on_error=GUARD_FAIL_CLOSED, fallback=[], context={"task_id": cand.task.get("id", ""), "command": "request"}, hint="conflict precheck", degraded=degraded_guards) or []
-            except OrchdError as e:
-                if e.code is not ErrorCode.E030:
-                    raise
+            if actual_probe_failed:
                 guard_unavailable_count += 1
                 excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get("files_to_edit", [])), "claimed_by": "guard_unavailable", "source": "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
                 continue
-        dep_closure = get_dependency_closure(cand.task.get("id", ""), tasks)
+            if actual_probe is None:
+                # 环境不适用（非 git / 无 git）：与原先一致——不取实际改动，不阻断该候选
+                actual_conflicts = []
+            else:
+                from orchd.worktree import actual_changes_conflict
+
+                try:
+                    actual_conflicts = run_guard(
+                        partial(actual_changes_conflict,
+                                project_root, state, tasks, cand.task),
+                        guard_name="actual_changes_conflict",
+                        on_error=GUARD_FAIL_CLOSED, fallback=[],
+                        context={"task_id": cand.task.get("id", ""),
+                                 "command": "request"},
+                        hint="conflict precheck",
+                        degraded=degraded_guards) or []
+                except OrchdError as e:
+                    # 预检故障 ⇒ 该候选按 guard_unavailable 排除（fail-closed，不做
+                    # "默认无冲突"假设）；原实现同样逐候选处置，此处保持语义不变。
+                    if e.code is not ErrorCode.E030:
+                        raise
+                    guard_unavailable_count += 1
+                    excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get("files_to_edit", [])), "claimed_by": "guard_unavailable", "source": "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
+                    continue
+        dep_closure = get_dependency_closure(
+            cand.task.get("id", ""), tasks, index=dep_index
+        )
         # 显式注解：本列表由多来源 dict 字面量拼装（declared / inflight / actual），
         # 无注解时 mypy 会按首个 append 收窄元素类型。
         excluded: list[dict[str, Any]] = []

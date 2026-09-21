@@ -507,7 +507,8 @@ def _guard_shared_entry_coverage(
             missing_baseline_test_coverage(
                 changed,
                 verify_cmd,
-                _baseline_test_predicate(Path(project_root), degraded_guards),
+                _nogit_manifest_probe(Path(project_root), task_id, degraded_guards)
+                or _baseline_test_predicate(Path(project_root), degraded_guards),
             )
             if project_root
             else None
@@ -571,6 +572,52 @@ def _guard_shared_entry_coverage(
     )
 
 
+def _nogit_manifest_probe(
+    project_root: Path,
+    task_id: str | None,
+    degraded_guards: list[dict[str, Any]] | None,
+) -> BaselineTestProbe | None:
+    """无 git 等价：以 **claim 时建立的主目录基线快照**判定「基线既有」（task-nogit-guard-parity）。
+
+    形态 A 的基线在 git 模式下由 ``git ls-tree <基线 ref>`` 判定；无 git 单目录模式下
+    分支/ref 不存在，此前整体降级为「基线 ref 不可解析」⇒ 形态 A 门禁在无 git 下**完全
+    不生效**。等价实现：claim 已对主目录取基线快照（``base`` manifest，见
+    ``orchd.nogit.take_snapshot``），「基线既有」⇔ 该路径出现在 base manifest 中。
+
+    Returns:
+        - 非无 git orchd 项目 / 无 ``task_id`` → ``None``（调用方走既有降级）；-
+        - 有基线快照 → 谓词（manifest 命中谓 True，否则 False）；
+        - 无基线快照（claim 未建立）→ 恒 ``None`` 谓词**并留痕**（reason 与 git 侧的
+          「基线 ref 不可解析」可区分，便于定位是快照缺失还是 ref 缺失）。
+    """
+    if not task_id:
+        return None
+    from orchd.nogit import is_nogit_project, read_manifest, snapshot_dir
+
+    if not is_nogit_project(project_root):
+        return None
+    base = read_manifest(snapshot_dir(Path(project_root), task_id, "base"))
+    if base is None:
+        record_degraded_guard(
+            degraded_guards,
+            guard_name="shared_entry_coverage",
+            status=GUARD_STATUS_NOT_APPLICABLE,
+            reason="无 git 且无 claim 基线快照（main-base manifest 缺失）：形态 A 基线不可判定",
+            context={
+                "guard_rule": "global_shared_file",
+                "task_id": task_id,
+                "project_root": str(project_root),
+            },
+            hint=(
+                "无 git 单目录模式的形态 A 基线来自 claim 时建立的主目录快照；"
+                "本任务缺少 base 快照 ⇒ 覆盖判定被跳过。请重跑 claim 建立基线后重试 done"
+            ),
+        )
+        return lambda path: None
+    baseline_paths = {str(p).replace("\\", "/") for p in base}
+    return lambda path: str(path).replace("\\", "/") in baseline_paths
+
+
 def _baseline_test_predicate(
     project_root: Path, degraded_guards: list[dict[str, Any]] | None = None
 ) -> BaselineTestProbe:
@@ -582,6 +629,11 @@ def _baseline_test_predicate(
 
     兼容「修改既有测试文件」：只要该文件在基线上存在即计为基线既有——形态 A 排除的只有
     「本任务新建的文件」，不是「本任务改过的文件」。
+
+    **无 git 等价（task-nogit-guard-parity）**：无 git orchd 项目的基线由
+    :func:`_nogit_manifest_probe` 提供（claim 时主目录基线快照），调用方
+    （:func:`_guard_shared_entry_coverage`）在其返回非 ``None`` 时优先采用，故本函数
+    **签名与调用口径零变化**（既有 monkeypatch 用例不受影响）。
 
     基线 ref 全不可解析（``origin/HEAD`` / ``main`` / ``master`` 均失败）时**留痕不静默**
     （task-e039-escape-hatch-bypass-fix，pass6 Q-2）：记 ``degraded_guards``（E030 /
@@ -875,7 +927,7 @@ def _commit_and_verify_integrity(
     # _guard_clean_workspace 以 E017 阻断。扩展仅限提交范围；declared_diff / zero_residual
     # / out_of_scope 门禁仍以 files_to_edit 为准，与既有语义零回归。
     commit_files = list(dict.fromkeys([*files_to_edit, *task_def.get("exempt_files", [])]))
-    commit_result = _done_auto_commit(project_root, commit_files, commit_message)
+    commit_result = _done_auto_commit(project_root, commit_files, commit_message, task_id)
 
     # task-commit-timeout-failure-surface AC4：自动提交硬失败（commit_timeout /
     # commit_failed）时，后续干净守卫抛的 E017 附引擎提交诊断（reason/message），
@@ -924,12 +976,30 @@ def _done_auto_commit(
     project_root: Path | None,
     files_to_edit: list[str],
     commit_message: str,
+    task_id: str | None = None,
 ) -> dict[str, Any] | None:
     """锁外 best-effort 自动提交（verify 通过后、写 DONE 事件前）。
 
     提交范围限定任务声明的 files_to_edit，失败/跳过不影响状态机。
+
+    A0b / 单目录无 git（task-nogit-single-dir-pivot）：「提交」= 推进主目录
+    committed 快照（:func:`orchd.nogit.take_snapshot`），不经 git commit；
+    返回结构与 ``ensure_committed`` 兼容。判据为主目录基线快照存在（claim 已建立）。
     """
-    if not (project_root and files_to_edit):
+    if not project_root:
+        return None
+    if task_id:
+        from orchd.nogit import git_available as _git_avail, take_snapshot
+
+        if not _git_avail(Path(project_root)):
+            info = take_snapshot(Path(project_root), task_id, "committed")
+            return {
+                "performed": True,
+                "reason": "committed",
+                "message": "nogit: committed snapshot advanced",
+                "files": info["files"],
+            }
+    if not files_to_edit:
         return None
     return ensure_committed(project_root, files_to_edit, commit_message)
 

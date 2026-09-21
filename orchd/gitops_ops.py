@@ -357,6 +357,61 @@ def _clean_stale_index_lock(workdir: Path) -> bool:
     return False
 
 
+def _classify_merge_failure(stderr: str) -> dict[str, Any]:
+    """merge 非冲突失败分类（task-merge-failure-diagnostic）。
+
+    ``stderr`` 为 ``git merge`` 的原始错误文本。返回
+    ``{"kind", "files", "hint"}``：
+    - ``untracked_collision``：untracked 同路径碰撞（附文件清单；处置为文件系统
+      移动/删除，**非 git 写操作**，不违反红线；切勿 ``git add`` 它）；
+    - ``local_changes``：主工作树已跟踪脏写阻断（提交/还原归属，主分支无手动提交
+      豁免，须报告归属）；
+    - ``unknown``：其余（含空 stderr），附原文摘录供人工判定。
+    """
+    text = stderr or ""
+    m = re.search(
+        r"untracked working tree files would be overwritten by merge:\s*\n"
+        r"((?:[ \t]+.*\n?)+)",
+        text,
+    )
+    if m:
+        files = [
+            ln.strip().strip('"').strip("'")
+            for ln in m.group(1).splitlines()
+            if ln.strip()
+        ]
+        files = [f for f in files if f]
+        listing = "、".join(files) if files else "（未能解析）"
+        return {
+            "kind": "untracked_collision",
+            "files": files,
+            "hint": (
+                f"主工作树有未跟踪文件阻挡合并：{listing}。"
+                "用文件系统移走或删除它们（Remove-Item / 移出工作树，非 git 写操作，"
+                "不违反红线；切勿 git add）后，由同一 reviewer 重试 code APPROVED。"
+            ),
+        }
+    if "would be overwritten by merge" in text:
+        return {
+            "kind": "local_changes",
+            "files": [],
+            "hint": (
+                "主工作树已跟踪改动阻挡合并：请先确认改动归属并提交/还原（主分支无"
+                "手动提交豁免，归属不明请报告），后由同一 reviewer 重试 code APPROVED。"
+            ),
+        }
+    excerpt = text.strip()[:300]
+    return {
+        "kind": "unknown",
+        "files": [],
+        "hint": (
+            "merge 失败但无冲突、无可分类原因"
+            + (f"（git 原文：{excerpt}）" if excerpt else "（git 无输出）")
+            + "：确认 git 可用且主工作树干净后，由同一 reviewer 重试 code APPROVED。"
+        ),
+    }
+
+
 def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     """best-effort 将任务分支合并到主工作树的 main（task-14-merge-main-tree）。
 
@@ -366,7 +421,11 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     - 成功：``{"conflict": False}``
     - 内容冲突：``{"conflict": True, "files": [...]}``（files 取权威真源
       :func:`orchd.gitops.unmerged_paths`，不再用末词启发式）
-    - 环境异常：``None``（调用方按 best-effort 降级）。
+    - 非冲突失败：``{"conflict": False, "merge_diagnostic": {...}}``
+      （task-merge-failure-diagnostic：stage/stderr 摘录/分类，不再裸 ``None``——
+      裸 ``None`` 使 review 只能报无诊断的 ``merge_env_error`` 黑洞）
+    - 环境异常（checkout 失败 / git 不可用 / 抛异常）：``None``（调用方按
+      best-effort 降级，行为不变）。
     """
     try:
         workdir = main_worktree_root(project_root)
@@ -391,8 +450,8 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
             # 权威真源：索引中的未合并路径。必须在 merge --abort **之前**取——abort 会
             # 清掉索引未合并态，之后再查必然为空（task-conflict-true-source-fix）。
             paths = unmerged_paths(workdir)
-            # 三态：非空 → 冲突；空 → merge 失败但非冲突（本地脏写等，走既有
-            # merge_env_error 降级）；None（测不到）→ 保守按冲突上报且不崩。
+            # 三态：非空 → 冲突；空 → 非冲突失败（透出诊断，见上）；None（测不到）→
+            # 保守按冲突上报且不崩。
             if paths or paths is None:
                 # P2-7：冲突后立即 abort 清理 MERGE_HEAD，避免残留中间态阻塞后续 git 操作。
                 # try_auto_resolve_conflict 开头会再次 abort（幂等），此处先清理无副作用。
@@ -401,7 +460,15 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
                     capture_output=True, timeout=10,
                 )
                 return {"conflict": True, "files": paths or []}
-            return None
+            err = (result.stderr or "").strip()
+            return {
+                "conflict": False,
+                "merge_diagnostic": {
+                    "stage": "merge",
+                    "stderr_excerpt": err[:500],
+                    **_classify_merge_failure(err),
+                },
+            }
         return {"conflict": False}
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
@@ -842,6 +909,7 @@ def resolve_task_worktree(
         layout = detect_layout(Path(project_root))
         if layout.get("layout") == "container":
             cand = Path(layout["task_wt_root"]) / _task_wt_name(task_id)
+            # A0b（单目录收敛后）：无 git 即无任务 worktree 概念，仅 git 登记生效。
             if (cand / ".git").exists():
                 return cand
             # AC2: strict 模式下解析不到任务 worktree 时抛错阻断

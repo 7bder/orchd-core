@@ -236,6 +236,27 @@ def _claim_setup_worktree(
     worktree_path = None
     degraded_warning = None
     if project_root:
+        from orchd.nogit import git_available, take_snapshot
+
+        if not git_available(project_root):
+            # 单目录无 git（task-nogit-single-dir-pivot）：不建 sibling 拷贝，
+            # 在项目主目录建立任务基线快照，并绑定任务到主目录（flat-git 同口径）。
+            # 基线建立失败仅降级留痕（越界门禁按无基线处理，不阻断认领）。
+            from orchd.worktree import bind_task_wt
+
+            try:
+                take_snapshot(Path(project_root), task_id, "base")
+            except Exception as exc:
+                degraded_guards.append({
+                    "guard": "nogit_base_snapshot", "task_id": task_id,
+                    "error": str(exc), "hint": "基线快照建立失败，已降级留痕",
+                })
+            worktree_path = str(Path(project_root).resolve())
+            try:
+                bind_task_wt(resolve_store_dir(store.orchd_dir), task_id, worktree_path)
+            except Exception as exc:  # pragma: no cover - 绑定失败降级留痕
+                degraded_guards.append({"guard": "bind_task_wt", "task_id": task_id, "error": str(exc), "hint": "binding failed, degraded"})
+            return worktree_path, degraded_warning
         from orchd.worktree import bind_task_wt, ensure_task_wt
         wt_info = ensure_task_wt(project_root, task_id)
         if wt_info.get("worktree") is not None:

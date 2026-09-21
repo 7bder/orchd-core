@@ -620,7 +620,10 @@ def _review_step_guidance(
             "command": cmd,
             "hint": (
                 f"有 {c['in_review']} 个任务待审查：领取审查任务（{phase_label} 阶段）——"
-                f"须在任务 worktree 内执行且带 --confirm；代码审查通过任务才算完成。"
+                f"认领须在任务 worktree 内执行且带 --confirm；审查结论也须在任务 worktree 内提交"
+                f"（E018 守卫：目标目录必须等于任务 worktree，防错目录审查）；提交成功后引擎回收"
+                f"该 worktree，回收前请先切出任务目录（Windows 句柄占用会导致回收失败）；"
+                f"代码审查通过任务才算完成。"
             ),
         }
     if step == "submit_review":

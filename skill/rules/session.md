@@ -1,6 +1,6 @@
 # Session 规则（状态检查 / 接管 / 优先级 / claim 细节）
 
-> TL;DR: ① session 开始三连检查（git status + branch + status）② 有在握任务回 task 分支继续，无则 main 且工作区干净 ③ 优先级：清审查积压→领实现→三者皆空即停不重试 ④ claim 两段式需 --confirm，auto-claim 默认禁用 ⑤ 摄入仅用户指定
+> TL;DR: ① session 开始三连检查（git status + branch + status）② 有在握任务回 task 分支继续，无则 main 且工作区干净 ③ 优先级：清审查积压→领实现→三者皆空即停不重试（**自动执行时"清审查"为硬默认：先做完审查闭环再领实现**）④ claim 两段式需 --confirm，auto-claim 默认禁用 ⑤ 摄入仅用户指定
 
 > 原 .orchd/SKILL.md「Session 开始」「接管中断 agent 任务」「工作优先级」及 WORKER implementer workflow 的 claim 细节，外置自 task-skill-hub-refactor。
 
@@ -35,6 +35,8 @@
 1. **清审查积压**：`python .orchd/__main__.py status` 存在 in_review 且审查未被认领 → 以当前会话指纹领取
 2. **领实现任务**：`python .orchd/__main__.py request` → 人工确认 → `python .orchd/__main__.py claim`
 3. 三者皆空 → **立即停止并报告**，不自行重试 `request`、不自行 `claim`、不 `--auto-claim`；等待用户下一条指令（引擎分配为准，无候选即停）
+- **自动执行时"清审查"为硬默认（2026-09-20 用户裁定）**：无人值守 / 连续自动跑圈时，池内凡有**可领审查**（in_review 且审查未被认领），**必须先走完审查闭环（claim review → `review` 提交结论 → 尚有 code 阶段则继续到 merged）再领实现**——"清审查"= **做完**，不是只认领；不得把优先级 1 当成一句可跳过的提示。
+- **禁止以点名 claim 绕过审查优先**：池内存在可领审查时，**不得用 `claim --task <pending-id>` 摘实现任务**——`request` 有 `review_first` 闸门（`candidate: null` + `next_action: "review_first"` + `blocked_by: "review_priority"`），而 `claim --task` 只按该任务自身状态分流（pending → 实现认领）、**不查全局审查积压**，点名即绕过（2026-09-20 实测：3 个 in_review 因此积压数小时未被领，`request` 早已给出 review_first 而从未被触发）。仅当审查**确实无人可领**（任务 `reviewers` 名单不含本指纹 / 已被他指纹认领 / 本会话 E011 busy）时，才落到优先级 2。
 - **摄入（intake）为手动触发**：仅在用户明确指定处理某条/某批 pending 时执行摄入协议 v2（见 rules/intake.md）；**agent 不得主动摄入 IDEAS.md 的 pending 条目**（2026-08-05 用户裁定：摄入需主动指定，不作为领取任务处理）
 
 ## 在途冲突与候选可见性（2026-09-12）
@@ -71,4 +73,4 @@ agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈�
 - **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，造成任务归属混淆、E011 单任务忙度冲突、E016 自审纠缠。发现同指纹并行时应先核对宿主注入粒度并切换到正确的会话级标识，不得通过伪造 agent ID 绕过身份校验。
 - **E021 豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021 `identity_mismatch` warning。
 - **指纹 vs 具名身份**：宿主受管自动化会话用指纹作身份锚定；具名 agent 身份（如 `marvis-1`、`workbuddy-1`）用于人工可追溯场景。
-- **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者——引擎当前**无分级实现**（只有全局 `enforce_self_review_block` 开关，默认仅提示、不硬阻断），故本判据写成建议而非禁令；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。
+- **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者——引擎当前**无分级实现**（只有全局 `enforce_self_review_block` 开关，默认仅提示、不硬阻断），故本判据写成建议而非禁令；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**硬约束升级（2026-09-21 用户裁定，D1-③＋）**：上述四类高危任务**必须**异指纹 reviewer（由调度者分派，引擎 `self_review_notice` + E035 碰撞告警自动识别）；同指纹提交的审查结论视为无效，须换会话重审。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。

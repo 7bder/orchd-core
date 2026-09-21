@@ -92,6 +92,19 @@ def _guard_declared_diff(
         return
 
     def _declared_diff_guard() -> list[dict[str, str]]:
+        from orchd.nogit import git_available as _git_avail
+
+        if not _git_avail(Path(project_root)):
+            # 单目录无 git（task-nogit-single-dir-pivot）：done 期不做声明完整性
+            # 校验，与 flat / 非任务 worktree 同口径（NotApplicable 降级留痕）。
+            # 理由：单目录没有隔离工作区，done 期无法区分“尚未实现”与辅助流程
+            # （如 --changes-file / --comments-file 这类声明文件未落盘的合法调用，
+            # AC4 要求按原写法通过）；声明完整性仅由 review 期诊断兜底。done 期
+            # 的无 git 有效门禁是 out-of-scope 与 residual（主目录快照口径，AC3）。
+            raise NotApplicableError(
+                "单目录无 git：声明文件分支 diff 门禁不适用（本次未生效，声明完整性"
+                "仅由 review 期诊断兜底，与 flat 口径一致）"
+            )
         if not is_task_worktree(project_root):
             raise NotApplicableError(
                 "非独立任务 worktree（flat / 容器降级模式）：声明文件分支 diff "
@@ -186,6 +199,14 @@ def _guard_zero_residual(
         return
 
     def _residual_guard() -> list[str]:
+        from orchd.nogit import git_available as _git_avail, maindir_residual_paths
+
+        if not _git_avail(Path(project_root)):
+            # 单目录无 git：committed 快照之后又发生的改动必须被检出。
+            from orchd.pool import _is_path_covered
+
+            residual = maindir_residual_paths(project_root, task_id)
+            return [f for f in residual if any(_is_path_covered(d, f) for d in files_to_edit)]
         st = check_workspace_state(project_root)
         if st.get("state") == "error":
             raise RuntimeError(
@@ -253,31 +274,49 @@ def _guard_out_of_scope(
     def _out_of_scope_guard() -> list[str]:
         state = check_workspace_state(project_root)
         state_name = state.get("state")
-        if state_name == "unavailable":
-            raise NotApplicableError(
-                f"git {state.get('reason')}：越界改动检测不适用"
-            )
         if state_name == "error":
             raise RuntimeError(
                 f"git 探测故障（{state.get('reason')}）：越界改动检测无法执行"
             )
-        default = _get_default_branch(project_root)
-        if not default:
-            raise NotApplicableError(
-                "无默认分支（main/master）引用：越界改动检测不适用"
-            )
-        exists = branch_exists(project_root, f"task/{task_id}")
-        if exists is None:
-            raise RuntimeError(
-                f"git 探测故障：无法确认任务分支 task/{task_id} 是否存在"
-            )
-        if not exists:
-            raise NotApplicableError(
-                f"任务分支 task/{task_id} 不存在：越界改动检测不适用"
-            )
-        from orchd.worktree import _git_diff_names
+        # 变更检测**单一真源**（task-nogit-changedet-core / A0a）：git 与无 git 两侧
+        # 共用 orchd.nogit.changed_paths，D/R 口径一致（kernel-contract INV-1）；
+        # 无 git 模式不再整体降级为 NotApplicable（红线 #3 不因环境退化，INV-2）。
+        if state_name == "unavailable":
+            from orchd.nogit import read_manifest, snapshot_changed_paths, snapshot_dir
 
-        actual_modified = _git_diff_names(project_root, task_id)
+            snapshot_paths = snapshot_changed_paths(project_root, task_id)
+            if snapshot_paths is None:
+                # 无基线快照 → 无法判定（A0b 起由 claim 建立基线，届时恒非空）；
+                # 显式降级留痕，不做静默放行以外的任何假设。
+                raise NotApplicableError(
+                    f"git {state.get('reason')} 且无基线快照：越界改动检测不适用"
+                    "（基线由 claim 建立，见 A0b）"
+                )
+            # 单目录无 git（task-nogit-single-dir-pivot）：只比照基线快照中已存在
+            # 的路径。基线中不存在的新增文件（如 --changes-file 这类运行辅助文件）
+            # 在 git 模式下同属不可见（未提交即不在分支 diff 内），此处同样跳过；
+            # 已知边界：改名落入声明外新路径的极端情形可能漏检（窄口径，需刻意跨
+            # 范围改名；单目录下 done 期声明门禁与 flat 同口径降级）。
+            base = read_manifest(snapshot_dir(Path(project_root), task_id, "base")) or {}
+            actual_modified = [p for p in snapshot_paths if p in base]
+        else:
+            default = _get_default_branch(project_root)
+            if not default:
+                raise NotApplicableError(
+                    "无默认分支（main/master）引用：越界改动检测不适用"
+                )
+            exists = branch_exists(project_root, f"task/{task_id}")
+            if exists is None:
+                raise RuntimeError(
+                    f"git 探测故障：无法确认任务分支 task/{task_id} 是否存在"
+                )
+            if not exists:
+                raise NotApplicableError(
+                    f"任务分支 task/{task_id} 不存在：越界改动检测不适用"
+                )
+            from orchd.nogit import changed_paths
+
+            actual_modified = changed_paths(project_root, task_id)
         from orchd.pool import _is_path_covered
         allowed_list = list(allowed)
         return [f for f in actual_modified if not any(_is_path_covered(a, f) for a in allowed_list)]

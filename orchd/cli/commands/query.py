@@ -284,6 +284,29 @@ def _cmd_watchdog(args):
     return result
 
 
+def _cmd_milestone_check(args) -> tuple[dict, int]:
+    """里程碑判据门禁（task-milestone-check-gate）：M1 freeze / M2 split-ready。
+
+    CLI 参数: args.milestone（freeze / split-ready）；args.master（可选 master 路径）。
+    返回: ``(payload, exit_code)``——退出码语义与 ``full-regression`` 一致：
+          达成（ready）→ 0，未达成 → 1（payload 含逐条 not_ready 与修复指引）。
+
+    判据清单单一真源 = ``orchd/milestone.py``（本命令只做上下文构造与输出）。
+    只读命令（不写账本 / 不改任务状态），故与 pool / status / watchdog 同列 query 域。
+    """
+    from orchd.cli._util import _load_tasks
+    from orchd.ledger import Store
+    from orchd.milestone import build_context, evaluate
+
+    tasks, orchd_dir, _master = _load_tasks(getattr(args, "master", None))
+    ctx = build_context(orchd_dir=orchd_dir, tasks=list(tasks), store=Store(orchd_dir))
+    payload = evaluate(args.milestone, ctx)
+    payload["guidance_step"] = (
+        "milestone_ready" if payload["ready"] else "milestone_not_ready"
+    )
+    return payload, (0 if payload["ready"] else 1)
+
+
 def register(sub) -> None:
     """注册 query 模块的子命令。"""
     # pool
@@ -327,4 +350,20 @@ def register(sub) -> None:
     p.add_argument("--backup-dir", default=None,
                    help="清理前备份目录（默认 .orchd/.doctor-backup/<timestamp>）")
     p.set_defaults(func=_cmd_doctor)
+
+    # milestone-check（task-milestone-check-gate）：里程碑判据门禁（只读）
+    from orchd.milestone import milestone_names
+
+    p = sub.add_parser(
+        "milestone-check",
+        help=(
+            "里程碑判据门禁：M1 单机内核冻结（freeze）/ M2 分线就绪（split-ready）"
+            "单一真源判定，输出 ready / 逐条 not_ready + 修复指引（退出码 0 = 达成）"
+        ),
+    )
+    p.add_argument("milestone", choices=milestone_names(),
+                   help="里程碑名（freeze / split-ready）")
+    p.add_argument("--master", default=None,
+                   help="master 路径（默认 canonical 主工作树 .orchd/_master.json）")
+    p.set_defaults(func=_cmd_milestone_check)
 

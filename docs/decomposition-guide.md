@@ -1,4 +1,7 @@
 <!--
+
+> **所属线**：共用内核（跨线）（2026-09-21 两条线分线规划归位，见 ROADMAP「## 里程碑」/「## 契约演进记录」）。
+> 跨线文档**不得**含版本号与排期（一律指 ROADMAP）；本文件描述的是两条线共享的内核语义与契约。
   拆解指南 — 教 BOOTSTRAP agent 将需求文档分解为合法的 _master.json。
   读者：执行 BOOTSTRAP 的外部 AI agent。变更频率：低。
   关联文档：system-design.md §3（入口链路）、schema/_master.schema.json（结构约束）、

@@ -195,7 +195,8 @@ def check_workspace_state(project_root: Path) -> dict[str, Any]:
             - ``{"available": True, "state": "available", "branch": <str|None>,
               "clean": <bool>}``
               branch 为当前分支名（detached HEAD 时为 None）；clean 表示无已
-              跟踪文件改动（untracked 文件不视为脏）。
+              跟踪文件改动（untracked 文件不视为脏；内容差异口径，porcelain
+              幻影脏不计，见 task-cleanliness-content-diff）。
             - ``{"available": False, "state": "unavailable", "reason":
               "git_unavailable" | "not_a_git_repo"}``
               **环境不适用**（无 git 可执行文件 / 非 git 工作树）→ 调用方可降级。
@@ -241,13 +242,21 @@ def check_workspace_state(project_root: Path) -> dict[str, Any]:
                 branch = head
         if branch is None:
             branch = get_current_branch(project_root)
-        # 已跟踪文件改动（不含 untracked）：除 `## ` 分支头行外有输出即脏。
+        # 已跟踪文件改动（不含 untracked）：porcelain 快道无输出即净（零新增 spawn）；
+        # 有输出再以内容差异确认（task-cleanliness-content-diff）——幻影脏
+        # （racy stat、杀软触碰 mtime 等内容零差异）不判脏，无法判定则偏脏。
         # 注意：`-b` 使 stdout 恒含头行，不可沿用旧 `not stdout.strip()` 判据
         # （否则恒判脏）；仅首行且以 `## ` 开头才剔除（路径行原样保留）。
         body_lines = status.stdout.splitlines()
         if body_lines and body_lines[0].startswith("## "):
             body_lines = body_lines[1:]
-        clean = status.returncode == 0 and not "".join(body_lines).strip()
+        if status.returncode != 0:
+            clean = False
+        elif not "".join(body_lines).strip():
+            clean = True
+        else:
+            confirmed = _has_content_diff(project_root)
+            clean = confirmed is False
         return {
             "available": True,
             "state": "available",
@@ -271,6 +280,48 @@ def check_workspace_state(project_root: Path) -> dict[str, Any]:
         }
 
 
+def _has_content_diff(project_root: Path) -> bool | None:
+    """内容差异确认（task-cleanliness-content-diff，porcelain 报脏后的确认档）。
+
+    ``git diff --quiet``（工作区 vs 暂存区）与 ``git diff --cached --quiet``
+    （暂存区 vs HEAD）双确认：任一返回码 1（有内容/模式差异）即真脏；双双
+    0 即幻影脏（racy stat、杀软触碰 mtime 等内容零差异）；返回码非 0/1
+    即无法判定 → None（调用方按脏处理，fail-closed，不静默放行）。
+    SubprocessError/OSError 向上传递（调用方既有异常通道处理）。
+
+    Returns:
+        True 真脏 / False 幻影净 / None 无法判定。
+    """
+    for args in (["diff", "--quiet"], ["diff", "--cached", "--quiet"]):
+        proc = _gitops_pkg._run_git(project_root, args)
+        if proc.returncode == 1:
+            return True
+        if proc.returncode != 0:
+            return None
+    return False
+
+
+def _content_changed_paths(project_root: Path) -> list[str] | None:
+    """有内容/模式差异的已跟踪路径（task-cleanliness-content-diff）。
+
+    ``git diff --name-only -z`` 双取（工作区 + 暂存区）并集、排序去重；
+    untracked 文件天然不在 diff 输出内（与既有排除语义一致）。双空即幻影净；
+    任一调用失败（返回码非零）→ None；异常向上传递。
+
+    Returns:
+        排序路径列表；None 表示无法判定。
+    """
+    out: set[str] = set()
+    for args in (["diff", "--name-only", "-z"], ["diff", "--cached", "--name-only", "-z"]):
+        proc = _gitops_pkg._run_git(project_root, args)
+        if proc.returncode != 0:
+            return None
+        out.update(
+            entry for entry in (proc.stdout or "").split("\0") if entry.strip()
+        )
+    return sorted(out)
+
+
 def list_tracked_changes(project_root: Path) -> list[str] | None:
     """返回已跟踪文件的未提交改动路径列表（best-effort）。
 
@@ -282,8 +333,10 @@ def list_tracked_changes(project_root: Path) -> list[str] | None:
         - ``None``：非 git 仓库 / git 不可用 / 异常（调用方降级为不阻断）。
 
     Note:
-        仅已跟踪文件（``--untracked-files=no``），与"工作区干净 = 无已跟踪
-        改动"的语义一致；untracked 工具/配置文件不列入。
+        仅已跟踪文件（diff 天然不含 untracked），与"工作区干净 = 无已跟踪
+        改动"的语义一致；untracked 工具/配置文件不列入。porcelain 仅作快道：
+        无输出直接返回空（零新增 spawn）；有输出再以内容差异确认，幻影脏
+        （racy stat 等内容零差异）不列入（task-cleanliness-content-diff）。
     """
     if shutil.which("git") is None:
         return None
@@ -294,19 +347,25 @@ def list_tracked_changes(project_root: Path) -> list[str] | None:
         status = _gitops_pkg._run_git(project_root, ["status", "--porcelain", "--untracked-files=no"])
         if status.returncode != 0:
             return None
-        files: list[str] = []
-        for line in status.stdout.splitlines():
-            if len(line) < 4:
-                continue
-            # porcelain v1：`XY path`（XY 各 1 字符 + 空格）；rename 为
-            # `R  old -> new`（取箭头后路径，保守处理，避免把 rename 目标误列）
-            code, _, path = line[:2], line[2], line[3:]
-            if code == "R " or code.startswith("R"):
-                arrow = path.find(" -> ")
-                if arrow != -1:
-                    path = path[arrow + 4:]
-            files.append(path.strip())
-        return files
+        if not "".join(status.stdout.splitlines()).strip():
+            return []
+        confirmed = _content_changed_paths(project_root)
+        if confirmed is None:
+            # 无法判定：回退 porcelain 解析（偏脏，fail-closed 方向）
+            files: list[str] = []
+            for line in status.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                # porcelain v1：`XY path`（XY 各 1 字符 + 空格）；rename 为
+                # `R  old -> new`（取箭头后路径，保守处理，避免把 rename 目标误列）
+                code, _, path = line[:2], line[2], line[3:]
+                if code == "R " or code.startswith("R"):
+                    arrow = path.find(" -> ")
+                    if arrow != -1:
+                        path = path[arrow + 4:]
+                files.append(path.strip())
+            return files
+        return confirmed
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return None
 

@@ -353,28 +353,187 @@ def _enforce_branch_allowed(
     )
 
 
+def commit_hint_for_branch(branch: str | None) -> str:
+    """E017 脏工作区处置指引：按分支限定提交动作（task-e017-hint-branch-triage）。
+
+    - 任务分支（``task/*``）：``git add + git commit`` 为红线 #1 唯一豁免，明示；
+    - 主分支 / 未知分支：不推手动提交（main 上无豁免），指引擎通道或报告；
+    - 恒附幻影脏分支：内容零差异时勿补声明、无需提交（当前内容差分门禁下此类
+      脏位本不应到达 E017，此为防御性指引，防旧引擎 / 边缘口径下的误动作）。
+    """
+    if isinstance(branch, str) and branch.startswith("task/"):
+        action = (
+            "请在任务分支内提交（git add + git commit，红线 #1 唯一豁免）"
+            "或还原改动后重试"
+        )
+    else:
+        action = (
+            "请勿在主分支手动提交（无豁免）：改动属本任务请回任务 worktree 由 "
+            "done 提交；属摄入产物请走 intake/amend 引擎通道；归属不明请报告"
+        )
+    return (
+        "工作区存在未提交的已跟踪文件改动（untracked 工具/配置文件不阻塞）。"
+        f"{action}。"
+        "若 git diff 显示无内容差异（换行符 EOL / 文件模式类幻影脏），不要补声明 "
+        "files_to_edit，也无需提交，可报告后重试。"
+    )
+
+
+def _sync_lag_exempted(
+    project_root: Path,
+) -> tuple[list[str], list[str]]:
+    """划分已跟踪改动为（真脏，同步滞后）（task-done-clean-sync-lag-exempt）。
+
+    “同步滞后” = 工作区文件相对主分支**无内容差异**（``git diff --quiet <base> --
+    <path>`` 为 0，含换行符归一化口径——git 入库时 CRLF→LF，字节直比必败，故不
+    用字节比较）、且暂存区无该文件改动：典型来源是引擎把主工作树资产
+    （ROADMAP.md 等）同步进任务 worktree（见 ``worktree._propagate_container_marker``
+    内同步段），同步动作本身在 worktree 侧留下与 index 的差异（M），但内容等于
+    主分支现状、无本地编辑。
+    判定失败（默认分支不可解析 / git 异常）→ 全部按真脏处理（fail-closed 方向）。
+    删除态（工作区文件缺失）恒为真脏——删除即改动，不豁免。
+    """
+    from orchd.gitops import get_default_branch, list_tracked_changes
+
+    dirty = list_tracked_changes(project_root)
+    if not dirty:
+        return [], []
+    try:
+        base = get_default_branch(project_root) or "main"
+    except Exception:
+        return sorted(dirty), []
+    # 暂存区改动不豁免：同步动作从不 stage，staged 即本地行为。
+    staged: set[str] = set()
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+            cwd=str(project_root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_GIT_TIMEOUT,
+        )
+        if proc.returncode == 0:
+            for entry in (proc.stdout or "").split("\0"):
+                if len(entry) < 4:
+                    continue
+                if entry[0] != " " and entry[0] != "?":
+                    path = entry[3:]
+                    arrow = path.find(" -> ")
+                    staged.add(path[arrow + 4:] if arrow != -1 else path)
+    except (subprocess.SubprocessError, OSError):
+        return sorted(dirty), []
+    exempted: list[str] = []
+    real: list[str] = []
+    for path in dirty:
+        if path in staged or not (Path(project_root) / path).is_file():
+            real.append(path)
+            continue
+        try:
+            diff = subprocess.run(
+                ["git", "diff", "--quiet", base, "--", path],
+                cwd=str(project_root), capture_output=True,
+                timeout=_GIT_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, OSError):
+            real.append(path)
+            continue
+        if diff.returncode == 0:
+            exempted.append(path)
+        else:
+            real.append(path)
+    return sorted(real), sorted(exempted)
+
+
 def _enforce_workspace_clean(
     state: dict[str, Any],
     require_clean: bool,
     command: str,
+    project_root: Path | None = None,
 ) -> None:
-    """判定工作区干净度；require_clean 且有已跟踪改动时抛 E017。"""
+    """判定工作区干净度；require_clean 且有已跟踪改动时抛 E017。
+
+    ``command == "done"`` 且传入 ``project_root`` 时，同步滞后文件（工作区字节
+    与主分支一致的引擎同步产物）不计入脏（task-done-clean-sync-lag-exempt）；
+    其余命令与缺 project_root 时语义不变（零回归）。
+    """
     if require_clean and not state.get("clean"):
+        exempted: list[str] = []
+        if command == "done" and project_root is not None:
+            try:
+                real, exempted = _sync_lag_exempted(Path(project_root))
+            except Exception:
+                real, exempted = None, []
+            if real is not None and not real:
+                return
         try:
             from orchd.guide import amend_patch_cmd as _amend_cmd
             _patch_hint = ("；若脏改动系本任务需新增的声明外文件，先在主工作树补声明："
                            + _amend_cmd("<id>", files=["<file>"], entry="orchd"))
         except Exception:
             _patch_hint = ""
+        details: dict[str, Any] = {
+            "command": command,
+            "hint": (commit_hint_for_branch(state.get("branch")) + _patch_hint),
+        }
+        if exempted:
+            details["sync_lag_exempted"] = exempted
         raise OrchdError(
             ErrorCode.E017,
             f"dirty_workspace: {command} 要求工作区干净（无已跟踪文件改动）",
-            [{
-                "command": command,
-                "hint": ("请先提交或还原已跟踪文件改动（untracked 工具/配置文件不阻塞）"
-                         + _patch_hint),
-            }],
+            [details],
         )
+
+
+def _is_nogit_orchd_dir(project_root: Path) -> bool:
+    """目录是否带 orchd 项目标记（``.orchd/``）——守卫等价分流的目录侧判据。
+
+    调用前提：``check_workspace_state`` 已判定 git 不可用（本函数不再探测 git，
+    避免重复 spawn）。惰性导入 ``orchd.nogit`` 保持依赖方向叶子化。
+    """
+    from orchd.nogit import nogit_project_markers
+
+    return nogit_project_markers(project_root)
+
+
+def _nogit_maindir_violation(
+    project_root: Path,
+    command: str,
+) -> dict[str, Any] | None:
+    """无 git 单目录模式的**主目录守卫**判据（L1 等价）；返回违反详情或 ``None``。
+
+    L1 分支守卫在 git 模式下的作用是「写命令必须发生在允许的位置」（分支 / 工作树）。
+    无 git 单目录模式（task-nogit-single-dir-pivot）没有分支与任务工作目录，唯一合法
+    写位置是**项目主目录**，故等价判据为**单目录不变量**：布局解析出的主工作树须等于
+    命令的操作根（:func:`orchd.nogit.maindir_invariant`）——不等说明操作根不是主目录，
+    典型非法形态：
+
+    - 在**容器根**执行（container 布局下主工作树为 ``<容器>/main``，命令却作用于容器根）；
+    - 在遗留 / 拷贝出的**任务工作目录**内执行（无 git 单目录模式不该存在该目录）。
+
+    **判据边界（刻意收窄，零回归）**：不使用进程工作目录（``cwd``）作判据——
+    ``orchd`` CLI 的项目根本就**由 cwd 解析**（cwd 恒在项目内，该判据在生产路径上
+    不会被触发），而库调用 / 宿主工具链（含测试隔离 cwd）会因此产生误报。位置判据
+    只取「布局主工作树 vs 命令操作根」这一条确定性判据。
+
+    Returns:
+        违反详情 dict（``rule`` / ``command`` / ``expected_dir`` / ``operating_root``
+        / ``hint``），无违反时 ``None``。
+    """
+    from orchd.nogit import maindir_invariant
+
+    inv = maindir_invariant(project_root)
+    if not inv.get("ok"):
+        return {
+            "rule": "nogit_main_dir",
+            "command": command,
+            "expected_dir": str(inv.get("main_worktree")),
+            "operating_root": str(inv.get("project_root")),
+            "layout": inv.get("layout"),
+            "marker_source": inv.get("marker_source"),
+            "hint": (
+                f"无 git 单目录模式下写命令须在项目主目录（{inv.get('main_worktree')}）"
+                f"执行；当前操作根不是布局主工作树。请 cd 到项目主目录后重试 {command}"
+            ),
+        }
+    return None
 
 
 def _record_git_unavailable_guard(
@@ -435,7 +594,17 @@ def guard_write_command(
     """L1 分支守卫 + L2 session 锁：写命令前校验分支、工作区干净度与 session 锁。
 
     fail-closed：state=error（git 超时/IO 故障）抛 E018 阻断；state=unavailable
-    （无 git/非仓库）降级跳过但记入 degraded；分支不符→E018，工作区脏→E017。
+    且属**无 git orchd 项目**时走等价守卫（L1 主目录守卫 + L2 会话锁，见
+    task-nogit-guard-parity）；state=unavailable 且为**无关目录**（无 ``.orchd/``）
+    时降级跳过但记入 degraded；分支不符→E018，工作区脏→E017。
+
+    **L1 等价（task-nogit-guard-parity）**：无 git 且属 orchd 项目时不再记
+    git-unavailable 降级，改以「主目录守卫」判定——写命令须在项目主目录执行，
+    违反结构化拒绝（E018，``details[0].rule="nogit_main_dir"``）。
+
+    **L2 等价（task-nogit-guard-parity）**：会话锁**在无 git 下同样启用**（锁载体是
+    文件系统维度，与 git 无关；无 git 单目录锁文件回退 ``.session.lock``，互斥语义
+    与 git 模式一致：他 session 持锁时本会话写命令抛 E019）。
 
     **L2 会话锁降级可观测**（task-session-lock-degrade-observability AC3）：会话锁
     未持有（``ensure_session_lock`` 返回 ``acquired=False``）时经
@@ -451,17 +620,30 @@ def guard_write_command(
     """
     branch = None
     git_available = False
+    nogit_equivalent = False
     if project_root is not None:
         state = _probe_guard_workspace_state(project_root, command, degraded)
         if state.get("available"):
             git_available = True
             branch = state.get("branch")
             _enforce_branch_allowed(branch, allowed_branches, command, project_root)
-            _enforce_workspace_clean(state, require_clean, command)
+            _enforce_workspace_clean(state, require_clean, command, project_root)
+        elif _is_nogit_orchd_dir(project_root):
+            # 无 git orchd 项目（task-nogit-guard-parity）：不降级——走 L1 等价
+            # 主目录守卫（违反 ⇒ E018 结构化拒绝），并让 L2 会话锁照常启用。
+            violation = _nogit_maindir_violation(project_root, command)
+            if violation is not None:
+                raise OrchdError(
+                    ErrorCode.E018,
+                    f"wrong_directory: {command} 须在无 git 项目主目录执行"
+                    f"（当前不在该目录：{violation.get('operating_root')}）",
+                    [violation],
+                )
+            nogit_equivalent = True
         else:
             _record_git_unavailable_guard(degraded, command, state)
 
-    if git_available and orchd_dir is not None and agent_id is not None:
+    if (git_available or nogit_equivalent) and orchd_dir is not None and agent_id is not None:
         # AC3：捕获持锁态——此前该返回值被丢弃（R2-7 只补了 stderr 留痕），会话锁失效
         # 时写命令照常执行且响应里看不到。未持锁 → 并入 degraded_guards 供 agent 与
         # 审计按结构化字段检索「本次未经会话锁保护」。
@@ -758,9 +940,9 @@ def checkout_default_strict(
         raise OrchdError(
             ErrorCode.E017,
             f"{command}_switch_branch: 工作区非干净，拒绝强制切换(避免把未提交改动带离"
-            "任务分支)，请先提交或还原已跟踪改动后重试",
+            "任务分支)",
             [{"command": command,
-              "hint": ("请先提交或还原已跟踪文件改动后重试" + _patch_hint2)}],
+              "hint": (commit_hint_for_branch(state.get("branch")) + _patch_hint2)}],
         )
     try:
         result = subprocess.run(

@@ -207,6 +207,10 @@ def _cmd_init(args) -> dict:
         result["runtime_root"] = boot["runtime_root"]
         result["marker"] = boot["marker"]
         result["created_files"] = boot["created"] + result.get("created_files", [])
+        # A0c：无 git 模式的落地基础——init 一并备好快照根（接入门槛「有目录即可」）
+        from orchd.nogit import ensure_snapshot_root
+
+        result["snapshot_root"] = ensure_snapshot_root(orchd_dir.parent)
         return result
 
     # 既有项目（master 已存在）→ flat（AC5 零回归）；标记缺失时补写 flat 标记（AC2）。
@@ -217,7 +221,12 @@ def _cmd_init(args) -> dict:
         if read_layout(orchd_dir) is None:
             write_layout(orchd_dir, "flat", project_root)
         master = load_master(master_path)
-        return init(orchd_dir, master)
+        result = init(orchd_dir, master)
+        # A0c：flat 同样备好快照根（无 git 模式下 claim/done 直接可用）
+        from orchd.nogit import ensure_snapshot_root
+
+        result["snapshot_root"] = ensure_snapshot_root(project_root)
+        return result
     finally:
         if lk is not None:
             intake_lock_release(lk)

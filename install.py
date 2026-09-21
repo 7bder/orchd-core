@@ -34,6 +34,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 最低支持 Python（与 pyproject requires-python 同步）：安装器与引擎均要求 >= 3.11。
+# 安装路径不经由 pip（文档主路径为 `python orchd-core/install.py .`），requires-python
+# 不约束此处 ⇒ 入口显式守卫，低于下限时给明确提示而非深层 SyntaxError
+# （task-python311-floor-convergence-fix，L3）。
+_MIN_PYTHON = (3, 11)
+
+
+def _require_min_python(version_info: tuple[int, int, int] | None = None) -> None:
+    """低于支持下限时向 stderr 输出中文提示并非零退出（安装路径无 pip 红线兜底）。
+
+    为可单测，版本取 ``version_info`` 形参（默认 ``sys.version_info``）；安装器入口
+    ``main()`` 不传参即按真实运行时版本守卫。
+    """
+    if version_info is None:
+        version_info = sys.version_info
+    if version_info < _MIN_PYTHON:
+        sys.stderr.write(
+            f"orchd 需要 Python >= {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]}，"
+            f"当前为 {version_info[0]}.{version_info[1]}。"
+            "请升级 Python 后重试（安装器与引擎均要求 >= 3.11）。\n"
+        )
+        sys.exit(2)
+
+
 # 资源根：本脚本所在目录的父目录（orchd-core 源码根）。
 # 自适应两种布局：主项目内脚本位于 release/ 子目录（资源根在 parent.parent），
 # 发布到 orchd-core 后脚本位于根目录（扁平布局，资源根即 parent）。
@@ -96,6 +120,31 @@ _ROADMAP_TEMPLATE = """\
 
 > 未来版本规划（宿主资产，纳入 git；ROADMAP 唯一源 = 宿主项目根，引擎不读 .orchd/ 内副本）：
 > 新版本先 `orchd roadmap-land` 落地为 IDEAS pending 条目，再走摄入注册为任务。
+"""
+
+# 宿主三文件骨架（task-installer-host-docs-skeleton）：CHANGELOG（已完成记录）与
+# docs/system-design.md（架构与关键技术）随安装就位；已存在则不动，不做 git add
+# （入库决定权在宿主，沿用 ROADMAP 既定口径：仅提示确认）。
+_CHANGELOG_TEMPLATE = """\
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased]
+"""
+
+_SYSTEM_DESIGN_TEMPLATE = """\
+# SystemDesign
+
+> 系统架构与关键技术描述（宿主资产，纳入 git）。
+
+## 架构总览
+
+## 关键技术
+
+## 决策记录
 """
 
 _MODE_LABEL = {"install": "安装", "update": "升级", "force": "覆盖安装"}
@@ -252,7 +301,8 @@ def _mk_skeleton(orchd: Path, host: Path) -> tuple[dict, dict]:
 
     Returns:
         ``(docs, roadmap)``：``docs`` 形如
-        ``{"IDEAS.md": "created"|"exists", "ROADMAP.md": <roadmap 的 status>}``；
+        ``{"IDEAS.md": "created"|"exists", "ROADMAP.md": <roadmap 的 status>,
+        "CHANGELOG.md": ..., "docs/system-design.md": ...}``；
         ``roadmap`` 为结构化处置记录（``status``/``action``/``path``/``legacy``/``hint``），
         由 :func:`install` 透出为返回值同名字段，供 ``--agent`` 消费。
     """
@@ -269,6 +319,23 @@ def _mk_skeleton(orchd: Path, host: Path) -> tuple[dict, dict]:
     # ROADMAP.md：宿主项目根（唯一源，不在 .orchd/）——含旧布局处置决策
     roadmap_status, roadmap_record = _roadmap_disposition(host)
     docs["ROADMAP.md"] = roadmap_status
+    # CHANGELOG.md：宿主项目根（已完成内容记录，纳入 git；只建骨架，已存在不动，
+    # 不做 git add——入库决定权在宿主，沿用 ROADMAP 既定口径）。
+    target = host / "CHANGELOG.md"
+    if target.exists():
+        docs["CHANGELOG.md"] = "exists"
+    else:
+        target.write_text(_CHANGELOG_TEMPLATE, encoding="utf-8")
+        docs["CHANGELOG.md"] = "created"
+    # docs/system-design.md：宿主 docs/ 目录（架构与关键技术描述，纳入 git）。
+    docs_dir = host / "docs"
+    target = docs_dir / "system-design.md"
+    if target.exists():
+        docs["docs/system-design.md"] = "exists"
+    else:
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        target.write_text(_SYSTEM_DESIGN_TEMPLATE, encoding="utf-8")
+        docs["docs/system-design.md"] = "created"
     return docs, roadmap_record
 
 
@@ -512,6 +579,7 @@ def _cleanup_source() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _require_min_python()
     _enable_utf8_stdio()
 
     parser = argparse.ArgumentParser(

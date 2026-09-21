@@ -140,6 +140,34 @@ def _wt_dir_name(task_id: str) -> str:
         return f"task-{short}"
 
 
+def _merge_diagnostic_action(task_id: str, diag: dict[str, Any]) -> str:
+    """merge 非冲突失败的可执行指引（task-merge-failure-diagnostic）。
+
+    ``diag`` 为 :func:`orchd.gitops_ops.try_git_merge` 的 ``merge_diagnostic``
+    （stage/stderr 摘录/kind/files/hint）。保持任务 in_review 不合并；结尾附
+    通用放弃通道（与 merge_env_error / merge_conflict 同形）。
+    """
+    kind = (diag or {}).get("kind", "unknown")
+    hint = (diag or {}).get("hint", "")
+    excerpt = (diag or {}).get("stderr_excerpt", "")
+    head = (
+        "git merge 未执行（非冲突失败，诊断已透出）：任务保持 in_review，"
+        "未标记完成、未回收任务 worktree。"
+    )
+    body = f"【诊断】{hint}" if hint else ""
+    if excerpt and kind == "unknown":
+        body += f"\n【git 原文】{excerpt[:300]}"
+    return (
+        f"{head}\n{body}\n"
+        "【修复步骤】\n"
+        "  1. 按上方诊断处置\n"
+        "  2. 由同一 reviewer 重试 code APPROVED\n"
+        "【放弃本次审查】\n"
+        f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'merge失败放弃'\n"
+        f"  orchd force-status --task {task_id} --status pending --reason 'merge失败回退'"
+    )
+
+
 def request_reviewer(
     store: Store,
     state: dict[str, TaskState],
@@ -720,8 +748,16 @@ def _review_submit_impl(
                 merge_lock.acquire_lock()
         try:
             merge_result = None
+            _nogit_single_dir = False
             if project_root:
-                merge_result = try_git_merge(project_root, task_id)
+                from orchd.nogit import git_available as _git_avail
+
+                if not _git_avail(Path(project_root)):
+                    # 单目录无 git（task-nogit-single-dir-pivot）：无合并动作
+                    # （工作已在主目录），直接走完成路径（与 merge 成功同后续）。
+                    _nogit_single_dir = True
+                else:
+                    merge_result = try_git_merge(project_root, task_id)
 
             auto_resolved = False
             conflict_files: list[str] = []
@@ -794,7 +830,7 @@ def _review_submit_impl(
                             f"  orchd force-status --task {task_id} --status pending --reason 'merge冲突回退'"
                         )
 
-            if merge_result is None and project_root is not None:
+            if merge_result is None and project_root is not None and not _nogit_single_dir:
                 # P0-18：rename merge_not_executed → merge_env_error（语义更精确）
                 result["merged"] = False
                 result["reason"] = "merge_env_error"
@@ -810,6 +846,17 @@ def _review_submit_impl(
                     f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'git环境异常'\n"
                     f"  orchd force-status --task {task_id} --status pending --reason 'git环境异常回退'"
                 )
+            elif (merge_result is not None and merge_result.get("merge_diagnostic")
+                    and project_root is not None):
+                # task-merge-failure-diagnostic：非冲突失败带诊断——保持 in_review
+                # 不合并；reason 沿用 merge_env_error（下游与既有测试稳定），action
+                # 按分类给可执行指引（untracked 碰撞为文件系统处置，非 git 写）。
+                _diag = merge_result["merge_diagnostic"]
+                result["merged"] = False
+                result["reason"] = "merge_env_error"
+                result["task_status"] = "in_review"
+                result["merge_diagnostic"] = _diag
+                result["action"] = _merge_diagnostic_action(task_id, _diag)
             elif merge_result is None or not merge_result.get("conflict") or auto_resolved:
                 # project_root 为 None（非 git / 无 worktree）时不进入 merge 分支，
                 # 不计算 store_root（此时 merge 必然未执行，remove_task_wt 不会命中）。

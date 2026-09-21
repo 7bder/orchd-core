@@ -185,6 +185,15 @@ def ensure_session_lock(
     Session Identity Layer：同 ``agent_id`` 但不同 ``session_id`` 视为另一个
     session（即使指纹相同），防止同 agent 多会话互踩/误释放锁。
 
+    **无 git 等价（task-nogit-guard-parity）**：本锁的载体是文件系统（账本根下的锁标记
+    文件 + flock gate），与 git 无关。无 git 单目录模式下 :func:`_git_worktree_name`
+    返回 ``None``，锁路径回退 ``.session.lock``（worktree 维度唯一 ⇒ 全局唯一），互斥
+    语义与 git 模式**完全一致**：他 session 持锁时本会话写命令抛 E019 ``workspace_busy``，
+    锁的释放仍由调用方（claim/done/review 的 ``finally`` →
+    :func:`release_session_lock_if_owned`）负责。此前调用方
+    （``orchd/gitops/guard.py``）把 L2 与 L1 挂在同一个 ``git_available`` 条件下，无 git
+    环境下并发保护**静默缺失**；现改为「git 可用 **或** 无 git orchd 项目」均启用。
+
     Returns:
         本会话的持锁真实态（以 :func:`session_lock_acquire` 结果为真源，永不抛异常
         之外的路径）：
