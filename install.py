@@ -213,6 +213,86 @@ def _clean_pycache(root: Path) -> None:
         shutil.rmtree(pyc, ignore_errors=True)
 
 
+def _git_ls_files(host: Path) -> set[str] | None:
+    """宿主 git 跟踪文件集合（相对宿主根的 posix 路径）；非 git 宿主 → None。"""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(host), "ls-files"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {
+        ln.strip().replace("\\", "/")
+        for ln in (proc.stdout or "").splitlines() if ln.strip()
+    }
+
+
+def _check_engine_inventory(host: Path, orchd: Path) -> dict:
+    """入库完整性断言（task-vendored-engine-integrity）。
+
+    背景（1.4.5 实踩）：安装器 ``.orchd/.gitignore``（``/*`` + 豁免集，不含
+    ``orchd/``）使升级新增的引擎文件落盘即被忽略、永不入库；
+    ``git worktree add`` 只带已跟踪文件 → 新 worktree 缺文件 → done 稳定 E999。
+
+    判定（布局感知——flat 宿主不跟踪引擎完全合法，不得误伤）：
+    - 非 git 宿主 → ``{"checked": False, "reason": "not_a_git_repo"}``；
+    - 磁盘 ``.orchd/orchd/**/*.py`` 全被跟踪 → ``{"checked": True, "missing": []}``；
+    - 差集非空 + container 布局（worktree 必用 git 检出，缺文件必断）→ **抛错阻断**；
+    - 差集非空 + flat/未知布局 → 警告留痕（``missing`` + ``hint``），不阻断。
+
+    Raises:
+        RuntimeError: container 布局下存在未入库引擎文件（附文件清单与
+        ``git add -f`` 指引；``-f`` 因忽略契约覆盖所必需）。
+    """
+    engine = orchd / "orchd"
+    disk = set()
+    if engine.is_dir():
+        for p in sorted(engine.rglob("*.py")):
+            try:
+                disk.add(p.relative_to(host).as_posix())
+            except ValueError:
+                continue
+    tracked = _git_ls_files(host)
+    if tracked is None:
+        return {"checked": False, "reason": "not_a_git_repo"}
+    missing = sorted(disk - tracked)
+    if not missing:
+        return {"checked": True, "missing": []}
+    hint = (
+        "升级新增的引擎文件未入库（.orchd/.gitignore 覆盖了 orchd/）："
+        "任务 worktree 是 git 纯净检出，缺文件即 done E999。请执行 "
+        + " ".join(["git", "add", "-f", *missing])
+        + " 后提交（-f 必需：忽略规则覆盖所致，非宿主失误）。"
+    )
+    layout = "unknown"
+    try:
+        marker = orchd / ".layout.json"
+        if marker.is_file():
+            import json as _json
+
+            layout = str(_json.loads(
+                marker.read_text(encoding="utf-8")) .get("layout", "unknown"))
+    except (OSError, ValueError):
+        layout = "unknown"
+    if layout == "container":
+        raise RuntimeError(
+            "入库完整性断言失败：container 布局下 %d 个引擎文件在盘不在库%s：%s"
+            % (len(missing), "（worktree 纯净检出必缺文件）", ", ".join(missing))
+            + "。" + hint
+        )
+    try:
+        print(f"orchd ▸ [inventory] 警告：{len(missing)} 个引擎文件未入库："
+              f"{', '.join(missing)}", file=sys.stderr)
+    except OSError:
+        pass
+    return {"checked": True, "missing": missing, "warning": "flat_layout_untracked_engine",
+            "hint": hint}
+
+
 def _assemble_assets(orchd: Path) -> None:
     """组装分发资产（首次安装 / --update / --force 共用）。"""
     (orchd / "docs").mkdir(parents=True, exist_ok=True)
@@ -266,6 +346,9 @@ def _install(host: Path, update: bool, force: bool) -> dict:
 
     agents_entry = _ensure_agents_entry(host)
     hooks_path = _ensure_repo_hooks(host)
+    # 入库完整性断言（task-vendored-engine-integrity）：三种模式统一执行——
+    # 新装即有差集同样是未来的 worktree 断点，不限于 --update。
+    inventory = _check_engine_inventory(host, orchd)
 
     return {
         "installed": True,
@@ -277,6 +360,7 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "skeleton": skeleton,
         "roadmap": roadmap,
         "gitignore": gitignore,
+        "inventory": inventory,
         "next": (
             "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
             "（与 guidance first_time 卡片 steps 顺序一致）"

@@ -4,13 +4,128 @@
 **只含端口** —— ``StorageBackend``（ABC，Store 通过其访问 ledger / checkpoint /
 lock 的全部 I/O）。文件适配器见 ``orchd.storage.filesystem``（一适配器一模块）。
 
-依赖方向：本模块仅标准库 typing；适配器反向依赖本模块（无顶层 import 环）。
+依赖方向：本模块仅标准库（typing / json / pathlib）；适配器反向依赖本模块
+（无顶层 import 环）。
+
+归档共享（task-ledger-archive-compact）：``_ledger.archive.jsonl`` 为跨后端
+共享的归档文件格式（JSONL 全量事件体，与活跃文件同编码/容错语义）。
+本模块承载与后端无关的归档原语；两适配器各自接线（读合并/计数/迁移），
+Store 侧（compact 操作与中断恢复）见 ``orchd.ledger``。
 """
 
 from __future__ import annotations
 
+import json
+import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
+
+#: 归档文件名（账本根下，与 ``_ledger.jsonl`` 同级）。
+ARCHIVE_FILENAME = "_ledger.archive.jsonl"
+
+#: 中断恢复标记（compact 三写中途崩溃的唯一可观测痕迹，见 Store.compact_archive）。
+COMPACT_JOURNAL_FILENAME = ".compact-journal.json"
+
+
+def archive_path(store_dir: Path | str) -> Path:
+    """归档文件路径（跨后端共享；不存在即无归档）。"""
+    return Path(store_dir) / ARCHIVE_FILENAME
+
+
+def compact_journal_path(store_dir: Path | str) -> Path:
+    """compact 中断恢复标记路径。"""
+    return Path(store_dir) / COMPACT_JOURNAL_FILENAME
+
+
+def read_archive_events(
+    store_dir: Path | str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """读取归档事件（去重保序）与损坏条目（task-ledger-archive-compact）。
+
+    - 按 event_id 去重（保留首次出现）：中断崩溃可能导致同一事件体同时落在
+      归档与活跃文件，读侧去重使重跑天然幂等；
+    - 损坏行跳过 + 结构化条目（行号为归档文件内物理行号，调用方叠加偏移上报，
+      与 ``corrupt_lines`` 同形）；
+    - 文件不存在 → ([], [])。
+
+    Returns:
+        ``(events, corrupt)``。
+    """
+    path = archive_path(store_dir)
+    events: list[dict[str, Any]] = []
+    corrupt: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if not path.is_file():
+        return events, corrupt
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return events, corrupt
+    for lineno, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            corrupt.append({
+                "code": "E030",
+                "severity": "warning",
+                "message": (
+                    f"归档第 {lineno} 行 JSON 解析失败，已跳过"
+                ),
+                "line": lineno,
+                "path": str(path),
+                "kind": "archive_torn_line",
+                "snippet": stripped[:80],
+            })
+            continue
+        if not isinstance(ev, dict):
+            corrupt.append({
+                "code": "E030",
+                "severity": "warning",
+                "message": f"归档第 {lineno} 行非 JSON 对象，已跳过",
+                "line": lineno,
+                "path": str(path),
+                "kind": "archive_torn_line",
+                "snippet": stripped[:80],
+            })
+            continue
+        eid = ev.get("event_id", "")
+        if eid and eid in seen:
+            continue
+        if eid:
+            seen.add(eid)
+        events.append(ev)
+    return events, corrupt
+
+
+def archive_event_count(store_dir: Path | str) -> int:
+    """归档解析成功事件数（逻辑行号基数；损坏行不计）。"""
+    events, _ = read_archive_events(store_dir)
+    return len(events)
+
+
+def write_archive_events(
+    store_dir: Path | str, events: list[dict[str, Any]]
+) -> Path:
+    """原子重写归档文件（task-ledger-archive-compact，compact 专用）。
+
+    全量重写（非追加）：compact 每次按当前逻辑前缀重算归档内容，幂等；
+    tmp + os.replace 原子替换。行格式与活跃文件一致。
+    """
+    path = archive_path(store_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for ev in events:
+            f.write(json.dumps(ev, ensure_ascii=False,
+                               separators=(",", ":")) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+    return path
 
 
 class StorageBackend(ABC):

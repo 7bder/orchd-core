@@ -159,6 +159,33 @@ _TERMINAL_TEXT_REVISABLE_FIELDS = frozenset({
 _TERMINAL_REVISION_EVENT_REASON = "terminal_spec_revision"
 
 
+def _ac_field_routing_hint(status: str, fields: set[str]) -> str:
+    """AC 类字段被拒时的状态感知路由指引（task-spec-hygiene-flat-sweep AC2）。
+
+    AC 类字段 = :data:`_TERMINAL_TEXT_REVISABLE_FIELDS`（acceptance_criteria /
+    brief / name / deliverables）：pending 态可直接改；claimed/done/in_review
+    锁死；终态走 ``amend --revise-terminal``。调用方在 E007 中附加本指引，
+    使用户按状态找到合法通道，而不是只看到"不可修改"。
+    """
+    names = sorted(fields & _TERMINAL_TEXT_REVISABLE_FIELDS)
+    if status == "claimed":
+        return (
+            f"字段 {names} 属 AC 类文本：claimed 态不可改；回 pending 改 "
+            "（retract --disposition retry 免冷却），或等终态走 "
+            "amend --revise-terminal <task_id> --reason \"<理由>\""
+        )
+    if status in ("done", "in_review"):
+        return (
+            f"字段 {names} 属 AC 类文本：review 阶段不可改；退回 pending 改，"
+            "或等终态（completed/cancelled）走 "
+            "amend --revise-terminal <task_id> --reason \"<理由>\""
+        )
+    return (
+        f"字段 {names} 属 AC 类文本：pending 态可直接改；终态走 "
+        "amend --revise-terminal <task_id> --reason \"<理由>\""
+    )
+
+
 def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
     """从 _master.json 生成 mod-*/spec.json + 空 ledger + 初始 checkpoint。
 
@@ -711,6 +738,7 @@ def amend(
                         "fields": sorted(changed_fields),
                     })
                 else:
+                    _rejected = set(changed_fields) - set(_CLAIMED_WHITELIST_FIELDS)
                     errors.append({
                         "task_id": tid,
                         "status": status,
@@ -719,6 +747,10 @@ def amend(
                             f"{sorted(_CLAIMED_WHITELIST_FIELDS)}, "
                             f"got {sorted(changed_fields)}"
                         ),
+                        # task-spec-hygiene-flat-sweep AC2：AC 类字段被拒时附加
+                        # 状态感知路由（pending 改 / 终态 revise-terminal）。
+                        **({"hint": _ac_field_routing_hint(status, _rejected)}
+                           if _rejected & _TERMINAL_TEXT_REVISABLE_FIELDS else {}),
                     })
             elif status in ("completed", "cancelled"):
                 # task-amend-terminal-drift-repair：终态任务 master≠snapshot 时，
@@ -744,7 +776,31 @@ def amend(
                     # 避免 key 存在性差异把空 diff 误判为"终态不可修改"（假阳性 E007）。
                     unchanged_tasks.append(tid)
                 elif not remaining:
-                    # 仅文本字段变更 → 走修订通道（审计事件在快照同步后写入）
+                    # 仅文本字段变更 → 走修订通道（审计事件在快照同步后写入）。
+                    # task-spec-hygiene-flat-sweep AC4：AC 条数启发式——文本修订不得
+                    # 改变 acceptance_criteria 条数（阈值 0，确定性）：条数增减会改变
+                    # E029 粒度语义与验收面，属范围变更而非文本对齐。命中即 E007，
+                    # 指引用户裁决后走逃生口（force-status 回 pending）。
+                    if revise_terminal == tid and "acceptance_criteria" in text_revised:
+                        _old_ac = old_task.get("acceptance_criteria") or []
+                        _new_ac = task.get("acceptance_criteria") or []
+                        if len(_old_ac) != len(_new_ac):
+                            errors.append({
+                                "task_id": tid,
+                                "status": status,
+                                "message": (
+                                    f"{status} 任务 acceptance_criteria 条数变更"
+                                    f"（{len(_old_ac)} → {len(_new_ac)}）："
+                                    "文本修订通道只放行条数不变的文本对齐"
+                                ),
+                                "hint": (
+                                    "AC 增删改变验收面，请先经用户裁决走逃生口回退："
+                                    f"python .orchd/__main__.py force-status --task {tid} "
+                                    "--status pending --reason \"<理由>\" --force"
+                                    "（completed→pending 另需 --evidence-sha <提交>）"
+                                ),
+                            })
+                            continue
                     updated_tasks.append(tid)
                 elif remaining <= _TERMINAL_ATTACHABLE_FIELDS:
                     updated_tasks.append(tid)
@@ -855,6 +911,11 @@ def amend(
                             "fields": sorted(changed_fields),
                         })
                 else:
+                    _normalized_changed = {
+                        key
+                        for key in set(task) | set(old_task)
+                        if task.get(key) != old_task.get(key)
+                    } - set(_AMEND_ATTACHABLE_FIELDS)
                     errors.append({
                         "task_id": tid,
                         "status": status,
@@ -863,6 +924,10 @@ def amend(
                             "(reviewers / verify_command / exempt_files / "
                             "verify_timeout_seconds)；检测到其他字段同时被修改"
                         ),
+                        # task-spec-hygiene-flat-sweep AC2：AC 类字段被拒时附加
+                        # 状态感知路由（pending 改 / 终态 revise-terminal）。
+                        **({"hint": _ac_field_routing_hint(status, _normalized_changed)}
+                           if _normalized_changed & _TERMINAL_TEXT_REVISABLE_FIELDS else {}),
                     })
             else:
                 # pending：可改全部

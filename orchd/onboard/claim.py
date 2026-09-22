@@ -44,6 +44,7 @@ from orchd.review import (
     find_last_done_event as _find_last_done_event,
     is_self_review_author as _is_self_review_author,
 )
+from orchd.gitops.repo import for_project as _repo_for_project
 from orchd.worktree import (
     _task_wt_name,
     actual_changes_conflict,
@@ -51,7 +52,6 @@ from orchd.worktree import (
     detect_layout,
     diagnose_missing_branch_files,
     ensure_task_wt,
-    task_branch_files,
     task_branch_head,
 )
 
@@ -202,7 +202,12 @@ def _claim_precheck(
     project_root: Path | None,
     review_type: str | None,
     enforce_self_review_block: bool,
-) -> tuple[dict[str, Any], str, str | None, list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], str, str | None, list[dict[str, Any]], dict[str, Any] | None]:
+    # task-flat-decl-authority：task_def 经 resolve_declaration_source 解析
+    # （flat 下从 main blob 读权威声明，防任务分支本地副本陈旧）。
+    degraded_guards: list[dict[str, Any]] = []
+    from orchd.worktree import resolve_declaration_source
+    tasks = resolve_declaration_source(project_root, tasks, degraded_guards)[0]
     task_map = {t.get("id", ""): t for t in tasks}
     task_def = task_map.get(task_id)
     if task_def is None:
@@ -212,7 +217,7 @@ def _claim_precheck(
         pre_state = store.replay()
         pre_ts = pre_state.get(task_id)
         role = "reviewer" if (pre_ts and pre_ts.status == "in_review") else "implementer"
-    degraded_guards = []
+    auto_checkout: dict[str, Any] | None = None
     if role == "reviewer" and project_root:
         from orchd.worktree import _task_wt_name, detect_layout
         _layout = detect_layout(project_root)
@@ -222,8 +227,15 @@ def _claim_precheck(
                 branch_state = _try_git_branch(project_root, task_id)
                 if branch_state and branch_state.get("state") == "failed":
                     degraded_guards.append(_branch_degraded_guard(task_id, branch_state))
+        else:
+            # task-review-auto-checkout：flat/降级无独立 worktree → 引擎自动切
+            # 任务分支（+ AMEND 审计 reason=auto_branch_prepare；脏工作区 / 分支
+            # 缺失时回落守卫 E017/E018）。container 行为逐字不变。
+            from orchd.gitops.guard import _reviewer_auto_checkout
+            auto_checkout = _reviewer_auto_checkout(
+                store, project_root, task_id, agent_id, degraded_guards)
     _guard_claim(project_root, role=role, task_id=task_id, orchd_dir=store.orchd_dir, agent_id=agent_id, degraded=degraded_guards)
-    return task_def, role, session_id, degraded_guards
+    return task_def, role, session_id, degraded_guards, auto_checkout
 
 
 def _claim_setup_worktree(
@@ -671,7 +683,9 @@ def _claim_review_branch(
         diag_root = _resolve_review_worktree(project_root, task_id)
         if not is_task_worktree(diag_root):
             raise NotApplicableError("not worktree")
-        return {"branch_files": task_branch_files(diag_root, task_id), "missing_declared_files": diagnose_missing_branch_files(diag_root, task_id, task_def.get("files_to_edit", []))}
+        # 诊断作用域已解析到任务 worktree（恒 git linked）→ 经端口分发恒命中
+        # GitBackend，与原 task_branch_files 同函数（task-repo-migration-callsites）。
+        return {"branch_files": _repo_for_project(diag_root).changed_paths(task_id), "missing_declared_files": diagnose_missing_branch_files(diag_root, task_id, task_def.get("files_to_edit", []))}
 
     diag = run_guard(_diag, guard_name="review_branch_diff_diagnosis", on_error=GUARD_WARN, fallback=None, context={"task_id": task_id}, hint="diag fail", degraded=review_degraded)
     if diag is None:
@@ -703,7 +717,7 @@ def claim(
     enforce_self_review_block: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
-    task_def, role, session_id, degraded_guards = _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block)
+    task_def, role, session_id, degraded_guards, auto_checkout = _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block)
     event, state, derived, integrity_warnings, is_self_review = _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_id, review_type, enforce_self_review_block, project_root, force=force)
     worktree_path = None
     degraded_warning = None
@@ -713,6 +727,10 @@ def claim(
     if role == "reviewer":
         rb = _claim_review_branch(store, task_id, task_def, project_root, role, derived, review_phase, is_self_review, event, degraded_guards, shared, enforce_self_review_block=enforce_self_review_block)
         if rb is not None:
+            if auto_checkout is not None:
+                # task-review-auto-checkout：reviewer 分支提前返回前挂载，
+                # 与 checked_out_main 往返对称。
+                rb["checked_out_task_branch"] = auto_checkout.get("checked_out")
             return rb
     files_to_read = list(task_def.get("files_to_read", []))
     if shared:
@@ -740,6 +758,10 @@ def claim(
         result["degraded_warning"] = degraded_warning
     if degraded_guards:
         result["degraded_guards"] = degraded_guards
+    if auto_checkout is not None:
+        # task-review-auto-checkout：引擎自动切分支与 checked_out_main 往返对称，
+        # 认领响应显式挂载（账本另有 reason=auto_branch_prepare 的 AMEND 事件）。
+        result["checked_out_task_branch"] = auto_checkout.get("checked_out")
     if role == "implementer" and project_root:
         from orchd.worktree import detect_layout
         layout = detect_layout(project_root)

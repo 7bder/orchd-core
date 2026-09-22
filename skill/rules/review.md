@@ -1,3 +1,14 @@
+---
+guide:
+  claim_review: 1
+  submit_review: 1
+  rework_first: 1
+  wait_review: 1
+  audit_merge: 1
+  done_submitted: 1
+  approved_completed: 1
+  changes_requested: 1
+---
 # 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
 
 > TL;DR: ① 自审默认**仅提示**（`self_review_notice`；线上版 `config.enforce_self_review_block=true` 才恢复 E016 硬阻断），引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换独立会话审查（非强制，详见 [session.md](session.md) 与 `shared/conventions.md`）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
@@ -21,7 +32,7 @@
 - **证据分层：in_review = 引擎已保证 verify_command 通过（done 前提），reviewer claim 响应附带 `verify` 摘要（P2 注入：ok/exit_code/output_summary），默认引用不重跑；仅 verify 摘要缺失/不可信或 diff 触及测试链路时重跑定向测试（禁全量 pytest / build / venv 重活，120s 预算）。**
 
 ## code APPROVED 的 merge 前置语义
-- 引擎先执行 git merge，成功才写完成事件（任务 completed）。merge 冲突 → 任务**停留 in_review**（完成事件不落地，`merged: false` + `conflict_files`），由实现者（或人工）在 task 分支执行 `git merge main` 解决冲突并提交后，同一 reviewer 再次提交 code APPROVED 重试 → merge 成功 → completed。
+- 引擎先执行 git merge，成功才写完成事件（任务 completed）。merge 冲突 → 任务**停留 in_review**（完成事件不落地，`merged: false` + `conflict_files`），由实现者（或人工）在 task 分支执行 `orchd git merge main`（受管通道，任务分支放行）解决冲突并提交后，同一 reviewer 再次提交 code APPROVED 重试 → merge 成功 → completed。
 - **completed 语义**：= 实现 + 双阶段审查 + merge 入 main 全部完成；merge 未成功的任务不是 completed（仍为 in_review）。
 
 ## 文档类单阶段（Q2 分级，2026-08-06；白名单收紧 2026-08-13）

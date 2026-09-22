@@ -1,3 +1,9 @@
+---
+# done 排位 1 理由：done 第一动作即确认 verify_command 与预算
+guide:
+  done: 1
+  claimed_impl: 3
+---
 # 自检约定（verify_command）
 
 > TL;DR: ① verify_command 120s 内完成（引擎硬上限）② **定向优先**：verify_command 只跑 files_to_edit 映射的定向测试（验收分级·定向档）③ **全量门禁**：全量 pytest 禁入任何 verify_command，只留在发版门禁点（验收分级·门禁档）④ 用 --basetemp 指向系统临时目录 ⑤ orchd 命令统一 python .orchd/__main__.py 形式。两档定义与选用规则见 [decomposition-guide §5.5 验收分级](../../docs/decomposition-guide.md)。

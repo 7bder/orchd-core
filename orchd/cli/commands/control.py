@@ -373,7 +373,8 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 (f"任务分支不再允许 amend；请在主工作树 {canonical_root} 上补充/注册 "
                  "files_to_edit 等声明后再执行。"
                  "定位方法：git worktree list 中带 (main) 标记的路径即主工作树；"
-                 "或从任务 worktree 路径上溯到项目根下的 main/ 目录。"
+                 "container 布局可从任务 worktree 路径上溯到项目根下的 main/ 目录，"
+                 "flat 布局主工作树即仓库根本身。"
                  f'可执行命令：cd "{canonical_root}"; python .orchd/__main__.py amend '
                  "--task <id> --files-to-edit <file>"),
             }],
@@ -462,10 +463,17 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     patch_sources = list(getattr(args, "additional_sources", None) or [])
     # task-verify-timeout-amend-channel：任务级 verify 预算补丁（default None = 不改）。
     patch_timeout = getattr(args, "verify_timeout_seconds", None)
+    # task-spec-hygiene-flat-sweep AC3：reviewers / files_to_read 补登（覆写语义；
+    # 名单/阅读域是整体替换，None=缺席不改，空列表=清空；两者本就在
+    # split._AMEND_ATTACHABLE_FIELDS 内，claimed/终态附加通道可补登）。
+    patch_reviewers = getattr(args, "reviewers", None)
+    patch_files_to_read = getattr(args, "files_to_read", None)
     if patch_task is not None:
         if not (patch_files or patch_exempt or patch_remove_files
                 or patch_remove_exempt or patch_verify is not None
-                or patch_sources or patch_timeout is not None):
+                or patch_sources or patch_timeout is not None
+                or patch_reviewers is not None
+                or patch_files_to_read is not None):
             raise OrchdError(
                 ErrorCode.E007,
                 "amend --task 需至少携带一个补丁字段",
@@ -475,7 +483,8 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                     "hint":
                     "补登示例：--files-to-edit <file> / --exempt-files <file> / "
                     "--verify-command \"<cmd>\" / --verify-timeout-seconds <N> / "
-                    "--additional-sources <ref>；撤回示例："
+                    "--additional-sources <ref> / --reviewers <id...> / "
+                    "--files-to-read <path...>；撤回示例："
                     "--remove-files-to-edit <file> / --remove-exempt-files <file>"
                     "（追加为并集、撤回为集合差，只增不删语义已由撤回通道补齐）",
                 }],
@@ -565,6 +574,15 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 cur_sources | set(patch_sources))
         if patch_verify is not None:
             target["verify_command"] = patch_verify
+        if patch_reviewers is not None:
+            # AC3：reviewers 整体替换（空列表即清空；schema 允空，身份模型已不依赖名单）。
+            target["reviewers"] = list(patch_reviewers)
+        if patch_files_to_read is not None:
+            # AC3：files_to_read 整体替换；CLI 路径形态按 priority=reference 登记
+            # （must_read 需走 --register 提案注册，避免 CLI 随手抬高阅读强度）。
+            target["files_to_read"] = [
+                {"path": p, "priority": "reference"} for p in patch_files_to_read
+            ]
         if patch_timeout is not None:
             # task-verify-timeout-amend-channel：任务级 verify 预算通道（默认 120s 不变）。
             # 与 --verify-command 同属 patch 语义（可同一次调用组合生效）；claimed /
@@ -1004,6 +1022,20 @@ def register(sub) -> None:
                    dest="remove_exempt_files",
                    help="撤回 exempt_files 声明（集合差；同上）")
     p.add_argument("--verify-command", default=None, help="覆写 verify_command")
+    p.add_argument("--reviewers",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   help="覆写 reviewers 名单（整体替换；空值即清空。不在 claimed 白名单"
+                   "之外——reviewers 本就在 _AMEND_ATTACHABLE_FIELDS 内，claimed/终态"
+                   "附加通道可补登）")
+    p.add_argument("--files-to-read",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="files_to_read",
+                   help="覆写 files_to_read（整体替换；条目按 priority=reference 登记，"
+                   "需 must_read 请走 --register 提案注册；空值即清空）")
     p.add_argument(
         "--verify-timeout-seconds",
         default=None,

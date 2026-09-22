@@ -1,7 +1,8 @@
 """orchd/gitops/proxy.py — git 写操作代理（红线 #1/#2 引擎化拦截）。
 
 **定位（ROADMAP §1.4.6 D1a/D1b）**：红线 #1「禁手动 git 写操作（checkout / branch /
-reset / stash / merge / push 等，唯一豁免 = **任务分支 git commit**）」与红线 #2
+reset / stash / merge / push 等，豁免 = **任务分支 git commit** + **任务分支
+``merge main`` 精确形态**）」与红线 #2
 「禁破坏性 git 操作」此前只写在 ``.orchd/rules/git.md``——**靠 agent 记得**。本模块把
 它变成引擎命令 ``orchd git <args>``：命中判定由代码承担，人工纪律退化为「照命令走」。
 
@@ -14,9 +15,15 @@ reset / stash / merge / push 等，唯一豁免 = **任务分支 git commit**）
 |                      | / ``ls-files`` …；含 ``branch``/``tag``/``stash``/       |
 |                      | ``config`` 的只读形态）                                 |
 +----------------------+--------------------------------------------------------+
-| ``commit``           | **红线 #1 唯一豁免**：仅 ``task/*`` 分支放行（否则       |
+| ``commit``           | **红线 #1 豁免一**：仅 ``task/*`` 分支放行（否则       |
 |                      | E018 wrong_branch）；提交范围由 E020 pre-commit hook     |
 |                      | 把守（staged ⊆ files_to_edit ∪ exempt_files）           |
++----------------------+--------------------------------------------------------+
+| ``merge main``       | **红线 #1 豁免二（task-proxy-merge-allowlist）**：仅    |
+| 精确形态             | ``task/*`` 分支上的 ``merge main`` /                    |
+|                      | ``merge --no-edit main`` 放行（否则 E018；其余 merge    |
+|                      | 形态仍拒绝）。任务分支合入 main 方向是安全的（不碰主分支；
+|                      | 冲突由 git 正常报告，解决后提交）。                     |
 +----------------------+--------------------------------------------------------+
 | 其余写操作           | 结构化拒绝（E007），按族给出引擎替代通道 + hint          |
 +----------------------+--------------------------------------------------------+
@@ -36,7 +43,8 @@ git 动作），只读同样 no-op 并说明 git 不可用。
 
 **错误码映射**（复用既有码，不新增 schema）：写操作拒绝 → ``E007 invalid_state``
 （与「amend 在任务分支被拒」「intake 非 main」同为「协议通道错误」语义）；
-commit 落在非任务分支 → ``E018 wrong_branch``（分支守卫语义，与 L1 分支守卫同码）。
+commit / 受管 merge 落在非任务分支 → ``E018 wrong_branch``（分支守卫语义，与
+L1 分支守卫同码）。
 """
 
 from __future__ import annotations
@@ -116,7 +124,10 @@ _WRITE_FAMILIES: dict[str, tuple[str, str]] = {
     "merge": (
         "red_line_git_write",
         "merge 由引擎在 code APPROVED 时于主工作树执行（review 流程）；"
-        "若需与 main 对账，走 orchd done（前置 reconcile）",
+        "任务分支合入 main 方向可用受管通道：orchd git merge main（精确形态，"
+        "仅 task/* 分支放行）；若需检查与 main 的冲突可合并性，另可走 "
+        "orchd done（前置 reconcile；reconcile 只判定合并冲突，不管声明同步"
+        "——声明权威按布局收敛，flat 下读 main blob）",
     ),
     "branch": (
         "red_line_git_write",
@@ -223,6 +234,21 @@ def _is_read_variant(subcommand: str, rest: list[str]) -> bool:
     return any(arg in allowed for arg in rest)
 
 
+# 受管 merge 出口的精确形态（task-proxy-merge-allowlist）：仅 task/* 分支上的
+# ``merge main`` 与 ``merge --no-edit main``。其余 merge 形态（换目标分支、加旗标、
+# 无参等）一律仍走 write 拒绝（fail-closed）。精确形态刻意收窄：合入 main 方向是
+# 任务分支同步的唯一合法手动形态，其余合并语义一律走引擎通道。
+_MERGE_PASSTHROUGH_RESTS: tuple[tuple[str, ...], ...] = (
+    ("main",),
+    ("--no-edit", "main"),
+)
+
+
+def _is_merge_passthrough(rest: list[str]) -> bool:
+    """是否为受管 merge 出口精确形态（与当前分支无关，分支在执行层判定）。"""
+    return tuple(rest) in _MERGE_PASSTHROUGH_RESTS
+
+
 def classify_git_argv(argv: list[str] | None) -> dict[str, Any]:
     """对 ``orchd git <args>`` 的 args 做放行/拒绝分类（纯函数，不执行 git）。
 
@@ -230,7 +256,8 @@ def classify_git_argv(argv: list[str] | None) -> dict[str, Any]:
         ``{"subcommand", "rest", "kind", "family", "reason"}``：
 
         - ``kind="read"``   只读，透传执行；
-        - ``kind="commit"`` 红线 #1 唯一豁免（仅任务分支）；
+        - ``kind="commit"`` 红线 #1 豁免一（仅任务分支）；
+        - ``kind="merge"``  红线 #1 豁免二（仅任务分支上的精确形态）；
         - ``kind="write"``  写操作，拒绝（``family`` 给出族与替代通道）；
         - ``kind="unknown"`` 未登记子命令（fail-closed，同拒绝处置）。
     """
@@ -254,7 +281,15 @@ def classify_git_argv(argv: list[str] | None) -> dict[str, Any]:
             "rest": rest,
             "kind": "commit",
             "family": "commit",
-            "reason": "任务分支 git commit 是红线 #1 唯一豁免（提交范围由 E020 hook 校验）",
+            "reason": "任务分支 git commit 是红线 #1 豁免一（提交范围由 E020 hook 校验）",
+        }
+    if subcommand == "merge" and _is_merge_passthrough(rest):
+        return {
+            "subcommand": subcommand,
+            "rest": rest,
+            "kind": "merge",
+            "family": "merge",
+            "reason": "任务分支 merge main 精确形态是红线 #1 豁免二（受管出口）",
         }
     if subcommand in READ_ONLY_SUBCOMMANDS:
         return {
@@ -428,13 +463,13 @@ def _nogit_payload(
 
 
 def _proxy_commit(project_root: Path, args: list[str], cls: dict[str, Any]) -> dict[str, Any]:
-    """任务分支 commit 放行（红线 #1 唯一豁免）；非任务分支 → E018。"""
+    """任务分支 commit 放行（红线 #1 豁免一）；非任务分支 → E018。"""
     state = check_workspace_state(project_root)
     branch = state.get("branch")
     if not branch or not str(branch).startswith("task/"):
         raise OrchdError(
             ErrorCode.E018,
-            f"wrong_branch: git commit 仅在任务分支允许（红线 #1 唯一豁免），当前在 '{branch}'",
+            f"wrong_branch: git commit 仅在任务分支允许（红线 #1 豁免一），当前在 '{branch}'",
             [{
                 "git_args": args,
                 "current_branch": branch,
@@ -449,6 +484,33 @@ def _proxy_commit(project_root: Path, args: list[str], cls: dict[str, Any]) -> d
     return _execute_git(project_root, args, cls)
 
 
+def _proxy_merge(project_root: Path, args: list[str], cls: dict[str, Any]) -> dict[str, Any]:
+    """任务分支 merge main 精确形态放行（红线 #1 豁免二，task-proxy-merge-allowlist）。
+
+    仅 ``task/*`` 分支放行（否则 E018，与 commit 豁免同码同语义）；合入 main 方向
+    不碰主分支，冲突由 git 正常报告、解决后提交。非精确形态在分类层已拒绝，
+    到此的必为 ``merge main`` / ``merge --no-edit main``。
+    """
+    state = check_workspace_state(project_root)
+    branch = state.get("branch")
+    if not branch or not str(branch).startswith("task/"):
+        raise OrchdError(
+            ErrorCode.E018,
+            f"wrong_branch: git merge main 仅在任务分支允许（红线 #1 豁免二），当前在 '{branch}'",
+            [{
+                "git_args": args,
+                "current_branch": branch,
+                "rule": "merge_requires_task_branch",
+                "hint": (
+                    "主分支的合并由引擎承担（code APPROVED 自动 merge）；"
+                    "任务分支同步 main 请先 orchd claim 获得 task/* 分支，"
+                    "再执行 orchd git merge main"
+                ),
+            }],
+        )
+    return _execute_git(project_root, args, cls)
+
+
 def run_git_proxy(
     argv: list[str] | None,
     *,
@@ -456,7 +518,8 @@ def run_git_proxy(
     orchd_dir: Path | None = None,
     agent_id: str | None = None,
 ) -> dict[str, Any]:
-    """``orchd git <args>`` 代理入口：只读透传 / 任务分支 commit 放行 / 其余结构化拒绝。
+    """``orchd git <args>`` 代理入口：只读透传 / 任务分支 commit 与 merge main 放行 /
+    其余结构化拒绝。
 
     Args:
         argv: git 参数（如 ``["status"]`` / ``["commit", "-m", "msg"]``）。
@@ -491,6 +554,8 @@ def run_git_proxy(
         return _execute_git(root, args, cls)
     if cls["kind"] == "commit":
         return _proxy_commit(root, args, cls)
+    if cls["kind"] == "merge":
+        return _proxy_merge(root, args, cls)
 
     rule, hint = _WRITE_FAMILIES.get(cls["family"], _WRITE_FAMILIES["other"])
     raise OrchdError(
@@ -506,7 +571,8 @@ def run_git_proxy(
             "hint": hint,
             "allowed": (
                 "只读子命令透传（orchd git status / log / diff …）；"
-                "任务分支内细粒度提交放行（orchd git commit -m '…'）"
+                "任务分支内细粒度提交放行（orchd git commit -m '…'）；"
+                "任务分支同步 main 受管放行（orchd git merge main 精确形态）"
             ),
         }],
     )

@@ -493,6 +493,79 @@ _GRANULARITY_MAX_HOURS = 8
 _GRANULARITY_MAX_AC = 6
 
 
+# AC 结构术语形态（task-ac-term-resolvability，并入 E023 家族——见 AC 说明）：
+# 新码 E040 的替代方案。并入理由：① E023 本就是"AC 不可判定"类 warning，
+# 未定义的结构术语是其子种；② E023 逐条 AC 只报一次，并入即天然去重（AC3）；
+# ③ warning 级 + 终态豁免现成，存量零变红（AC4）；④ 免动 errors.py 计数契约
+# （test_errors.py 断言码数，域外文件）。
+# 形态 = 数字 + 环/链/阶/步法（如 六环 / 论证链 / 三阶 / 四步法）。后随 段/级/梯/
+# 节/条 时为普通词（阶段/阶级/阶梯/环节/链条），不命中——宁可漏判不可误报。
+_STRUCTURAL_TERM_RE = re.compile(
+    r"[一二三四五六七八九十百千万\d]+(?:环|链|阶|步法)(?![段级梯节条])"
+)
+
+# 结构术语 allowlist（AC2）：命中即视为已定义，不告警。默认空——数字形态术语多为
+# 方法论专名（如 四步法），未定义就该告警；确需放行的通用词由用户在此登记。
+_STRUCTURAL_TERM_ALLOWLIST: frozenset[str] = frozenset()
+
+# 术语定义语料上限（best-effort 防护）：单文件 512KB、总量 8MB、最多 3000 文件。
+# 超限静默截断（已收集部分照常用，不抛异常、不阻断校验）。
+_TERM_CORPUS_MAX_FILE_BYTES = 512 * 1024
+_TERM_CORPUS_MAX_TOTAL_BYTES = 8 * 1024 * 1024
+_TERM_CORPUS_MAX_FILES = 3000
+# 语料 walk 跳过的重型目录（与定义无关的生成物/依赖）。
+_TERM_CORPUS_SKIP_DIRS = frozenset({
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+    "target", "build", "dist", ".idea", ".vscode",
+})
+
+
+def _build_term_corpus(project_root: Path) -> str:
+    """构建术语定义语料（task-ac-term-resolvability）：``.orchd/`` 文本 + 全库 ``*.md``。
+
+    被校验工件自身的 ``*_master.json`` 排除在外——否则待检 AC 文本自命中，
+    定义检查恒通过（真空）。定义应落在文档/规则/术语表（IDEAS / shared /
+    conventions / docs），不在任务定义里自证。
+    """
+    parts: list[str] = []
+    total = 0
+    files = 0
+
+    def _take(path: Path) -> None:
+        nonlocal total, files
+        if files >= _TERM_CORPUS_MAX_FILES or total >= _TERM_CORPUS_MAX_TOTAL_BYTES:
+            return
+        try:
+            if path.stat().st_size > _TERM_CORPUS_MAX_FILE_BYTES:
+                return
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            return
+        files += 1
+        total += len(text)
+        parts.append(text)
+
+    try:
+        root = Path(project_root)
+        orchd_dir = root / ".orchd"
+        if orchd_dir.is_dir():
+            for path in sorted(orchd_dir.rglob("*")):
+                if not path.is_file() or path.name.endswith("_master.json"):
+                    continue
+                if _TERM_CORPUS_SKIP_DIRS & set(path.parts):
+                    continue
+                _take(path)
+        for path in sorted(root.rglob("*.md")):
+            if not path.is_file():
+                continue
+            if _TERM_CORPUS_SKIP_DIRS & set(path.parts):
+                continue
+            _take(path)
+    except (OSError, RuntimeError):
+        pass
+    return "\n".join(parts)
+
+
 def _is_doc_task(t: dict) -> bool:
     """判定任务是否为文档/基础设施类（files_to_edit 全部为文档后缀）。
 
@@ -589,7 +662,10 @@ def _verify_command_path_tokens(verify_cmd: str) -> list[str]:
     return out
 
 
-def validate_quality(master: Master) -> list[ValidationError]:
+def validate_quality(
+    master: Master,
+    terminal_ids: frozenset[str] | None = None,
+) -> list[ValidationError]:
     """任务定义质量校验（弱 LLM 兜底）。
 
     加法式校验：不改变 validate_structure / validate_references 的既有行为，
@@ -606,6 +682,14 @@ def validate_quality(master: Master) -> list[ValidationError]:
        （同任务；**非拆分建议**，专用码从 E029 拆出）。
     5. E024 / E026 / E029 其余项 —— 见各代码块内注释（basetemp / 测试连带 / 粒度锚点）。
 
+    Args:
+        master: 任务池 master。
+        terminal_ids: 终态（completed/cancelled）任务 id 集合（P2-2 模式，
+            task-validate-terminal-quiet）：集合内任务跳过 E026/E027（已关闭
+            任务的缺陷不再重复上报）；为 None/空时行为与旧版完全一致。其余
+            终态豁免码（E023/E029/E037/E038）仍由调用方经
+            :func:`filter_terminal_quality_warnings` 处理，本函数不扩大口径。
+
     Returns:
         ValidationError 列表（E022/E023/E024/E026/E027/E029/E037/E038…）；合法时返回空列表。
     """
@@ -614,8 +698,33 @@ def validate_quality(master: Master) -> list[ValidationError]:
     # 声明路径存在性的解析基准（校验①用）：与 E026 的 tests/ 推导同源，单一真源。
     project_root = _project_root_from_master(master)
 
+    # task-ac-term-resolvability：结构术语候选预扫描（纯正则、零 IO）。无候选时
+    # 不建语料、不走文件系统，行为与旧版逐字一致。
+    _term_candidates: dict[tuple[int, int], list[str]] = {}
+    for _i, _t in enumerate(tasks):
+        for _j, _ac in enumerate(_t.get("acceptance_criteria", []) or []):
+            if not isinstance(_ac, str):
+                continue
+            _seen: set[str] = set()
+            _uniq: list[str] = []
+            for _h in _STRUCTURAL_TERM_RE.findall(_ac):
+                if _h not in _seen:
+                    _seen.add(_h)
+                    _uniq.append(_h)
+            if _uniq:
+                _term_candidates[(_i, _j)] = _uniq
+    _term_corpus: str | None = None
+
+    def _corpus() -> str:
+        nonlocal _term_corpus
+        if _term_corpus is None:
+            _term_corpus = _build_term_corpus(project_root) if _term_candidates else ""
+        return _term_corpus
+
     for i, t in enumerate(tasks):
         tid = t.get("id", "")
+        # F6（task-validate-terminal-quiet，P2-2 同式）：终态任务跳过 E026/E027。
+        terminal = tid in (terminal_ids or frozenset())
 
         # E022: verify_command 必填
         # R5（task-constraint-quality-checks）：缺 verify_command 是否阻断，取决于任务类型。
@@ -710,6 +819,26 @@ def validate_quality(master: Master) -> list[ValidationError]:
                             f"task '{tid}' acceptance_criteria[{j}] contains vague term '{vague}' (use quantifiable criteria)",
                         ))
                     break  # 一条 AC 只报一次
+            else:
+                # 无模糊词命中 → 结构术语可解析性（task-ac-term-resolvability，
+                # 并入 E023 家族：同一条 AC 只报一次，去重不叠加）。
+                for _term in _term_candidates.get((i, j), []):
+                    if _term in _STRUCTURAL_TERM_ALLOWLIST:
+                        continue
+                    if _term in _corpus():
+                        continue
+                    errors.append(
+                        ValidationError(
+                            code=ErrorCode.E023,
+                            path=f"$.tasks[{i}].acceptance_criteria[{j}]",
+                            message=(
+                                f"task '{tid}' acceptance_criteria[{j}] contains "
+                                f"undefined structural term '{_term}' (no definition "
+                                "found in repo docs; define it or register in "
+                                "shared/conventions.md glossary)"
+                            ),
+                        ))
+                    break
 
         # E024: verify_command 含 pytest 但缺 --basetemp（沙箱坑，warning）
         # 2026-08-06 实踩 3 例：pytest 默认落 C:\Temp 触发 SAFE_DELETE_BULK_CONFIRM_REQUIRED → E014
@@ -740,7 +869,8 @@ def validate_quality(master: Master) -> list[ValidationError]:
             # 2026-08-12（task-cross-platform-validation）：--basetemp 路径平台性校验。
             # 与 E027 同源（不安全/不兼容），计入 unsafe_reasons 一并上报。
             unsafe_reasons += _basetemp_platform_issues(verify_cmd)
-            if unsafe_reasons:
+            # F6（task-validate-terminal-quiet）：终态任务跳过 E027。
+            if unsafe_reasons and not terminal:
                 errors.append(
                     ValidationError(
                         code=ErrorCode.E027,
@@ -793,6 +923,10 @@ def validate_quality(master: Master) -> list[ValidationError]:
             f for f in (t.get("exempt_files") or []) if isinstance(f, str)
         ]
         tests_root = _tests_root_from_master(master)
+        # F6（task-validate-terminal-quiet）：终态任务跳过 E026。
+        # 其余终态豁免码（E023/E029/E037/E038）口径不变，仍由调用方过滤。
+        if terminal:
+            continue
         for fe in files_edit:
             expect_test = derive_related_test_file(fe, tests_root)
             if (expect_test is not None and expect_test not in files_edit

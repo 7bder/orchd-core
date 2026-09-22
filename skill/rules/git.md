@@ -1,6 +1,12 @@
+---
+guide:
+  done: 4
+  claimed_impl: 2
+  done_submitted: 2
+---
 # git 纪律（引擎 best-effort 建分支/merge + done/amend 自动提交，从不 push）
 
-> TL;DR: ① 禁手动 git 写操作（checkout/branch/reset/stash/merge/push 等），唯一豁免任务分支 git commit ② 禁破坏性 git 操作 ③ 声明文件必须随任务分支提交进 diff，否则 done/review 被拒 ④ worktree 全生命周期由引擎管理，agent 零操作
+> TL;DR: ① 禁手动 git 写操作（checkout/branch/reset/stash/merge/push 等），豁免 = 任务分支 git commit + 任务分支 `orchd git merge main` 精确形态（受管出口） ② 禁破坏性 git 操作 ③ 声明文件必须随任务分支提交进 diff，否则 done/review 被拒 ④ worktree 全生命周期由引擎管理，agent 零操作
 
 > 原 .orchd/SKILL.md「git 纪律」，外置自 task-skill-hub-refactor。
 
@@ -71,8 +77,17 @@ python .orchd/__main__.py sync --remote <name>  # 指定远端名（默认 origi
 
    - `--files-to-edit` / `--exempt-files`：并集追加（只增不删，删改走 E007 矩阵）；
    - `--verify-command "<cmd>"`：覆写 verify_command（白名单内不阻断）；
+   - `--reviewers <id...>` / `--files-to-read <path...>`：整体覆写（空值即清空；
+     files_to_read 条目按 reference 登记；task-spec-hygiene-flat-sweep 起）；
    - `--task` 需至少携带一个补丁字段，否则 E007 拒绝；
    - 终态任务（completed/cancelled）补登仍 E007 拒绝。
+
+   **AC 字段编辑窗口（task-spec-hygiene-flat-sweep）**：`acceptance_criteria` /
+   `brief` / `name` / `deliverables` 四字段按任务状态分流——pending 态可直接改
+   全部；claimed / done / in_review 锁死（E007 附状态路由指引：回 pending 改，或
+   等终态走 `--revise-terminal`）；终态（completed/cancelled）仅
+   `amend --revise-terminal <id> --reason` 且条数不变（AC 增删属范围变更，另走
+   用户裁决逃生口）。
 
 3. **回到任务 worktree 继续**：amend 成功后引擎自动提交 `_master.json`，任务 worktree 下次 claim / done 时自动读取最新声明。无需手动同步或重建 worktree。
 

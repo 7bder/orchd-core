@@ -663,7 +663,12 @@ def _check_checkpoint_consistency(project_root: Path) -> list[dict[str, str]]:
                     f"{ckpt_path.name} 顶层不是 JSON 对象（replay 将退化为全量重建）",
                 )
             ]
-        total = len([
+        # task-ledger-archive-compact：逻辑行 = 归档解析成功数 + 活跃文件非空行
+        # （与 backend.event_count 同口径；纯 SQLite 部署下 jsonl 缺失按 0 计，
+        # 沿用本检查既有的文件缺失语义，不新增后端选择逻辑）。
+        from orchd.storage import archive_event_count
+
+        total = archive_event_count(store_dir) + len([
             ln for ln in ledger_path.read_text(encoding="utf-8").splitlines()
             if ln.strip()
         ])

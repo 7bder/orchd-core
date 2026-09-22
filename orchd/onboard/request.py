@@ -39,7 +39,8 @@ from orchd.review import (
     extract_review_comments as _extract_review_comments,
     request_reviewer as _request_reviewer,
 )
-from orchd.worktree import _git_diff_names
+from orchd.gitops.repo import GitBackend
+
 
 # conflict_policy（task-inflight-conflict-visibility）：在途任务重叠的处置策略。
 # 缺省 warn —— 不新增任何跨任务硬阻断（硬阻断会造成互等死锁，且在途集合本身
@@ -220,7 +221,9 @@ def _inflight_files(
         tid = branch[len(prefix):]
         if tid not in known:
             continue
-        files = _git_diff_names(project_root, tid) or []
+        # 在途=分支级事实（仅 git 有分支概念）：经端口 GitBackend 直连（与原
+        # _git_diff_names 同函数；无 git 时分支循环本就为空，此处不做快照语义外溢）。
+        files = GitBackend(project_root).changed_paths(tid) or []
         if files:
             inflight[tid] = files
     return inflight

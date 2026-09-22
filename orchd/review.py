@@ -35,7 +35,7 @@ from orchd.gitops_ops import (
     try_delete_task_branch,
     try_git_merge,
 )
-from orchd.guide import NEXT_ACTION_EXIT
+from orchd.guide import NEXT_ACTION_EXIT, read_for
 from orchd.ledger import (
     Store,
     TaskDerived,
@@ -166,6 +166,115 @@ def _merge_diagnostic_action(task_id: str, diag: dict[str, Any]) -> str:
         f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'merge失败放弃'\n"
         f"  orchd force-status --task {task_id} --status pending --reason 'merge失败回退'"
     )
+
+
+def _own_merge_residual(
+    audit_root: Path | None,
+    task_id: str,
+    tip_sha: str | None,
+    worktree_recycled: dict[str, Any] | None,
+    branch_deleted: bool | None,
+) -> list[dict[str, Any]]:
+    """窄口径自家残留检查（task-merge-audit-inline，AC2）。
+
+    只查**本任务** merge 成功后应已清理的三项；无关告警（幽灵分支 / 他任务
+    残留 / cancelled 遗留）由 :func:`orchd.report.merge_audit` 全量巡检注解，
+    不进入本函数（AC3：注解不拦）。
+
+    检查项（均为"本应已清理却仍存在"= 真残留才命中）：
+      1. ``worktree_not_recycled``：``worktree_recycled.removed is False``
+         （回收函数已区分"无可回收"→removed=True，故 False 即真残留）；
+      2. ``branch_not_cleaned``：分支删除未报告成功 **且** 分支实际仍存在
+         （``git show-ref`` 验证；删除报 False 但分支已无 = 幂等口径差异，
+         属良性，不拦）；
+      3. ``branch_not_merged_into_main``：分支 tip 已知 **且** main 不包含它
+         （``git merge-base --is-ancestor``；tip 未知时无法判定，不拦）。
+
+    只读 git，永不抛异常（探针失败返回已确认项，不阻断完成路径）。
+    """
+    residual: list[dict[str, Any]] = []
+    wr = worktree_recycled or {}
+    if wr.get("removed") is False:
+        res = wr.get("residual") or {}
+        residual.append({
+            "task_id": task_id,
+            "reason": "worktree_not_recycled",
+            "detail": res.get("reason") or wr.get("reason") or "worktree 回收未成功",
+        })
+    if audit_root is not None:
+        try:
+            root = str(audit_root)
+            if branch_deleted is not True:
+                show = subprocess.run(
+                    ["git", "-C", root, "show-ref", "--verify",
+                     f"refs/heads/task/{task_id}"],
+                    capture_output=True, timeout=10,
+                )
+                if show.returncode == 0:
+                    residual.append({
+                        "task_id": task_id,
+                        "reason": "branch_not_cleaned",
+                        "detail": f"task/{task_id} 分支仍存在（分支删除未成功）",
+                    })
+            if tip_sha:
+                anc = subprocess.run(
+                    ["git", "-C", root, "merge-base", "--is-ancestor",
+                     tip_sha, "main"],
+                    capture_output=True, timeout=10,
+                )
+                if anc.returncode != 0:
+                    residual.append({
+                        "task_id": task_id,
+                        "reason": "branch_not_merged_into_main",
+                        "detail": f"task/{task_id} tip {tip_sha[:7]} 未被 main 包含",
+                    })
+        except Exception:
+            pass
+    return residual
+
+
+def _own_residual_action(
+    task_id: str, own: list[dict[str, Any]], audit_root: Path | None
+) -> str:
+    """自家残留的可执行指引（task-merge-audit-inline，AC2）。
+
+    与 merge_conflict / merge_env_error 指引同形：修复步骤 + 同一 reviewer
+    重试 + 通用放弃通道。
+    """
+    lines = [
+        "merge 已落地但本任务残留未清理：任务已退回 in_review，未标记完成。",
+        "【残留】",
+    ]
+    for entry in own:
+        reason = entry.get("reason", "unknown")
+        detail = entry.get("detail", "")
+        if reason == "worktree_not_recycled":
+            fix = (
+                "先切出任务 worktree 目录后重试回收，或运行 doctor --fix "
+                "清理残留；不要在已失效的 worktree 目录内执行命令"
+            )
+        elif reason == "branch_not_cleaned":
+            fix = (
+                f"在主工作树执行 git branch -d task/{task_id}（root={audit_root}），"
+                "失败则运行 doctor --fix"
+            )
+        elif reason == "branch_not_merged_into_main":
+            fix = (
+                "核对 main 是否包含本次实现（git log main 查找任务提交）；"
+                "缺失则进入任务 worktree 执行 orchd git merge main 确认后重试"
+            )
+        else:
+            fix = "按残留详情人工处置"
+        lines.append(f"  - {reason}：{detail}。{fix}")
+    lines += [
+        "【修复步骤】",
+        "  1. 按上方残留逐项处置",
+        "  2. 由同一 reviewer 重试 code APPROVED",
+        "【放弃本次审查】",
+        f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason '自家残留放弃'\n"
+        f"  orchd force-status --task {task_id} --status pending --reason '自家残留回退'",
+    ]
+    return "\n".join(lines)
 
 
 def request_reviewer(
@@ -418,6 +527,17 @@ def review_submit(
     由 ``_review_submit_impl`` 尾部释放并写 ``session_lock_released``；异常/提前
     返回路径由本包装器的 finally 兜底，杜绝漏放锁（此前需 60min 超时 + watchdog 兜底）。
     """
+    # task-guide-routing-meta：防御性重入路由（库调用无 main() 启动初始化时）。
+    # .orchd 存在但 rules/ 缺失 → 跳过（保留既有缓存）；其余失败静默（响应路径
+    # 不因子虚乌有而崩，缺失路由由 read_for 的 fail-closed 在使用点报错）。
+    try:
+        from orchd.guide import init_routing
+
+        _rr_orchd = Path(project_root) / ".orchd" if project_root else None
+        if _rr_orchd is not None and _rr_orchd.is_dir():
+            init_routing(_rr_orchd, project_root)
+    except Exception:
+        pass
     try:
         return _review_submit_impl(
             store, tasks, agent_id, task_id, review_type, verdict, comments,
@@ -709,7 +829,11 @@ def _review_submit_impl(
         # （区分“漏提交”与“声明但未改动”），声明未改动的冗余文件不再误拦 merge。
         if project_root:
             try:
-                task_map = {t.get("id", ""): t for t in tasks}
+                # task-flat-decl-authority：声明经 resolve_declaration_source 解析
+                # （flat 下从 main blob 读权威声明，防任务分支本地副本陈旧）。
+                from orchd.worktree import resolve_declaration_source
+                _tasks = resolve_declaration_source(project_root, tasks, degraded)[0]
+                task_map = {t.get("id", ""): t for t in _tasks}
                 task_def = task_map.get(task_id) or {}
                 from orchd.worktree import diagnose_missing_branch_files
 
@@ -804,7 +928,7 @@ def _review_submit_impl(
                         _e015_resp = structured_error(
                             "E015",
                             f"merge 冲突：{_cf_text}（main 已恢复，需人工裁决）",
-                            [{"conflict_files": conflict_files, "hint": "进入任务 worktree 执行 git merge main，解决冲突后 commit，再由同一 reviewer 重试 code APPROVED"}],
+                            [{"conflict_files": conflict_files, "hint": "进入任务 worktree 执行 orchd git merge main，解决冲突后 commit，再由同一 reviewer 重试 code APPROVED"}],
                             project_root,
                         )
                         result["error"] = _e015_resp.get("error")
@@ -823,7 +947,7 @@ def _review_submit_impl(
                             f"【解决步骤】\n"
                             f"  1. 进入任务 worktree 目录：cd ../{_wt_dir_name(task_id)}/\n"
                             f"     （container 布局下主工作树内无法 checkout task/{task_id} 分支）\n"
-                            f"  2. 执行 git merge main，解决冲突后 git commit\n"
+                            f"  2. 执行 orchd git merge main（受管通道，任务分支放行），解决冲突后 git commit\n"
                             f"  3. 由同一 reviewer 重试 code APPROVED\n"
                             f"【放弃本次审查】\n"
                             f"  orchd retract --task {task_id} --type REVIEW_CLAIMED --reason 'merge冲突放弃'\n"
@@ -863,6 +987,21 @@ def _review_submit_impl(
                 store_root = (
                     resolve_store_dir(project_root / ".orchd") if project_root else None
                 )
+                # 内联审计根（task-merge-audit-inline）：回收会删掉任务 worktree，
+                # 审计 git 探针必须以主工作树为稳定 cwd（与删分支的 delete_root 同口径）。
+                # main_wt 仅 project_root 非空时绑定，嵌套取值防 NameError。
+                _audit_root = (
+                    (main_wt if main_wt is not None else project_root)
+                    if project_root else None
+                )
+                # 回收/删分支前捕获任务分支 tip：之后分支可能已删无法再取；
+                # best-effort，取不到则跳过 tip 落 main 项（不拦）。
+                _tip_sha: str | None = None
+                if _audit_root is not None:
+                    try:
+                        _tip_sha = _task_branch_tip(_audit_root, task_id)
+                    except Exception:
+                        _tip_sha = None
                 # container（merge_lock 与 store_root/sl 落在同一共享账本根 .lock）下，
                 # merge_lock 已持那把 .lock 排他锁：完成事件写入 + 终态回收（unbind）
                 # 复用它而非再次 flock，避免 E012 同进程双 fd 死锁（task-14-review
@@ -915,8 +1054,22 @@ def _review_submit_impl(
                 if result.get("reason") != "state_changed_during_merge":
                     if merge_result is None:
                         # 无 git 上下文（project_root=None，单元测试/无仓库）best-effort：
-                        # 无实际合并，不回收 worktree、不删分支。
+                        # 无实际合并，不回收 worktree、不删分支。审计恒跳过但仍附
+                        # 响应（task-merge-audit-inline AC1/AC4：nogit 单目录 /
+                        # 无上下文如实标记 skipped，不阻断完成）。
                         result["merged"] = None
+                        if _nogit_single_dir:
+                            result["merge_audit"] = {
+                                "skipped": True, "reason": "nogit_single_dir",
+                            }
+                        elif project_root is None:
+                            result["merge_audit"] = {
+                                "skipped": True, "reason": "no_project_root",
+                            }
+                        else:
+                            result["merge_audit"] = {
+                                "skipped": True, "reason": "merge_not_executed",
+                            }
                     else:
                         result["merged"] = True
                         if auto_resolved:
@@ -947,6 +1100,86 @@ def _review_submit_impl(
                         result["branch_deleted"] = try_delete_task_branch(
                             delete_root, task_id
                         )
+                        # 内联 merge 审计（task-merge-audit-inline，AC1/AC2/AC3）：
+                        # code APPROVED 在 merge 成功后自动跑 merge_audit 并附响应。
+                        # 只读 best-effort：探针失败 / 跳过（非 git / 无 main /
+                        # 无 project_root）不阻断完成。
+                        try:
+                            from orchd.report import merge_audit as _merge_audit_fn
+                        except Exception:
+                            _merge_audit_fn = None
+                        if _merge_audit_fn is not None and _audit_root is not None:
+                            try:
+                                _audit = _merge_audit_fn(store, tasks, _audit_root)
+                            except Exception:
+                                _audit = {"skipped": True, "reason": "audit_failed"}
+                        else:
+                            _audit = {"skipped": True, "reason": "no_project_root"}
+                        result["merge_audit"] = _audit
+                        # 窄口径自家残留（AC2）：仅本任务残留退回 in_review +
+                        # 可执行指引；无关告警只注解不拦（AC3：completed 维持）。
+                        _own: list[dict[str, Any]] = []
+                        try:
+                            _own = _own_merge_residual(
+                                _audit_root, task_id, _tip_sha,
+                                result.get("worktree_recycled"),
+                                result.get("branch_deleted"),
+                            )
+                        except Exception:
+                            _own = []
+                        if _own:
+                            if not _audit.get("skipped", False):
+                                _audit.setdefault("warnings", []).extend(_own)
+                            else:
+                                _audit["own_residual"] = _own
+                            # task-recycle-noblock：残留分两档处置——
+                            # ① 分支类（未合入 / 未清理）：代码未落地，不得标记完成，
+                            #    仍打回 in_review（下不变）；
+                            # ② 目录残留（worktree_not_recycled，Windows 下调用方
+                            #    shell 句柄占用常见）：改警告注解 + completed 维持，
+                            #    不再空转第二轮审查；回收 journal 保留（仅全成功才删），
+                            #    引擎下次回收该任务时按 journal 重放收敛（延迟回收）。
+                            # 未知 reason 按分支档处理（fail-closed 方向）。
+                            _bounce = [w for w in _own
+                                       if w.get("reason") != "worktree_not_recycled"]
+                            _deferred = [w for w in _own
+                                         if w.get("reason") == "worktree_not_recycled"]
+                            if _bounce:
+                                # 退回 in_review：FORCE_STATUS 通道（replay 层 ungated，
+                                # target=in_review 保留审查认领字段，同一 reviewer 可重试；
+                                # revive 巡检只认 completed→pending，本通道零审计噪音）。
+                                _reopen = make_event(
+                                    task_id, agent_id, "FORCE_STATUS",
+                                    target_status="in_review",
+                                    reason="own_merge_residual",
+                                    residual=_bounce,
+                                )
+                                if not reuse_write:
+                                    store.acquire_lock()
+                                try:
+                                    store.append_event(_reopen)
+                                    _reopened_state = store.replay()
+                                    store.update_checkpoint(_reopened_state)
+                                    result["task_status"] = "in_review"
+                                finally:
+                                    if not reuse_write:
+                                        store.release_lock()
+                                result["reason"] = "own_merge_residual"
+                                result["action"] = _own_residual_action(
+                                    task_id, _bounce, _audit_root)
+                            elif _deferred:
+                                # 目录残留：completed 维持，仅注解（merge_audit
+                                # warnings 已含该项；延迟回收指引见完成态 guidance）。
+                                result["worktree_residual_deferred"] = {
+                                    "task_id": task_id,
+                                    "residual": _deferred,
+                                    "hint": (
+                                        "任务已 completed；目录残留改警告注解，不再打回 "
+                                        "in_review。回收 journal 已保留，引擎下次回收该任务"
+                                        "时按 journal 重放收敛；目录残留可运行 doctor --fix "
+                                        "清理（doctor_check=worktree_residual）"
+                                    ),
+                                }
         finally:
             if merge_lock is not None:
                 merge_lock.release_lock()
@@ -987,12 +1220,17 @@ def _build_completion_guidance(
     AC1：明确下一步在主工作树执行 status --audit-merge（rules/review.md 硬要求）。
     AC2：回收未成功（worktree_recycled.removed=false）时额外给出处置指引，
     文案与 residual 实际结局一致、不承诺已清理。
+    task-merge-audit-inline：内联审计已在 code APPROVED 内自动执行（响应
+    merge_audit 字段），此处复核命令保留作人工二次确认。
+    task-recycle-noblock：目录残留不再打回审查时，此处附延迟回收指引
+    （journal 保留 + doctor --fix）。
     """
     from orchd.guide import _ENTRY_CMD
 
     hint = (
-        f"任务 {task_id} 已审查通过并合并（completed）。请在**主工作树**执行 "
-        f"{_ENTRY_CMD} status --audit-merge 确认 merge_audit.warnings 为空"
+        f"任务 {task_id} 已审查通过并合并（completed）。内联 merge 审计已执行"
+        f"（见响应 merge_audit 字段）；请在**主工作树**执行 "
+        f"{_ENTRY_CMD} status --audit-merge 复核确认 merge_audit.warnings 为空"
         "（rules/review.md 硬要求）。"
     )
     wr = worktree_recycled or {}
@@ -1003,12 +1241,14 @@ def _build_completion_guidance(
             f" 注意：任务 worktree 回收未成功（{reason}），"
             "请先切出该目录后重试回收，或运行 doctor --fix 清理残留；"
             "不要在已失效的 worktree 目录内执行命令。"
+            " 回收 journal 已保留（延迟回收）：引擎下次回收该任务时按 journal "
+            "重放收敛，无需重审。"
         )
     return {
         "step": "audit_merge",
         "command": f"{_ENTRY_CMD} status --audit-merge",
         "hint": hint,
-        "read": ["rules/review.md"],
+        "read": read_for("audit_merge"),
     }
 
 

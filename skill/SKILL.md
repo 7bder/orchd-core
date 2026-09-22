@@ -21,7 +21,7 @@
 
 ## 纪律红线（MUST / MUST NOT，违反 = 事故；优先级最高）
 **MUST NOT**（禁止项；每条约满足条件 → 禁止动作 → 例外/出口）：
-1. **禁手动 git 写操作**：任何会话中，不得执行 `git checkout / branch / reset / stash / gc / prune / clean / rebase / cherry-pick / merge / push`。git 写操作仅由引擎自动执行；唯一豁免 = 任务分支上的 `git commit`。若确需其他手动 git 写，先向人报告获许可。
+1. **禁手动 git 写操作**：任何会话中，不得执行 `git checkout / branch / reset / stash / gc / prune / clean / rebase / cherry-pick / merge / push`。git 写操作仅由引擎自动执行；豁免 = 任务分支上的 `git commit` + 任务分支上的 `orchd git merge main`（精确形态，受管出口，详见 rules/git.md）。若确需其他手动 git 写，先向人报告获许可。
 2. **禁破坏性 git**：`reset --hard` / `gc --prune=now` / `clean -fdx` / `branch -D` / `push --force` 一律禁止，无豁免。
 3. **禁改范围外文件**：只读 files_to_read、只写 files_to_edit；不触 `.git/`；删文件前确认属验收范围。确需增删声明文件时回主工作树执行 amend 补登，不手改 _master.json。
 4. **禁绕过身份（自审三档）**：

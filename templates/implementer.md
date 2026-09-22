@@ -1,3 +1,8 @@
+---
+guide_template:
+  roles: [implementer]
+  order: 1
+---
 # Implementer — 实现者工作模板
 
 ## 角色定位

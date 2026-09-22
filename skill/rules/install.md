@@ -1,3 +1,7 @@
+---
+# 显式未路由（安装协议走 BOOTSTRAP 专道，不进 guidance 场景）
+guide: {}
+---
 # 安装规则（Agent 无感安装协议 + BOOTSTRAP mode）
 
 > TL;DR: ① BOOTSTRAP 自启动安装流程 ② --cleanup 安装后自动删除克隆源（无痕安装） ③ 安装/claim 流程自动启用仓库自带 `.githooks`（`core.hooksPath` 是本地配置、不随 clone 传播；已自定义为其他路径则仅提示不改写）

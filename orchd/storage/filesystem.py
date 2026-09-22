@@ -70,32 +70,55 @@ class FilesystemBackend(StorageBackend):
     def read_events(
         self, from_line: int = 1, to_line: int | None = None
     ) -> list[dict[str, Any]]:
-        """读取 ledger 事件（``from_line`` / ``to_line`` 均为 1-based **物理行号**）。
+        """读取 ledger 事件（``from_line`` / ``to_line`` 均为 1-based **逻辑行号**）。
 
-        ``from_line`` 语义：在文件层先跳过前 ``from_line-1`` 行，再解析剩余行。
-        这样 checkpoint 之前（已被快照覆盖）的损坏行不会被解析——B-1 修复，
-        恢复增量 replay 的容错语义（重构前 ``_read_ledger_lines`` 直接在文件层
-        跳过，不解析被跳过的行）。
+        逻辑行 = 归档前缀（``_ledger.archive.jsonl`` 解析成功事件）+ 活跃文件。
+        compact 后 checkpoint.ledger_line 即逻辑行号体系下的计数（见
+        ``Store.compact_archive``），此处必须同口径，否则增量起点错位。
 
-        ``to_line``（L-11，task-ledger-replay-visibility）：只解析到第 ``to_line``
-        **物理行**（含）。checkpoint.ledger_line 是物理行号，撕裂/损坏行会让
-        「解析事件序号」与「物理行号」错位——按序号切片（``read_events()[:n]``）
-        会多带一条事件，导致 check_integrity 把引擎自身的撕裂行误报成「疑似被篡改」。
-
-        损坏行（L-12）：除 ``warnings.warn``（向后兼容）外，同时把结构化条目
-        追加到 ``self.corrupt_lines``（每次调用重置），供
-        :meth:`Store.check_integrity` 汇总进 integrity_warnings / guidance——
-        agent 因此可见「丢了哪些事件」，不再只有 stderr 之外的沉默。
-
-        容错规则（task-audit-ledger-write-atomicity AC4）：
-        - 最后一行 JSON 解析失败 → 跳过 + warning（可能写入未完成）
-        - 中间行解析失败 → warning（E030 语义）+ 跳过，不再硬抛 E002 中断引擎；
-          撕裂行（并发 append 被中断）因此降级为可读，数据可继续恢复
+        以下既有语义保持（task-ledger-archive-compact：仅叠加归档前缀）：
+        容错规则（末行/中间行损坏分级跳过 + E030）、``to_line`` 物理行语义
+        （现为逻辑行，撕裂错位防护同理）、``corrupt_lines`` 收集（含归档段，
+        其行号为归档内物理行号）。
+        跨段去重：崩溃残留可能使同一事件体同时落在归档与活跃文件，去重保序
+        （归档优先），使中断后重跑天然幂等。
         """
+        from orchd.storage import read_archive_events
+
         self.corrupt_lines = []
-        if not self.ledger_path.exists():
-            return []
+        arch, arch_corrupt = read_archive_events(self.orchd_dir)
+        Ka = len(arch)
+        for entry in arch_corrupt:
+            self.corrupt_lines.append(entry)
+        arch_ids = {e.get("event_id", "") for e in arch if e.get("event_id")}
+        a_active = max(1, from_line - Ka)
+        b_active = None if to_line is None else max(a_active, to_line - Ka)
+        active, active_corrupt = self._read_active_range(a_active, b_active)
+        for entry in active_corrupt:
+            entry = dict(entry)
+            if isinstance(entry.get("line"), int):
+                entry["line"] = entry["line"] + Ka
+            self.corrupt_lines.append(entry)
+        out: list[dict[str, Any]] = []
+        if from_line <= Ka:
+            stop = None if to_line is None else max(0, to_line)
+            out.extend(arch[from_line - 1:stop])
+        out.extend(e for e in active
+                   if not e.get("event_id") or e.get("event_id") not in arch_ids)
+        return out
+
+    def _read_active_range(
+        self, from_line: int, to_line: int | None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """读取活跃文件指定物理行范围（既有逻辑下沉，行号为文件内物理行号）。
+
+        Returns:
+            ``(events, corrupt)``；corrupt 条目沿用既有形状（含物理行号）。
+        """
         events: list[dict[str, Any]] = []
+        corrupt: list[dict[str, Any]] = []
+        if not self.ledger_path.exists():
+            return events, corrupt
         raw_lines: list[str] = []
         with open(self.ledger_path, "r", encoding="utf-8") as f:
             raw_lines = f.readlines()
@@ -129,7 +152,7 @@ class FilesystemBackend(StorageBackend):
                         stacklevel=2,
                     )
                 # 结构化留痕（L-12）：不因 warn 无法被程序化消费而静默
-                self.corrupt_lines.append({
+                corrupt.append({
                     "code": ErrorCode.E030.name,
                     "severity": "warning",
                     "message": (
@@ -143,16 +166,37 @@ class FilesystemBackend(StorageBackend):
                     ),
                     "snippet": stripped[:80],
                 })
-        return events
+        return events, corrupt
 
     def event_count(self) -> int:
-        if not self.ledger_path.exists():
-            return 0
-        count = 0
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            for _ in f:
-                count += 1
+        """逻辑事件总数 = 归档解析成功数 + 活跃文件行数（task-ledger-archive-compact）。
+
+        compact 只搬运不删除逻辑事件，故总数在压实前后不变； doctor 的
+        checkpoint_consistency 与 H4 计数器沿用本口径，无需改动。
+        """
+        from orchd.storage import archive_event_count
+
+        count = archive_event_count(self.orchd_dir)
+        if self.ledger_path.exists():
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                for _ in f:
+                    count += 1
         return count
+
+    def replace_active_events(self, events: list[dict[str, Any]]) -> None:
+        """全量重写活跃文件（task-ledger-archive-compact，compact 专用）。
+
+        原子替换（tmp + os.replace）；调用方（Store compact 流程）须已持
+        store 锁。行格式与 append_event 一致（紧凑 JSON + LF）。
+        """
+        tmp_path = self.ledger_path.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev, ensure_ascii=False,
+                                   separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.ledger_path)
 
     def load_checkpoint(self) -> dict[str, Any] | None:
         if not self.checkpoint_path.exists():

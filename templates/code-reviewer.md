@@ -1,3 +1,9 @@
+---
+guide_template:
+  roles: [reviewer]
+  modes: [two_phase]
+  order: 2
+---
 # Code Reviewer — 代码审查模板（清单化）
 
 ## 角色定位

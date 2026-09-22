@@ -345,7 +345,41 @@ def _get_ref_tx_hook_path(project_root: Path) -> Path:
     return _get_hooks_dir(project_root) / _REF_TX_HOOK_FILENAME
 
 
-def ref_tx_hook_content() -> str:
+def _baked_hook_endpoints(project_root: Path) -> tuple[str | None, str | None]:
+    """安装期固化 hook 的解释器与引擎源码根（task-ref-tx-hook-cost）。
+
+    运行期钩子每次 checkout 都重走「解释器探测 + 嵌套 ``git rev-parse``」，
+    在 MSYS 祖先链下被放大 35–90 倍。安装期 ``project_root`` 已知，一次性
+    解析并烘焙进脚本，运行期零探测直达执行；固化路径失效时回退既有探针。
+
+    Returns:
+        ``(python_exe, src_dir)``；任一不可用即 ``(None, None)``（= 不烘焙，
+        生成物与旧版逐字一致）。
+    """
+    try:
+        py = sys.executable
+        if not py:
+            return None, None
+        from orchd.gitops._run import _run_git
+
+        top = _run_git(project_root, ["rev-parse", "--show-toplevel"])
+        if top.returncode != 0 or not (top.stdout or "").strip():
+            return None, None
+        root = Path((top.stdout or "").strip())
+        module_rel = "orchd/gitops/ref_tx_hook.py"
+        if (root / ".orchd" / module_rel).is_file():
+            return py, str(root / ".orchd")
+        if (root / module_rel).is_file():
+            return py, str(root)
+    except Exception:
+        pass
+    return None, None
+
+
+def ref_tx_hook_content(
+    py_exe: str | None = None,
+    src_dir: str | None = None,
+) -> str:
     """生成强制层 hook 脚本（shell shim → ``python -m orchd.gitops.ref_tx_hook``）。
 
     与 pre-commit hook 同约定：纯 LF、含 shebang 与 orchd 归属标记（首部 5 行内）——
@@ -353,30 +387,52 @@ def ref_tx_hook_content() -> str:
     owner-aware 判定（宿主自有 reference-transaction hook 一律不覆盖 / 不删除）。
 
     引擎定位（宿主布局事实：宿主项目自带 ``.orchd/`` 引擎副本，`python .orchd/__main__.py`）：
-    ① ``$ORCHD_SRC_DIR``（显式；CI / 外置安装）→ ② ``<git toplevel>/.orchd``（宿主自带）
-    → ③ ``import orchd``（源码仓库内运行）。三者皆不可用时打印诊断并放行（**禁止静默**，
+    ① ``$ORCHD_SRC_DIR``（显式；CI / 外置安装）→ ② 安装期烘焙路径（解释器 +
+    源码根已知，零探测直达；失效回退探针）→ ③ ``<git toplevel>/.orchd``（宿主自带）
+    → ④ ``import orchd``（源码仓库内运行）。皆不可用时打印诊断并放行（**禁止静默**，
     且不阻断宿主 git 操作——与 pre-commit 的解释器缺失处置同族）。
     """
+    # 注：py_code 内只用双引号字符串——外层 sh 以单引号包裹 -c 参数，
+    # 单引号会提前闭合 sh 引用（task-ref-tx-hook-cost 实测回归）。
     py_code = (
-        "import sys; sys.path.insert(0, sys.argv[1]); "
-        "from orchd.gitops.ref_tx_hook import main; "
-        'sys.exit(main(["reference-transaction"] + sys.argv[2:]))'
+        "import sys, importlib.util as _ilu; "
+        '_p = sys.argv[1] + "/orchd/gitops/ref_tx_hook.py"; '
+        '_s = _ilu.spec_from_file_location("orchd_ref_tx_hook_standalone", _p); '
+        "_m = _ilu.module_from_spec(_s); _s.loader.exec_module(_m); "
+        'sys.exit(_m.main(["reference-transaction"] + sys.argv[2:]))'
     )
     module_rel = "orchd/gitops/ref_tx_hook.py"
     py_probe = "python / python3 / py"
     no_py = f"[orchd ref-tx] 未找到可用 python 解释器（{py_probe}）"
     no_engine = (
-        "[orchd ref-tx] 未定位到 orchd 引擎（ORCHD_SRC_DIR / <toplevel>/.orchd / "
-        "<toplevel> 均不含引擎源码）"
+        "[orchd ref-tx] 未定位到 orchd 引擎（ORCHD_SRC_DIR / 烘焙路径 / "
+        "<toplevel>/.orchd / <toplevel> 均不含引擎源码）"
     )
+    # 安装期烘焙快道（task-ref-tx-hook-cost）：解释器与源码根已知时，运行期
+    # 零探测、零嵌套 git 直达执行；固化路径失效（升级/迁移）时落到下探针。
+    baked = ""
+    if py_exe and src_dir:
+        baked = (
+            "# 安装期固化快道：零探测直达；失效回退下探针。\n"
+            f"ORCHD_BAKED_PY={_shell_quote(py_exe)}\n"
+            f"ORCHD_BAKED_SRC={_shell_quote(src_dir)}\n"
+            f'if [ -x "$ORCHD_BAKED_PY" ] && [ -f "$ORCHD_BAKED_SRC/{module_rel}" ]; then\n'
+            f"    exec \"$ORCHD_BAKED_PY\" -c '{py_code}' \"$ORCHD_BAKED_SRC\" \"$@\"\n"
+            "fi\n"
+            "# 能执行到此处即固化快道未命中（exec 成功即替换进程）→ 留痕后回退探针。\n"
+            'echo "[orchd ref-tx] 烘焙路径失效，回退解释器/引擎探针" >&2\n'
+            "\n"
+        )
     return (
         f"{_HOOK_SHEBANG}\n"
         f"{_HOOK_MARKER}\n"
         f"{_REF_TX_HOOK_MARKER}\n"
         "# 红线 #1/#2 强制层：引用事务 prepared 阶段拦截（绕过代理直连 git 同样被拒）。\n"
+        "# 模块 orchd.gitops.ref_tx_hook 按文件路径独立加载，不走包 __init__。\n"
         "# 逃生口：ORCHD_ALLOW_REF_TX=1（人工修复 / 仓库迁移）。\n"
         "set -u\n"
         "\n"
+        + baked +
         'ORCHD_PY=""\n'
         "for _CAND in python python3 py; do\n"
         '    if command -v "$_CAND" >/dev/null 2>&1; then\n'
@@ -427,7 +483,7 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
         }
         _log_hook_skip("install_ref_tx_skipped_foreign_hook", result)
         return result
-    content = ref_tx_hook_content()
+    content = ref_tx_hook_content(*_baked_hook_endpoints(project_root))
     check = _validate_hook_content(content)
     if not check["ok"]:
         result = {"installed": False, "reason": "invalid_generated_hook",
@@ -446,7 +502,10 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
                 "error": str(exc)}
     if _REF_TX_HOOK_MARKER not in written or not _validate_hook_content(written)["ok"]:
         return {"installed": False, "reason": "invalid_written_hook", "path": str(path)}
-    return {"installed": True, "path": str(path)}
+    installed_result: dict[str, Any] = {"installed": True, "path": str(path)}
+    # 烘焙可观测（task-ref-tx-hook-cost）：写盘生成物是否含固化快道。
+    installed_result["baked"] = "ORCHD_BAKED_PY=" in written
+    return installed_result
 
 
 def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:

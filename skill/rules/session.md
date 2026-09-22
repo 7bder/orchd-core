@@ -1,3 +1,14 @@
+---
+guide:
+  lesson_review: 2
+  check_status: 1
+  rework_first: 2
+  request_impl: 1
+  done: 3
+  claimed_impl: 1
+  changes_requested: 2
+  warning_unmapped: 1
+---
 # Session 规则（状态检查 / 接管 / 优先级 / claim 细节）
 
 > TL;DR: ① session 开始三连检查（git status + branch + status）② 有在握任务回 task 分支继续，无则 main 且工作区干净 ③ 优先级：清审查积压→领实现→三者皆空即停不重试（**自动执行时"清审查"为硬默认：先做完审查闭环再领实现**）④ claim 两段式需 --confirm，auto-claim 默认禁用 ⑤ 摄入仅用户指定
@@ -29,7 +40,7 @@
 ## 双布局（container / flat）
 - **container（默认，多 worktree 并行）**：仓库根为容器，**主工作树在 `main/` 子目录**（带 `(main)` 标记），任务 worktree 为容器根的 `task-<id>/` 独立目录；账本运行时在 `<容器>/.orchd-runtime/`（可 `ORCHD_HOME` 重定向）。**agent 只在任务 worktree 内工作，绝不触碰 main**——merge 由引擎在主工作树执行。
 - **flat（单 worktree）**：无 `main/` 子目录，工作树即仓库根；账本运行时在 `.orchd/`。任务认领 / done / review 行为与 container 完全一致（零回归）。
-- **定位主工作树**：`git worktree list` 中带 `(main)` 标记的路径；或从任务 worktree 路径上溯到项目根下的 `main/` 目录（见 rules/git.md「持任务 amend 补登」三步流程）。
+- **定位主工作树**：`git worktree list` 中带 `(main)` 标记的路径；container 布局可从任务 worktree 路径上溯到项目根下的 `main/` 目录，flat 布局主工作树即仓库根本身、无需上溯（见 rules/git.md「持任务 amend 补登」三步流程）。
 
 ## 工作优先级（按序找活，做完一件再做下一件）
 1. **清审查积压**：`python .orchd/__main__.py status` 存在 in_review 且审查未被认领 → 以当前会话指纹领取

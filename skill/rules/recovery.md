@@ -1,3 +1,7 @@
+---
+# 显式未路由（事故恢复走 doctor/SOP 专道，不进 guidance 场景）
+guide: {}
+---
 # 仓库事故恢复（git 对象/refs 丢失 SOP）
 
 > TL;DR: ① 仓库对象/refs 丢失按 SOP 恢复 ② 先报告再操作，不自行猜测处置

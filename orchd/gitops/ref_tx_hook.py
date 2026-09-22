@@ -40,7 +40,6 @@ stdin 每行 ``<old-value> <new-value> <ref-name>``。非零退出仅对 **prepa
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -221,6 +220,8 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
     拿不到结论（非 git / 对象缺失 / git 不可用）时返回 True（**放行**）——强制层
     优先不打断引擎流程；非快进判定的兜底由 ``classify_update`` 的显式分支承担。
     """
+    import subprocess
+
     def _check(old: str, new: str) -> bool:
         try:
             proc = subprocess.run(
@@ -239,13 +240,46 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
 
 
 def _resolve_default_branch(project_root: Path) -> str:
-    """默认分支名（best-effort；失败回退 ``main``）。"""
-    try:
-        from orchd.gitops import get_default_branch
+    """默认分支名（best-effort；失败回退 ``main``）。
 
-        return get_default_branch(project_root) or _FALLBACK_DEFAULT_BRANCH
+    task-ref-tx-hook-cost：本地轻量实现，不再 ``from orchd.gitops import
+    get_default_branch``——该包导入会拉起整包引擎面（hook 每次调用付一次
+    import 成本）。判定口径与 ``query.get_default_branch`` 逐字同源
+    （非工作树→None / 显式配置优先 / 本地 main→master），仅改用裸 subprocess。
+    """
+    import subprocess
+
+    def _git(*args: str) -> subprocess.CompletedProcess[bytes] | None:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(project_root), *args],
+                capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    try:
+        inside = _git("rev-parse", "--is-inside-work-tree")
+        if inside is None or inside.returncode != 0:
+            return _FALLBACK_DEFAULT_BRANCH
+        out = (inside.stdout or b"").decode("utf-8", errors="replace").strip()
+        if out != "true":
+            return _FALLBACK_DEFAULT_BRANCH
+        cfg = _git("config", "--get", "init.defaultBranch")
+        if cfg is not None and cfg.returncode == 0:
+            name = (cfg.stdout or b"").decode("utf-8", errors="replace").strip()
+            if name:
+                return name
+        names = _git("branch", "--list", "main", "master", "--format=%(refname:short)")
+        if names is not None and names.returncode == 0:
+            have = set((names.stdout or b"").decode("utf-8", errors="replace").split())
+            if "main" in have:
+                return "main"
+            if "master" in have:
+                return "master"
     except Exception:  # noqa: BLE001 - hook 环境最小依赖，任何失败都回退
-        return _FALLBACK_DEFAULT_BRANCH
+        pass
+    return _FALLBACK_DEFAULT_BRANCH
 
 
 def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int:
@@ -267,10 +301,22 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int
     if not updates:
         return 0
     project_root = Path.cwd()
+    # 默认分支按需解析（task-ref-tx-hook-cost）：classify 仅在更新触及
+    # refs/heads/ 非任务命名空间时才消费 default_branch；任务分支等常见
+    # 路径跳过解析，省下最多 3 个 git 子进程（MSYS 下每个都被放大）。
+    need_default = any(
+        u["ref"].startswith(HEADS_PREFIX)
+        and not u["ref"].startswith((TASK_PREFIX, ENGINE_REF_PREFIX))
+        for u in updates
+    )
+    default_branch = (
+        _resolve_default_branch(project_root)
+        if need_default else _FALLBACK_DEFAULT_BRANCH
+    )
     verdict = evaluate(
         updates,
         state=state,
-        default_branch=_resolve_default_branch(project_root),
+        default_branch=default_branch,
         is_ancestor=_git_ancestor_check(project_root),
     )
     if not verdict["blocked"]:

@@ -1,3 +1,9 @@
+---
+guide_template:
+  roles: [reviewer]
+  modes: [unified]
+  order: 1
+---
 # Reviewer — 单阶段审查模板（unified 模式，清单化）
 
 ## 角色定位

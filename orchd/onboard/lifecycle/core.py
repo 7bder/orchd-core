@@ -256,7 +256,14 @@ def _done_precheck(
     仅要求任务处于 claimed 状态，不比对 caller 指纹与 claimed_by——宿主会话身份漂移
     场景下，done 按认领者记账（见锁内 author_mismatch）。返回 task_def /
     files_to_edit / degraded_guards（门禁降级登记表，随阶段透传、收尾统一挂响应）。
+
+    task-flat-decl-authority：task_def 经 :func:`orchd.worktree.resolve_declaration_source`
+    解析（flat 下从 main blob 读权威声明，防任务分支本地副本陈旧）；返回的 task_def
+    随阶段下传复用，本 done 调用内 blob 只读一次。
     """
+    degraded_guards: list[dict[str, Any]] = []
+    from orchd.worktree import resolve_declaration_source
+    tasks = resolve_declaration_source(project_root, tasks, degraded_guards)[0]
     task_def = None
     for t in tasks:
         if t.get("id") == task_id:
@@ -269,10 +276,11 @@ def _done_precheck(
             [{"task_id": task_id}],
         )
     files_to_edit: list[str] = list(task_def.get("files_to_edit", []))
-    degraded_guards: list[dict[str, Any]] = []
 
     state = store.replay()
     ts = state.get(task_id)
+    # B1（task-flat-decl-authority）：done 重复调用语义——首次 done 后任务离 claimed
+    # 态，再次 done 在此闸口 E007 拒绝，不写第二个 DONE 事件（幂等安全）。
     if not ts or ts.status != "claimed":
         raise OrchdError(
             ErrorCode.E007,
@@ -464,10 +472,13 @@ def _guard_shared_entry_coverage(
     verify_cmd = str(task_def.get("verify_command") or "")
     changed: list[str] = []
     if project_root:
-        from orchd.worktree import task_branch_files
+        # E039 输入经端口 GitBackend 直连（与原 task_branch_files 同函数；
+        # 无 git 时同返空列表→回退声明判定，行为零漂移。快照语义不外溢至此：
+        # 本门禁的"已提交"即分支 diff，单目录另由声明/越界门禁覆盖）。
+        from orchd.gitops.repo import GitBackend
 
         try:
-            changed = list(task_branch_files(Path(project_root), task_id))
+            changed = list(GitBackend(Path(project_root)).changed_paths(task_id))
         except Exception:
             # diff 基建故障（如 git 子进程异常）⇒ 退化为声明判定（fail-open）：
             # 「取不到 diff」与「未触及入口」不可区分，且该故障场景下越界/声明门禁

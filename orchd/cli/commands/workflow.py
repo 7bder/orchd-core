@@ -381,8 +381,11 @@ def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     changes = _resolve_text_arg(args.changes, args.changes_file, "--changes", "--changes-file")
     # 红线 #3 硬化：done 前提前校验范围外文件（复用 L3 同一判定 _guard_out_of_scope，不出现两套标准）
     # 提前在 verify 之前失败，verify 未执行
-    _task_map_early = {t.get("id", ""): t for t in tasks}
-    _task_def_early = _task_map_early.get(args.task)
+    # task-flat-decl-authority：early guard 的 task_def 经 resolve_declaration_source
+    # 解析（flat 下从 main blob 读权威声明；否则陈旧声明会在引擎之前先误拦 E010）。
+    from orchd.worktree import resolve_declaration_source as _resolve_decl_early
+    _tasks_early = _resolve_decl_early(orchd_dir.parent, tasks, None)[0]
+    _task_def_early = {t.get("id", ""): t for t in _tasks_early}.get(args.task)
     if _task_def_early is not None:
         from orchd.onboard import _guard_out_of_scope as _early_scope_guard
         _early_scope_guard(orchd_dir.parent, _task_def_early, args.task, [])

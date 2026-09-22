@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
-from orchd.gitops._const import _GIT_ENCODING, _GIT_ERRORS, _GIT_TIMEOUT, _T
+from orchd.gitops._const import (
+    _GIT_CHECKOUT_TIMEOUT,
+    _GIT_ENCODING,
+    _GIT_ERRORS,
+    _GIT_TIMEOUT,
+    _T,
+)
 from orchd.gitops.query import check_workspace_state, get_default_branch, is_task_worktree
 from orchd.gitops.session_lock import ensure_session_lock
 
@@ -281,6 +287,125 @@ def _probe_guard_workspace_state(
     return state
 
 
+def _container_task_wt_exists(project_root: Path, task_id: str) -> bool:
+    """container 布局下独立任务 worktree 是否存在（wt_exists 门控单一来源）。
+
+    ``_build_wrong_branch_hint`` 的 wt_exists 判定与 reviewer 自动切分支门控共用：
+    仅 container 布局且 ``<task_wt_root>/<wt_name>/.git`` 存在时为真；其余
+    （flat / 降级 / 探测异常）一律 False。异常永不抛（调用方据此分流，不阻断）。
+    """
+    try:
+        from orchd.worktree import worktree_hint, detect_layout
+
+        _layout = detect_layout(project_root)
+        if _layout.get("layout") != "container":
+            return False
+        return (_layout["task_wt_root"] / worktree_hint(task_id) / ".git").exists()
+    except Exception:
+        return False
+
+
+def _reviewer_auto_checkout(
+    store,
+    project_root: Path | None,
+    task_id: str,
+    agent_id: str | None,
+    degraded: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """reviewer 认领在 flat/降级布局下自动切任务分支（task-review-auto-checkout）。
+
+    前置（container 行为逐字不变）：仅当独立任务 worktree 不存在
+    （``_container_task_wt_exists`` 为 False，含 flat 全场景）才继续；container
+    有 worktree 时返回 None，后续守卫走既有 cd-hint + E018。
+
+    触发条件（缺一即返回 None，交由守卫按旧语义 E017/E018 拒绝）：
+    已在任务分支 / 工作区非干净（脏 → E017 可执行指引）/ 任务分支不存在 /
+    非 git / 探测失败 / 切分支执行失败。
+
+    成功时写 AMEND 审计事件（``reason=auto_branch_prepare``，与连带登记同形：
+    append + checkpoint，不影响状态机；best-effort，失败不阻断认领）并在
+    degraded 留痕；调用方另将返回值挂认领响应（与 ``checked_out_main`` 往返对称）。
+
+    Returns:
+        ``{"checked_out": "task/<id>", "from_branch": <str|None>}`` 或 None（未触发）。
+    """
+    branch_name = f"task/{task_id}"
+    if project_root is None:
+        return None
+    try:
+        check_root = _resolve_claim_check_root(project_root)
+    except Exception:
+        return None
+    if check_root is None:
+        return None
+    if _container_task_wt_exists(Path(project_root), task_id):
+        return None
+    try:
+        state = _probe_guard_workspace_state(check_root, "review claim", None)
+    except Exception:
+        return None  # 探测失败 → 守卫 fail-closed E018（与旧行为一致）
+    if not state.get("available"):
+        return None  # 无 git：nogit 等价守卫处理
+    from_branch = state.get("branch")
+    if from_branch == branch_name:
+        return None  # 已在任务分支
+    if not state.get("clean"):
+        # 脏 → 与守卫完全相同的 E017（可执行指引），且先于分支判定：错分支 + 脏
+        # 若交由守卫，会先撞 E018（分支优先），脏因被掩盖。复用同一执法函数，
+        # 错误体与守卫逐字一致。
+        _enforce_workspace_clean(state, True, "review claim", check_root)
+        return None  # 防御：上行恒抛，不应到达
+    try:
+        from orchd.gitops import branch_exists
+
+        if not branch_exists(check_root, branch_name):
+            return None  # 分支缺失 → 守卫 E018
+    except Exception:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "checkout", branch_name],
+            cwd=str(check_root),
+            capture_output=True,
+            encoding=_GIT_ENCODING,
+            errors=_GIT_ERRORS,
+            timeout=_GIT_CHECKOUT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _clear_timeout_index_lock(check_root)
+        return None
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    # AMEND 审计（best-effort，与连带登记同形：append + checkpoint，不影响
+    # 状态机；失败不阻断认领）。agent_id 为空时记空串（直调守卫场景；生产路径
+    # claim 恒传指纹）。
+    try:
+        from orchd.gitops_ops import make_event
+
+        _audit_agent = agent_id if isinstance(agent_id, str) else ""
+        store.acquire_lock()
+        try:
+            ev = make_event(
+                task_id, _audit_agent, "AMEND",
+                reason="auto_branch_prepare",
+                branch=branch_name,
+                from_branch=from_branch,
+                hint="review claim 在 flat/降级布局下由引擎自动切到任务分支",
+            )
+            store.append_event(ev)
+            store.update_checkpoint(store.replay())
+        finally:
+            store.release_lock()
+    except Exception:
+        pass  # best-effort：审计落账失败不阻断认领（切换本身已生效）
+    info = {"checked_out": branch_name, "from_branch": from_branch}
+    if degraded is not None:
+        degraded.append({"guard": "review_auto_checkout", "task_id": task_id, **info})
+    return info
+
+
 def _build_wrong_branch_hint(
     allowed_branches: set[str],
     command: str,
@@ -298,16 +423,11 @@ def _build_wrong_branch_hint(
         # worktree_hint(task_id)（内部使用 _task_wt_name），消除双前缀 fallback。
         # task_id 由分支名 task/<id> 截出后已含 task- 前缀，再拼 "task-" 会产出
         # task-task-<id> 双前缀（实测：提示 cd ../task-task-check-test-dedup-utf8/）。
-        wt_exists = False
+        wt_exists = _container_task_wt_exists(project_root, task_id)
         try:
-            from orchd.worktree import worktree_hint, detect_layout
+            from orchd.worktree import worktree_hint
 
             wt_name = worktree_hint(task_id)
-            _layout = detect_layout(project_root)
-            if _layout.get("layout") == "container":
-                wt_exists = (
-                    _layout["task_wt_root"] / wt_name / ".git"
-                ).exists()
         except Exception:
             # Fallback: engine unavailable, use equivalent logic (no double prefix)
             short = task_id[5:] if task_id.startswith("task-") else task_id
@@ -316,6 +436,15 @@ def _build_wrong_branch_hint(
             hint_parts.append(
                 f"{command} 应在任务 worktree 执行：container 布局下请进入"
                 f"任务 worktree 目录 {wt_name}/（或 cd ../{wt_name}）"
+            )
+        elif command == "review claim":
+            # task-review-auto-checkout：review claim 由引擎自动切分支，不再给
+            # 手动 checkout 指令；走到 E018 说明自动切换未生效（分支不存在 /
+            # 工作区非干净 / 切换失败）。
+            hint_parts.append(
+                f"降级模式（无独立任务 worktree）：review claim 由引擎自动切到 "
+                f"任务分支 {tb}；本次未自动切换（分支不存在 / 工作区非干净 / "
+                "切换失败），请确认后重试"
             )
         else:
             hint_parts.append(
@@ -945,25 +1074,105 @@ def checkout_default_strict(
               "hint": (commit_hint_for_branch(state.get("branch")) + _patch_hint2)}],
         )
     try:
-        result = subprocess.run(
-            ["git", "checkout", default],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=10,
-        )
+        result = _checkout_default_with_retry(project_root, default)
     except (subprocess.SubprocessError, FileNotFoundError) as exc:
         raise OrchdError(
             ErrorCode.E018,
             f"{command}_switch_branch: git checkout 失败: {exc}",
-            [{"command": command, "hint": "切换失败前未写事件，可安全重试"}],
+            [{"command": command, "hint": "切换失败前未写事件，可安全重试",
+              "concurrent_git_processes": _count_git_processes()}],
         ) from exc
     if result.returncode != 0:
         raise OrchdError(
             ErrorCode.E018,
             f"{command}_switch_branch: git checkout {default} 失败: "
             f"{result.stderr.strip()[:300]}",
-            [{"command": command, "hint": "切换失败前未写事件，可安全重试"}],
+            [{"command": command, "hint": "切换失败前未写事件，可安全重试",
+              "concurrent_git_processes": _count_git_processes()}],
         )
     return {"checked_out_to": default}
+
+
+def _count_git_processes() -> int | None:
+    """当前系统 git 进程数（task-ref-tx-hook-cost；best-effort）。
+
+    checkout 超时多由并发 git 负载（回归测试夹具 / 并行会话）引起，
+    而失败信息此前无任何环境维度，agent 只能从零自查。失败返回 None
+    （不阻断），成功返回非负整数。只读探测，不触碰任何进程。
+    """
+    import sys as _sys
+
+    try:
+        if _sys.platform == "win32":
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, timeout=10,
+            )
+            if proc.returncode != 0:
+                return None
+            out = (proc.stdout or b"").decode("utf-8", errors="replace")
+            return sum(
+                1 for ln in out.splitlines()
+                if ln.strip().strip('"').lower().startswith("git.exe")
+            )
+        proc = subprocess.run(
+            ["pgrep", "-c", "-x", "git"],
+            capture_output=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        return int((proc.stdout or b"").decode("utf-8", errors="replace").strip() or 0)
+    except Exception:
+        return None
+
+
+def _clear_timeout_index_lock(project_root: Path) -> bool:
+    """超时强杀后清理 ``.git/index.lock`` 残留（best-effort）。
+
+    仅由 :func:`_checkout_default_with_retry` 在 ``TimeoutExpired`` 分支调用——
+    此时锁必为本进程刚强杀的 git 子进程遗留（Windows ``TerminateProcess`` 不跑
+    清理），不同于陈旧锁探测（后者按年龄判定，5 分钟内不动）；故此处不做年龄
+    判断，直接清。失败静默（重试自会给出真实错误）。
+    """
+    try:
+        lock = Path(project_root) / ".git" / "index.lock"
+        if lock.is_file():
+            lock.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _checkout_default_with_retry(
+    project_root: Path, default: str
+) -> subprocess.CompletedProcess[str]:
+    """执行 ``git checkout <default>``，超时给一次重试机会（task-flaky-hunt-freeze-gate）。
+
+    根因（2026-09-22 全量回归实测）：全量回归 ``-n auto``（本机 16 worker）下，
+    checkout 属写操作族且落在进程/IO 竞争窗口，单次可越过读操作 10s 上限 →
+    ``TimeoutExpired`` 被吞成 E018 ``done_switch_branch``。两次全量各触发一例
+    （test_no_mergeability_when_not_triggered / test_flat_review_branch_deleted_
+    regression），而单跑与整文件跑恒绿——纯并行负载抖动，非判定错误。
+
+    处置：写预算 ``_GIT_CHECKOUT_TIMEOUT``（与 commit 同口径，强杀同样遗留
+    index.lock）+ 对超时给**一次**重试（累计上限 2×预算，有界）。重试前清残留锁，
+    避免第二次必然锁冲突。返回最终 CompletedProcess；两次皆超时则抛最后一个
+    ``TimeoutExpired``（由调用方转 E018，文案含"超时"以便区分环境故障与判定失败）。
+    """
+    last_exc: subprocess.TimeoutExpired | None = None
+    for _attempt in range(2):
+        try:
+            return subprocess.run(
+                ["git", "checkout", default],
+                cwd=str(project_root),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_GIT_CHECKOUT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_exc = exc
+            _clear_timeout_index_lock(project_root)
+    assert last_exc is not None  # 循环至少执行一次且仅超时才会走到此处
+    raise last_exc

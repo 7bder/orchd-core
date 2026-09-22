@@ -809,7 +809,8 @@ def try_auto_resolve_conflict(
                     "conflict_files": files,
                     "action": (
                         f"分支 task/{task_id} 与 main 合并冲突：请在 task 分支上执行 "
-                        f"git merge main 解决冲突并提交（{len(files) or '若干'} 个文件），"
+                        "orchd git merge main（受管通道）解决冲突并提交"
+                        f"（{len(files) or '若干'} 个文件），"
                         f"然后由同一 reviewer 重试 code APPROVED"
                     ),
                 }

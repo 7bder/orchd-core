@@ -166,6 +166,69 @@ def _current_task_from_branch(project_root: Path) -> str | None:
     return None
 
 
+def record_session_command(orchd_dir, command: str | None) -> None:
+    """记录本会话最近执行的命令（task-ref-tx-hook-cost；E035 数据源）。
+
+    best-effort：仅当 runtime 文件存在且 active 时写 ``last_command``；
+    **不碰 ``last_seen``**（TTL 活性语义不变——只读命令不续命）。任何异常
+    静默降级，绝不阻断主流程。由 CLI 入口统一调用，调用方无需判活。
+    """
+    if not command:
+        return
+    try:
+        from orchd.ledger import _session_runtime_path, resolve_session_identity
+
+        identity = resolve_session_identity(orchd_dir)
+        session_id = (identity or {}).get("session_id")
+        if not session_id:
+            return
+        from pathlib import Path as _Path
+
+        path = _session_runtime_path(_Path(orchd_dir), session_id)
+        if not path.exists():
+            return
+        import json as _json
+
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not data.get("active"):
+            return
+        data["last_command"] = str(command)
+        path.write_text(_json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except Exception:
+        return
+
+
+def _session_last_commands(orchd_dir) -> dict[str, str | None]:
+    """各活跃会话的最近命令 ``{session_id: last_command}``（best-effort）。
+
+    缺失 / 损坏 / inactive 文件跳过（不抛异常）。供 E035 告警标注冲突会话
+    正在执行的命令（如 full-regression），免去从零排查。
+    """
+    out: dict[str, str | None] = {}
+    try:
+        from orchd.ledger import session_runtime_dir
+        from pathlib import Path as _Path
+        import json as _json
+
+        sdir = session_runtime_dir(_Path(orchd_dir))
+        if not sdir.is_dir():
+            return out
+        for fp in sorted(sdir.glob("*.json")):
+            try:
+                data = _json.loads(fp.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict) or not data.get("active"):
+                continue
+            sid = data.get("session_id") or fp.stem
+            cmd = data.get("last_command")
+            out[str(sid)] = str(cmd) if cmd else None
+    except Exception:
+        pass
+    return out
+
+
 def _session_collision_warning(
     agent_id: str,
     store,
@@ -255,16 +318,41 @@ def _session_collision_warning(
                     "导致并行对话被识别为同一身份、归属错乱。请为每次对话注入唯一会话码，"
                     "或核对任务归属。"
                 ),
+                colliding_commands=_colliding_task_commands(
+                    getattr(store, "orchd_dir", None), states, colliding),
             )
     return None
 
 
+def _colliding_task_commands(
+    orchd_dir, states, colliding: list[str],
+) -> dict[str, str | None]:
+    """冲突任务 → 其属主会话最近命令（task-ref-tx-hook-cost）。
+
+    经任务状态的 ``claimed_session`` / ``review_claimed_session`` 定位属主
+    会话文件，读其 ``last_command``（见 :func:`record_session_command`）。
+    会话文件缺失 / 无记录 → None（显式空值，不静默省略）。
+    """
+    cmds = _session_last_commands(orchd_dir)
+    out: dict[str, str | None] = {}
+    for tid in colliding:
+        ts = (states or {}).get(tid)
+        owner = None
+        if ts is not None:
+            owner = getattr(ts, "claimed_session", None) or getattr(
+                ts, "review_claimed_session", None)
+        out[tid] = cmds.get(str(owner)) if owner else None
+    return out
+
+
 def _session_collision_warn_dict(
     reason: str, colliding_tasks: list[str], hint: str,
+    colliding_commands: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """构造 ``session_collision_warning`` 告警 dict（E035 告警码，不阻断命令）。Channel C via structured_error."""
     _msg = "session_collision_warning: 同一工作区多会话碰撞"
-    _details = [{"reason": reason, "colliding_tasks": colliding_tasks, "warning": "session_collision_warning", "hint": hint}]
+    _details = [{"reason": reason, "colliding_tasks": colliding_tasks, "warning": "session_collision_warning", "hint": hint,
+                 "colliding_commands": colliding_commands if colliding_commands is not None else {}}]
     try:
         from orchd.cli import _find_orchd_dir
         _base = _find_orchd_dir()
@@ -278,6 +366,7 @@ def _session_collision_warn_dict(
         "warning": "session_collision_warning",
         "reason": reason,
         "colliding_tasks": colliding_tasks,
+        "colliding_commands": colliding_commands if colliding_commands is not None else {},
         "hint": hint,
         "details": _err.get("details", _details),
         "guidance": _guidance,

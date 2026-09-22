@@ -48,6 +48,11 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
       固定路径可复用，避免 ``$$`` 每次新建且从不清理导致临时目录膨胀；
     - 显式 ``-c pyproject.toml`` 确保读到 addopts 的 ``-n auto --dist=loadscope``
       并行配置，不依赖 shell cwd 推断 rootdir。
+    - 显式 ``-n 8 --max-worker-restart=5``（task-suite-slow-guard，对齐
+      design/full-regression-parallel-crash-fix-20260830.md §三B/C）：addopts 的
+      ``-n auto`` 在本机起 16 worker，Windows 文件系统竞争下单次 git 操作可被拖过
+      超时且历史上批量 worker down 挂死；回归是独占通道，固定 8 worker + 崩溃自愈。
+      命令行参数后于 ini addopts 生效，故 ``-n 8`` 覆盖 ``-n auto``。
     """
     import subprocess
     import time
@@ -66,17 +71,22 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
     basetemp_arg = str(basetemp).replace("\\", "/")
     reg_cmd = (
         f'"{py}" -m pytest tests/ -q -c pyproject.toml '
-        f"--basetemp={basetemp_arg}"
+        f"--basetemp={basetemp_arg} -n 8 --max-worker-restart=5"
     )
     reg_started = time.monotonic()
+    # 预算（task-flaky-hunt-freeze-gate，2026-09-22 实测）：旧值 600s 小于本机
+    # 16 worker 并行实测时长（528~646s），导致 M1 冻结 B1/B2 从未盖章（命令自身
+    # 超时 + 未写 last_pass_commit）。给足 2.5x 余量覆盖负载抖动；这是**发版门禁
+    # 单次预算**，非测试自身超时，超时仍显式失败不留假绿。
+    regression_budget = 1500
     try:
-        reg_result = run_shell(reg_cmd, str(project_root), 600)
+        reg_result = run_shell(reg_cmd, str(project_root), regression_budget)
     except subprocess.TimeoutExpired:
         reg_elapsed = round(time.monotonic() - reg_started, 1)
         return {
             "ok": False,
             "code": "full_regression_timeout",
-            "message": f"全量回归超时（600s）after {reg_elapsed}s",
+            "message": f"全量回归超时（{regression_budget}s）after {reg_elapsed}s",
         }, 1
     reg_elapsed = round(time.monotonic() - reg_started, 1)
     if reg_result.returncode != 0:
@@ -96,7 +106,7 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
     payload = {
         "last_pass_commit": head,
         "passed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "command": "python -m pytest tests/ -q -c pyproject.toml",
+        "command": "python -m pytest tests/ -q -c pyproject.toml -n 8 --max-worker-restart=5",
     }
     orchd_dir.mkdir(exist_ok=True)
     (orchd_dir / "_full_regression.json").write_text(
@@ -159,6 +169,21 @@ def _cmd_context_digest(args) -> dict:
     return context_digest(orchd_dir.parent)
 
 
+def _cmd_ledger_compact(args) -> dict:
+    """终态任务事件归档压实（task-ledger-archive-compact）。
+
+    CLI 参数: args.dry_run（只算搬运计划，不写文件）。
+    返回: compact 摘要（moved_events / archived_tasks / active_before-after /
+    checkpoint_lines / journal_recovered / dry_run）——后者为 c2（双文件归档）
+    决策的增长曲线输入。
+    """
+    from orchd.ledger import open_store
+
+    orchd_dir = _find_orchd_dir()
+    store = open_store(orchd_dir)
+    return store.compact_archive(dry_run=bool(getattr(args, "dry_run", False)))
+
+
 def _cmd_git(args) -> dict:
     """git 写操作代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截。
 
@@ -208,6 +233,15 @@ def register(sub) -> None:
     # context-digest（task-context-digest-command）：必读面内容哈希只读命令
     p = sub.add_parser("context-digest", help="输出必读面内容哈希与字节数（未变即跳过重读的机械判据）")
     p.set_defaults(func=_cmd_context_digest)
+
+    # ledger-compact（task-ledger-archive-compact）：终态任务事件归档压实
+    p = sub.add_parser(
+        "ledger-compact",
+        help="终态任务事件归档至 _ledger.archive.jsonl 并重写 checkpoint（幂等；--dry-run 只算计划）",
+    )
+    p.add_argument("--dry-run", action="store_true",
+                   help="只计算搬运计划，不写任何文件")
+    p.set_defaults(func=_cmd_ledger_compact)
 
     # git 代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截
     p = sub.add_parser(

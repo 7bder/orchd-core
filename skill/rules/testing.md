@@ -1,3 +1,11 @@
+---
+guide:
+  claim_review: 2
+  rework_first: 3
+  request_impl: 3
+  done: 2
+  claimed_impl: 4
+---
 # 测试纪律（防复制式测试）
 
 > TL;DR: ① 复用 tests/conftest.py 的 make_task / orchd_dir ② 参数化，禁止在测试文件内另造副本 ③ 一个测试文件一个域，新域新建文件不塞泛用文件
@@ -17,6 +25,22 @@
 - **迁移就近归位**：文件拆分 / 包拆分 / 删除迁移测试时，用例只搬进**同域**测试文件（`cli/` 拆包 → `tests/test_cli_<域>.py`）；**禁止**「集中收纳」到同一个文件。
 - **同域内聚合**：同一域的不同取值走参数化，不为变体新开文件。
 - **理由（实测）**：2026-09-11 `task-test-cli-split-domains` 一次 modify/delete 冲突使两轮审查全部作废（13:59 → 22:03，**4h15m / 1 个文件**）。根因即「测试迁移跨域集中收纳」在并发下反复制造同型冲突。
+
+## per-op 外部进程纪律（2026-09-22，task-suite-slow-guard）
+
+> 反例：`reference-transaction` 强制层 hook 被 claim 装进每个测试仓库后，
+> git commit 93ms→1728ms、git branch 783ms，全量涨回 ~10min——而既有
+> `tests/test_perf_budget.py` 只数子进程**次数**，对**单价**上涨免疫，无门禁可拦。
+
+- **新增 git hook / 命令包装器 / 解释器启动必须附 before/after 计数实测**：
+  计数 = 新增的外部进程调用次数（单次操作 × 触发面），不是墙钟——墙钟跨机抖动，
+  禁止用墙钟硬断言（否则制造新的 flaky 源）。实测附在提交信息或
+  `docs/perf-call-census.md`。
+- **同步更新 `tests/test_perf_budget.py` 的计数上限**：上限只收紧（次数下降才合入），
+  不放宽；放宽须另立任务说明理由。
+- **默认不进测试临时仓库**：生产安全机制（hook / 强制拦截）在测试会话默认跳过安装，
+  专门用例 opt-in（见 `tests/conftest.py` 会话补丁注释与 `tests/test_ref_tx_hook.py`
+  的恢复夹具）。判定标准：代表性流程跑完后，测试仓库内该机制制品计数为 0。
 
 ## 热点测试文件禁止尾部追加（2026-09-13，task-test-hotspot-sharding）
 

@@ -1,3 +1,8 @@
+---
+# request_impl 理由：引擎改动触碰 §9.1 停服边界时，领实现任务先确认
+guide:
+  request_impl: 4
+---
 # 安全边界（详见 docs/self-hosting-design-merged.md §9）
 
 > TL;DR: ① 改引擎触碰 §9.1 停服边界先确认

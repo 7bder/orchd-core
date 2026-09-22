@@ -32,6 +32,7 @@ from orchd.cli.identity import (
     _current_task_from_branch,
     _session_collision_warning,
     _session_collision_warn_dict,
+    record_session_command,
 )
 # 3a 收尾（task-split-cli-remove-legacy）：从子包导入全部符号，
 # 替代原 legacy cli.py importlib 透传段。
@@ -110,6 +111,33 @@ from orchd.cli._util import (
     _maybe_archive_ideas,
 )
 
+
+def _init_guide_routing_best_effort() -> None:
+    """初始化引导路由缓存（task-guide-routing-meta）。
+
+    - 找到 .orchd 且含 rules/ → 加载宿主规则路由；
+    - .orchd 缺失 → 空降级（bootstrap 形态，输出本就无 read）；
+    - rules/ 缺失 → 跳过（保留既有缓存；fixture 极简项目）；
+    - front-matter 损坏（ValueError 点名文件）→ 直接抛出（fail-closed：
+      坏元数据静默丢路由比崩更糟，文件名行号随异常给出）。
+    其他异常 → 空降级（启动优先；结构问题由合入门禁拦截）。
+    """
+    from orchd.guide import init_routing
+
+    try:
+        try:
+            orchd_dir = _find_orchd_dir()
+        except Exception:
+            orchd_dir = None
+        init_routing(orchd_dir, Path.cwd())
+    except ValueError:
+        raise
+    except Exception:
+        try:
+            init_routing(None)
+        except Exception:
+            pass
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口。返回 exit code。
 
@@ -125,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     _fix_windows_console_encoding()
     _auto_inject_session_id()
+    _init_guide_routing_best_effort()
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)
@@ -158,6 +187,12 @@ def main(argv: list[str] | None = None) -> int:
     command = _command_name(args)
     try:
         _reject_container_root_cwd()   # 纪律护栏：容器根拒绝（E036）
+        try:
+            # 会话命令记录（task-ref-tx-hook-cost）：E035 colliding_command
+            # 数据源；best-effort，不阻断主流程。
+            record_session_command(_find_orchd_dir(), command)
+        except Exception:
+            pass
         result = args.func(args)
         if result is None:
             return 0

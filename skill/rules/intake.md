@@ -1,3 +1,7 @@
+---
+guide:
+  request_impl: 2
+---
 # 摄入协议 v2（IDEAS.md pending → orchd 任务）
 
 > TL;DR: ① 三条铁律：原文可追溯 / 推断项标注 / 全量查重 ② 双闸门：草案人工确认"做什么"、claim 确认"谁做" ③ 仅在 main 且工作区干净时 amend ④ 撞车条目置 taskified 或 questioning，不得重复注册

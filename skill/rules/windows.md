@@ -1,3 +1,8 @@
+---
+# done 路由理由：verify_command 本机执行，Windows 约束直接相关
+guide:
+  done: 5
+---
 # Windows 环境准备（自托管仓库）与管道编码
 
 > TL;DR: ① **Windows 下 agent 执行任何 shell 命令必须走 Git Bash（`bash -lc`）或零根入口 `python .orchd/__main__.py`，禁止用 PowerShell / cmd.exe 直接执行协议中的 POSIX 命令** ② 管道消费 orchd JSON 须按 UTF-8 解码 ③ 零根入口不依赖 PATH，优先使用

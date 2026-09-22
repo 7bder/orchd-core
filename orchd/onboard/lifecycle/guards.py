@@ -278,14 +278,18 @@ def _guard_out_of_scope(
             raise RuntimeError(
                 f"git 探测故障（{state.get('reason')}）：越界改动检测无法执行"
             )
-        # 变更检测**单一真源**（task-nogit-changedet-core / A0a）：git 与无 git 两侧
-        # 共用 orchd.nogit.changed_paths，D/R 口径一致（kernel-contract INV-1）；
+        # 变更检测**单一真源**（task-nogit-changedet-core / A0a + task-repo-backend-port / b1）：
+        # 经 RepositoryBackend 端口分发（git→GitBackend≡_git_diff_names，
+        # 无 git→SnapshotBackend≡快照差分），D/R 口径一致（kernel-contract INV-1）；
         # 无 git 模式不再整体降级为 NotApplicable（红线 #3 不因环境退化，INV-2）。
+        # 基线缺失判定与单目录可见性策略保留在调用方（端口只算差分，不管策略）：
+        # 前者是降级留痕依据，后者是 git“未提交不可见”的等价口径。
         if state_name == "unavailable":
-            from orchd.nogit import read_manifest, snapshot_changed_paths, snapshot_dir
+            from orchd.gitops.repo import SnapshotBackend
+            from orchd.nogit import read_manifest, snapshot_dir
 
-            snapshot_paths = snapshot_changed_paths(project_root, task_id)
-            if snapshot_paths is None:
+            base = read_manifest(snapshot_dir(Path(project_root), task_id, "base"))
+            if base is None:
                 # 无基线快照 → 无法判定（A0b 起由 claim 建立基线，届时恒非空）；
                 # 显式降级留痕，不做静默放行以外的任何假设。
                 raise NotApplicableError(
@@ -297,8 +301,8 @@ def _guard_out_of_scope(
             # 在 git 模式下同属不可见（未提交即不在分支 diff 内），此处同样跳过；
             # 已知边界：改名落入声明外新路径的极端情形可能漏检（窄口径，需刻意跨
             # 范围改名；单目录下 done 期声明门禁与 flat 同口径降级）。
-            base = read_manifest(snapshot_dir(Path(project_root), task_id, "base")) or {}
-            actual_modified = [p for p in snapshot_paths if p in base]
+            changed = SnapshotBackend(project_root).changed_paths(task_id)
+            actual_modified = [p for p in changed if p in base]
         else:
             default = _get_default_branch(project_root)
             if not default:
@@ -314,9 +318,9 @@ def _guard_out_of_scope(
                 raise NotApplicableError(
                     f"任务分支 task/{task_id} 不存在：越界改动检测不适用"
                 )
-            from orchd.nogit import changed_paths
+            from orchd.gitops.repo import for_project
 
-            actual_modified = changed_paths(project_root, task_id)
+            actual_modified = for_project(project_root).changed_paths(task_id)
         from orchd.pool import _is_path_covered
         allowed_list = list(allowed)
         return [f for f in actual_modified if not any(_is_path_covered(a, f) for a in allowed_list)]

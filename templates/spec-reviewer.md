@@ -1,3 +1,9 @@
+---
+guide_template:
+  roles: [reviewer]
+  modes: [two_phase]
+  order: 1
+---
 # Spec Reviewer — 规格审查模板（清单化）
 
 ## 角色定位

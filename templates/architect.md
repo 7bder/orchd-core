@@ -1,3 +1,7 @@
+---
+# 显式未路由（分解提示词走 BOOTSTRAP 专道，不进 guidance 场景）
+guide: {}
+---
 # Architect — 任务分解 Prompt
 
 ## 角色

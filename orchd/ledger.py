@@ -1778,9 +1778,22 @@ class Store:
                 return 0, {}, set()
             warnings.warn("checkpoint 解析失败，回退全量 replay", stacklevel=2)
             tasks = self.replay_full()
-            # 返回一个特殊标记让调用者知道已全量 replay
+            # 返回一个特殊标记让调用方知道已全量 replay
             total_lines = self._count_ledger_lines()
             return total_lines, tasks, set()
+        # task-ledger-archive-compact：compact 中断恢复。journal 存在说明上次
+        # 三写（归档→活跃→checkpoint）未走完：checkpoint 行号不可信，直接全量
+        # 重放（去重读天然幂等），与解析失败分支同形。
+        try:
+            from orchd.storage import compact_journal_path
+
+            if compact_journal_path(
+                    resolve_store_dir(self.orchd_dir)).is_file():
+                tasks = self.replay_full()
+                total_lines = self._count_ledger_lines()
+                return total_lines, tasks, set()
+        except Exception:
+            pass
         # 兼容旧格式：tasks 为 dict[str, TaskState.from_dict]
         ledger_line = data.get("ledger_line", 0)
         tasks = {
@@ -1860,7 +1873,28 @@ class Store:
             return warnings_list
 
         actual = self._count_ledger_lines()
+        # task-ledger-archive-compact：journal 感知。中断崩溃的三写残留与"篡改"
+        # 不可区分对待——前者重跑即愈，后者须人工核对，故以 distinct 代码分流。
+        try:
+            from orchd.storage import compact_journal_path
+
+            _journal_present = compact_journal_path(
+                resolve_store_dir(self.orchd_dir)).is_file()
+        except Exception:
+            _journal_present = False
         if ledger_line > actual:
+            if _journal_present:
+                warnings_list.append(_attach_structured_guidance({
+                    "code": "compact_interrupted",
+                    "severity": "warning",
+                    "message": (
+                        f"compact 疑似中断：checkpoint.ledger_line={ledger_line} "
+                        f"超过实际逻辑行数 {actual}，且中断标记仍在；非篡改——"
+                        "重跑 ledger-compact 即可收敛（幂等），不自动修复"
+                    ),
+                    "path": str(self.checkpoint_path),
+                }, self.orchd_dir))
+                return warnings_list
             warnings_list.append(_attach_structured_guidance({
                 "code": ErrorCode.E030.name,
                 "severity": "warning",
@@ -1875,6 +1909,17 @@ class Store:
         # 兼容层清理：schema 升级后 checkpoint 快照与重放结果不一致属预期
         # 版本落后时跳过快照一致性比较，消除升级后误报 E030
         ckpt_version = checkpoint.get("schema_version")
+        if _journal_present:
+            # 计数一致但标记残留（成功后删标记前崩溃）：仅提示清理，不阻断。
+            warnings_list.append(_attach_structured_guidance({
+                "code": "compact_interrupted",
+                "severity": "warning",
+                "message": (
+                    "compact 中断标记残留但计数一致：上次压实已完成，仅标记未删；"
+                    "重跑一次 ledger-compact 即可清除（幂等）"
+                ),
+                "path": str(self.checkpoint_path),
+            }, self.orchd_dir))
         if isinstance(ckpt_version, int) and ckpt_version != _CHECKPOINT_SCHEMA_VERSION:
             return warnings_list
 
@@ -2343,6 +2388,135 @@ class Store:
                 if target_eid:
                     retracted.add(target_eid)
         return retracted
+
+    def compact_archive(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """压实：终态任务事件归档至共享归档文件（task-ledger-archive-compact）。
+
+        前缀闭包规则：逻辑事件流（归档去重 + 活跃后缀）自头起的最大连续段，
+        其中每条满足「task_id 为空」或「所属任务当前终态（completed/cancelled）」。
+        已归档 event_id 直接跳过（不重复搬运）；首个不满足即停（其后纵有终态
+        事件亦不动——前缀性保证读合并恒为"归档+活跃"拼接，无需索引）。
+        RETRACT 事件按 task_id 同规则纳入（两遍收集与重建均经透明读，
+        位置无关正确性）。
+
+        原子性：持 store 锁全程；写序为 journal → 归档重写 → 活跃重写 →
+        checkpoint 重写 → 删 journal。中断崩溃后：读侧去重天然幂等；
+        下次运行重算收敛；``check_integrity`` / ``_load_checkpoint`` 凭 journal
+        区分"中断残留"与"篡改"。
+
+        checkpoint 语义：重写为 ``{ledger_line: 新逻辑总数, tasks: 全量状态
+        （含已归档任务）, retracted: 当前集合}``——逻辑总数压实前后不变
+        （只搬运不删除逻辑事件），故 H4 计数器与各处行号比较无需改动。
+
+        Args:
+            dry_run: 只计算搬运计划（prefix/stats），不写任何文件、不删 journal。
+
+        Returns:
+            ``{"moved_events", "archived_tasks", "active_before/after": {"lines",
+            "bytes"}, "checkpoint_lines", "journal_recovered", "dry_run"}``——
+            后者为 c2（双文件归档）决策的增长曲线输入。
+        """
+        store_dir = resolve_store_dir(self.orchd_dir)
+        self.acquire_lock()
+        try:
+            return self._compact_archive_locked(store_dir, dry_run=dry_run)
+        finally:
+            self.release_lock()
+
+    def _compact_archive_locked(
+        self, store_dir: Path, *, dry_run: bool
+    ) -> dict[str, Any]:
+        from orchd.storage import (
+            compact_journal_path,
+            read_archive_events,
+            write_archive_events,
+        )
+
+        journal = compact_journal_path(store_dir)
+        # 全量状态与终态集（与 ideas 归档"组内全终态"同源语义）
+        state = self.replay_full()
+        terminal = {
+            tid for tid, ts in state.items()
+            if ts.status in ("completed", "cancelled")
+        }
+        events = self._read_ledger_lines(from_line=1)
+        arch, _ = read_archive_events(store_dir)
+        arch_ids = {e.get("event_id", "") for e in arch if e.get("event_id")}
+        moved: list[dict[str, Any]] = []
+        moved_tasks: set[str] = set()
+        for ev in events:
+            eid = ev.get("event_id", "")
+            if eid and eid in arch_ids:
+                moved.append(ev)
+                if ev.get("task_id"):
+                    moved_tasks.add(ev.get("task_id"))
+                continue
+            tid = ev.get("task_id", "")
+            if tid and tid not in terminal:
+                break
+            moved.append(ev)
+            if tid:
+                moved_tasks.add(tid)
+        # moved 为逻辑前缀：suffix 即其后段（去重读已保证无交集，直接切片）
+        suffix = events[len(moved):]
+        stats: dict[str, Any] = {
+            "moved_events": len([e for e in moved if e.get("event_id")
+                                 not in arch_ids]),
+            "archived_tasks": sorted(moved_tasks),
+            "logical_lines": len(events),
+            "dry_run": dry_run,
+            "journal_recovered": False,
+        }
+        active_before = self._active_file_size(store_dir)
+        stats["active_before"] = active_before
+        if not moved or all(e.get("event_id", "") in arch_ids for e in moved):
+            # 无新搬运：一致即收尾（顺手清理残留 journal，中断自愈的一部分）
+            try:
+                if journal.is_file():
+                    journal.unlink()
+                    stats["journal_recovered"] = True
+            except OSError:
+                pass
+            stats["active_after"] = active_before
+            stats["checkpoint_lines"] = len(events)
+            return stats
+        if dry_run:
+            return stats
+        journal.write_text(json.dumps({
+            "op": "compact_archive",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "pre_logical_lines": len(events),
+        }), encoding="utf-8")
+        try:
+            write_archive_events(store_dir, moved)
+            self.backend.replace_active_events(suffix)
+            self.update_checkpoint(
+                {tid: ts for tid, ts in state.items()},
+                self._collect_retracted_event_ids(),
+            )
+            # H4：内存行计数器按新逻辑总数重校准（否则后续 append 在旧基数上递增漂移）
+            self._line_count = len(moved) + len(suffix)
+            try:
+                journal.unlink()
+            except OSError:
+                pass
+        except Exception:
+            raise
+        stats["active_after"] = self._active_file_size(store_dir)
+        stats["checkpoint_lines"] = len(moved) + len(suffix)
+        return stats
+
+    @staticmethod
+    def _active_file_size(store_dir: Path) -> dict[str, Any]:
+        """活跃账本文件体积（c2 增长曲线输入；后端无关 best-effort）。"""
+        info: dict[str, Any] = {}
+        for name in ("_ledger.jsonl", "_ledger.sqlite3"):
+            p = Path(store_dir) / name
+            try:
+                info[name] = p.stat().st_size if p.is_file() else 0
+            except OSError:
+                info[name] = 0
+        return info
 
     def scan_task_derived(self) -> TaskDerived:
         """单次扫描 ledger 构建 per-task 派生信息缓存（H2，2026-08-13 性能审核）。
