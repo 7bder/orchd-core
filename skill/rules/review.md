@@ -11,20 +11,20 @@ guide:
 ---
 # 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
 
-> TL;DR: ① 自审默认**仅提示**（`self_review_notice`；线上版 `config.enforce_self_review_block=true` 才恢复 E016 硬阻断），引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换独立会话审查（非强制，详见 [session.md](session.md) 与 `shared/conventions.md`）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
+> TL;DR: ① 自审默认**仅提示**（`self_review_notice`；线上版 `config.enforce_self_review_block=true` 才恢复 E016 硬阻断；任务级 `require_independent_review=true` 同效且与全局开关 OR，见下）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
 
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
 ## 审查者身份约定（自审默认仅提示）
 - 实现任务用各 agent 会话级指纹（12 位 hex，由 `ORCHD_SESSION_ID` 派生），**禁止跨对话复用同一指纹**；审查以当前会话指纹领取（不再使用固定 `reviewer-1` ID）
-- **自审默认降级为仅提示**（2026-08-17，单机模型；线上版可设 `_master.json config.enforce_self_review_block=true` 恢复阻断）：
-  - **默认（enforce=false）**：claim review 时若 DONE 实现指纹 == 当前指纹，**照常放行**，认领结果附 `self_review_notice`（含 `done_by` + 引导）；request 候选 / review_first 中自审任务标注 `is_self_review: true`，不参与任何决策与阻断
-  - **enforce=true（线上版）**：恢复 `E016 self_review_blocked`——claim review 拒绝、request 候选排除自审任务
+- **自审默认降级为仅提示**（2026-08-17，单机模型；线上版可设 `_master.json config.enforce_self_review_block=true` 恢复阻断；任务级 `require_independent_review=true` 同效，见下）：
+  - **默认（enforce=false 且无任务级 flag）**：claim review 时若 DONE 实现指纹 == 当前指纹，**照常放行**，认领结果附 `self_review_notice`（含 `done_by` + 引导）；request 候选 / review_first 中自审任务标注 `is_self_review: true`，不参与任何决策与阻断
+  - **enforce=true（线上版）或任务 `require_independent_review=true`**：恢复 `E016 self_review_blocked`——claim review 拒绝、request 候选排除自审任务（两者 OR，任一成立即阻断；字段缺省 false 保持默认行为）
 - **Review 优先调度（自动执行时为硬默认，2026-09-20 用户裁定）**：implementer 请求任务时，若存在该 agent 可认领的 in_review 任务，引擎返回 `next_action: "review_first"` + `review_priority` 提示先领取审查；**无人值守 / 连续自动跑圈时必须先把可领审查做完（claim review → `review` 提交结论 → 尚有 code 阶段则到 merged）再领实现**，且**不得用 `claim --task <pending-id>` 点名绕过本闸门**——`claim` 只按该任务自身状态分流、不查全局审查积压（2026-09-20 实测：3 个 in_review 因此积压数小时未被领）。详见 rules/session.md「工作优先级」
 - 领审查前两项自查（决策权在人，此为可见性辅助）：
   - `python .orchd/__main__.py status` 中不存在本 session 实现 ID 名下的 claimed 任务（busy 检查按 ID 判定，换 ID 即可绕过，故须自查）
   - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 自审，默认仅标注提示（是否继续由人裁决）
-- **code review APPROVED 后必须运行 merge audit 验证**：提交 code APPROVED 且 merge 成功（任务进入 completed）后，立即运行 `python .orchd/__main__.py status --audit-merge`，确认 `merge_audit.warnings` 为空（零告警）。若有告警（completed 任务对应分支仍悬空未入 main），立即在当前 reviewer session 内 cherry-pick 修复并重新验证，不得将漏 merge 遗留到下游
+- **code review APPROVED 后必须运行 merge audit 验证**：提交 code APPROVED 且 merge 成功（任务进入 completed）后，立即运行 `python .orchd/__main__.py status --audit-merge`，确认 `merge_audit.warnings` 为空（零告警）。若有告警（completed 任务对应分支仍悬空未入 main），不得将漏 merge 遗留到下游——处置：reviewer 先 `retract` 本次审查结论（释放 R1-b 审查冻结），由实现者（或人工）在 task 分支补提交后重新 `done`，同一 reviewer 再次提交 code APPROVED 重试 → merge 成功 → completed。**禁 reviewer 直接在任务分支提交或 cherry-pick 修复**（R1-b 审查期实现者冻结 + git 代理必拒 E007，无例外）。
 - **合入前验碰撞集而非整树干净（2026-09-21）**：code APPROVED 提交前，只需确认主工作树没有"未跟踪、且任务分支已跟踪"的同路径文件（真碰撞会触发 untracked 覆盖拒绝）；已跟踪改动若为 IDEAS / IDEAS-archive / _master.json / ROADMAP 等引擎自提交产物，属后台提交瞬态（ideas-archive 自动归档等），等待数秒重验即可，不得当真脏拦截。真撞上时 merge 诊断会精确报文件名，按指引处置重试。
 
 ## 清单化模板与证据分层（M2-2，2026-08-06；证据分层 2026-08-08）

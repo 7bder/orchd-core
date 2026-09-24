@@ -138,14 +138,16 @@ def _cmd_validate(args) -> dict:
         warnings_out = warnings_annot
 
     if structure_errors:
-        return {
+        # task-cli-exit-honesty：结构错误是硬失败——返回 (dict, 1) 使退出码非零，
+        # 脚本只读退出码时不再把 valid:false 误判为通过（B3）。
+        return ({
             "valid": False,
             "errors": errors_out,
             "warnings": warnings_out,
             "errors_summary": errors_summary,
             "warnings_summary": warnings_summary,
             "exempted_terminal_warnings": exempted_terminal_warnings,
-        }
+        }, 1)
     return {
         "valid": True,
         "errors": errors_out,
@@ -168,8 +170,12 @@ def _cmd_bootstrap(args) -> dict:
 def _cmd_init(args) -> dict:
     """初始化 .orchd/ 目录：从 master 生成 snapshot + 空 ledger + checkpoint。
 
-    CLI 参数: args.master — master 文件路径（默认 .orchd/_master.json）。
+    CLI 参数: args.master — master 文件路径（默认 .orchd/_master.json）；
+    args.root — 显式项目根（可选；--master 在当前项目外时必填）。
     返回: {"initialized": True, "created_files": [...]}。
+
+    越界守卫（task-init-master-guard，E-21）：无 --root 时推断根必须落在
+    cwd 所属 git 仓库边界内，否则 E007 拒绝（防跨目录静默写入）。
 
     1.4 双布局（task-14-worktree-layout，AC2/AC3/AC5）：
     - 新项目（master 不存在）→ 默认 container：自建默认 master + ``main/`` +
@@ -178,7 +184,12 @@ def _cmd_init(args) -> dict:
     """
     from orchd.spec import load_master
     from orchd.split import init
-    from orchd.worktree import bootstrap_container, read_layout, write_layout
+    from orchd.worktree import (
+        bootstrap_container,
+        nearest_git_root,
+        read_layout,
+        write_layout,
+    )
     from orchd.ledger import (
         intake_lock_acquire,
         intake_lock_release,
@@ -188,6 +199,51 @@ def _cmd_init(args) -> dict:
     master_path = Path(args.master).resolve()
     orchd_dir = master_path.parent
     project_root = orchd_dir.parent
+
+    # task-init-master-guard（E-21）：--master 指向项目外即静默跨目录写。
+    # 显式 --root 声明目标根时以其为准（须与 master 路径自洽）；否则推断根
+    # 必须落在 cwd 所属 git 仓库边界内（与
+    # find_orchd_dir_within_git_boundary 同源：仓库内不越顶，非 git 则不
+    # 越出 cwd）。越界即 E007 结构化拒绝——在写任何文件之前拦截。
+    explicit_root = getattr(args, "root", None)
+    if explicit_root:
+        declared = Path(explicit_root).resolve()
+        if orchd_dir.parent != declared:
+            raise OrchdError(
+                ErrorCode.E007,
+                "init_root_mismatch: --root 与 --master 路径不一致",
+                [{
+                    "master": str(master_path),
+                    "root": str(declared),
+                    "hint": (
+                        "--root 须为 master 所在 .orchd/ 的父目录；"
+                        "如 --master <root>/.orchd/_master.json --root <root>，"
+                        "或去掉 --root 改从目标目录内执行"
+                    ),
+                }],
+            )
+        project_root = declared
+    else:
+        anchor = nearest_git_root(Path.cwd())
+        if anchor is None:
+            anchor = Path.cwd().resolve()
+        try:
+            project_root.relative_to(anchor)
+        except ValueError:
+            raise OrchdError(
+                ErrorCode.E007,
+                "init_master_out_of_project: --master 指向当前项目之外，拒绝跨目录写入",
+                [{
+                    "master": str(master_path),
+                    "inferred_root": str(project_root),
+                    "cwd": str(Path.cwd().resolve()),
+                    "hint": (
+                        "请 cd 到目标项目目录内再执行 init，或显式声明目标根："
+                        "python .orchd/__main__.py init"
+                        f" --master {args.master} --root <目标项目根>"
+                    ),
+                }],
+            ) from None
 
     # 初始化串行化（task-admission-lock-engine：E 项）—— 并发 orchd init 竞态防护。
     # 关键约束：锁必须加在「稳定、不会被 shutil.move 搬动」的路径上，否则 Windows
@@ -250,5 +306,7 @@ def register(sub) -> None:
     # init
     p = sub.add_parser("init", help="初始化 .orchd/ 并生成 snapshot")
     p.add_argument("--master", default=".orchd/_master.json")
+    p.add_argument("--root", default=None,
+                   help="显式声明项目根（--master 在项目外时必填，须为其 .orchd/ 父目录）")
     p.set_defaults(func=_cmd_init)
 

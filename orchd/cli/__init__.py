@@ -206,6 +206,12 @@ def main(argv: list[str] | None = None) -> int:
         data = _attach_guidance(result, command, guidance_mode=getattr(args, "guidance", "slim"))
         _output(data)
         _emit_guidance(data)
+        # task-cli-exit-honesty：软失败必须体现在退出码——顶层含 error 键的
+        # 纯 dict 响应（如 request E032 拒绝、retract 用法错误）此前恒返回 0，
+        # 下游脚本只读退出码即静默失败（E-13）。成功响应无顶层 error 键
+        # （check 命令的 error 嵌在 checks 条目内，不触发本规则）。
+        if isinstance(data, dict) and "error" in data:
+            return 1
         return 0
     except OrchdError as exc:
         resp = to_json_response(exc)

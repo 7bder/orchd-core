@@ -112,6 +112,7 @@ def classify_update(
     update: dict[str, str],
     *,
     default_branch: str,
+    task_prefix: str = TASK_PREFIX,
     is_ancestor: Callable[[str, str], bool] | None = None,
 ) -> dict[str, Any]:
     """单条引用更新的分类（纯函数；``is_ancestor`` 由调用方注入以隔离 git 依赖）。
@@ -122,7 +123,7 @@ def classify_update(
     ref = update["ref"]
     base: dict[str, Any] = {"ref": ref}
 
-    if ref.startswith(TASK_PREFIX):
+    if ref.startswith(task_prefix):
         return {**base, "action": "allow", "rule": _ALLOW_TASK}
     if ref.startswith(ENGINE_REF_PREFIX):
         return {**base, "action": "allow", "rule": _ALLOW_ENGINE}
@@ -178,6 +179,7 @@ def evaluate(
     *,
     state: str,
     default_branch: str = _FALLBACK_DEFAULT_BRANCH,
+    task_prefix: str = TASK_PREFIX,
     is_ancestor: Callable[[str, str], bool] | None = None,
 ) -> dict[str, Any]:
     """对一个引用事务做判定（纯函数）。
@@ -195,7 +197,8 @@ def evaluate(
     allowed: list[dict[str, Any]] = []
     for update in updates:
         verdict = classify_update(
-            update, default_branch=default_branch, is_ancestor=is_ancestor,
+            update, default_branch=default_branch, task_prefix=task_prefix,
+            is_ancestor=is_ancestor,
         )
         (refusals if verdict["action"] == "refuse" else allowed).append(verdict)
     return {
@@ -301,22 +304,24 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int
     if not updates:
         return 0
     project_root = Path.cwd()
-    # 默认分支按需解析（task-ref-tx-hook-cost）：classify 仅在更新触及
-    # refs/heads/ 非任务命名空间时才消费 default_branch；任务分支等常见
-    # 路径跳过解析，省下最多 3 个 git 子进程（MSYS 下每个都被放大）。
+    # task-line-ref-tx-per-line：多线下命名空间前缀与 trunk 由**安装期烘焙 env** 提供
+    # （未启用多线时不烘焙 → 与历史口径逐字一致，零额外 git 子进程）。
+    line_prefix = os.environ.get("ORCHD_LINE_TASK_PREFIX") or TASK_PREFIX
+    line_trunk = os.environ.get("ORCHD_LINE_TRUNK") or ""
     need_default = any(
         u["ref"].startswith(HEADS_PREFIX)
-        and not u["ref"].startswith((TASK_PREFIX, ENGINE_REF_PREFIX))
+        and not u["ref"].startswith((line_prefix, ENGINE_REF_PREFIX))
         for u in updates
     )
     default_branch = (
-        _resolve_default_branch(project_root)
+        (line_trunk or _resolve_default_branch(project_root))
         if need_default else _FALLBACK_DEFAULT_BRANCH
     )
     verdict = evaluate(
         updates,
         state=state,
         default_branch=default_branch,
+        task_prefix=line_prefix,
         is_ancestor=_git_ancestor_check(project_root),
     )
     if not verdict["blocked"]:

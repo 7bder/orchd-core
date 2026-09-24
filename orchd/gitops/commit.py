@@ -60,6 +60,24 @@ def _filter_committable_paths(project_root: Path, paths: list[str]) -> list[str]
     return non_ignored_paths
 
 
+def _split_subject_body(message: str) -> tuple[str, str]:
+    """commit message 拆分为 subject + body（task-review-rework-scope）。
+
+    首段做 subject（单行超 100 字符截断注记），余下做 body——`git log
+    --oneline` 不再出现 KB 级标题行；完整原文仍存账本（DONE changes_description）
+    与响应 message，可审计。
+    """
+    text = (message or "").strip()
+    if "\n\n" in text:
+        subject, _, body = text.partition("\n\n")
+    else:
+        subject, _, body = text.partition("\n")
+    subject = " ".join(subject.split())
+    if len(subject) > 100:
+        subject = subject[:97] + "..."
+    return subject, body.strip()
+
+
 def _commit_filtered_paths(
     project_root: Path,
     paths: list[str],
@@ -87,10 +105,17 @@ def _commit_filtered_paths(
     # commit 同样限定 paths：不提交声明范围外的 staged 内容，不 push。
     # 写操作使用独立超时预算（_GIT_COMMIT_TIMEOUT）：pre-commit hook 等写路径
     # 单次可越过读操作 10s 上限，超时不再吞成 commit_failed（AC1/AC2）。
+    # task-review-rework-scope：首段做 subject、正文放 body（git -m ×2），
+    # 响应 message 仍回传完整原文（可审计）。
+    subject, body = _split_subject_body(message)
+    commit_argv = ["commit", "-m", subject]
+    if body:
+        commit_argv += ["-m", body]
+    commit_argv += ["--", *paths]
     try:
         commit = _run_git(
             project_root,
-            ["commit", "-m", message, "--", *paths],
+            commit_argv,
             timeout=_GIT_COMMIT_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:

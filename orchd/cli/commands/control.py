@@ -82,7 +82,10 @@ def _decl_withdraw_branch_overlap(project_root: Path, task_id: str,
 
     if not paths:
         return []
-    branch = f"task/{task_id}"
+    # task-line-diag-wiring：分支名与 base 按当前线解析（单线恒 task/{id} / main）
+    from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+
+    branch = resolve_task_branch_for(project_root, task_id)
     try:
         exists = subprocess.run(
             [
@@ -96,7 +99,7 @@ def _decl_withdraw_branch_overlap(project_root: Path, task_id: str,
         )
         if exists.returncode != 0:
             return []
-        base = "main"
+        base = resolve_trunk_for(project_root)
         probe = subprocess.run(
             [
                 "git", "-C",
@@ -318,8 +321,7 @@ def _apply_register_proposals(master, register_path: str) -> None:
         existing.add(tid)
 
 
-@_cli_skeleton
-def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
+def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """增量更新 snapshot，依据状态约束矩阵过滤变更。
 
     CLI 参数: args.master — master 文件路径（默认 .orchd/_master.json）。
@@ -899,6 +901,231 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     return result
 
 
+def _amend_roundtrip_applicable(
+    caller_root: Path,
+    caller_branch: str,
+    patch_task: str | None,
+    args: Any,
+) -> bool:
+    """判定是否进入 amend 受管分支往返（task-flat-amend-channel AC1/AC3）。
+
+    适用条件（缺一即 False，交 :func:`_amend_impl` 既有 E007 守卫）：
+
+    - ``--task`` 补丁通道：裸 amend / ``--register`` / ``--revise-terminal`` 不走
+      往返——注册与终态文本修订超出「附加字段补丁域」，属补丁越域；
+    - 当前分支为任务分支（``task/{id}`` 或 ``{line}/task/{id}``）；
+    - 非 container 布局的独立任务 worktree（flat / 降级）——container 下任务
+      worktree 走既有「cd 主工作树」路径，零回归。
+
+    说明：附加字段补丁域由 CLI 暴露面天然限定（全部 ⊆
+    ``split._AMEND_ATTACHABLE_FIELDS``），实际矩阵仍由 ``split.amend`` 强制执行；
+    本判据只决定「是否走往返」，不放宽 amend 允许集。
+    """
+    if patch_task is None:
+        return False
+    if getattr(args, "register", None) is not None:
+        return False
+    if getattr(args, "revise_terminal", None) is not None:
+        return False
+    if not (caller_branch.startswith("task/") or "/task/" in caller_branch):
+        return False
+    # container 布局的任务 worktree 是 linked worktree（``git rev-parse --git-dir``
+    # 含 ``worktrees/``）——不触发往返，走既有「cd 主工作树」E007 路径（零回归）。
+    # flat / 降级（单 worktree，含 container 主工作树）→ 触发。判据不依赖布局标记
+    # （任务 worktree 可能未携带标记），与 ``is_task_worktree`` 单一真源一致。
+    try:
+        from orchd.gitops import is_task_worktree
+
+        if is_task_worktree(caller_root):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _enter_amend_roundtrip(
+    args: Any,
+    caller_root: Path,
+    caller_branch: str,
+    default_branch: str,
+) -> dict[str, Any] | None:
+    """进入 amend 受管分支往返：干净校验（E017）+ ``git checkout <default>``。
+
+    Returns:
+        往返上下文 ``{"from_branch", "default_branch", "task_id"}``；不适用返回
+        None（交既有 E007 守卫）。
+    """
+    patch_task = getattr(args, "task", None)
+    if not _amend_roundtrip_applicable(caller_root, caller_branch, patch_task, args):
+        return None
+    from orchd.gitops.guard import managed_checkout_branch
+
+    outcome = managed_checkout_branch(caller_root, default_branch, command="amend")
+    if not outcome.get("ok"):
+        raise OrchdError(
+            ErrorCode.E018,
+            "amend_roundtrip_enter_failed: 受管分支往返无法切到 default"
+            f"（{default_branch}）分支",
+            [{
+                "command": "amend",
+                "from_branch": caller_branch,
+                "target_branch": default_branch,
+                "reason": outcome.get("reason"),
+                "hint": (
+                    "往返入口切换失败（工作区脏 / 分支缺失 / git 故障）；本次未写"
+                    "任何内容，可安全重试。脏工作区请先在任务分支提交"
+                    "（git add + git commit，红线 #1 唯一豁免）或 orchd restore 还原"
+                ),
+            }],
+        )
+    return {
+        "from_branch": caller_branch,
+        "default_branch": default_branch,
+        "task_id": patch_task,
+    }
+
+
+def _emit_amend_roundtrip_event(
+    store,
+    agent_id: str | None,
+    roundtrip: dict[str, Any],
+) -> None:
+    """落 AMEND 审计事件（``reason=implementer_amend_roundtrip``；best-effort）。"""
+    try:
+        from orchd.gitops_ops import make_event
+
+        _agent = agent_id if isinstance(agent_id, str) else ""
+        store.acquire_lock()
+        try:
+            ev = make_event(
+                roundtrip["task_id"], _agent, "AMEND",
+                reason="implementer_amend_roundtrip",
+                branch=roundtrip["from_branch"],
+                from_branch=roundtrip["default_branch"],
+                hint=("flat/降级布局下实现者持任务分支执行 amend --task：引擎受管"
+                      "往返（切到 default 写 canonical master 并提交后切回任务分支）"),
+            )
+            store.append_event(ev)
+            store.update_checkpoint(store.replay())
+        finally:
+            store.release_lock()
+    except Exception:
+        pass  # best-effort：审计落账失败不阻断 amend（往返本身已生效）
+
+
+def _finish_amend_roundtrip(
+    caller_root: Path,
+    roundtrip: dict[str, Any],
+    store,
+    agent_id: str | None,
+) -> None:
+    """成功路径：checkout 回任务分支，并落 AMEND 审计事件。"""
+    from orchd.gitops.guard import managed_checkout_branch
+
+    from_branch = roundtrip["from_branch"]
+    outcome = managed_checkout_branch(caller_root, from_branch, command="amend")
+    if not outcome.get("ok"):
+        raise OrchdError(
+            ErrorCode.E018,
+            "amend_roundtrip_exit_failed: amend 已写入 canonical master，但受管往返"
+            f"未能切回任务分支 {from_branch}",
+            [{
+                "command": "amend",
+                "task_id": roundtrip.get("task_id"),
+                "from_branch": roundtrip.get("default_branch"),
+                "target_branch": from_branch,
+                "reason": outcome.get("reason"),
+                "hint": (
+                    "amend 已提交到 default 分支（未丢），但工作区仍停留在 "
+                    f"{roundtrip.get('default_branch')}；请重试本命令以完成切回，"
+                    "或报告人工处置"
+                ),
+            }],
+        )
+    _emit_amend_roundtrip_event(store, agent_id, roundtrip)
+
+
+def _rollback_amend_roundtrip(
+    caller_root: Path,
+    roundtrip: dict[str, Any],
+    cause: BaseException,
+) -> None:
+    """失败路径：回滚到原任务分支；回滚失败结构化上报（链式原始异常）。"""
+    from orchd.gitops.guard import managed_checkout_branch
+
+    from_branch = roundtrip["from_branch"]
+    try:
+        outcome = managed_checkout_branch(caller_root, from_branch, command="amend")
+        ok = bool(outcome.get("ok"))
+        reason = outcome.get("reason")
+    except Exception as exc:
+        ok = False
+        reason = f"{type(exc).__name__}: {exc}"[:200]
+    if ok:
+        return
+    raise OrchdError(
+        ErrorCode.E018,
+        "amend_roundtrip_rollback_failed: 受管往返失败后无法切回任务分支 "
+        f"{from_branch}（半完成态，须人工核对）",
+        [{
+            "command": "amend",
+            "task_id": roundtrip.get("task_id"),
+            "from_branch": roundtrip.get("default_branch"),
+            "target_branch": from_branch,
+            "reason": reason,
+            "cause": f"{type(cause).__name__}: {cause}"[:300],
+            "hint": (
+                "受管往返的 amend 步骤失败且回滚未成功：工作区可能停留在 "
+                f"{roundtrip.get('default_branch')}。请核对分支后重试或报告人工处置"
+            ),
+        }],
+    ) from cause
+
+
+@_cli_skeleton
+def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
+    """amend 入口：flat/降级态下受管分支往返 + 增量更新 snapshot。
+
+    task-flat-amend-channel：非 default 分支调用时——
+
+    - container 布局（存在独立任务 worktree）→ 交 :func:`_amend_impl` 既有 E007
+      守卫（提示回主工作树，零回归）；
+    - flat / 降级布局 + ``--task`` 附加字段补丁 + 任务分支 → 引擎执行**受管分支
+      往返**（checkout default → 写 canonical master 并提交 → checkout 回任务
+      分支），落 AMEND 审计事件（``reason=implementer_amend_roundtrip``）；任一步
+      失败即回滚到原任务分支并结构化上报（不静默、不留半完成态）。
+    """
+    from orchd.gitops import get_current_branch, get_default_branch
+
+    caller_root = Path.cwd()
+    caller_branch = get_current_branch(caller_root)
+    default_branch = get_default_branch(caller_root) or "main"
+
+    roundtrip: dict[str, Any] | None = None
+    if caller_branch is not None and caller_branch != default_branch:
+        roundtrip = _enter_amend_roundtrip(
+            args, caller_root, caller_branch, default_branch)
+
+    if roundtrip is None:
+        # 未进入往返：既有 E007 守卫在 _amend_impl 内按原语义拒绝
+        # （container 任务 worktree / 裸 amend / --register / 非任务分支）。
+        return _amend_impl(args, tasks, orchd_dir, master, store, agent_id)
+
+    try:
+        result = _amend_impl(args, tasks, orchd_dir, master, store, agent_id)
+    except BaseException as exc:
+        _rollback_amend_roundtrip(caller_root, roundtrip, exc)
+        raise
+    _finish_amend_roundtrip(caller_root, roundtrip, store, agent_id)
+    if isinstance(result, dict):
+        result["amend_roundtrip"] = {
+            "from_branch": roundtrip["from_branch"],
+            "default_branch": roundtrip["default_branch"],
+            "checked_out": roundtrip["from_branch"],
+        }
+    return result
+
+
 def _cmd_retract(args) -> dict:
     from orchd.cli import _load_tasks
     """撤回已提交的事件。
@@ -970,6 +1197,24 @@ def _cmd_force_status(args) -> dict:
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
     if result.get("new_status") == "cancelled":
         result["ideas_archive"] = _maybe_archive_ideas(orchd_dir)
+    return result
+
+
+def _cmd_restore(args) -> dict:
+    """受管工作树还原（task-restore-channel）：指定路径回到 HEAD，不碰历史。
+
+    CLI 参数: args.path（必需，相对仓库根的文件路径，可多个）。
+    返回: ``{"restored": [...], "project_root": str}``；任一路径被拒则整体
+    E007（一个也不执行）。目录 / 仓库外 / 未跟踪新建一律拒绝。
+    """
+    from orchd.cli import _load_tasks
+    from orchd.gitops.guard import restore_worktree_paths
+
+    _, orchd_dir, _ = _load_tasks()
+    agent_id = _require_agent_id(orchd_dir)
+    result = restore_worktree_paths(
+        orchd_dir.parent, list(getattr(args, "path", None) or []))
+    result["agent_id"] = agent_id
     return result
 
 
@@ -1076,7 +1321,7 @@ def register(sub) -> None:
                    dest="event_type",
                    choices=[
                        "CLAIMED", "DONE", "REVIEW_CLAIMED", "REVIEW_SUBMITTED",
-                       "REVIEW_READY", "AMEND", "MERGE_WARNING"
+                       "REVIEW_READY", "AMEND",
                    ],
                    help="事件类型（配合 --task 自动定位最近匹配事件）")
     p.add_argument("--reason", required=True)
@@ -1109,3 +1354,10 @@ def register(sub) -> None:
     p.add_argument("--task", required=True, help="已人工确认的 task_id")
     p.add_argument("--reason", required=True, help="确认原因（必填）")
     p.set_defaults(func=_cmd_merge_ack)
+
+    # restore（task-restore-channel）
+    p = sub.add_parser("restore", help="受管工作树还原：指定路径回到 HEAD，不碰历史")
+    p.add_argument("--path", nargs="+", required=True,
+                   help="相对仓库根的文件路径（可多个；仅已跟踪且有 HEAD 版本的文件，"
+                   "目录/仓库外/未跟踪新建一律拒绝）")
+    p.set_defaults(func=_cmd_restore)

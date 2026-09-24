@@ -131,8 +131,21 @@ class SqliteBackend(StorageBackend):
         return logical[max(0, from_line - 1):stop]
 
     def event_count(self) -> int:
-        """逻辑事件总数（与 read_events 全量口径一致）。"""
-        return len(self.read_events())
+        """逻辑事件总数（O(1)：读 meta 计数器；N2 兑现 docstring 承诺）。
+
+        计数器由 append_event（+1）/ replace_active_events（同步总数）/
+        import_jsonl（归档 + 活跃总数）维护；此处只读 meta，不全量读事件。
+        meta 缺失（旧库）时回退全量口径（与旧实现一致，不抛错）。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT v FROM meta WHERE k = ?", (_COUNT_KEY,)).fetchone()
+        if row is None:
+            return len(self.read_events())
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return len(self.read_events())
 
     def replace_active_events(self, events: list[dict[str, Any]]) -> None:
         """全量重写活跃事件表（task-ledger-archive-compact，compact 专用）。
@@ -146,10 +159,19 @@ class SqliteBackend(StorageBackend):
                 conn.execute(
                     "INSERT INTO events (payload) VALUES (?)",
                     (json.dumps(ev, ensure_ascii=False, separators=(",", ":")),))
+            # N2（计数器口径对齐）：逻辑总数 = 归档文件数 + 本次重插活跃数，
+            # 与 import_jsonl 口径一致。读失败按 0 计，不阻断 compact。
+            from orchd.storage import read_archive_events
+
+            try:
+                _arch, _ = read_archive_events(self.orchd_dir)
+                _arch_n = len(_arch)
+            except Exception:
+                _arch_n = 0
             conn.execute(
                 "INSERT INTO meta (k, v) VALUES (?, ?) "
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-                (_COUNT_KEY, str(len(events))),
+                (_COUNT_KEY, str(_arch_n + len(events))),
             )
 
     def load_checkpoint(self) -> dict[str, Any] | None:
@@ -198,7 +220,7 @@ class SqliteBackend(StorageBackend):
         导入后截断点推进到归档事件数（与归档文件口径对齐，后续读合并零重叠）。
         归档与活跃文件均缺失 → 0。
 
-        Returns: 导入的事件条数（0 表示无需导入 / 源文件不存在）。
+        Returns: 导入的事件条数（归档 + 活跃总数；N3：此前硬重置丢归档部分）。
         """
         from orchd.storage import read_archive_events
 
@@ -215,7 +237,7 @@ class SqliteBackend(StorageBackend):
                     "INSERT INTO events (payload) VALUES (?)",
                     (json.dumps(ev, ensure_ascii=False, separators=(",", ":")),))
                 count += 1
-            count = 0
+            # N3：此前此处 `count = 0` 硬重置丢归档部分——归档计数累计保留。
             with open(self.ledger_path, "r", encoding="utf-8") as f:
                 for line in f:
                     stripped = line.strip()

@@ -63,9 +63,12 @@ def _require_agent_id(orchd_dir: Path | None = None) -> str:
             [{
                 "agent_id": agent_id,
                 "hint": (
-                    "本命令需要会话身份。请宿主在启动 orchd 前把当前会话唯一码注入 "
-                    "ORCHD_SESSION_ID（TRAE 会话自动注入；codex/opencode/workbuddy "
-                    "由各自接入层注入），再重试"
+                    "本命令需要会话身份：一键取号并注入——先运行 "
+                    "python .orchd/__main__.py session start 获取 token，再执行其返回的"
+                    "注入命令（PowerShell：$env:ORCHD_SESSION_ID=\"<token>\"；bash："
+                    "export ORCHD_SESSION_ID=\"<token>\"，与 session start 的 inject_action"
+                    " 同形），后续命令即识别为同一会话身份，后重试"
+                    "（TRAE 会话自动注入；codex/opencode/workbuddy 由各自接入层注入）"
                 ),
             }],
         )
@@ -163,6 +166,9 @@ def _current_task_from_branch(project_root: Path) -> str | None:
     branch = proc.stdout.strip()
     if branch.startswith("task/"):
         return branch[len("task/"):]
+    # task-line-diag-wiring：识别 {line}/task/{id}（多线命名空间）
+    if "/task/" in branch:
+        return branch.rsplit("/task/", 1)[1]
     return None
 
 

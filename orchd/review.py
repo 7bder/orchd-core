@@ -36,6 +36,7 @@ from orchd.gitops_ops import (
     try_git_merge,
 )
 from orchd.guide import NEXT_ACTION_EXIT, read_for
+from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
 from orchd.ledger import (
     Store,
     TaskDerived,
@@ -109,7 +110,7 @@ def _task_branch_tip(project_root: Path, task_id: str) -> str | None:
 
     try:
         result = subprocess.run(
-            ["git", "rev-parse", f"task/{task_id}"],
+            ["git", "rev-parse", resolve_task_branch_for(project_root, task_id)],
             cwd=str(project_root),
             capture_output=True,
             encoding="utf-8",
@@ -204,29 +205,31 @@ def _own_merge_residual(
     if audit_root is not None:
         try:
             root = str(audit_root)
+            branch = resolve_task_branch_for(audit_root, task_id)
+            trunk = resolve_trunk_for(audit_root)
             if branch_deleted is not True:
                 show = subprocess.run(
                     ["git", "-C", root, "show-ref", "--verify",
-                     f"refs/heads/task/{task_id}"],
+                     f"refs/heads/{branch}"],
                     capture_output=True, timeout=10,
                 )
                 if show.returncode == 0:
                     residual.append({
                         "task_id": task_id,
                         "reason": "branch_not_cleaned",
-                        "detail": f"task/{task_id} 分支仍存在（分支删除未成功）",
+                        "detail": f"{branch} 分支仍存在（分支删除未成功）",
                     })
             if tip_sha:
                 anc = subprocess.run(
                     ["git", "-C", root, "merge-base", "--is-ancestor",
-                     tip_sha, "main"],
+                     tip_sha, trunk],
                     capture_output=True, timeout=10,
                 )
                 if anc.returncode != 0:
                     residual.append({
                         "task_id": task_id,
                         "reason": "branch_not_merged_into_main",
-                        "detail": f"task/{task_id} tip {tip_sha[:7]} 未被 main 包含",
+                        "detail": f"{branch} tip {tip_sha[:7]} 未被 {trunk} 包含",
                     })
         except Exception:
             pass
@@ -517,6 +520,7 @@ def review_submit(
     comments: str | None = None,
     project_root: Path | None = None,
     authorize_reviewer_resolve: bool = False,
+    rework_scope: str | None = None,
 ) -> dict[str, Any]:
     """提交审查结果（task-session-lock-lifecycle：异常路径也保证释放会话锁）。
 
@@ -542,6 +546,7 @@ def review_submit(
         return _review_submit_impl(
             store, tasks, agent_id, task_id, review_type, verdict, comments,
             project_root, authorize_reviewer_resolve=authorize_reviewer_resolve,
+            rework_scope=rework_scope,
         )
     finally:
         if project_root:
@@ -627,6 +632,7 @@ def _review_submit_impl(
     project_root: Path | None = None,
     *,
     authorize_reviewer_resolve: bool = False,
+    rework_scope: str | None = None,
 ) -> dict[str, Any]:
     """提交审查结果（APPROVED 或 CHANGES_REQUESTED）。
 
@@ -737,11 +743,34 @@ def _review_submit_impl(
         is_self_review = is_self_review_author(
             derived.last_done.get(task_id), agent_id, current_session
         )
+        # task-review-rework-scope：打回范围分类。rework_scope 仅伴随
+        # CHANGES_REQUESTED，且仅 code 阶段打回可声明 code（spec 打回重走
+        # spec 是唯一语义）；APPROVED / 非 code 阶段携带即 E007，防误用。
+        if rework_scope is not None:
+            if verdict != "CHANGES_REQUESTED" or review_type != "code":
+                raise OrchdError(
+                    ErrorCode.E007,
+                    "invalid_rework_scope: rework_scope 仅用于 code 阶段的 CHANGES_REQUESTED",
+                    [{"task_id": task_id, "verdict": verdict,
+                      "review_type": review_type,
+                      "hint": "仅 code 审查打回实现问题时可附 --rework-scope code"
+                              "（返工后直达 code）；其余情形不得携带"}],
+                )
+            if rework_scope not in ("spec", "code"):
+                raise OrchdError(
+                    ErrorCode.E007,
+                    f"invalid_rework_scope: {rework_scope!r} 非法",
+                    [{"task_id": task_id,
+                      "hint": "rework_scope 仅支持 spec（默认，全退重走）/ code"
+                              "（仅实现问题，返工直达 code）"}],
+                )
         event = make_event(
             task_id, agent_id, "REVIEW_SUBMITTED",
             verdict=verdict,
             is_self_review=is_self_review,
         )
+        if rework_scope is not None:
+            event["rework_scope"] = rework_scope
         # review-unify-r2：unified 单阶段（review_type 为 None）不写 review_type
         # 字段（R2-b：新事件无 review_type）；two_phase 保留 spec/code 供 replay
         # 按两阶段语义解释，与老事件兼容。
@@ -864,7 +893,20 @@ def _review_submit_impl(
         # 多个 code APPROVED 同时进主工作树 merge 时排队，互不干扰。
         # flat（任务 worktree == 主工作树 == 本 store）不加锁——review_submit
         # 已在开头持有并释放同一把 store 锁，此处复用会重复 acquire 死锁（零回归）。
+        # task-audit-hint-show：内联审计的 report 导入必须在 merge/回收之前完成——
+        # container 下终态回收会删掉任务 worktree 连带其 orchd/ 源码副本，之后再
+        # 延迟导入即 ModuleNotFoundError → merge_audit 恒 skipped(no_project_root)
+        # （生产 11/11 code APPROVED 实证；与 _cmd_review 的 _preimport_archive_deps
+        # 同模式）。此处提前绑定，后续只用不再导入。
+        try:
+            from orchd.report import merge_audit as _merge_audit_fn
+        except Exception:
+            _merge_audit_fn = None
         merge_lock: Any | None = None
+        # task-audit-hint-show：main_wt 显式初始化为 None——原仅在
+        # `if project_root:` 内赋值，无 project 上下文时后文引用即 NameError；
+        # 初始化后无上下文安全降级（审计跳过 + 指引不附主工作树字段）。
+        main_wt = None
         if project_root:
             main_wt = main_worktree_root(project_root)
             if main_wt != Path(project_root).resolve():
@@ -898,13 +940,15 @@ def _review_submit_impl(
                     reviewer_resolved = False
                     if authorize_reviewer_resolve and project_root and conflict_files:
                         _rr_workdir = main_worktree_root(project_root)
+                        _rr_trunk = resolve_trunk_for(project_root)
+                        _rr_branch = resolve_task_branch_for(project_root, task_id)
                         # 重新触发 merge 以获得冲突工作树状态（try_git_merge 已 abort）
                         subprocess.run(["git", "-C", str(_rr_workdir), "merge", "--abort"],
                                        capture_output=True, timeout=10)
-                        subprocess.run(["git", "-C", str(_rr_workdir), "checkout", "main"],
+                        subprocess.run(["git", "-C", str(_rr_workdir), "checkout", _rr_trunk],
                                        capture_output=True, timeout=10)
                         _rr_merge = subprocess.run(
-                            ["git", "-C", str(_rr_workdir), "merge", f"task/{task_id}"],
+                            ["git", "-C", str(_rr_workdir), "merge", _rr_branch],
                             capture_output=True, timeout=30,
                         )
                         if _rr_merge.returncode != 0:
@@ -1103,11 +1147,9 @@ def _review_submit_impl(
                         # 内联 merge 审计（task-merge-audit-inline，AC1/AC2/AC3）：
                         # code APPROVED 在 merge 成功后自动跑 merge_audit 并附响应。
                         # 只读 best-effort：探针失败 / 跳过（非 git / 无 main /
-                        # 无 project_root）不阻断完成。
-                        try:
-                            from orchd.report import merge_audit as _merge_audit_fn
-                        except Exception:
-                            _merge_audit_fn = None
+                        # 无 project_root）不阻断完成。_merge_audit_fn 已在
+                        # merge/回收前提前绑定（task-audit-hint-show），此处不再
+                        # 延迟导入——回收后任务 worktree 源码副本已删，现导入必败。
                         if _merge_audit_fn is not None and _audit_root is not None:
                             try:
                                 _audit = _merge_audit_fn(store, tasks, _audit_root)
@@ -1201,7 +1243,8 @@ def _review_submit_impl(
     # status --audit-merge；回收未成功时额外给出处置指引。
     if result.get("task_status") == "completed" and result.get("merged") is True:
         result["guidance"] = _build_completion_guidance(
-            task_id, result.get("worktree_recycled")
+            task_id, result.get("worktree_recycled"),
+            main_worktree=str(main_wt) if main_wt is not None else None,
         )
 
     # AC4：守卫降级不静默——会话锁未持有时非空，并入响应（沿用「有降级才补字段」
@@ -1213,7 +1256,8 @@ def _review_submit_impl(
 
 
 def _build_completion_guidance(
-    task_id: str, worktree_recycled: dict[str, Any] | None
+    task_id: str, worktree_recycled: dict[str, Any] | None,
+    main_worktree: str | None = None,
 ) -> dict[str, Any]:
     """构造 code APPROVED + merge 成功后的完成态 guidance（AC1/AC2）。
 
@@ -1249,6 +1293,7 @@ def _build_completion_guidance(
         "command": f"{_ENTRY_CMD} status --audit-merge",
         "hint": hint,
         "read": read_for("audit_merge"),
+        **({"main_worktree": main_worktree} if main_worktree else {}),
     }
 
 

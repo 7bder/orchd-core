@@ -612,10 +612,14 @@ def _summarize(
     first_rework_tid: str | None = None
     first_unclaimed_review: str | None = None
     first_unclaimed_review_phase: str | None = None
+    # task-review-independence-enforce：焦点审查任务是否要求独立审查（claim_review
+    # hint 显式指引换会话；step 词表不新增，hint 文案与 rules/review.md 同语义）。
+    first_unclaimed_review_requires_independence = False
     # 本 agent 已领未提交的审查（task-guide-step-vocab-and-routing-fix）：原实现只
     # 计数 my_in_review 却不产出出口，导致 in_review 全被领走时引导指回 request。
     my_review_tid: str | None = None
     my_review_phase: str | None = None
+    _task_map = {t.get("id", ""): t for t in tasks}
     for task in tasks:
         tid = task.get("id", "")
         ts = state.get(tid)
@@ -636,12 +640,16 @@ def _summarize(
             if ts and ts.review_claimed_by is None and first_unclaimed_review is None:
                 first_unclaimed_review = tid
                 first_unclaimed_review_phase = ts.review_phase or "unified"
+                if _task_map.get(tid, {}).get("require_independent_review"):
+                    first_unclaimed_review_requires_independence = True
     counts["total"] = len(tasks)
     counts["my_claimed"] = my_claimed
     counts["rework"] = rework
     counts["first_rework_tid"] = first_rework_tid
     counts["first_unclaimed_review"] = first_unclaimed_review
     counts["first_unclaimed_review_phase"] = first_unclaimed_review_phase
+    counts["first_unclaimed_review_requires_independence"] = (
+        first_unclaimed_review_requires_independence)
     counts["my_review_tid"] = my_review_tid
     counts["my_review_phase"] = my_review_phase
     return counts
@@ -713,7 +721,8 @@ def first_time_guide(has_master: bool = False) -> dict[str, Any]:
             "read": read_for("empty_project"),
             "template": [],
             "command": f"{_ENTRY_CMD} idea propose --title '<灵感>' --feasibility '<论证>'",
-            "hint": "项目已初始化但还没有任务：可提交新 idea 供拆解，或直接规划下一阶段。",
+            "hint": "项目已初始化但还没有任务：先 status 确认状态（validate 校验），"
+                    "可提交新 idea 供拆解，或直接规划下一阶段。",
         }
     return {
         "step": "first_time",
@@ -851,6 +860,11 @@ def _review_step_guidance(
                 f"（E018 守卫：目标目录必须等于任务 worktree，防错目录审查）；提交成功后引擎回收"
                 f"该 worktree，回收前请先切出任务目录（Windows 句柄占用会导致回收失败）；"
                 f"代码审查通过任务才算完成。"
+            ) + (
+                " 注意：该任务 require_independent_review=true，要求异指纹审查——"
+                "实现会话不得认领，请换独立会话（不同 ORCHD_SESSION_ID）执行 claim"
+                "（同指纹提交的审查结论视为无效）。"
+                if c.get("first_unclaimed_review_requires_independence") else ""
             ),
         }
     if step == "submit_review":
@@ -1116,6 +1130,22 @@ _CMD_BRANCH_CTX_TIPS: dict[str, str] = {
 }
 
 
+def _current_line_trunk() -> str | None:
+    """当前线 trunk（best-effort；供 branch_context 识别非默认线主干，失败 → None）。
+
+    task-line-audit-guide-wiring：引导层保持纯函数为默认，此处按 cwd 惰性解析；
+    解析失败（非仓库 / 无 master）回退 ``None``，角色判定退回 main/master 历史口径。
+    """
+    try:
+        from pathlib import Path
+
+        from orchd.line_ctx import resolve_trunk_for
+
+        return resolve_trunk_for(Path.cwd())
+    except Exception:  # noqa: BLE001 - 引导层 best-effort，不得影响主流程
+        return None
+
+
 def branch_context(
     branch: str | None,
     state: dict[str, Any],
@@ -1132,8 +1162,9 @@ def branch_context(
     if not branch:
         return None
     tip = _CMD_BRANCH_CTX_TIPS.get(command) if command else None
-    if branch.startswith("task/"):
-        tid = branch[len("task/"):]
+    # task-line-audit-guide-wiring：识别 {line}/task/{id} 任务分支（多线命名空间）
+    if branch.startswith("task/") or "/task/" in branch:
+        tid = branch.rsplit("/task/", 1)[1] if "/task/" in branch else branch[len("task/"):]
         hint = (
             f"当前在任务分支 {branch}：实现/提交只在本分支，勿在主分支改动任务文件；"
             f"完成后 {_ENTRY_CMD} done 会自动切回主分支。"
@@ -1146,7 +1177,7 @@ def branch_context(
             "task_id": tid,
             "hint": hint,
         }
-    if branch in ("main", "master"):
+    if branch in ("main", "master") or branch == _current_line_trunk():
         hint = (
             f"当前在主分支 {branch}：只允许 claim 前的读操作与引擎自动 merge；"
             "任务改动必须在 task 分支完成，不要在主分支直接提交任务文件。"
@@ -1620,12 +1651,14 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     ("E030", "运行时文件完整性校验失败（警告不阻断）：用 doctor 诊断并修复引擎文件", ("rules/recovery.md",), f"{_ENTRY_CMD} doctor", "manual", "continue"),
     ("E031", "ROADMAP 规划章节未落地 IDEAS：章节 {chapter} 需先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS pending 后再 intake", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
     ("E032", "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
-    ("E033", "会话身份缺失：先 session start 注入 ORCHD_SESSION_ID", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
+    ("E033", "会话身份缺失：先 session start 取 token 并执行其注入命令（$env:ORCHD_SESSION_ID=\"<token>\" / export ORCHD_SESSION_ID=\"<token>\"），再重试", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
     ("E034", "撤认归属守卫：仅事件作者 {owner} 或 admin 可撤回 {task_id}，当前 {caller} 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
     ("E035", "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
     ("E036", "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),
     ("E037", "verify_command 引用路径未声明且不存在：将路径加入 files_to_edit/exempt_files，或改指向实际存在的文件（声明口径一致性）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit <path>", "suggest", "exec-command"),
-    ("E038", "brief 声明的 files_to_edit 数量口径与实际声明不一致：对齐 brief 文案与声明集合（非拆分建议，warning 不阻断）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --brief <对齐后文案>", "suggest", "continue"),
+    # task-hint-ghost-fix（pass7 P1-5/D2）：原建议命令 `amend --brief` 旗标不存在（幽灵命令）。
+    # 改为两条可执行通道：补声明（--files-to-edit）或终态文本修订（--revise-terminal）。
+    ("E038", f"brief 声明的 files_to_edit 数量口径与实际声明不一致（warning 不阻断）：对齐二者——补声明 {amend_patch_cmd('<id>', files='<f>')}，或修订 brief 文本（终态任务用 {_ENTRY_CMD} amend --revise-terminal <id> --reason <理由>）", ("rules/intake.md",), amend_patch_cmd("<id>", files="<f>"), "suggest", "continue"),
     ("E039", f"共享入口改动未覆盖登记的既有测试：{{missing}} 必须出现在 verify_command 的 pytest 目标里（否则既有断言静默变红），用 {amend_patch_cmd('{task_id}', verify='<补入登记测试后的命令>')} 补登后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<补入登记测试后的命令>"), "suggest", "exec-command"),
 )
 # 显式豁免集：允许裸弱出口的码（默认空集，加入需逐一说理注释）

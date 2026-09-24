@@ -388,11 +388,18 @@ def _m2_c1_release_per_line(ctx: MilestoneContext) -> tuple[bool, str, str]:
     if not path.is_file():
         return False, f"{RELEASE_SCRIPT} 不存在", "确认发布脚本位置（发版链入口）"
     text = path.read_text(encoding="utf-8", errors="replace")
-    if not re.search(r"--line|ORCHD_LINE|--tag", text):
-        return False, f"{RELEASE_SCRIPT} 未支持按线 / 按 tag 归属发版", (
-            "发布脚本当前把 MAIN_DIR 与 push main 写死：分线后第二线无发版通道，须先参数化"
+    # task-milestone-c1-fix：原 regex 含裸 ``--tag``，被脚本内 ``git describe --tags``
+    # 子串误命中 → C1 假阳性（pass7 P2-8/C-3）。改为要求**显式线参数化 token**：
+    # ``--line``（独立 token，非子串）或 ``ORCHD_LINE`` 环境变量。
+    line_aware = bool(re.search(r"(?<![\w-])--line(?![\w-])", text)) or bool(
+        re.search(r"(?<!\w)ORCHD_LINE(?!\w)", text)
+    )
+    if not line_aware:
+        return False, f"{RELEASE_SCRIPT} 未按线参数化（无 --line / ORCHD_LINE）", (
+            "发布脚本把 MAIN_DIR 与 push 目标写死：分线后第二线无发版通道，"
+            "须显式支持 --line <name> 或 ORCHD_LINE 环境变量"
         )
-    return True, "发布脚本支持按线 / 按 tag 归属", ""
+    return True, "发布脚本支持按线（--line / ORCHD_LINE）", ""
 
 
 def _m2_d1_drill_artifact(ctx: MilestoneContext) -> tuple[bool, str, str]:

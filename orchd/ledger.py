@@ -1591,6 +1591,31 @@ def validate_transition(
         )
 
 
+def latest_rework_scope(store: "Store", task_id: str) -> str | None:
+    """最近一次打回的返工范围（task-review-rework-scope）。
+
+    扫描账本：最近一条该任务的 ``REVIEW_SUBMITTED`` 若为 CHANGES_REQUESTED
+    且带 ``rework_scope``，返回其值（``spec`` 缺省不写，读不到即 None）；
+    其后若有新的 REVIEW_SUBMITTED（任何 verdict），以最新一条为准——标记
+    随 done 消费隐式失效，无需显式清除（pending 语义零污染）。
+    """
+    scope: str | None = None
+    try:
+        if not store.ledger_exists():
+            return None
+        events = store._read_ledger_lines(from_line=1)
+    except Exception:
+        return None
+    for ev in events:
+        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+            continue
+        if ev.get("verdict") == "CHANGES_REQUESTED":
+            scope = ev.get("rework_scope") or "spec"
+        else:
+            scope = None
+    return scope
+
+
 class Store:
     """事件存储引擎，封装 ledger / checkpoint / lock 的全部 I/O。
 
@@ -2279,6 +2304,18 @@ class Store:
                 # v4：审查被打回 → 回退 pending，本轮自审标记随回退清零
                 # （事实仍由历史 REVIEW_SUBMITTED 事件承载，缺口不回退）
                 ts.review_self_review = False
+            else:
+                # B5（task-gate-cleanup-batch）：未知 verdict 不再静默 no-op——
+                # 写路径 review 已 E007 拦截，此处守历史/手造/跨设备脏事件。
+                # replay 是纯派生路径（无 store/响应可挂 E030），故记进程级
+                # warnings（与既有未知事件语义一致），不阻断、不抛错。
+                warnings.warn(
+                    f"unknown REVIEW_SUBMITTED verdict "
+                    f"{event.get('verdict')!r} for task "
+                    f"{event.get('task_id', '?')} "
+                    f"(event {event.get('event_id', '?')})",
+                    UserWarning, stacklevel=2,
+                )
 
         elif etype == "FORCE_STATUS":
             # 强制状态覆盖：根据 target_status 重置关联字段，

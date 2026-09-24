@@ -176,7 +176,11 @@ def write_layout(orchd_dir: Path, layout: str, main_worktree: Path) -> dict[str,
     marker = marker_path(orchd_dir)
     marker.parent.mkdir(parents=True, exist_ok=True)
     tmp = marker.with_name(f".{marker.name}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # A3（task-hostfix-pack-b）：强制 LF。Windows 文本模式默认把 \n 翻成 \r\n，
+    # 而标记文件以 LF 入库（或首次写入即 LF）→ git status 出現内容为空的幻影脏位
+    # （ROADMAP.md 同款已在 hook 写盘路径修复，此处同源）。
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8", newline="\n")
     os.replace(tmp, marker)
     return {"written": True, "path": str(marker), "layout": layout}
 
@@ -1077,8 +1081,11 @@ def task_branch_head(project_root: Path, task_id: str) -> str | None:
     git 不可用 / 分支不存在 / 异常 → None（调用方回退旧行为，best-effort）。
     """
     try:
+        from orchd.line_ctx import resolve_task_branch_for
+
+        branch = resolve_task_branch_for(project_root, task_id)
         proc = subprocess.run(
-            ["git", "rev-parse", "--verify", f"task/{task_id}"],
+            ["git", "rev-parse", "--verify", branch],
             cwd=str(project_root),
             capture_output=True,
             encoding="utf-8",
@@ -1779,7 +1786,9 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
     if not separate:
         return {"worktree": project_root, "separate": False, "created": False}
 
-    branch = f"task/{task_id}"
+    from orchd.line_ctx import resolve_task_branch_for
+
+    branch = resolve_task_branch_for(project_root, task_id)
     wt_path = layout["task_wt_root"] / _task_wt_name(task_id)
     # AC4（task-review-baseline-and-worktree-recycle-fix）：目录名单一来源与不变量。
     # 禁止用含 / 的分支名（task/<id>）拼路径——否则容器根出现 task/task-<id>
@@ -2304,9 +2313,12 @@ def _tx_fact_branch_gone(stable_wt: Path | None, task_id: str) -> bool | None:
     if stable_wt is None:
         return None
     try:
+        from orchd.line_ctx import resolve_task_branch_for
+
+        branch = resolve_task_branch_for(stable_wt, task_id)
         proc = subprocess.run(
             ["git", "-C", str(stable_wt), "show-ref", "--verify",
-             f"refs/heads/task/{task_id}"],
+             f"refs/heads/{branch}"],
             capture_output=True, timeout=_GIT_TIMEOUT,
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
@@ -2406,6 +2418,9 @@ def _tx_step_remove_worktree(
     """
     removed = False
     discarded_uncommitted = False
+    # task-recycle-observability：--force 前快照的被丢弃路径清单（None=无丢弃
+    # 或未走到 --force；[] 不可能——空清单时不附键，见 _remove_record 组装）。
+    _remove_record_discarded: list[str] | None = None
     wt_existed = (wt_path / ".git").exists()
     # task-worktree-recycle-cwd-selfheal（AC1）：回收前检测调用方进程 cwd 是否
     # 位于待回收 worktree 内。Windows 下进程 cwd 会锁定目录，导致 git worktree
@@ -2461,6 +2476,24 @@ def _tx_step_remove_worktree(
                 # 改动，句柄占用时白跑一遍 --force 且掩盖真实原因）。
                 _err = (proc.stderr or "").lower()
                 if "modified or untracked" in _err:
+                    # task-recycle-observability：--force 前快照将被丢弃的路径清单
+                    # （静默 discarded_uncommitted=true 即数据丢失尾巴；清单上限 50，
+                    # best-effort，取不到不阻断 --force）。
+                    discarded_files: list[str] | None = None
+                    try:
+                        _st = subprocess.run(
+                            ["git", "-C", str(wt_path), "status",
+                             "--porcelain=v1", "--untracked-files=all"],
+                            capture_output=True, encoding="utf-8",
+                            errors="replace", timeout=30,
+                        )
+                        if _st.returncode == 0:
+                            discarded_files = [
+                                ln[3:].strip() for ln in
+                                (_st.stdout or "").splitlines() if ln.strip()
+                            ][:50]
+                    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                        discarded_files = None
                     proc = subprocess.run(
                         ["git", "worktree", "remove", "--force", str(wt_path)],
                         cwd=str(stable_wt),
@@ -2470,6 +2503,8 @@ def _tx_step_remove_worktree(
                         timeout=30,
                     )
                     discarded_uncommitted = proc.returncode == 0
+                    if discarded_uncommitted and discarded_files:
+                        _remove_record_discarded = list(discarded_files)
                 else:
                     remove_error = (proc.stderr or proc.stdout or "").strip()[:300]
                     _remove_reason = _classify_remove_failure(
@@ -2518,6 +2553,8 @@ def _tx_step_remove_worktree(
         _remove_record["error"] = remove_error
     if _remove_reason:
         _remove_record["reason"] = _remove_reason
+    if _remove_record_discarded:
+        _remove_record["discarded_files"] = _remove_record_discarded
     if registry_pruned is not None:
         _remove_record["registry_pruned"] = registry_pruned
     recycle_log.append(_remove_record)
@@ -2547,6 +2584,7 @@ def _tx_step_remove_worktree(
     return {
         "removed": removed,
         "discarded_uncommitted": discarded_uncommitted,
+        "discarded_files": _remove_record_discarded,
         "residual_cleaned": residual_cleaned,
         "remove_reason": _remove_reason,
     }
@@ -2573,9 +2611,13 @@ def _tx_step_delete_branch(
     branch_deleted = False
     branch_refused: dict[str, Any] | None = None
     unmerged_count: int | None = None
+    from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+
+    branch = resolve_task_branch_for(stable_wt, task_id)
+    trunk = resolve_trunk_for(stable_wt)
     try:
         count_proc = subprocess.run(
-            ["git", "-C", str(stable_wt), "rev-list", "--count", f"main..task/{task_id}"],
+            ["git", "-C", str(stable_wt), "rev-list", "--count", f"{trunk}..{branch}"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -2590,7 +2632,7 @@ def _tx_step_delete_branch(
 
     if unmerged_count and unmerged_count > 0 and not force_recycle:
         branch_refused = {
-            "branch": f"task/{task_id}",
+            "branch": branch,
             "unmerged_commits": unmerged_count,
             "reason": "unmerged_branch_protected",
             "hint": "该分支未被主分支包含；确需丢弃请显式 force_recycle（CLI: --force-recycle）",
@@ -2598,7 +2640,7 @@ def _tx_step_delete_branch(
         recycle_log.append({
             "action": "branch_delete_refused",
             "task_id": task_id,
-            "branch": f"task/{task_id}",
+            "branch": branch,
             "unmerged_commits": unmerged_count,
             "reason": "unmerged_branch_protected",
             "actor": actor,
@@ -2607,7 +2649,7 @@ def _tx_step_delete_branch(
         _branch_flag = "-D" if (force_recycle and unmerged_count) else "-d"
         try:
             proc = subprocess.run(
-                ["git", "-C", str(stable_wt), "branch", _branch_flag, f"task/{task_id}"],
+                ["git", "-C", str(stable_wt), "branch", _branch_flag, branch],
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -2627,7 +2669,7 @@ def _tx_step_delete_branch(
         recycle_log.append({
             "action": "branch_delete",
             "task_id": task_id,
-            "branch": f"task/{task_id}",
+            "branch": branch,
             "mode": _branch_flag,
             "unmerged_commits": unmerged_count,
             "deleted": branch_deleted,
@@ -2867,6 +2909,7 @@ def remove_task_wt(
     if _skip_remove:
         removed = True
         discarded_uncommitted = False
+        discarded_files = None
         residual_cleaned = False
         _remove_reason = None
         # 子动作收敛：prune 仍跑（防崩溃落在 prune 与记 done 之间——幽灵登记会
@@ -2885,6 +2928,7 @@ def remove_task_wt(
             actor=actor, task_id=task_id, recycle_log=recycle_log)
         removed = _s1["removed"]
         discarded_uncommitted = _s1["discarded_uncommitted"]
+        discarded_files = _s1.get("discarded_files")
         residual_cleaned = _s1["residual_cleaned"]
         _remove_reason = _s1["remove_reason"]
         if removed:
@@ -2964,6 +3008,8 @@ def remove_task_wt(
         result["branch_delete_refused"] = branch_refused
     if discarded_uncommitted:
         result["discarded_uncommitted"] = True
+        if discarded_files:
+            result["discarded_files"] = discarded_files
     if residual_cleaned:
         result["residual_cleaned"] = True
     if _jx_resumed:
@@ -2980,6 +3026,25 @@ def remove_task_wt(
     # 返回 residual 标记并指向 worktree_residual 处置入口（禁止静默失败）。
     residual_dir = str(wt_path) if wt_path.exists() else None
     if not removed or residual_dir:
+        # task-recycle-observability：残留附诊断束——并发 git 进程数（复用
+        # guard 计数，只读）、调用方 cwd/pid（句柄占用归因线索）。无 sysinternals
+        # 不可得句柄持有者 PID，此处不做无据指认，只给可执行排查信息。
+        _diag: dict[str, Any] = {}
+        try:
+            from orchd.gitops.guard import _count_git_processes
+
+            _diag["concurrent_git_processes"] = _count_git_processes()
+        except Exception:
+            pass
+        try:
+            _diag["caller_cwd"] = str(Path.cwd().resolve())
+        except OSError:
+            pass
+        try:
+            _diag["caller_pid"] = os.getpid()
+            _diag["caller_ppid"] = os.getppid()
+        except (OSError, AttributeError):
+            pass
         result["residual"] = {
             "path": residual_dir or str(wt_path),
             "removed": removed,
@@ -3001,6 +3066,8 @@ def remove_task_wt(
             ),
             "doctor_check": "worktree_residual",
         }
+        if _diag:
+            result["residual"]["diagnostics"] = _diag
     return result
 
 
@@ -3330,8 +3397,12 @@ def _git_diff_names(project_root: Path, task_id: str) -> list[str]:
     git 不可用返回空列表。
     """
     try:
+        from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+
+        base = (f"{resolve_trunk_for(project_root)}..."
+                f"{resolve_task_branch_for(project_root, task_id)}")
         proc = subprocess.run(
-            ["git", "diff", "--name-only", f"main...task/{task_id}"],
+            ["git", "diff", "--name-only", base],
             cwd=str(project_root),
             capture_output=True,
             encoding="utf-8",
@@ -3371,6 +3442,44 @@ def main_worktree_dirty_overlap(
         return _prefix_overlap(dirty, declared_files)
     except Exception:
         return []
+
+
+def _is_flat_task_branch(project_root: Path, task_id: str) -> bool:
+    """当前检出分支是否为 ``task/<id>``（task-flat-guard-parity，flat 等价门）。
+
+    container 降级（主工作树检出任务分支）同理适用——后续探针（status /
+    check-ignore）均以 project_root 为 cwd，与独立任务 worktree 语义一致。
+    best-effort：探测失败一律 False（调用方回落跳过，不扩大阻断面）。
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(project_root),
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
+    from orchd.line_ctx import resolve_task_branch_for
+
+    expected = resolve_task_branch_for(project_root, task_id)
+    return proc.returncode == 0 and (proc.stdout or "").strip() == expected
+
+
+def is_current_task_branch(project_root: Path, task_id: str) -> bool:
+    """当前工作区是否即该任务的分支检出（flat 等价门对外口径，守卫层共用）。
+
+    独立任务 worktree 恒为真（其 HEAD 即任务分支）；flat / 容器降级下以后续
+    ``_is_flat_task_branch`` 判定为准。best-effort，异常 False。
+    """
+    try:
+        from orchd.gitops import is_task_worktree
+
+        if is_task_worktree(Path(project_root)):
+            return True
+    except Exception:
+        pass
+    return _is_flat_task_branch(Path(project_root), task_id)
 
 
 def missing_declared_branch_files(
@@ -3419,13 +3528,13 @@ def diagnose_missing_branch_files(
     - gitignored：文件存在但被 .gitignore 忽略（附命中规则）
     - not_committed：文件存在且未被忽略，但未进入任务分支 diff（漏提交）
 
-    flat / 非任务 worktree 场景返回空列表（与原函数行为一致）。
+    task-flat-guard-parity：独立任务 worktree 之外，flat / 容器降级下当前检出
+    分支即任务分支时同样执行（分支 diff + 本 worktree 探针，语义一致）；其余
+    （main 上等）返回空列表。
     """
     try:
-        from orchd.gitops import is_task_worktree
-
         pr = Path(project_root)
-        if not is_task_worktree(pr):
+        if not is_current_task_branch(pr, task_id):
             return []
         branch_files = set(task_branch_files(pr, task_id))
         if not branch_files:

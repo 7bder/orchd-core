@@ -376,9 +376,29 @@ def _baked_hook_endpoints(project_root: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _line_ref_tx_env(project_root: Path) -> tuple[str | None, str | None]:
+    """多线下强制层需要的命名空间前缀与 trunk；**单线 → (None, None)**。
+
+    task-line-ref-tx-per-line：单线不烘焙（生成物与历史逐字一致、零额外成本）；
+    多线烘焙 ``refs/heads/{line}/task/`` 与线 trunk，使引擎向第二线 trunk 的受管
+    merge 与线内任务分支提交被强制层正确放行。
+    """
+    try:
+        from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+
+        prefix_rel = resolve_task_branch_for(project_root, "")  # "task/" 或 "{line}/task/"
+        if prefix_rel == "task/":
+            return None, None
+        return "refs/heads/" + prefix_rel, resolve_trunk_for(project_root)
+    except Exception:  # noqa: BLE001 - best-effort，失败退回单线口径
+        return None, None
+
+
 def ref_tx_hook_content(
     py_exe: str | None = None,
     src_dir: str | None = None,
+    line_task_prefix: str | None = None,
+    line_trunk: str | None = None,
 ) -> str:
     """生成强制层 hook 脚本（shell shim → ``python -m orchd.gitops.ref_tx_hook``）。
 
@@ -423,6 +443,14 @@ def ref_tx_hook_content(
             'echo "[orchd ref-tx] 烘焙路径失效，回退解释器/引擎探针" >&2\n'
             "\n"
         )
+    line_env = ""
+    if line_task_prefix and line_trunk:
+        line_env = (
+            "# 多线（契约 v2）：安装期烘焙当前线命名空间前缀与 trunk"
+            "（task-line-ref-tx-per-line）。\n"
+            f"export ORCHD_LINE_TASK_PREFIX={_shell_quote(line_task_prefix)}\n"
+            f"export ORCHD_LINE_TRUNK={_shell_quote(line_trunk)}\n"
+        )
     return (
         f"{_HOOK_SHEBANG}\n"
         f"{_HOOK_MARKER}\n"
@@ -432,7 +460,8 @@ def ref_tx_hook_content(
         "# 逃生口：ORCHD_ALLOW_REF_TX=1（人工修复 / 仓库迁移）。\n"
         "set -u\n"
         "\n"
-        + baked +
+        + line_env +
+        baked +
         'ORCHD_PY=""\n'
         "for _CAND in python python3 py; do\n"
         '    if command -v "$_CAND" >/dev/null 2>&1; then\n'
@@ -483,7 +512,12 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
         }
         _log_hook_skip("install_ref_tx_skipped_foreign_hook", result)
         return result
-    content = ref_tx_hook_content(*_baked_hook_endpoints(project_root))
+    line_prefix, line_trunk = _line_ref_tx_env(project_root)
+    content = ref_tx_hook_content(
+        *_baked_hook_endpoints(project_root),
+        line_task_prefix=line_prefix,
+        line_trunk=line_trunk,
+    )
     check = _validate_hook_content(content)
     if not check["ok"]:
         result = {"installed": False, "reason": "invalid_generated_hook",
@@ -522,6 +556,22 @@ def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:
     except (OSError, IOError) as exc:
         return {"uninstalled": False, "reason": "io_error", "path": str(path),
                 "error": str(exc)}
+
+
+def _resolve_ledger_path(project_root: Path) -> str:
+    """共享账本根的 ledger 路径（与 :func:`orchd.ledger.resolve_store_dir` 同源）。
+
+    container → ``<容器>/.orchd-runtime/_ledger.jsonl``；flat → ``<repo>/.orchd/_ledger.jsonl``；
+    ``ORCHD_HOME`` 重定向由 resolve_store_dir 处理。解析失败回退相对默认值
+    （best-effort，运行时另有 ORCHD_HOME / 相对值兜底）。
+    """
+    try:
+        from orchd.ledger import resolve_store_dir
+
+        root = resolve_store_dir(Path(project_root) / ".orchd")
+        return str(Path(root) / "_ledger.jsonl").replace("\\", "/")
+    except Exception:  # noqa: BLE001 - 解析失败退回相对默认（运行时兜底）
+        return ".orchd/_ledger.jsonl"
 
 
 def hook_install(
@@ -615,6 +665,9 @@ def hook_install(
     # 「拒绝即不写任何文件」的既有语义，见 test_hook_content_guard）。
 
     exempt = exempt_files or []
+    # 账本路径在安装期按布局解析并烘入模板（task-hook-ledger-container-fix）
+    ledger_abs = _resolve_ledger_path(project_root)
+    ledger_q = _shell_quote(ledger_abs)
 
     # 生成 hook 脚本内容（shell 逻辑 + 运行时动态解析；回退用静态列表）
     # 顶部注释保留绑定任务与文件清单（可读性 / 既有断言兼容，不参与正常路径判定）。
@@ -699,7 +752,19 @@ def hook_install(
 # Bound allowed files:
 {files_list}
 
-LEDGER=".orchd/_ledger.jsonl"
+# 账本路径（task-hook-ledger-container-fix）：安装期按布局解析共享账本根并烘绝对路径
+# （container → <容器>/.orchd-runtime/_ledger.jsonl；flat → <repo>/.orchd/_ledger.jsonl），
+# 运行时对 ORCHD_HOME / 相对默认值兜底。旧实现硬编码相对 ".orchd/_ledger.jsonl"，
+# container 任务 worktree 下账本副本不存在 → 恒落「无 ledger」，使 E020 越界拦截与
+# R1-b 审查冻结整体静默 fail-open（报告 P1-2/D-1）。
+LEDGER={ledger_q}
+if [ ! -f "$LEDGER" ]; then
+    if [ -n "${{ORCHD_HOME:-}}" ] && [ -f "$ORCHD_HOME/_ledger.jsonl" ]; then
+        LEDGER="$ORCHD_HOME/_ledger.jsonl"
+    elif [ -f ".orchd/_ledger.jsonl" ]; then
+        LEDGER=".orchd/_ledger.jsonl"
+    fi
+fi
 
 # 0) 当前分支 → 任务 id（动态识别；无匹配分支回退绑定任务并留痕）
 # BOUND_TASK：安装期绑定任务（静态列表的归属）。3a 快路径仅在
@@ -740,8 +805,9 @@ if [ -f "$LEDGER" ]; then
             ;;
     esac
 else
-    # 无 ledger（异常环境）→ 保守放行（best-effort）
-    exit 0
+    # 无 ledger（异常环境）→ **不静默放行**（task-hook-ledger-container-fix AC2）：
+    # stderr 留痕并保守按「任务活跃」处理，继续走后续范围校验（fail-closed 方向）。
+    echo "[orchd E020] ledger 未找到（$LEDGER）→ 保守按任务活跃处理（继续范围校验）" >&2
 fi
 
 # 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件是 REVIEW_CLAIMED

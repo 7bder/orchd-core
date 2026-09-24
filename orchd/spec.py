@@ -49,24 +49,20 @@ _DEFAULT_SCHEMA_PATH = _SCHEMA_DIR / "_master.schema.json"
 # 其余越界文件一律高风险类，仍 E010 拒绝、需显式确认。
 
 
-def derive_related_test_file(fe: str,
-                             tests_root: str | Path | None = None
-                             ) -> str | None:
-    """从引擎源码文件推导对应测试文件（单一来源，E026 与 done 分诊共用）。
+def derive_related_test_files(
+        fe: str,
+        tests_root: str | Path | None = None,
+) -> list[str]:
+    """从引擎源码文件推导**全部**同 stem 测试候选（task-e026-related-test-candidates）。
 
-    ``orchd/<stem>.py`` → ``tests/test_<stem>.py``；嵌套路径（``orchd/a/b/x.py``）
-    按仓库实际命名约定拍平推导——候选为 ``tests/test_<一级目录>_<stem>.py`` 与
-    ``tests/test_<stem>.py``（如 ``orchd/cli/commands/session.py`` →
-    ``tests/test_cli_session.py``，``orchd/onboard/claim.py`` → ``tests/test_claim.py``）。
-    非 orchd/ 源码或无对应测试返回 ``None``。传入 ``tests_root`` 时做 **tests/
-    实际存在性兜底**：候选文件在 tests/ 下实际存在才返回，全部不存在返回
-    ``None``（E026 对不存在的派生测试文件不产生无法满足的预警）；未传时保持
-    纯字符串推导（guards.py 的 done 越界分诊以字符串比较复用本函数）。
-    E026 预警与 guards.py 的 done 越界分诊**必须**调用本函数取得同名测试路径，
-    禁止各自实现推导（双写漂移检测见 tests）。
+    ``derive_related_test_file``（单数）的复数底座：候选顺序与单数一致
+    （嵌套路径先 ``test_<一级目录>_<stem>.py`` 后 ``test_<stem>.py``）。
+    传入 ``tests_root`` 时只保留实际存在的文件（E026 对不存在文件不预警）；
+    未传时返回全部字符串候选（done 越界分诊的字符串比较口径）。
+    非 orchd/ 源码返回空列表。
     """
     if not (fe.startswith("orchd/") and fe.endswith(".py")):
-        return None
+        return []
     rel = fe[len("orchd/"):-3]  # 如 "errors" / "cli/commands/session"
     parts = rel.split("/")
     stem = parts[-1]
@@ -78,21 +74,35 @@ def derive_related_test_file(fe: str,
             f"test_{stem}.py",
         ]
     if tests_root is None:
-        return f"tests/{rel_candidates[0]}"
+        return [f"tests/{c}" for c in rel_candidates]
     root = Path(tests_root)
-    for rel_cand in rel_candidates:
-        if (root / rel_cand).is_file():
-            return f"tests/{rel_cand}"
-    return None
+    return [f"tests/{c}" for c in rel_candidates if (root / c).is_file()]
+
+
+def derive_related_test_file(fe: str,
+                             tests_root: str | Path | None = None
+                             ) -> str | None:
+    """从引擎源码文件推导对应测试文件（单一来源，E026 与 done 分诊共用）。
+
+    复数底座 :func:`derive_related_test_files` 的首个候选（顺序与历史一致，
+    行为零回归）：``orchd/<stem>.py`` → ``tests/test_<stem>.py``；嵌套路径
+    先 ``tests/test_<一级目录>_<stem>.py`` 后 ``tests/test_<stem>.py``。
+    非 orchd/ 源码或（传 tests_root 时）无实际存在候选返回 ``None``；
+    未传 tests_root 时保持纯字符串推导（guards.py 的 done 越界分诊以字符串
+    比较复用本函数）。E026 预警与 done 越界分诊**必须**经复数底座取候选，
+    禁止各自实现推导（双写漂移检测见 tests）。
+    """
+    candidates = derive_related_test_files(fe, tests_root)
+    return candidates[0] if candidates else None
 
 
 def is_concession_file(file: str, files_to_edit: list[str]) -> bool:
     """done 越界分诊白名单判定（单一来源，task-decl-concession-autoregister）。
 
-    返回 ``True`` = 连带类（同名测试 / docs/*.md）→ 引擎自动登记、done 不阻断；
+    返回 ``True`` = 连带类（同 stem 测试任一候选 / docs/*.md）→ 引擎自动登记、done 不阻断；
     ``False`` = 高风险类 → 仍 E010 拒绝并需显式确认。白名单判定规则：
-      - 同名测试：``tests/test_<stem>.py`` 且 ``orchd/<stem>.py`` 在 files_to_edit
-        中（经 :func:`derive_related_test_file`，与 E026 同一推导）；
+      - 同 stem 测试：``file`` 落在 ``derive_related_test_files(fe)`` 任一候选中
+        （经复数底座，与 E026 同一推导）；
       - 文档：``docs/*.md``。
     引擎核心 ``orchd/`` 既有文件、约定文件（``.orchd/SKILL.md`` /
     ``.orchd/shared/conventions.md``）、``.orchd/_master.json``、他人声明或
@@ -101,7 +111,10 @@ def is_concession_file(file: str, files_to_edit: list[str]) -> bool:
     if file.startswith("docs/") and file.endswith(".md"):
         return True
     for fe in files_to_edit:
-        if derive_related_test_file(fe) == file:
+        # task-e026-related-test-candidates：经复数底座判定（单一来源）——
+        # 同 stem 任一候选命中即连带（如 control.py 域的 test_control.py），
+        # 不再只认首候选（旧口径漏 test_control.py 致 done E010 误拦实证）。
+        if file in derive_related_test_files(fe):
             return True
     return False
 
@@ -928,19 +941,22 @@ def validate_quality(
         if terminal:
             continue
         for fe in files_edit:
-            expect_test = derive_related_test_file(fe, tests_root)
-            if (expect_test is not None and expect_test not in files_edit
-                    and expect_test not in exempts
-                    and any(f.startswith("tests/") for f in files_edit)):
-                errors.append(
-                    ValidationError(
-                        code=ErrorCode.E026,
-                        path=f"$.tasks[{i}].exempt_files",
-                        message=(
-                            f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
-                            "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
-                            "否则 E020 hook 会拦截）"),
-                    ))
+            # task-e026-related-test-candidates：同 stem 全部候选逐一预警——
+            # 任一未声明即一条 warning（control.py 域声明 test_cli_control.py
+            # 后仍提示 test_control.py），同域多候选不再漏报。
+            for expect_test in derive_related_test_files(fe, tests_root):
+                if (expect_test not in files_edit
+                        and expect_test not in exempts
+                        and any(f.startswith("tests/") for f in files_edit)):
+                    errors.append(
+                        ValidationError(
+                            code=ErrorCode.E026,
+                            path=f"$.tasks[{i}].exempt_files",
+                            message=(
+                                f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
+                                "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
+                                "否则 E020 hook 会拦截）"),
+                        ))
 
     return errors
 

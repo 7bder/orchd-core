@@ -33,7 +33,7 @@ guide: {}
 
 | 情况 | 行为 |
 |---|---|
-| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **36 个**（`orchd/guide.py::_ERROR_GUIDANCE_TABLE` 全量覆盖 E001-E036）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
+| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **39 个**（`orchd/guide.py::_ERROR_GUIDANCE_TABLE` 全量覆盖 E001-E039，计数由 `tests/test_docs_single_source.py` 与 `orchd/errors.py` 双边锁定）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
 | **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --resolved` 沉淀；未解决 → 停止报告 |
 | **红线 14 纪律场景**（candidate=None / next_action=exit） | 维持不变：停止等待，**不**视为自愈 |
 

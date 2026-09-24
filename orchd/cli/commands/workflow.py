@@ -479,6 +479,7 @@ def _cmd_review(args) -> dict:
         store, tasks, agent_id=agent_id, task_id=args.task,
         review_type=args.type, verdict=args.verdict, comments=comments,
         project_root=orchd_dir.parent,
+        rework_scope=getattr(args, "rework_scope", None),
     )
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
@@ -539,6 +540,8 @@ def register(sub) -> None:
                    help="审查结论（提交模式必填；--show 回看模式下不得提供）")
     p.add_argument("--comments")
     p.add_argument("--comments-file", help="从文件读取审查意见（UTF-8），与 --comments 二选一")
+    p.add_argument("--rework-scope", choices=["spec", "code"], default=None,
+                   help="打回范围分类（仅 code 阶段 CHANGES_REQUESTED 可用：code=仅实现问题，返工直达 code；缺省 spec=全退重走）")
     p.add_argument("--show", action="store_true",
                    help="只读回看该任务全部历史审查意见（与 --verdict 互斥，不写事件）")
     p.set_defaults(func=_cmd_review)

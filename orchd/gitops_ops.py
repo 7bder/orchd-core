@@ -12,6 +12,10 @@ L2 session 锁 / 事件构造等在 onboarding 与 review 路径间共享的辅�
 
 依赖方向：本模块不导入 onboard.py / review.py，二者各自单向依赖本模块，
 杜绝循环依赖。
+
+task-line-trunk：任务分支 fork / merge 目标 / 对账基线按**当前线**解析
+（``orchd.line_ctx``：canonical master 的 ``project.lines`` + ``ORCHD_LINE``）；
+单线（未配置多线）恒为 ``main`` / ``task/{id}``，与 v1.5.0 逐字一致（opt-in 零回归）。
 """
 
 from __future__ import annotations
@@ -34,13 +38,15 @@ from orchd.gitops import (
     checkout_default_strict,
     check_workspace_state,
     ensure_session_lock,
-    get_default_branch,
     guard_write_command,
     is_task_worktree,
     main_worktree_root,
     unmerged_paths,
 )
 from orchd.ledger import generate_event_id, resolve_session_identity
+# task-line-trunk：任务生命周期 git 写动作的 trunk / 分支名按**当前线**解析
+# （单线零回归：未配置 project.lines 时恒为 main / task/{id}）。
+from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
 
 
 # ------------------------------------------------------------------
@@ -275,7 +281,7 @@ def try_git_branch(project_root: Path, task_id: str) -> dict[str, Any] | None:
       - 环境异常（非 git 仓库 / git 不可用 / 子进程超时）：``None``
         ——静默降级、不抛异常（既有契约 test_non_git_dir_no_error 锁定）。
     """
-    branch = f"task/{task_id}"
+    branch = resolve_task_branch_for(project_root, task_id)
     try:
         # 环境探测：区分「非 git 仓库等环境异常」（返回 None）与
         # 「真实仓库内 git 命令失败」（返回 failed 状态字典）。
@@ -313,7 +319,7 @@ def try_git_branch(project_root: Path, task_id: str) -> dict[str, Any] | None:
                 "step": "checkout",
                 "error": _git_error_summary(checkout),
             }
-        default = get_default_branch(project_root) or "main"
+        default = resolve_trunk_for(project_root)
         create = subprocess.run(
             ["git", "checkout", "-b", branch, default],
             cwd=str(project_root),
@@ -427,11 +433,13 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     - 环境异常（checkout 失败 / git 不可用 / 抛异常）：``None``（调用方按
       best-effort 降级，行为不变）。
     """
+    trunk = resolve_trunk_for(project_root)
+    branch = resolve_task_branch_for(project_root, task_id)
     try:
         workdir = main_worktree_root(project_root)
         _clean_stale_index_lock(workdir)
         checkout = subprocess.run(
-            ["git", "-C", str(workdir), "checkout", "main"],
+            ["git", "-C", str(workdir), "checkout", trunk],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -440,7 +448,7 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
         if checkout.returncode != 0:
             return None
         result = subprocess.run(
-            ["git", "-C", str(workdir), "merge", f"task/{task_id}"],
+            ["git", "-C", str(workdir), "merge", branch],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -455,10 +463,7 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
             if paths or paths is None:
                 # P2-7：冲突后立即 abort 清理 MERGE_HEAD，避免残留中间态阻塞后续 git 操作。
                 # try_auto_resolve_conflict 开头会再次 abort（幂等），此处先清理无副作用。
-                subprocess.run(
-                    ["git", "-C", str(workdir), "merge", "--abort"],
-                    capture_output=True, timeout=10,
-                )
+                _abort_merge(workdir)
                 return {"conflict": True, "files": paths or []}
             err = (result.stderr or "").strip()
             return {
@@ -470,8 +475,28 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
                 },
             }
         return {"conflict": False}
+    except subprocess.TimeoutExpired:
+        # B2（task-gate-cleanup-batch）：merge 超时同样残留 MERGE_HEAD（与冲突
+        # 同源）——先 abort 再返回可诊断的 None（调用方 review 报 merge_env_error
+        # 附超时诊断，原裸 None 与真环境异常不可区分）。
+        _abort_merge(workdir)
+        return None
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
+
+
+def _abort_merge(workdir: Path) -> None:
+    """merge 中止清理（B2，task-gate-cleanup-batch）：冲突/超时共用。
+
+    best-effort：失败静默（调用方已有降级路径），10s 有界。
+    """
+    try:
+        subprocess.run(
+            ["git", "-C", str(workdir), "merge", "--abort"],
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
 
 
 def try_ff_merge_to_main(
@@ -490,7 +515,8 @@ def try_ff_merge_to_main(
         - ``{"state": "diverged", "branch": <task_branch>}``：与 main 分叉，拒绝自动合并。
         - ``None``：环境异常，调用方按 best-effort 降级。
     """
-    branch = f"task/{task_id}"
+    branch = resolve_task_branch_for(project_root, task_id)
+    trunk = resolve_trunk_for(project_root)
 
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
         workdir = main_worktree_root(project_root)
@@ -504,15 +530,15 @@ def try_ff_merge_to_main(
         # 任务分支不存在 → 无待落码（无独立分支即视为已并入/无实现）
         if _git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode != 0:
             return {"state": "already_in_main"}
-        main_is_ancestor = _git("merge-base", "--is-ancestor", "main", branch).returncode == 0
-        task_is_ancestor = _git("merge-base", "--is-ancestor", branch, "main").returncode == 0
-        if main_is_ancestor and task_is_ancestor:
-            # main 与任务分支同 commit → 无待落码（已并入）
+        trunk_is_ancestor = _git("merge-base", "--is-ancestor", trunk, branch).returncode == 0
+        task_is_ancestor = _git("merge-base", "--is-ancestor", branch, trunk).returncode == 0
+        if trunk_is_ancestor and task_is_ancestor:
+            # trunk 与任务分支同 commit → 无待落码（已并入）
             return {"state": "already_in_main"}
-        if main_is_ancestor:
-            # 任务领先 main → 可快进。先确认主工作树落到 main（flat 布局下主工作树
+        if trunk_is_ancestor:
+            # 任务领先 trunk → 可快进。先确认主工作树落到 trunk（flat 布局下主工作树
             # 可能正 checkout 任务分支），再 --ff-only 快进。
-            if _git("checkout", "main").returncode != 0:
+            if _git("checkout", trunk).returncode != 0:
                 return {"state": "diverged", "branch": branch}
             if _git("merge", "--ff-only", branch).returncode == 0:
                 return {"state": "merged"}
@@ -538,7 +564,7 @@ def try_delete_task_branch(project_root: Path, task_id: str) -> bool:
         True：删除成功，或分支已不存在（幂等视为成功，best-effort 不抛异常）。
         False：删除失败或环境不支持。
     """
-    branch = f"task/{task_id}"
+    branch = resolve_task_branch_for(project_root, task_id)
     try:
         workdir = main_worktree_root(project_root)
         result = subprocess.run(
@@ -780,13 +806,15 @@ def try_auto_resolve_conflict(
         except (subprocess.SubprocessError, FileNotFoundError):
             return None
 
+    trunk = resolve_trunk_for(project_root)
+    branch = resolve_task_branch_for(project_root, task_id)
     try:
         workdir = main_worktree_root(project_root)
         run(workdir, "merge", "--abort")
-        co = run(workdir, "checkout", f"task/{task_id}")
+        co = run(workdir, "checkout", branch)
         if co is None or co.returncode != 0:
             return None
-        pre = run(workdir, "merge", "main")
+        pre = run(workdir, "merge", trunk)
         if pre is None:
             return None
         if pre.returncode != 0:
@@ -808,7 +836,7 @@ def try_auto_resolve_conflict(
                     "resolved": False,
                     "conflict_files": files,
                     "action": (
-                        f"分支 task/{task_id} 与 main 合并冲突：请在 task 分支上执行 "
+                        f"分支 {branch} 与 {trunk} 合并冲突：请在 task 分支上执行 "
                         "orchd git merge main（受管通道）解决冲突并提交"
                         f"（{len(files) or '若干'} 个文件），"
                         f"然后由同一 reviewer 重试 code APPROVED"
@@ -816,10 +844,10 @@ def try_auto_resolve_conflict(
                 }
             # union 成功：task 分支已含 main 的 union 合并结果，继续后续
             # checkout main → merge task（此时应可快进或无冲突合并）。
-        co2 = run(workdir, "checkout", "main")
+        co2 = run(workdir, "checkout", trunk)
         if co2 is None or co2.returncode != 0:
             return None
-        final = run(workdir, "merge", f"task/{task_id}")
+        final = run(workdir, "merge", branch)
         if final is None:
             return None
         if final.returncode != 0:
@@ -925,7 +953,8 @@ def resolve_task_worktree(
                         "hint": (
                             f"请进入任务 worktree 执行 done：cd '{cand}'; "
                             f"python .orchd/__main__.py done --task {task_id} --changes '<描述>'；"
-                            f"或先重建 worktree：git worktree add {cand} task/{task_id}"
+                            f"或先重建 worktree：git worktree add {cand} "
+                            f"{resolve_task_branch_for(project_root, task_id)}"
                         ),
                     }],
                 )
@@ -985,7 +1014,8 @@ def reconcile_with_main(
     本函数**不抛异常**（best-effort）：git 异常一律降级为
     ``reason="git_unavailable"``，调用方据 ``checked`` 决定是否采信。
     """
-    branch = f"task/{task_id}"
+    branch = resolve_task_branch_for(project_root, task_id)
+    trunk = resolve_trunk_for(project_root)
     workdir = resolve_task_worktree(project_root, task_id)
     result: dict[str, Any] = {
         "checked": False,
@@ -1020,26 +1050,26 @@ def reconcile_with_main(
         result["reason"] = "no_branch"
         return result
 
-    # 1) merge-base：任务分支冻结基线与 main 的分叉点
-    mb = _run(["merge-base", "main", branch])
+    # 1) merge-base：任务分支冻结基线与 trunk 的分叉点
+    mb = _run(["merge-base", trunk, branch])
     if mb is None or mb.returncode != 0 or not (mb.stdout or "").strip():
         return result
     base = mb.stdout.strip()
 
-    # 2) main 自 merge-base 以来的改动（空 → main 未推进 → 零成本跳过）
-    main_diff = _run(["diff", "--name-only", base, "main"])
-    if main_diff is None or main_diff.returncode != 0:
+    # 2) trunk 自 merge-base 以来的改动（空 → trunk 未推进 → 零成本跳过）
+    trunk_diff = _run(["diff", "--name-only", base, trunk])
+    if trunk_diff is None or trunk_diff.returncode != 0:
         return result
-    main_files = _split_nonempty_lines(main_diff.stdout)
-    if not main_files:
+    trunk_files = _split_nonempty_lines(trunk_diff.stdout)
+    if not trunk_files:
         result.update(reason="no_main_advance", clean=True)
         return result
 
-    # 3) 本任务分支的实际改动；与 main 推进文件无交集 → 零成本跳过
+    # 3) 本任务分支的实际改动；与 trunk 推进文件无交集 → 零成本跳过
     task_diff = _run(["diff", "--name-only", base, branch])
     if task_diff is None or task_diff.returncode != 0:
         return result
-    if not (set(main_files) & set(_split_nonempty_lines(task_diff.stdout))):
+    if not (set(trunk_files) & set(_split_nonempty_lines(task_diff.stdout))):
         result.update(reason="no_overlap", clean=True)
         return result
 
@@ -1054,7 +1084,7 @@ def reconcile_with_main(
             [
                 "-c", "core.quotePath=false",
                 "merge-tree", "--write-tree", "--name-only", "--no-messages",
-                "main", branch,
+                trunk, branch,
             ]
         )
         if mt is not None and mt.returncode in (0, 1):
@@ -1067,7 +1097,7 @@ def reconcile_with_main(
 
     if clean is None:
         # 降级（git < 2.38 或 merge-tree 执行异常）：真合并预演
-        merged = _run(["merge", "--no-commit", "--no-ff", "main"])
+        merged = _run(["merge", "--no-commit", "--no-ff", trunk])
         if merged is None:
             result["checked"] = False
             return result
@@ -1095,7 +1125,7 @@ def reconcile_with_main(
     # 冲突：apply=True 时在任务 worktree 内落地合并、保留现场并取权威清单
     conflict_files = list(files or [])
     if apply and not staged_merge:
-        _run(["merge", "main"])
+        _run(["merge", trunk])
         authoritative = unmerged_paths(workdir)
         if authoritative:  # 非空才采信（空 = 未落地成功，保留探测清单）
             conflict_files = authoritative
@@ -1104,7 +1134,7 @@ def reconcile_with_main(
         clean=False,
         files=conflict_files,
         action=(
-            f"任务分支 {branch} 与 main 对账发现冲突"
+            f"任务分支 {branch} 与 {trunk} 对账发现冲突"
             f"（{len(conflict_files) or '若干'} 个文件）："
             + ("合并现场已保留在任务 worktree（MERGE_HEAD 存在），" if apply else "")
             + "请解决冲突 → git add → git commit，然后重新 done"

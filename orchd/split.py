@@ -65,12 +65,9 @@ def _validate_module_id(mod_id: str) -> str:
 # intake-commit-enforcement（2026-08-14）：摄入产物文件白名单（两种布局）。
 # 摄入 → amend 的正当链路中，这些文件允许以未提交态进入 amend（引擎随后强制
 # 提交）；其余任何已跟踪改动视为非摄入脏改动，amend / intake 前置阻断（E017）。
-_INTAKE_PRODUCT_FILES = frozenset({
-    ".orchd/_master.json",
-    "IDEAS.md",
-    ".orchd/IDEAS.md",
-    "ROADMAP.md",
-})
+# task-inventory-honesty（F9）：以 orchd.intake._INTAKE_PRODUCT_FILES 为单一
+# 真源（禁双写漂移；此前两处手写集合已分叉：split 独缺 IDEAS-archive.md）。
+from orchd.intake import _INTAKE_PRODUCT_FILES
 
 
 # M-2（2026-08-12 全面审计）：三处状态（claimed / done / in_review / 终态附加）
@@ -651,8 +648,16 @@ def amend(
             if tid not in existing_tasks:
                 # 新增任务强制 source 声明（2026-08-11 硬约束 + 存量豁免）。
                 # 存量任务（snapshot 中存在）grandfather：不要求 source、不校验引用。
+                # A4（task-amend-terminal-exempt）：快照漂移的终态卡不按新卡要求溯源。
+                # existing_tasks 来自 snapshot，快照落后账本时终态任务会被误判为新卡，
+                # 进而因归档 idea 恒 E025（执行者被迫回灌引擎自己的引用完整性）。账本
+                # 终态为准：completed/cancelled 跳过 source 硬要求（与 validate_source
+                # 的 P2-2 豁免同源）。
+                _terminal_drifted = status in ("completed", "cancelled")
                 source = task.get("source")
-                if not source or not isinstance(source, str) or not source.strip():
+                if not _terminal_drifted and (
+                        not source or not isinstance(source, str)
+                        or not source.strip()):
                     sources_missing.append(tid)
                     source_errors.append({
                         "task_id": tid,
@@ -1073,22 +1078,24 @@ def amend(
                         })
 
         # task-decl-withdraw-channel：与上方「声明了但不存在的路径」对称的反向提示——
-        # exempt_files 中路径**已存在**说明豁免已失效（该文件不再需要豁免），而豁免
-        # 此前只增不删、只能长期常驻（幽灵豁免）。此处只告警不阻断（维护窗口可随时
-        # 撤回），并给出可执行的撤回命令；同样只对本次新增/变更任务生效。
+        # E-16（task-hostfix-pack-b）：仅当豁免**真冗余**（同任务 files_to_edit 内
+        # 也有该文件，豁免已无对象）才告警。旧口径“存在即失效”与 E026 主用例矛盾：
+        # E026 正是要求把**既有**连带测试文件声明进 exempt_files，存在即告会把正确
+        # 用法全量误报；且照告警去 remove 会立刻触发 E010 越界。只告警不阻断。
         for task in tasks:
             tid = task.get("id", "")
             if tid not in _changed_ids:
                 continue
+            _declared = set(task.get("files_to_edit", []) or [])
             for fp in task.get("exempt_files", []) or []:
-                if (project_root / fp).exists():
+                if (project_root / fp).exists() and fp in _declared:
                     conflict_warnings.append({
                         "task_id": tid,
                         "type": "exempt_files_path_exists",
                         "file": fp,
                         "message": (
-                            f"exempt_files 声明的路径 '{fp}' 已存在于磁盘：豁免已失效"
-                            f"（该文件无需再豁免）。可执行 "
+                            f"exempt_files 声明的路径 '{fp}' 已存在于磁盘且同时在 "
+                            f"files_to_edit 内：豁免已冗余。可执行 "
                             f"`orchd amend --task {tid} --remove-exempt-files {fp}` 撤回该声明。"
                         ),
                     })

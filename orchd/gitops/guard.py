@@ -20,6 +20,7 @@ from orchd.gitops._const import (
 )
 from orchd.gitops.query import check_workspace_state, get_default_branch, is_task_worktree
 from orchd.gitops.session_lock import ensure_session_lock
+from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
 
 
 # ------------------------------------------------------------------
@@ -305,6 +306,114 @@ def _container_task_wt_exists(project_root: Path, task_id: str) -> bool:
         return False
 
 
+def managed_checkout_branch(
+    check_root: Path,
+    branch_name: str,
+    *,
+    command: str,
+    degraded: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """受管分支切换（单一实现）：reviewer 认领自动切分支与 amend 受管往返共用。
+
+    task-flat-amend-channel AC4：把 reviewer auto-checkout 的「探测 → 干净 →
+    分支存在 → checkout」收敛为**唯一实现**，amend 受管往返复用同一原语，
+    禁双写漂移。判定顺序与 L1 守卫同源：
+
+    1. 工作区状态探测——探测故障（state=error / 异常）→ ``ok=False`` /
+       ``reason=probe_failed``（不抛，交调用方按各自旧语义处置）；
+    2. 非 git 可用 → ``ok=False`` / ``reason=not_available``；
+    3. 已在目标分支 → ``ok=True`` / ``changed=False``（不动作）；
+    4. 工作区脏 → **E017**（复用 :func:`_enforce_workspace_clean`，错误体与守卫
+       逐字一致；先于分支存在性判定，避免错分支 + 脏被分支错误掩盖）；
+    5. 目标分支不存在 → ``ok=False`` / ``reason=branch_missing``；
+    6. ``git checkout <branch>`` 失败 / 超时 → ``ok=False`` / ``reason`` 见返回。
+
+    Args:
+        check_root: 分支探测与切换的根（reviewer 场景为
+            :func:`_resolve_claim_check_root`；amend 往返为调用方 cwd）。
+        branch_name: 目标分支名。
+        command: 触发方命令名（仅用于报错 / 降级文案）。
+        degraded: 探测降级登记表（透传 :func:`_probe_guard_workspace_state`）。
+
+    Returns:
+        ``{"ok": bool, "changed": bool, "checked_out": branch_name,
+        "from_branch": <str|None>, "reason": <str|None>}``。
+        ``ok=True`` 表示当前已处于目标分支（``changed`` 标记本次是否发生切换）；
+        ``ok=False`` 表示前置不满足 / 切换失败，调用方按各自旧语义处置
+        （reviewer 返回 None 交守卫 E018；amend 往返结构化上报）。
+    """
+    try:
+        state = _probe_guard_workspace_state(check_root, command, degraded)
+    except Exception:
+        # 探测故障：与 reviewer auto-checkout 旧行为一致（返回不适用，
+        # 交调用方守卫按 E018 处置）；amend 往返据此结构化上报。
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": None, "reason": "probe_failed",
+        }
+    if not isinstance(state, dict) or not state.get("available"):
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": None, "reason": "not_available",
+        }
+    from_branch = state.get("branch")
+    if from_branch == branch_name:
+        return {
+            "ok": True, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": None,
+        }
+    if not state.get("clean"):
+        # 脏 → 与守卫完全相同的 E017（可执行指引），且先于分支判定。
+        _enforce_workspace_clean(state, True, command, check_root)
+        return {  # 防御：上行恒抛，不应到达
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "dirty",
+        }
+    try:
+        from orchd.gitops import branch_exists
+
+        exists = branch_exists(check_root, branch_name)
+    except Exception:
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "probe_failed",
+        }
+    if not exists:
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "branch_missing",
+        }
+    try:
+        proc = subprocess.run(
+            ["git", "checkout", branch_name],
+            cwd=str(check_root),
+            capture_output=True,
+            encoding=_GIT_ENCODING,
+            errors=_GIT_ERRORS,
+            timeout=_GIT_CHECKOUT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _clear_timeout_index_lock(check_root)
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "timeout",
+        }
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "checkout_failed",
+        }
+    if proc.returncode != 0:
+        return {
+            "ok": False, "changed": False, "checked_out": branch_name,
+            "from_branch": from_branch, "reason": "checkout_failed",
+        }
+    return {
+        "ok": True, "changed": True, "checked_out": branch_name,
+        "from_branch": from_branch, "reason": None,
+    }
+
+
 def _reviewer_auto_checkout(
     store,
     project_root: Path | None,
@@ -329,9 +438,9 @@ def _reviewer_auto_checkout(
     Returns:
         ``{"checked_out": "task/<id>", "from_branch": <str|None>}`` 或 None（未触发）。
     """
-    branch_name = f"task/{task_id}"
     if project_root is None:
         return None
+    branch_name = resolve_task_branch_for(project_root, task_id)
     try:
         check_root = _resolve_claim_check_root(project_root)
     except Exception:
@@ -340,44 +449,14 @@ def _reviewer_auto_checkout(
         return None
     if _container_task_wt_exists(Path(project_root), task_id):
         return None
-    try:
-        state = _probe_guard_workspace_state(check_root, "review claim", None)
-    except Exception:
-        return None  # 探测失败 → 守卫 fail-closed E018（与旧行为一致）
-    if not state.get("available"):
-        return None  # 无 git：nogit 等价守卫处理
-    from_branch = state.get("branch")
-    if from_branch == branch_name:
-        return None  # 已在任务分支
-    if not state.get("clean"):
-        # 脏 → 与守卫完全相同的 E017（可执行指引），且先于分支判定：错分支 + 脏
-        # 若交由守卫，会先撞 E018（分支优先），脏因被掩盖。复用同一执法函数，
-        # 错误体与守卫逐字一致。
-        _enforce_workspace_clean(state, True, "review claim", check_root)
-        return None  # 防御：上行恒抛，不应到达
-    try:
-        from orchd.gitops import branch_exists
-
-        if not branch_exists(check_root, branch_name):
-            return None  # 分支缺失 → 守卫 E018
-    except Exception:
+    # task-flat-amend-channel AC4：切换逻辑收敛到 managed_checkout_branch 单一
+    # 实现（探测 / 干净 / 分支存在 / checkout 与 amend 往返共用）。前置不满足
+    # （已在任务分支 / 非 git / 分支缺失 / 切换失败）→ None，交守卫按旧语义 E018
+    # 拒绝；脏工作区仍由同一执法函数抛 E017（错误体与守卫逐字一致）。
+    outcome = managed_checkout_branch(check_root, branch_name, command="review claim")
+    if not outcome.get("ok") or not outcome.get("changed"):
         return None
-    try:
-        proc = subprocess.run(
-            ["git", "checkout", branch_name],
-            cwd=str(check_root),
-            capture_output=True,
-            encoding=_GIT_ENCODING,
-            errors=_GIT_ERRORS,
-            timeout=_GIT_CHECKOUT_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        _clear_timeout_index_lock(check_root)
-        return None
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return None
-    if proc.returncode != 0:
-        return None
+    from_branch = outcome.get("from_branch")
     # AMEND 审计（best-effort，与连带登记同形：append + checkpoint，不影响
     # 状态机；失败不阻断认领）。agent_id 为空时记空串（直调守卫场景；生产路径
     # claim 恒传指纹）。
@@ -413,12 +492,13 @@ def _build_wrong_branch_hint(
 ) -> str:
     """构建 wrong_branch 错误的 hint（含 task branch worktree 位置指引）。"""
     expected = sorted(allowed_branches)
-    task_branches = [b for b in expected if b.startswith("task/")]
+    # task-line-guard-intake-wiring：任务分支族按线命名空间识别（task/{id} 或 {line}/task/{id}）
+    task_branches = [b for b in expected if b.startswith("task/") or "/task/" in b]
     if not task_branches:
         return f"请先切换到 {' 或 '.join(expected)} 分支再执行 {command}"
     hint_parts = []
     for tb in task_branches:
-        task_id = tb[len("task/"):]
+        task_id = tb.rsplit("/task/", 1)[1] if "/task/" in tb else tb[len("task/"):]
         # AC4（task-review-diagnostics-hardening）：worktree 目录名单一来源 =
         # worktree_hint(task_id)（内部使用 _task_wt_name），消除双前缀 fallback。
         # task_id 由分支名 task/<id> 截出后已含 task- 前缀，再拼 "task-" 会产出
@@ -447,11 +527,15 @@ def _build_wrong_branch_hint(
                 "切换失败），请确认后重试"
             )
         else:
+            # task-line-guard-intake-wiring（P2-2 / E-02 残留）：不再输出「手动 git
+            # checkout」（红线 #1 禁止手动 checkout）——改指受管通道：引擎在评审
+            # 认领路径自动切分支；工作区脏先用 orchd restore 清理后重试。
             hint_parts.append(
-                f"降级模式（无独立任务 worktree）：在主工作树执行 "
-                f"git checkout {tb} 后重试"
+                "降级模式（无独立任务 worktree）：请先清理工作区后重试"
+                f"（可用 python .orchd/__main__.py restore --path <文件>）；"
+                f"引擎会在评审认领时自动切到 {tb}"
             )
-    non_task = [b for b in expected if not b.startswith("task/")]
+    non_task = [b for b in expected if not b.startswith("task/") and "/task/" not in b]
     if non_task:
         hint_parts.append(
             f"或切换到 {' 或 '.join(non_task)} 分支再执行 {command}"
@@ -490,7 +574,7 @@ def commit_hint_for_branch(branch: str | None) -> str:
     - 恒附幻影脏分支：内容零差异时勿补声明、无需提交（当前内容差分门禁下此类
       脏位本不应到达 E017，此为防御性指引，防旧引擎 / 边缘口径下的误动作）。
     """
-    if isinstance(branch, str) and branch.startswith("task/"):
+    if isinstance(branch, str) and (branch.startswith("task/") or "/task/" in branch):
         action = (
             "请在任务分支内提交（git add + git commit，红线 #1 唯一豁免）"
             "或还原改动后重试"
@@ -522,13 +606,14 @@ def _sync_lag_exempted(
     判定失败（默认分支不可解析 / git 异常）→ 全部按真脏处理（fail-closed 方向）。
     删除态（工作区文件缺失）恒为真脏——删除即改动，不豁免。
     """
-    from orchd.gitops import get_default_branch, list_tracked_changes
+    from orchd.gitops import list_tracked_changes
+    from orchd.line_ctx import resolve_trunk_for
 
     dirty = list_tracked_changes(project_root)
     if not dirty:
         return [], []
     try:
-        base = get_default_branch(project_root) or "main"
+        base = resolve_trunk_for(project_root)
     except Exception:
         return sorted(dirty), []
     # 暂存区改动不豁免：同步动作从不 stage，staged 即本地行为。
@@ -600,7 +685,9 @@ def _enforce_workspace_clean(
             _patch_hint = ""
         details: dict[str, Any] = {
             "command": command,
-            "hint": (commit_hint_for_branch(state.get("branch")) + _patch_hint),
+            "hint": (commit_hint_for_branch(state.get("branch")) + _patch_hint
+                     + "；或执行 orchd restore --path <文件> 丢弃未提交改动"
+                       "（仅已跟踪文件，未跟踪新建文件不适用）"),
         }
         if exempted:
             details["sync_lag_exempted"] = exempted
@@ -906,7 +993,7 @@ def guard_claim(
     if role == "reviewer":
         guard_write_command(
             _resolve_claim_check_root(project_root),
-            allowed_branches={f"task/{task_id}"},
+            allowed_branches={resolve_task_branch_for(project_root, task_id)},
             require_clean=True,
             command="review claim",
             orchd_dir=orchd_dir,
@@ -914,8 +1001,7 @@ def guard_claim(
             degraded=degraded,
         )
     else:
-        default = get_default_branch(project_root) if project_root else None
-        default = default or "main"
+        default = resolve_trunk_for(project_root) if project_root else "main"
         guard_write_command(
             project_root,
             allowed_branches={default},
@@ -965,9 +1051,8 @@ def guard_done_branch(
     ensure_committed 兜底提交）；干净校验放在自动提交之后
     （见 ``guard_clean_workspace``，提交后仍有已跟踪改动 = 范围外改动）。
     """
-    default = get_default_branch(project_root) if project_root else None
-    default = default or "main"
-    allowed: set[str] = {f"task/{task_id}"}
+    default = resolve_trunk_for(project_root) if project_root else "main"
+    allowed: set[str] = {resolve_task_branch_for(project_root, task_id)}
     if project_root is None or _layout_is_not_container(project_root):
         allowed.add(default)
     guard_write_command(
@@ -1142,6 +1227,144 @@ def _clear_timeout_index_lock(project_root: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def restore_worktree_paths(
+    project_root: Path, paths: list[str]
+) -> dict[str, Any]:
+    """受管工作树还原（task-restore-channel）：指定路径回到 HEAD，不碰历史。
+
+    红线 #1 受管出口（与 commit / merge-main 精确形态同族）：agent 把"写文件"与
+    "需要干净工作区的命令"排进同一批导致脏工作区拒绝（E017）时，用本通道逐字
+    还原，而不必走原生 ``git checkout --``（红线禁止，需审批）。
+
+    逐路径门禁（任一失败即整体 E007，一个也不执行——先验后做）：
+    - 路径逃逸仓库根 → 拒绝（路径穿越）；
+    - 目录 → 拒绝（只接受文件，防 ``--path .`` 级误伤）；
+    - 无 HEAD 版本（未跟踪新建 / 已暂存新文件）→ 拒绝（无可还原目标；
+      未跟踪文件的删除不在本通道内，请走审批后手动处置）。
+
+    执行：单次 ``git checkout HEAD -- <paths>``（原子语义）；失败 → E007
+    （fail-closed，可安全重试）。
+
+    Args:
+        project_root: 仓库根目录（git 命令 cwd）。
+        paths: 仓库根相对路径列表（非空）。
+
+    Returns:
+        ``{"restored": [...], "project_root": str}``。
+
+    Raises:
+        OrchdError(E007): 空路径表 / 非 git 仓库 / 任一路径被拒 / 执行失败。
+    """
+    root = Path(project_root).resolve()
+    # 路径按 posix 归一化（git 的 HEAD:path 形态要求正斜杠；Windows 反斜杠亦可传入）。
+    # 绝对路径一律拒绝（必须相对仓库根，避免歧义）。
+    raw = [str(p).replace("\\", "/").strip() for p in (paths or [])]
+    if any(Path(r).is_absolute() for r in raw if r):
+        raise OrchdError(
+            ErrorCode.E007,
+            "restore_refused: 路径须相对仓库根，拒绝绝对路径",
+            [{"hint": "用法：orchd restore --path <相对仓库根的文件路径>..."}],
+        )
+    rels = [r.strip("/") for r in raw]
+    rels = [r for r in rels if r and r != "."]
+    if not rels:
+        raise OrchdError(
+            ErrorCode.E007,
+            "invalid_usage: restore 需要至少一个 --path 文件路径",
+            [{"hint": "用法：orchd restore --path <相对仓库根的文件路径>..."}],
+        )
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(root),
+            capture_output=True, encoding=_GIT_ENCODING, errors=_GIT_ERRORS,
+            timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"restore_unavailable: git 不可用：{exc}",
+            [{"hint": "确认目录是有效 git 仓库后重试"}],
+        ) from exc
+    if inside.returncode != 0:
+        raise OrchdError(
+            ErrorCode.E007,
+            "restore_unavailable: 非 git 仓库，无 HEAD 可还原",
+            [{"project_root": str(root)}],
+        )
+    refused: list[dict[str, str]] = []
+    ok: list[str] = []
+    for rel in rels:
+        reason = _restore_refusal_reason(root, rel)
+        if reason is None:
+            ok.append(rel)
+        else:
+            refused.append({"path": rel, "reason": reason})
+    if refused:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"restore_refused: {len(refused)} 个路径不可还原（一个也未执行）",
+            [{
+                "refused": refused,
+                "hint": (
+                    "仅已跟踪且有 HEAD 版本的文件可还原；目录、仓库外路径、"
+                    "未跟踪新建文件一律拒绝（后者无可还原目标，删除请走审批后"
+                    "手动处置）"
+                ),
+            }],
+        )
+    try:
+        proc = subprocess.run(
+            ["git", "checkout", "HEAD", "--", *ok],
+            cwd=str(root),
+            capture_output=True, encoding=_GIT_ENCODING, errors=_GIT_ERRORS,
+            timeout=_GIT_CHECKOUT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _clear_timeout_index_lock(root)
+        raise OrchdError(
+            ErrorCode.E007,
+            "restore_timeout: git checkout 超时，未确认是否生效，请先核对后重试",
+            [{"paths": ok}],
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"restore_failed: git 执行失败：{exc}",
+            [{"paths": ok}],
+        ) from exc
+    if proc.returncode != 0:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"restore_failed: git checkout HEAD 失败：{(proc.stderr or '').strip()[:300]}",
+            [{"paths": ok}],
+        )
+    return {"restored": ok, "project_root": str(root)}
+
+
+def _restore_refusal_reason(root: Path, rel: str) -> str | None:
+    """单路径还原准入判定（None = 放行，否则为拒绝原因码）。"""
+    try:
+        target = (root / rel).resolve()
+        target.relative_to(root)
+    except (OSError, ValueError):
+        # ValueError = 逃逸仓库根（路径穿越）；OSError = 不可解析
+        return "path_traversal"
+    if target.is_dir():
+        return "is_directory"
+    # 有 HEAD 版本才可还原（未跟踪新建 / 已暂存新文件无还原目标）。
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"HEAD:{rel}"],
+            capture_output=True, timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return "git_unavailable"
+    if probe.returncode != 0:
+        return "no_head_version"
+    return None
 
 
 def _checkout_default_with_retry(

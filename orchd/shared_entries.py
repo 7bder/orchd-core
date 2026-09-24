@@ -98,6 +98,14 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_docs_drift_batch.py",
         "tests/test_gate_ci_wiring.py",
     ),
+    # 2026-09-24 task-shared-entry-init-mapping：改 validate 退出码后只跑了新文件，
+    # 漏了同样断言 init/validate 行为的 test_cli_init.py（2 处旧断言在主分支上
+    # 变红入库）。init/validate 行为由三文件直接断言，改 commands/init.py 须全跑。
+    "orchd/cli/commands/init.py": (
+        "tests/test_cli_init.py",
+        "tests/test_cli_query.py",
+        "tests/test_nogit_init_layout.py",
+    ),
 }
 
 # 全局共享文件（形态 A）：影响面无法枚举的共享入口——改它影响**全量**用例，因此不存在

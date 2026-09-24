@@ -590,7 +590,141 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
     # 7c) 账本事件 schema 合法性（DR-14）：坏行 / 缺字段 / 字段类型错误
     checks.extend(_check_event_schema(project_root))
 
+    # 7d) 僵持 git 进程盘点（task-doctor-proc，F8/E-11）：并发 full-regression
+    # 曾遗留 13 个僵持 git 进程拖慢 checkout，而检测面长期无进程维度。
+    checks.extend(_check_hung_git_processes())
+
     return checks
+
+
+# 僵持 git 进程阈值（task-doctor-proc，F8/E-11）：
+# git 命令均为短命进程；POSIX 存活超本阈值即疑似僵持（并发 full-regression
+# 实测遗留 13 个）。Windows 无廉价进程年龄通道（tasklist 不暴露启动时间），
+# 改用“持久性”判定：两次采样（间隔数秒）交集仍在的同批 PID 即僵持——瞬时
+# 并发 Spitze（xdist 并行建 worktree）两次采样 PID 集合不同，不误伤；
+# 真僵持（锁死 indefinately）PID 纹丝不动，必命中。首样本门槛取 10
+# （E-11 实测 13 个；xdist -n 8 瞬时峰值通常低于此，免除多数无谓等待）。
+_HUNG_GIT_AGE_S = 600
+_WIN_FIRST_SAMPLE_MIN = 10
+_WIN_PERSIST_FAIL_MIN = 5
+_WIN_RESAMPLE_DELAY_S = 3
+
+
+def _list_git_processes() -> list[dict[str, Any]] | None:
+    """枚举系统 git 进程（task-doctor-proc；纯标准库 subprocess，禁 psutil）。
+
+    - Windows：``tasklist /FI IMAGENAME eq git.exe /FO CSV`` 取 PID（无年龄）。
+    - POSIX：``ps -eo pid,etimes,comm`` 取 PID + 存活秒（etimes 数值型易解析）；
+      进程名精确匹配 ``git``（与 guard._count_git_processes 的 pgrep -x 同口径；
+      git-remote-https 等帮手进程不在本轮口径内）。
+
+    Returns:
+        ``[{pid, age_s|None}]``；工具缺失 / 超时 / 解析失败返回 None
+        （调用方按“未探明”跳过，不判 fail——见 _check_hung_git_processes）。
+    """
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        pids: list[dict[str, Any]] = []
+        for line in (proc.stdout or "").splitlines():
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if (len(parts) >= 2 and parts[0].lower() == "git.exe"
+                    and parts[1].isdigit()):
+                pids.append({"pid": int(parts[1]), "age_s": None})
+        return pids
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid,etimes,comm"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: list[dict[str, Any]] = []
+    for line in (proc.stdout or "").splitlines()[1:]:
+        parts = line.split()
+        if (len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit()
+                and parts[2].split("/")[-1] == "git"):
+            out.append({"pid": int(parts[0]), "age_s": int(parts[1])})
+    return out
+
+
+def _windows_pids_persist(first: set[int]) -> bool:
+    """Windows 二次采样确认（task-doctor-proc）：间隔后同批 PID 仍全部存活。
+
+    首样本不足 _WIN_FIRST_SAMPLE_MIN 时调用方已直接 ok，不会走到这里。
+    二次采样失败（工具异常）→ 保守返回 False（不判 fail，未探明≠有问题）。
+    """
+    try:
+        time.sleep(_WIN_RESAMPLE_DELAY_S)
+        second = _list_git_processes()
+    except Exception:
+        return False
+    if not second:
+        return False
+    return len(first & {p["pid"] for p in second}) >= _WIN_PERSIST_FAIL_MIN
+
+
+def _check_hung_git_processes() -> list[dict[str, str]]:
+    """僵持 git 进程盘点（task-doctor-proc，F8/E-11；只读盘点 + 人工清理出口）。
+
+    - 确认僵持（POSIX 年龄超阈）或高度疑似（并发计数达阈，年龄未知）→ fail，
+      附 PID + 存活时长 + 精确 kill 命令；``doctor --fix`` 不自动杀进程
+      （fix 仅处理 detect_residues 项，本检查天然只报告——杀进程恒为人工动作）。
+    - 探针失败（无 tasklist/ps）→ ok + 未探明注记后跳过：INV-4a 要求检测不可用
+      不静默，但本探针是环境相关 best-effort——fail 会在精简容器（无 ps）上
+      误红整个 doctor，故以 ok 注记收敛（确认僵持仍 fail，无漏报）。
+    - 时钟口径注记（F7 余波）：会话僵死另有三套时钟（ledger 24h /
+      doctor-session 30min / watchdog 认领 60min，见 rules/session.md）——
+      本项只看 git 进程存活，与会话 stuck 判定无关。
+    """
+    try:
+        procs = _list_git_processes()
+    except Exception:
+        procs = None
+    if procs is None:
+        return [_make_check(
+            "hung_git_processes", "ok",
+            "git 进程盘点未探明（缺 tasklist/ps 或执行失败），已跳过；"
+            "疑似僵持请人工核对（Windows: tasklist /FI \"IMAGENAME eq git.exe\"；"
+            "POSIX: ps -eo pid,etimes,comm | grep git）")]
+    hung = [p for p in procs
+            if p["age_s"] is not None and p["age_s"] >= _HUNG_GIT_AGE_S]
+    if hung:
+        if os.name == "nt":
+            kill = "taskkill /F /PID " + " /PID ".join(str(p["pid"]) for p in hung)
+        else:
+            kill = "kill -9 " + " ".join(str(p["pid"]) for p in hung)
+        detail = ("僵持 git 进程（存活超 "
+                  f"{_HUNG_GIT_AGE_S}s）："
+                  + "、".join(f"PID {p['pid']}（{p['age_s']}s）" for p in hung))
+    elif (os.name == "nt" and len(procs) >= _WIN_FIRST_SAMPLE_MIN
+            and _windows_pids_persist({p["pid"] for p in procs})):
+        kill = ("taskkill /F /PID "
+                + " /PID ".join(str(p["pid"]) for p in procs))
+        detail = (f"{len(procs)} 个 git 进程两次采样（间隔 "
+                  f"{_WIN_RESAMPLE_DELAY_S}s）PID 完全相同，判定僵持"
+                  "（Windows 无年龄通道，以持久性为据；瞬时并发 Spitze 两次"
+                  "采样集合不同，不会误判）")
+    else:
+        return [_make_check(
+            "hung_git_processes", "ok",
+            f"{len(procs)} 个存活 git 进程，均在年龄/持久性阈值内")]
+    return [_make_check(
+        "hung_git_processes", "fail",
+        f"{detail}。确认僵持后人工清理：{kill}；doctor --fix 不自动杀进程。"
+        "（会话僵死另有三套时钟：ledger 24h / doctor-session 30min / "
+        "watchdog 认领 60min——本项只看 git 进程存活。）")]
 
 
 # checkpoint 滞后容忍行数（DR-14）：引擎按**写命令**惰性落盘 checkpoint，因此
@@ -613,6 +747,8 @@ _EVENT_OPTIONAL_FIELDS: tuple[tuple[str, type], ...] = (
     ("review_type", str),
     # v4（2026-09-15 停服升级）：REVIEW_CLAIMED / REVIEW_SUBMITTED 的自审标注
     ("is_self_review", bool),
+    # task-review-rework-scope：REVIEW_SUBMITTED 打回范围（spec/code 缺省不写）
+    ("rework_scope", str),
 )
 
 
@@ -951,7 +1087,10 @@ def _check_in_review_worktree_integrity(
         entry = bindings.get(tid)
         wt = Path(entry["worktree"]).resolve() if (
             entry and entry.get("worktree")) else None
-        branch = f"task/{tid}"
+        # task-line-diag-wiring：分支名按当前线命名空间
+        from orchd.line_ctx import resolve_task_branch_for
+
+        branch = resolve_task_branch_for(Path(project_root), tid)
         problems: list[str] = []
         # 1) 分支存在且可解析（branch/task-<id> 引用丢失 = 核心失效模式）
         rev = _run_git(
@@ -1018,16 +1157,20 @@ def _check_in_review_worktree_integrity(
             entry and entry.get("worktree")) else default_wt
         # AC5：引用自愈模板——refs 被删但 reflog 存活时（2026-08-08 / 2026-09-10
         # 两次同型事故），reflog 末行 tip 即分支最后落点，可直接用于重建。
-        tip = branch_reflog_tip(Path(project_root), f"task/{tid}")
+        # task-line-diag-wiring：自愈提示分支名按当前线命名空间
+        from orchd.line_ctx import resolve_task_branch_for
+
+        _branch = resolve_task_branch_for(Path(project_root), tid)
+        tip = branch_reflog_tip(Path(project_root), _branch)
         if tip:
-            rebuild = (f"git branch task/{tid} {tip}（reflog tip 自愈："
-                       f"git reflog show --format=%H task/{tid} 末行）")
+            rebuild = (f"git branch {_branch} {tip}（reflog tip 自愈："
+                       f"git reflog show --format=%H {_branch} 末行）")
         else:
-            rebuild = (f"git branch task/{tid} <悬空sha>"
+            rebuild = (f"git branch {_branch} <悬空sha>"
                        "（git fsck --lost-found 找回；无 reflog 时用此兜底）")
         hints.append(
             f"{tid}：{'；'.join(problems)}。重建：{rebuild}; "
-            f"git worktree add {wt} task/{tid}; "
+            f"git worktree add {wt} {_branch}; "
             "并补回任务 worktree 的 .orchd/.layout.json（_propagate_container_marker 语义）"
         )
     return [_make_check("in_review_integrity", "fail", "；".join(hints))]
@@ -2140,7 +2283,9 @@ def _doctor_fix_impl(
                 "error": f"{type(exc).__name__}: {exc}",
             })
 
-    return {
+    # A1（task-hostfix-pack-b）：收尾顺带收敛备份保留期（best-effort）。
+    _pruned = _prune_stale_backups(Path(project_root) / ".orchd" / ".doctor-backup")
+    result: dict[str, Any] = {
         "dry_run":
         False,
         "backup_dir":
@@ -2162,8 +2307,12 @@ def _doctor_fix_impl(
          f"{len(errors)} 项失败）。"
          f"备份目录：{backup_path}" +
          (f"；{len(untracked)} 项已从 git 索引移除但未提交，"
-          f"需 git commit 收口：{', '.join(untracked)}" if untracked else "")),
+          f"需 git commit 收口：{', '.join(untracked)}" if untracked else "") +
+         (f"；过期备份已清理 {len(_pruned)} 项" if _pruned else "")),
     }
+    if _pruned:
+        result["backups_pruned"] = _pruned
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2233,6 +2382,60 @@ def _residue_disposition(rtype: str | None, action: str | None = None) -> str:
     if rtype in _LEGACY_MOVE_TYPES:
         return "legacy_move"
     return "manual"
+
+
+# A1（task-hostfix-pack-b）：备份保留期。`.doctor-backup/` 只增不减会长期积累
+# （auto_clean 每次残留处置都新建时间戳桶）。策略：早于 30 天**且**不在各分类
+# 最新 5 个之内的桶才删；非时间戳命名一律不动；best-effort（删失败静默跳过，
+# 不阻断主流程）。只删自家备份目录，不碰其他内容。
+_BACKUP_RETENTION_DAYS = 30
+_BACKUP_RETENTION_KEEP_NEWEST = 5
+
+
+def _prune_stale_backups(backup_base: Path) -> list[str]:
+    """清理过期备份桶，返回已删路径（相对名，供留痕）。"""
+    pruned: list[str] = []
+    try:
+        import time as _time
+
+        base = Path(backup_base)
+        if not base.is_dir():
+            return pruned
+        now = _time.time()
+        # 顶层时间戳桶 + residual/legacy 分类桶逐个收敛。
+        buckets: list[Path] = []
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and child.name.isdigit():
+                buckets.append(child)
+            elif child.is_dir() and child.name in ("residual", "legacy"):
+                buckets.extend(
+                    sorted(p for p in child.iterdir()
+                           if p.is_dir() and p.name.isdigit()))
+        if not buckets:
+            return pruned
+        by_parent: dict[str, list[Path]] = {}
+        for b in buckets:
+            by_parent.setdefault(str(b.parent), []).append(b)
+        for siblings in by_parent.values():
+            ordered = sorted(siblings, key=lambda p: int(p.name), reverse=True)
+            for b in ordered[_BACKUP_RETENTION_KEEP_NEWEST:]:
+                try:
+                    age_days = (now - int(b.name)) / 86400
+                except ValueError:
+                    continue
+                if age_days < _BACKUP_RETENTION_DAYS:
+                    continue
+                try:
+                    import shutil as _shutil
+
+                    _shutil.rmtree(str(b), ignore_errors=False)
+                    if not b.exists():
+                        pruned.append(str(b))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return pruned
 
 
 def _auto_clean_item(project_root: Path,
@@ -2460,9 +2663,14 @@ def _auto_clean_impl(project_root: Path,
             # 零 stderr（未执行任何清理动作，读写路径均不发噪声）
             manual_notice.append({**item, "disposition": "manual"})
 
-    return {
+    # A1（task-hostfix-pack-b）：收尾顺带收敛备份保留期（best-effort；有删除才补字段）。
+    _pruned = _prune_stale_backups(Path(project_root) / ".orchd" / ".doctor-backup")
+    result = {
         "auto_cleaned": auto_cleaned,
         "auto_moved": auto_moved,
         "manual_notice": manual_notice,
         "disabled": disabled,
     }
+    if _pruned:
+        result["backups_pruned"] = _pruned
+    return result

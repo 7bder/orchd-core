@@ -105,13 +105,22 @@ def _guard_declared_diff(
                 "单目录无 git：声明文件分支 diff 门禁不适用（本次未生效，声明完整性"
                 "仅由 review 期诊断兜底，与 flat 口径一致）"
             )
-        if not is_task_worktree(project_root):
-            raise NotApplicableError(
-                "非独立任务 worktree（flat / 容器降级模式）：声明文件分支 diff "
-                "门禁不适用（本次未生效，声明完整性仅由 review 期诊断兜底）"
-            )
-        from orchd.worktree import diagnose_missing_branch_files
+        # task-flat-guard-parity：独立任务 worktree 走既有口径；flat / 降级下
+        # 当前即任务分支时走等价口径（与独立任务 worktree 同语义，见
+        # worktree.is_current_task_branch）；其余（main 上等）保持跳过留痕。
+        # 判定顺序保留 is_task_worktree 在先：既有测试打该缝线，且容器语义不变
+        # （is_task_worktree 为本模块顶层导入，与 diagnose 内同源）。
+        from orchd.worktree import (
+            diagnose_missing_branch_files,
+            is_current_task_branch,
+        )
 
+        if not is_task_worktree(Path(project_root)):
+            if not is_current_task_branch(Path(project_root), task_id):
+                raise NotApplicableError(
+                    "非任务分支工作区（main 上等）：声明文件分支 diff 门禁不适用"
+                    "（本次未生效，声明完整性仅由 review 期诊断兜底）"
+                )
         return diagnose_missing_branch_files(project_root, task_id, files_to_edit)
 
     diagnosed = run_guard(
@@ -304,19 +313,22 @@ def _guard_out_of_scope(
             changed = SnapshotBackend(project_root).changed_paths(task_id)
             actual_modified = [p for p in changed if p in base]
         else:
+            from orchd.line_ctx import resolve_task_branch_for
+
             default = _get_default_branch(project_root)
             if not default:
                 raise NotApplicableError(
                     "无默认分支（main/master）引用：越界改动检测不适用"
                 )
-            exists = branch_exists(project_root, f"task/{task_id}")
+            branch = resolve_task_branch_for(project_root, task_id)
+            exists = branch_exists(project_root, branch)
             if exists is None:
                 raise RuntimeError(
-                    f"git 探测故障：无法确认任务分支 task/{task_id} 是否存在"
+                    f"git 探测故障：无法确认任务分支 {branch} 是否存在"
                 )
             if not exists:
                 raise NotApplicableError(
-                    f"任务分支 task/{task_id} 不存在：越界改动检测不适用"
+                    f"任务分支 {branch} 不存在：越界改动检测不适用"
                 )
             from orchd.gitops.repo import for_project
 

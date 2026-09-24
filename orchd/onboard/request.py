@@ -75,8 +75,8 @@ def _find_review_priority_tasks(
        直接排除（不计入自审）；字段缺失/为空（生产 _master.json 已无
        reviewers）则跳过名单门禁，仅按实现指纹去重。
     3. self-review：DONE 实现指纹 == 当前 request 指纹时，默认仅标注
-       is_self_review（照常分配）；enforce_self_review_block=True 时归入
-       excluded_self_review（不分配，AC1）。
+       is_self_review（照常分配）；enforce_self_review_block=True 或任务
+       require_independent_review=true 时归入 excluded_self_review（不分配，AC1）。
 
     H2（2026-08-13）：``derived`` 为 request 单次扫描的派生缓存，
     循环内查询实现者改为 O(1)（原实现对每个候选任务全扫一次 ledger）。
@@ -110,7 +110,9 @@ def _find_review_priority_tasks(
                 "done_author": done_author,
                 "is_self_review": True,
             })
-        if is_self and enforce_self_review_block:
+        # task-review-independence-enforce：任务级独立审查与全局开关 OR。
+        if is_self and (enforce_self_review_block
+                        or task_def.get("require_independent_review", False)):
             continue
         entry = {
             "task_id": tid,
@@ -163,11 +165,11 @@ def _git_lines(project_root: Path, *args: str) -> list[str] | None:
 
 
 def _default_branch(project_root: Path) -> str:
-    """默认分支名（best-effort；取不到回退 "main"，与 worktree._git_diff_names 一致）。"""
+    """当前线 trunk（best-effort；取不到回退 "main"，与 worktree._git_diff_names 一致）。"""
     try:
-        from orchd.gitops import get_default_branch
+        from orchd.line_ctx import resolve_trunk_for
 
-        return get_default_branch(project_root) or "main"
+        return resolve_trunk_for(project_root)
     except Exception:
         return "main"
 
@@ -197,7 +199,9 @@ def _inflight_files(
     if project_root is None:
         return {}
     known = {t.get("id", "") for t in tasks}
-    prefix = "task/"
+    from orchd.line_ctx import resolve_task_branch_for
+
+    prefix = resolve_task_branch_for(project_root, "")
     refspec = f"refs/heads/{prefix}"
     branches = _git_lines(
         project_root, "for-each-ref", "--format=%(refname:short)", refspec

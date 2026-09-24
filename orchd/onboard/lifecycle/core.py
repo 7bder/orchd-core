@@ -352,12 +352,14 @@ def _check_base_freshness(
     if not rec.get("checked") or rec.get("clean", True):
         return
     # 真正冲突：main 推进且与本任务文件同路径冲突 → 阻断 early
+    from orchd.line_ctx import resolve_task_branch_for
+
     raise OrchdError(
         ErrorCode.E015,
-        "stale_base: 任务分支落后 main 且与 main 存在文件冲突",
+        "stale_base: 任务分支落后 trunk 且与 trunk 存在文件冲突",
         [{
             "task_id": task_id,
-            "branch": f"task/{task_id}",
+            "branch": resolve_task_branch_for(project_root, task_id),
             "files": rec.get("files") or [],
             "hint": (
                 "任务分支落后 main 且同文件冲突，请先 merge main 解决冲突并重跑 "
@@ -685,7 +687,9 @@ def _probe_task_branch(workdir: str, task_id: str) -> bool:
     """任务分支存在性（best-effort）：不存在返回 False（由调用方放行）。"""
     import subprocess
 
-    branch = f"task/{task_id}"
+    from orchd.line_ctx import resolve_task_branch_for
+
+    branch = resolve_task_branch_for(workdir, task_id)
     try:
         proc = subprocess.run(
             ["git", "-C", workdir, "rev-parse", "--verify", "--quiet",
@@ -1066,6 +1070,14 @@ def _write_done_event(
             review_type = "code" if _is_doc_single_stage(
                 task_def.get("files_to_edit", []), blocked=blocked_config
             ) else "spec"
+            # task-review-rework-scope：code 范围打回的返工直达 code 审查，
+            # 跳过 spec（缺省/历史事件无标记即 spec，与旧行为一致；标记随
+            # 本次 done 消费隐式失效，见 ledger.latest_rework_scope）。
+            if review_type == "spec":
+                from orchd.ledger import latest_rework_scope
+
+                if latest_rework_scope(store, task_id) == "code":
+                    review_type = "code"
             review_event = _make_event(task_id, claimed_by, "REVIEW_READY", review_type=review_type)
         store.append_event(review_event)
 

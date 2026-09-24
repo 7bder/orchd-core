@@ -34,15 +34,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
 # study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm/drop 裁决。
 _VALID_IDEA_STATUSES = frozenset({"pending", "taskified", "questioning", "dropped", "study"})
 
-# 摄入产物文件白名单（与 split._INTAKE_PRODUCT_FILES 对齐，两种布局）：
+# 摄入产物文件白名单（task-inventory-honesty/F9 起以本集合为单一真源；
+# split._INTAKE_PRODUCT_FILES 复用此处，禁双写漂移。两种布局）：
 # 摄入 → amend / intake 的正当链路中允许未提交态；其余已跟踪改动视为非摄入脏。
+# IDEAS-archive.md 在列：released-pending 条目的归档改动可随 intake 提交落盘。
 _INTAKE_PRODUCT_FILES = frozenset({
     ".orchd/_master.json",
     "IDEAS.md",
     ".orchd/IDEAS.md",
+    ".orchd/IDEAS-archive.md",
     "ROADMAP.md",
     ".orchd/ROADMAP.md",
 })
+
+# init 后必脏提示后缀（task-intake-hint-phase）：init 必然产生未提交文件
+# （mod-*/spec.json、_ledger.jsonl 等），无该句时新项目按 init → intake
+# 自然顺序必撞 dirty_workspace 死循环。两处 dirty hint 共用，禁手写漂移。
+_DIRTY_AFTER_INIT_HINT = (
+    "；若刚执行 init（mod-*/spec.json、_ledger.jsonl 等必然未提交），"
+    "请先提交落盘后再继续"
+)
 
 # 条目标题中的显式 id 约定写法：`<标题>（id: <slug>）`
 # slug 仅允许字母、数字、连字符、下划线，且以字母或数字开头（与 source: idea:<id>
@@ -117,11 +128,13 @@ def _intake_guard(project_root: Path) -> dict[str, Any] | None:
         - 通过: ``None``。
         - 失败: 结构化错误 dict（not_on_main / dirty_workspace），调用方直接返回。
     """
-    from orchd.gitops import get_current_branch, get_default_branch, list_tracked_changes
+    from orchd.gitops import get_current_branch, list_tracked_changes
+    from orchd.line_ctx import resolve_trunk_for
 
     project_root = Path(project_root)
     current_branch = get_current_branch(project_root)
-    default_branch = get_default_branch(project_root) or "main"
+    # task-line-guard-intake-wiring：主干按当前线解析（单线恒 main）
+    default_branch = resolve_trunk_for(project_root)
     if current_branch is not None and current_branch != default_branch:
         return {
             "committed": False,
@@ -140,6 +153,7 @@ def _intake_guard(project_root: Path) -> dict[str, Any] | None:
                 "hint": (
                     "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
                     "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                    + _DIRTY_AFTER_INIT_HINT
                 ),
             }
     return None
@@ -292,7 +306,6 @@ def roadmap_land(
     from orchd.gitops import (
         ensure_committed,
         get_current_branch,
-        get_default_branch,
         list_tracked_changes,
     )
     from orchd.ledger import resolve_roadmap_path, resolve_workspace_root
@@ -301,13 +314,15 @@ def roadmap_land(
         intake_lock_release,
         resolve_agent_id,
     )
+    from orchd.line_ctx import resolve_trunk_for
     from orchd.spec import _parse_roadmap_sections
 
     project_root = Path(project_root)
 
-    # 1) 前置守卫：main + 非摄入产物干净（对齐 intake_commit 语义）
+    # 1) 前置守卫：主干 + 非摄入产物干净（对齐 intake_commit 语义）
     current_branch = get_current_branch(project_root)
-    default_branch = get_default_branch(project_root) or "main"
+    # task-line-guard-intake-wiring：主干按当前线解析（单线恒 main）
+    default_branch = resolve_trunk_for(project_root)
     if current_branch is not None and current_branch != default_branch:
         return {
             "landed": False,
@@ -326,6 +341,7 @@ def roadmap_land(
                 "hint": (
                     "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
                     "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                    + _DIRTY_AFTER_INIT_HINT
                 ),
             }
 

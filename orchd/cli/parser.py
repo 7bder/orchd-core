@@ -18,6 +18,26 @@ from orchd.cli._util import (
 )
 
 
+def _resolve_version() -> str:
+    """--version 显示版本的三级回退（task-installer-hygiene，F1）。
+
+    ``importlib.metadata``（pip 安装态）→ 宿主 ``.orchd/VERSION`` 文件
+    （安装器落盘的版本收据，源码裸跑态）→ ``0.0.0.dev0``。查找失败
+    （无 .orchd / 文件缺失）静默回退，不阻断 parser 构建。
+    """
+    if __version__ != "0.0.0.dev0":
+        return __version__
+    try:
+        from orchd.cli._util import _find_orchd_dir
+
+        text = (_find_orchd_dir() / "VERSION").read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return __version__
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """构建 argparse 解析器并注册全部子命令。
 
@@ -36,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "指导下一步行动）；运行 'orchd status --text' 查看任务池与下一步引导。"
         ),
     )
-    parser.add_argument("--version", action="version", version=f"orchd {__version__}")
+    parser.add_argument("--version", action="version", version=f"orchd {_resolve_version()}")
     parser.add_argument("--guidance", choices=["slim", "full"], default="slim",
                         help="guidance 输出模式：slim（默认，仅 step/command/hint 核心三字段，省 token）"
                              " / full（含 read/rules/branch_ctx 全量，调试或弱 LLM 场景）")

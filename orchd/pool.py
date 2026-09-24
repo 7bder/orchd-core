@@ -285,6 +285,22 @@ def _is_path_covered(declared: str, target: str) -> bool:
     return False
 
 
+# B3（task-gate-cleanup-batch）：目录串不能直接交集——双目录对撞返回
+# 带尾斜杠目录串，与文件粒度的 SHARED_CORE_FILES 恒不命中。目录项展开判定：
+# 其下任一核心文件即命中（响应 overlap 原样返回，契约不变）。
+def _overlap_is_shared_core(overlap: list[str] | set[str]) -> bool:
+    for f in overlap:
+        if f in SHARED_CORE_FILES:
+            return True
+        if f.endswith("/"):
+            prefix = f
+            stem = f.rstrip("/")
+            for core in SHARED_CORE_FILES:
+                if core == stem or core.startswith(prefix):
+                    return True
+    return False
+
+
 def _prefix_overlap(files_a: list[str] | set[str],
                     files_b: list[str] | set[str]) -> list[str]:
     """目录式声明感知的文件重叠计算（task-decl-dir-match-conflict）。
@@ -354,7 +370,7 @@ def detect_file_conflict(
                     task_id=tid,
                     files=overlap,
                     claimed_by=claimed_by,
-                    is_shared_core=bool(set(overlap) & SHARED_CORE_FILES),
+                    is_shared_core=_overlap_is_shared_core(overlap),
                 ))
     return conflicts
 

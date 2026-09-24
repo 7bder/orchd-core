@@ -261,6 +261,20 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         return None
     return result
 
+def _cmd_show(args) -> dict:
+    """单任务卡面直达（task-audit-hint-show）：`status <task-id>` 别名。
+
+    与 status 单任务模式同一实现（委托已装饰的 _cmd_status，骨架重载任务
+    一次，幂等只读）；补齐 show 解析器缺失的 audit/text 标志缺省，避免
+    AttributeError。--text/巡检标志请走 status 本体。
+    """
+    for flag in ("text", "all", "audit_merge", "audit_intake",
+                 "audit_revive", "audit_task"):
+        if not hasattr(args, flag):
+            setattr(args, flag, False)
+    return _cmd_status(args)
+
+
 def _cmd_watchdog(args):
     """巡检僵死任务（实现者超时 / 审查者超时）。
 
@@ -330,6 +344,13 @@ def register(sub) -> None:
     p.add_argument("--audit-task", action="store_true",
                    help="附加任务完整性巡检：merged 任务的历史缺失/残留（main 残留 + 分支 diff 缺失声明文件，只读）")
     p.set_defaults(func=_cmd_status)
+
+    # show（task-audit-hint-show）：单任务卡面直达，`status <task-id>` 别名。
+    # 无 orchd show 可发现是长期可用性缺口（卡面 AC 只能 json.load master）；
+    # 本别名与 status 单任务模式同一实现（_cmd_status），零语义分叉。
+    p = sub.add_parser("show", help="单任务卡面详情（status <task-id> 别名）")
+    p.add_argument("task", help="任务 ID，查询单任务详情（含 AC / 声明文件 / verify）")
+    p.set_defaults(func=_cmd_show)
 
     # watchdog
     p = sub.add_parser("watchdog", help="僵死任务巡检")

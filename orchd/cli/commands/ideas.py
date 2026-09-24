@@ -43,7 +43,7 @@ def register(sub):
     idea_sub = p.add_subparsers(dest="idea_action", required=True)
 
     _p = idea_sub.add_parser("propose", help="为灵感追加 status: study 条目到 IDEAS.md（agent 执行）")
-    _p.add_argument("--title", required=True, help="灵感标题")
+    _p.add_argument("--title", required=True, help="灵感标题（须内嵌「（id: <slug>）」后缀声明条目 id，如“标题（id: my-idea）”；缺 id 即 missing_idea_id 拒绝）")
     _p.add_argument("--feasibility", required=True, help="可行性论证（写入 - 论证: 字段）")
     _p.set_defaults(func=_cmd_idea_propose)
 
@@ -71,12 +71,21 @@ def _cmd_idea_propose(args) -> dict:
     """为灵感追加 status: study 条目到 IDEAS.md（idea-write-gate，agent 执行）。
 
     CLI 参数: args.title / args.feasibility。
-    返回: 提案结果字典（proposed / title / commit）。
+    返回: 提案结果字典（proposed / title / commit）；被拒时（missing_idea_id /
+    duplicate 等）附顶层 error 键，退出码非零（task-cli-exit-honesty，
+    E-15：失败不再静默 exit 0）。
     """
     from orchd.intake import idea_propose
 
     orchd_dir = _find_orchd_dir()
-    return idea_propose(orchd_dir.parent, args.title, args.feasibility)
+    result = idea_propose(orchd_dir.parent, args.title, args.feasibility)
+    if not result.get("proposed"):
+        result["error"] = {
+            "code": "idea_rejected",
+            "reason": result.get("reason", "unknown"),
+            "hint": result.get("hint", ""),
+        }
+    return result
 
 def _cmd_idea_confirm(args) -> dict:
     """将 status: study 条目升为 pending（idea-write-gate，仅用户执行）。

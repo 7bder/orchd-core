@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,10 @@ from orchd.errors import ErrorCode, OrchdError
 # 进程级 depth 登记：路径 → (fd, total_depth)。
 # 同一进程内所有 ExclusiveFileLock 实例共享，保证跨实例重入语义与释放安全。
 # total_depth 是路径级总引用计数，实例各自维护 self._depth（本实例引用数）。
+# B6（task-gate-cleanup-batch）：登记表读写经 _REGISTRY_LOCK 串行——多线程同
+# 进程并发 acquire/release 时 depth 计数不错乱、fd 不泄漏/双 close。
 _depth_registry: dict[str, tuple[int, int]] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def _flock_op(fd: int, op: str) -> None:
@@ -93,27 +97,58 @@ class ExclusiveFileLock:
         """
         key = str(self._lock_path.resolve())
 
-        # 同进程跨实例重入：路径已在注册表 → 共享 fd，引用计数+1
-        if key in _depth_registry:
-            fd, depth = _depth_registry[key]
-            self._fd = fd
-            self._depth += 1
-            _depth_registry[key] = (fd, depth + 1)
-            return True
+        # B6（task-gate-cleanup-batch）：登记表读写经 _REGISTRY_LOCK 串行。
+        # 非阻塞路径全程持 threading 锁做完 check-open-flock-insert（flock NB
+        # 即时返回，无睡眠，不会阻塞其他线程）；阻塞路径沿用重试循环，超时/
+        # 失败回退时若已有他线程胜出则共享其 fd（防 OS 层独占导致的误 E012）。
+        with _REGISTRY_LOCK:
+            if key in _depth_registry:
+                fd, depth = _depth_registry[key]
+                self._fd = fd
+                self._depth += 1
+                _depth_registry[key] = (fd, depth + 1)
+                return True
 
-        # 新获取：打开 fd 并 flock
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
+            # 新获取：打开 fd 并 flock
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
+
+            if not blocking:
+                try:
+                    self._acquire_nonblocking(fd)
+                except OrchdError:
+                    # helper 已 close(fd)；此处不重抛前先看是否有他线程胜出
+                    # （同进程另一线程已持锁）→ 共享其 fd 而非误报 E012。
+                    if key in _depth_registry:
+                        sfd, sdepth = _depth_registry[key]
+                        self._fd = sfd
+                        self._depth += 1
+                        _depth_registry[key] = (sfd, sdepth + 1)
+                        return True
+                    raise
+                self._fd = fd
+                self._depth = 1
+                _depth_registry[key] = (fd, 1)
+                return True
 
         if blocking:
             self._acquire_blocking(fd, timeout_s)
-        else:
-            self._acquire_nonblocking(fd)
-
-        self._fd = fd
-        self._depth = 1
-        _depth_registry[key] = (fd, 1)
-        return True
+            with _REGISTRY_LOCK:
+                if key in _depth_registry:
+                    # 等待期间他线程已持锁：复用其 fd，关闭本 fd（防泄漏）。
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    sfd, sdepth = _depth_registry[key]
+                    self._fd = sfd
+                    self._depth += 1
+                    _depth_registry[key] = (sfd, sdepth + 1)
+                    return True
+                self._fd = fd
+                self._depth = 1
+                _depth_registry[key] = (fd, 1)
+            return True
 
     def _acquire_nonblocking(self, fd: int) -> None:
         """非阻塞获取 flock，失败抛 E012。"""
@@ -163,16 +198,17 @@ class ExclusiveFileLock:
 
         self._depth -= 1
 
-        if key in _depth_registry:
-            fd, depth = _depth_registry[key]
-            if depth > 1:
-                _depth_registry[key] = (fd, depth - 1)
-                if self._depth == 0:
-                    self._fd = None
-                return False
-            # 全局 depth == 1 → 释放后归零，真正释放
-            self._release_flock(fd)
-            _depth_registry.pop(key, None)
+        with _REGISTRY_LOCK:
+            if key in _depth_registry:
+                fd, depth = _depth_registry[key]
+                if depth > 1:
+                    _depth_registry[key] = (fd, depth - 1)
+                    if self._depth == 0:
+                        self._fd = None
+                    return False
+                # 全局 depth == 1 → 释放后归零，真正释放
+                self._release_flock(fd)
+                _depth_registry.pop(key, None)
 
         if self._depth == 0:
             self._fd = None
@@ -242,10 +278,10 @@ class ExclusiveFileLock:
         key = str(self._lock_path.resolve())
 
         # 同进程任一实例持锁 → by_current_process=True
-        if key in _depth_registry:
-            fd, depth = _depth_registry[key]
-            if depth > 0:
-                return {"held": True, "by_current_process": True, "depth": depth}
+        with _REGISTRY_LOCK:
+            entry = _depth_registry.get(key)
+        if entry is not None and entry[1] > 0:
+            return {"held": True, "by_current_process": True, "depth": entry[1]}
 
         # 尝试非阻塞获取：成功=未持有（我们刚拿到），失败=被其他进程持有
         if not self._lock_path.exists():
@@ -277,10 +313,11 @@ class ExclusiveFileLock:
         注意：clear 释放全局锁，不管理各实例引用计数；调用后所有实例的 fd 失效。
         """
         key = str(self._lock_path.resolve())
-        if key in _depth_registry:
-            fd, _ = _depth_registry[key]
-            self._release_flock(fd)
-            _depth_registry.pop(key, None)
+        with _REGISTRY_LOCK:
+            if key in _depth_registry:
+                fd, _ = _depth_registry[key]
+                self._release_flock(fd)
+                _depth_registry.pop(key, None)
         self._fd = None
         self._depth = 0
 
@@ -293,7 +330,8 @@ def read_locked_text(lock_path: Path | str, encoding: str = "utf-8") -> str | No
     避免 Windows 下字节锁导致的新句柄读取 Permission denied。
     """
     key = str(Path(lock_path).resolve())
-    entry = _depth_registry.get(key)
+    with _REGISTRY_LOCK:
+        entry = _depth_registry.get(key)
     if entry is None:
         return None
     fd, _ = entry

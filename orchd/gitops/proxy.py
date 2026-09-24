@@ -57,6 +57,7 @@ from typing import Any
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops._const import _GIT_ENCODING, _GIT_ERRORS, _GIT_TIMEOUT
 from orchd.gitops.query import check_workspace_state
+from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
 
 # ------------------------------------------------------------------
 # 分类表
@@ -118,6 +119,18 @@ CONDITIONAL_READ_FLAGS: dict[str, frozenset[str]] = {
 
 # 无参即只读列举的子命令（``git branch`` / ``git tag`` / ``git reflog``）
 _BARE_READ_SUBCOMMANDS: frozenset[str] = frozenset({"branch", "tag", "reflog"})
+
+# 已知写动词/写旗标（task-proxy-read-strict，N4）：出现在双形态子命令的
+# rest 中即判写操作——位置参数不能假设中性（``branch main`` 实为创建分支）。
+# 命名与白名单动词（list/show）互斥；分支名恰为此表的极端情况按 fail-closed
+# 拒绝（agent 改用 --list 形态仍被拒？否——纯 ``--list`` 无位置参数即放行）。
+_WRITE_TOKENS: frozenset[str] = frozenset({
+    "-d", "-D", "-m", "-M", "-c", "-C", "-f", "--force", "--delete",
+    "--edit-description", "--unset-upstream", "--set-upstream-to", "--move",
+    "--copy", "--rename", "add", "rm", "remove", "delete", "push", "pop",
+    "apply", "drop", "clear", "store", "create", "set", "unset", "rename",
+    "record", "prune",
+})
 
 # 写操作族 → (红线, 引擎替代通道 hint)
 _WRITE_FAMILIES: dict[str, tuple[str, str]] = {
@@ -225,31 +238,56 @@ _WRITE_SUBCOMMANDS: dict[str, str] = {
 
 
 def _is_read_variant(subcommand: str, rest: list[str]) -> bool:
-    """双形态子命令的**只读形态**判定（命中白名单旗标/动词，或无参列举）。"""
+    """双形态子命令的**只读形态**判定（task-proxy-read-strict，N4）。
+
+    fail-closed 三段式（任一不满足即写操作）：
+    1. 所有 ``-`` 旗标必须命中只读白名单（未知旗标即拒绝）；
+    2. 任何已知写动词/写旗标（``-d/-D/-m/add/push/--edit-description`` 等）
+       出现即拒绝——位置参数不能假设中性；
+    3. 无旗标时：仅白名单动词本身可独立成读（如 ``stash list``）；裸位置
+       参数（``branch main`` 实为创建分支）一律拒绝。
+
+    旧 ``any()`` 任一命中即放行，``branch -v --edit-description`` 等混合形态
+    逃逸为只读，违背自身 fail-closed 承诺。无参列举保持原语义。
+    """
     allowed = CONDITIONAL_READ_FLAGS.get(subcommand)
     if allowed is None:
         return False
     if not rest:
         return subcommand in _BARE_READ_SUBCOMMANDS
-    return any(arg in allowed for arg in rest)
+    has_flag = False
+    for arg in rest:
+        if arg == "--":
+            continue
+        if arg.startswith("-"):
+            has_flag = True
+            if arg not in allowed:
+                return False
+        elif arg in _WRITE_TOKENS:
+            return False
+        elif not has_flag and arg not in allowed:
+            # 无旗标的裸位置参数：白名单动词（如 list）除外一律拒绝
+            # （branch main / config user.name x 皆为写操作）。
+            return False
+    return True
 
 
-# 受管 merge 出口的精确形态（task-proxy-merge-allowlist）：仅 task/* 分支上的
-# ``merge main`` 与 ``merge --no-edit main``。其余 merge 形态（换目标分支、加旗标、
-# 无参等）一律仍走 write 拒绝（fail-closed）。精确形态刻意收窄：合入 main 方向是
-# 任务分支同步的唯一合法手动形态，其余合并语义一律走引擎通道。
-_MERGE_PASSTHROUGH_RESTS: tuple[tuple[str, ...], ...] = (
-    ("main",),
-    ("--no-edit", "main"),
-)
+# 受管 merge 出口的精确形态（task-proxy-merge-allowlist）：仅任务分支上的
+# ``merge <trunk>`` 与 ``merge --no-edit <trunk>``。其余 merge 形态（换目标分支、
+# 加旗标、无参等）一律仍走 write 拒绝（fail-closed）。精确形态刻意收窄：合入
+# 当前线 trunk 方向是任务分支同步的唯一合法手动形态，其余合并语义一律走引擎通道。
+# task-line-guard-worktree：``<trunk>`` 按当前线解析（单线恒 main）。
+def _merge_passthrough_forms(trunk: str) -> tuple[tuple[str, ...], ...]:
+    """受管 merge 出口精确形态：``merge <trunk>`` / ``merge --no-edit <trunk>``。"""
+    return ((trunk,), ("--no-edit", trunk))
 
 
-def _is_merge_passthrough(rest: list[str]) -> bool:
+def _is_merge_passthrough(rest: list[str], trunk: str = "main") -> bool:
     """是否为受管 merge 出口精确形态（与当前分支无关，分支在执行层判定）。"""
-    return tuple(rest) in _MERGE_PASSTHROUGH_RESTS
+    return tuple(rest) in _merge_passthrough_forms(trunk)
 
 
-def classify_git_argv(argv: list[str] | None) -> dict[str, Any]:
+def classify_git_argv(argv: list[str] | None, trunk: str = "main") -> dict[str, Any]:
     """对 ``orchd git <args>`` 的 args 做放行/拒绝分类（纯函数，不执行 git）。
 
     Returns:
@@ -283,13 +321,13 @@ def classify_git_argv(argv: list[str] | None) -> dict[str, Any]:
             "family": "commit",
             "reason": "任务分支 git commit 是红线 #1 豁免一（提交范围由 E020 hook 校验）",
         }
-    if subcommand == "merge" and _is_merge_passthrough(rest):
+    if subcommand == "merge" and _is_merge_passthrough(rest, trunk):
         return {
             "subcommand": subcommand,
             "rest": rest,
             "kind": "merge",
             "family": "merge",
-            "reason": "任务分支 merge main 精确形态是红线 #1 豁免二（受管出口）",
+            "reason": f"任务分支 merge {trunk} 精确形态是红线 #1 豁免二（受管出口）",
         }
     if subcommand in READ_ONLY_SUBCOMMANDS:
         return {
@@ -466,7 +504,8 @@ def _proxy_commit(project_root: Path, args: list[str], cls: dict[str, Any]) -> d
     """任务分支 commit 放行（红线 #1 豁免一）；非任务分支 → E018。"""
     state = check_workspace_state(project_root)
     branch = state.get("branch")
-    if not branch or not str(branch).startswith("task/"):
+    task_prefix = resolve_task_branch_for(project_root, "")
+    if not branch or not str(branch).startswith(task_prefix):
         raise OrchdError(
             ErrorCode.E018,
             f"wrong_branch: git commit 仅在任务分支允许（红线 #1 豁免一），当前在 '{branch}'",
@@ -493,10 +532,12 @@ def _proxy_merge(project_root: Path, args: list[str], cls: dict[str, Any]) -> di
     """
     state = check_workspace_state(project_root)
     branch = state.get("branch")
-    if not branch or not str(branch).startswith("task/"):
+    task_prefix = resolve_task_branch_for(project_root, "")
+    if not branch or not str(branch).startswith(task_prefix):
         raise OrchdError(
             ErrorCode.E018,
-            f"wrong_branch: git merge main 仅在任务分支允许（红线 #1 豁免二），当前在 '{branch}'",
+            f"wrong_branch: git merge {resolve_trunk_for(project_root)} 仅在任务分支允许"
+            f"（红线 #1 豁免二），当前在 '{branch}'",
             [{
                 "git_args": args,
                 "current_branch": branch,
@@ -534,7 +575,6 @@ def run_git_proxy(
         OrchdError: 写操作被拒（E007）/ commit 不在任务分支（E018）/ git 执行故障（E007）。
     """
     args = [str(a) for a in (argv or [])]
-    cls = classify_git_argv(args)
     if project_root is None:
         raise OrchdError(
             ErrorCode.E007,
@@ -545,6 +585,7 @@ def run_git_proxy(
             }],
         )
     root = Path(project_root)
+    cls = classify_git_argv(args, trunk=resolve_trunk_for(root))
 
     if not _git_available(root):
         # 无 git 降级（A0）：commit → 本地快照，其余 → no-op（不抛错）

@@ -1,7 +1,7 @@
 """Orchd CLI 命令注册表（3b 阶段启用）。
 
 统一注册入口：``register(subparsers)`` 按模块顺序调用各 commands 子模块的
-``register(subparsers)``，完成全部 23 个顶层命令 + 3 个二级子命令组的注册。
+``register(subparsers)``，完成全部顶层命令 + 3 个二级子命令组的注册。
 
 模块顺序即 argparse help 中的命令显示顺序：
   1. init      — validate / bootstrap / init
@@ -13,6 +13,8 @@
   7. session   — session 二级子命令组
   8. lessons   — lesson 二级子命令组
   9. sync      — sync（账本 git 跨设备同步，task-ledger-git-sync）
+ 10. line      — line（跨线回移通道 line-sync，task-line-sync）
+ 11. check     — check（静态门禁 ruff + mypy，task-check-command）
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ from orchd.cli.commands import (
     session as _session,
     lessons as _lessons,
     sync as _sync,
+    line as _line,
+    check as _check,
 )
 
 _REGISTER_ORDER = [
@@ -39,6 +43,8 @@ _REGISTER_ORDER = [
     _session,
     _lessons,
     _sync,
+    _line,
+    _check,
 ]
 
 

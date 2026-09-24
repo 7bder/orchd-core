@@ -73,7 +73,7 @@
 
 ## 规则目录（见 rules/README.md）
 - 会话/claim → rules/session.md · 摄入 → rules/intake.md · verify → rules/verify.md
-- 分支/merge → rules/git.md · 审查 → rules/review.md（模板 templates/spec-reviewer.md + templates/code-reviewer.md；语义变更三查；`review --show` 只读回看历史意见）
+- 分支/merge/AC 修改窗口 → rules/git.md · 审查 → rules/review.md（模板 templates/spec-reviewer.md + templates/code-reviewer.md；语义变更三查；`review --show` 只读回看历史意见）
 - 测试纪律（复用 tests/conftest.py make_task/orchd_dir，参数化，不得另造副本）→ rules/testing.md
 - 安装 → rules/install.md · 恢复 → rules/recovery.md · lesson → [skill-lesson.md](skill-lesson.md)
 

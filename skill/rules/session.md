@@ -30,7 +30,7 @@ guide:
 - **识别**：`python .orchd/__main__.py status` 存在 claimed 任务，但该 agent 已不可用（session 中断/token 耗尽）；或 ledger 有该任务 CLAIMED 但无 DONE/RETRACT，且无活跃 session（session 锁超 60min watchdog 阈值）
 - **标准流程**：
   1. 查 ledger 断点（用 python 替代 grep|tail，跨平台无 POSIX 工具依赖）：`python -c "import pathlib; ls=[l for l in pathlib.Path('.orchd/_ledger.jsonl').read_text(encoding='utf-8').splitlines() if '<task_id>' in l]; print(chr(10).join(ls[-10:]))"`——确认实现进行到哪一步（已提交？已 done？）
-  2. **清理僵死锁**：`.orchd/.session.lock` 超 60min → 按 L2 watchdog 语义释放（`python .orchd/__main__.py watchdog --timeout 0` 或 Python 删除）；`.git/index.lock` 无 git 进程 → 直接删
+  2. **清理僵死锁**：`.orchd/.session.lock` 超 60min → 按 L2 watchdog 语义释放（`python .orchd/__main__.py watchdog --timeout 0` 或 Python 删除）；**僵死 `.git/index.lock` 不要手动删**（红线 3：不触 `.git/`）——引擎在下一次 git 写操作前内建清理（`_clean_stale_index_lock`）；持续阻塞则按异常报告等待处置
   3. **确认实现完整性**：检查 task 分支是否有已提交实现（`git log task/{id}`）；工作区未提交改动若属于该任务 files_to_edit → 提交到 task 分支（不丢实现）
   4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）。**前提（E034 撤认归属守卫）**：跨 agent 撤认他人事件仅当目标认领已超时（僵尸）时放行——`CLAIMED` 超时阈值 `claim_stale_timeout_s()`（默认 **600s**，`ORCHD_CLAIM_STALE_SECS` 可覆盖）、`REVIEW_CLAIMED` 超时阈值 `review_stale_timeout_s()`（`ORCHD_REVIEW_STALE_SECS` 可覆盖）；**未超时撤认他人 CLAIMED 会被 E034 拒绝**（仅事件作者本人或 admin 可撤），此时应等待其退出或走 `force-status` 控制面，不得重试硬撤。另注意：`retract` 默认 `disposition=abandon` 触发 **300s 认领冷却**（`_RETRACT_COOLDOWN_S`），冷却期内重新 `claim` 被拒，需加 `--force` 绕过；`disposition=retry` / `handoff` 不触发冷却。
   5. **重新 claim**：`python .orchd/__main__.py claim --task <id> --confirm`（身份由引擎自动识别当前会话指纹；或按用户指示）
@@ -84,4 +84,13 @@ agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈�
 - **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，造成任务归属混淆、E011 单任务忙度冲突、E016 自审纠缠。发现同指纹并行时应先核对宿主注入粒度并切换到正确的会话级标识，不得通过伪造 agent ID 绕过身份校验。
 - **E021 豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021 `identity_mismatch` warning。
 - **指纹 vs 具名身份**：宿主受管自动化会话用指纹作身份锚定；具名 agent 身份（如 `marvis-1`、`workbuddy-1`）用于人工可追溯场景。
-- **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者——引擎当前**无分级实现**（只有全局 `enforce_self_review_block` 开关，默认仅提示、不硬阻断），故本判据写成建议而非禁令；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**硬约束升级（2026-09-21 用户裁定，D1-③＋）**：上述四类高危任务**必须**异指纹 reviewer（由调度者分派，引擎 `self_review_notice` + E035 碰撞告警自动识别）；同指纹提交的审查结论视为无效，须换会话重审。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。
+
+## 会话 TTL 与在握任务（task-e033-ttl-docs，三套时钟一次说清）
+
+- **ledger 会话 TTL（24h）**：`last_seen` 超过 TTL（默认 24h = 1440min，`ORCHD_SESSION_TTL_MIN` 可覆盖）→ 惰性过期为 E033（reason=session_expired），判定即生效、不删文件；`last_seen` 仅写命令续命，只读命令不碰。
+- **doctor 僵尸判定（30min）**：session 运行时文件 mtime 超 30min（`_SESSION_TTL_SECONDS=1800`）即判僵尸（巡检口径，与 ledger 的 24h 是两套时钟）。
+- **watchdog 在途判定（60min）**：claimed / in_review 超 60min 无进展即 stuck 上报。
+- **在握任务不因 session 过期自动回收**：过期仅报告（`stale_sessions` / `stale_claims`，reason=missing_runtime/inactive/session_expired），默认不释放；需接管时显式 `--takeover`（经 `force-status → pending`），回池后重新 claim。
+- **一键取号**：`python .orchd/__main__.py session start` 返回 token，执行其 `inject_action`（PowerShell：`$env:ORCHD_SESSION_ID="<token>"`；bash：`export ORCHD_SESSION_ID="<token>"`）即完成注入；`session current` 复用 token，无需重复 start。
+- **读路径顺手卫生**：`status` / `watchdog` 会清理 TTL 过期 session 文件与 orphan session lock——久置未操作后会话消失属正常，直接重 `session start` 即可（勿当事故）。
+- **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定；task-review-independence-enforce 落地字段级强制）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**字段级强制（B1，task-review-independence-enforce 已落地，不再是“建议”）**：任务 `require_independent_review=true` 时 E016 硬阻断 + request 排除，与全局开关 OR——调度者给高危任务置该字段即获强制异指纹。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。

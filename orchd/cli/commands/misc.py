@@ -59,6 +59,9 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
     from datetime import datetime, timezone
 
     from orchd.subproc import run_shell
+    from orchd.gitops_ops import (
+        verify_output_summary as _verify_output_summary,
+    )
 
     project_root = Path(args.path).resolve() if args.path else Path.cwd()
     orchd_dir = project_root / ".orchd"
@@ -90,6 +93,9 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         }, 1
     reg_elapsed = round(time.monotonic() - reg_started, 1)
     if reg_result.returncode != 0:
+        # task-recycle-observability：失败透传 output_summary（与
+        # onboard/lifecycle/regression.py 同源复用 _verify_output_summary）——
+        #此前仅 exit code，失败原因须另跑全量才可见。
         return {
             "ok": False,
             "code": "full_regression_failed",
@@ -97,6 +103,8 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
             "details": {
                 "returncode": reg_result.returncode,
                 "elapsed_seconds": reg_elapsed,
+                "output_summary": _verify_output_summary(
+                    reg_result.stdout, reg_result.stderr),
             },
         }, 1
     head = subprocess.run(
@@ -116,6 +124,8 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         "ok": True,
         "last_pass_commit": head,
         "elapsed_seconds": reg_elapsed,
+        "output_summary": _verify_output_summary(
+            reg_result.stdout, reg_result.stderr),
         "note": f"已写入 {orchd_dir / '_full_regression.json'}",
         # task-milestone-check-gate：本次记录是 M1（单机内核冻结）B 组判据的输入，
         # 刷新后可直接查门禁（避免"刷了记录却不知道下一步判什么"）。

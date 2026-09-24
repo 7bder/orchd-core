@@ -164,6 +164,10 @@ def status(
             "importance": task_def.get("importance", "normal"),
             "reviewers": task_def.get("reviewers", []),
             "verify_command": task_def.get("verify_command", ""),
+            # task-hostfix-pack-a B1：单任务详情含声明域（看完整卡面不再绕道读
+            # _master.json；加法字段，零破坏）。
+            "files_to_edit": task_def.get("files_to_edit", []),
+            "acceptance_criteria": task_def.get("acceptance_criteria", []),
         }
         if ts:
             if ts.claimed_by:
@@ -314,6 +318,12 @@ def merge_audit(
 
     root = Path(project_root)
 
+    # task-line-audit-guide-wiring：巡检按当前线解析（任务分支命名空间 + trunk）
+    from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+
+    trunk = resolve_trunk_for(root)
+    branch_prefix = resolve_task_branch_for(root, "")  # "task/" 或 "{line}/task/"
+
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args], cwd=str(root),
@@ -321,7 +331,7 @@ def merge_audit(
         )
 
     def _ahead(branch: str) -> int:
-        revs = _git("rev-list", "--count", f"main..{branch}")
+        revs = _git("rev-list", "--count", f"{trunk}..{branch}")
         if revs.returncode != 0:
             return 0
         return int(revs.stdout.strip() or "0")
@@ -329,7 +339,7 @@ def merge_audit(
     try:
         if _git("rev-parse", "--is-inside-work-tree").returncode != 0:
             return {"skipped": True, "reason": "not_a_git_repo"}
-        if _git("rev-parse", "--verify", "main").returncode != 0:
+        if _git("rev-parse", "--verify", trunk).returncode != 0:
             return {"skipped": True, "reason": "no_main_branch"}
     except (subprocess.SubprocessError, OSError):
         return {"skipped": True, "reason": "git_unavailable"}
@@ -338,7 +348,9 @@ def merge_audit(
     registered_ids = {t.get("id", "") for t in tasks}
     warnings: list[dict[str, Any]] = []
     try:
-        refs = _git("for-each-ref", "--format=%(refname:short)", "refs/heads/task/*")
+        refs = _git(
+            "for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch_prefix}*"
+        )
     except (subprocess.SubprocessError, OSError):
         return {"skipped": False, "warnings": warnings}
     branch_names = [
@@ -346,7 +358,7 @@ def merge_audit(
     ] if refs.returncode == 0 else []
 
     # 已并入 main 的分支集合（git branch --merged main 判定）：tip 为 main 祖先
-    merged_out = _git("branch", "--merged", "main")
+    merged_out = _git("branch", "--merged", trunk)
     merged_branches: set[str] = set()
     if merged_out.returncode == 0:
         for ln in merged_out.stdout.splitlines():
@@ -433,20 +445,25 @@ def merge_audit(
 
 
 def _is_ancestor_of_main(project_root: Path, sha: str) -> bool:
-    """main 是否已包含 sha（git merge-base --is-ancestor <sha> main，best-effort）。
+    """当前线 trunk 是否已包含 sha（``git merge-base --is-ancestor <sha> <trunk>``）。
+
+    task-line-audit-guide-wiring：trunk 按当前线解析（单线恒 main）。
 
     Args:
         project_root: 仓库根目录（git 命令 cwd，与 merge_audit 一致）。
         sha: 待判定的 commit SHA（resolve_sha）。
 
     Returns:
-        True：sha 是 main 的祖先（实现已并入 main）；False：未包含 / git 不可用。
+        True：sha 是 trunk 的祖先（实现已并入主干）；False：未包含 / git 不可用。
     """
     import subprocess
 
+    from orchd.line_ctx import resolve_trunk_for
+
+    trunk = resolve_trunk_for(project_root)
     try:
         proc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", sha, "main"],
+            ["git", "merge-base", "--is-ancestor", sha, trunk],
             cwd=str(project_root),
             capture_output=True,
             encoding="utf-8",
@@ -681,13 +698,9 @@ def intake_audit(project_root: Path) -> dict[str, Any]:
     dirty = list_tracked_changes(root)
     if dirty is None:
         return {"skipped": True, "reason": "git_unavailable"}
-    # 摄入产物白名单（两种布局，与 split._INTAKE_PRODUCT_FILES 对齐）
-    products = {
-        ".orchd/_master.json",
-        "IDEAS.md",
-        ".orchd/IDEAS.md",
-        "ROADMAP.md",
-    }
+    # 摄入产物白名单（task-inventory-honesty 起以 orchd.intake._INTAKE_PRODUCT_FILES
+    # 为单一真源，禁双写漂移；此前三处手写集合已分叉）。
+    from orchd.intake import _INTAKE_PRODUCT_FILES as products
     hit = sorted(f for f in dirty if f in products)
     warnings = [
         {

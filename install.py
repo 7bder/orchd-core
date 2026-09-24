@@ -105,6 +105,7 @@ _ORCHD_GITIGNORE = """\
 !/SKILL.md
 !/__main__.py
 !/rules/
+!/VERSION
 """
 
 # 工作区文档模板（安装即就位，免去宿主人工补建；已存在则不动，保护宿主内容）
@@ -176,11 +177,28 @@ git clone https://github.com/7bder/orchd-core.git"""
 
 
 def _enable_utf8_stdio() -> None:
-    """Windows 控制台按 GBK 解码 UTF-8 中文会乱码，强制 stdout 重配为 UTF-8。"""
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError, OSError):
-        pass
+    """Windows 控制台按 GBK 解码 UTF-8 中文会乱码，强制 stdio 重配为 UTF-8。
+
+    task-installer-hygiene（F5）：此前仅重配 stdout，stderr 的中文
+    （inventory 提示 / roadmap 处置 / ERROR 行）仍乱码——双流同配
+    （参照 orchd/cli/skeleton.py 双流模式）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def _shorten_list(items: list[str], limit: int = 10) -> str:
+    """长清单截断为 top-N + 省略计数（task-installer-hygiene，F5）。
+
+    参照 orchd/doctor.py [:10] + "..." 模式：人类可读输出只给前 N 个，
+    全量数组仍保留在结构化返回里可审计——刷屏与可审计兼得。
+    """
+    if len(items) <= limit:
+        return ", ".join(items)
+    return ", ".join(items[:limit]) + f"...（等共 {len(items)} 个，全量见返回数组）"
 
 
 def _find_first(candidates: list[Path]) -> Path:
@@ -262,12 +280,10 @@ def _check_engine_inventory(host: Path, orchd: Path) -> dict:
     missing = sorted(disk - tracked)
     if not missing:
         return {"checked": True, "missing": []}
-    hint = (
-        "升级新增的引擎文件未入库（.orchd/.gitignore 覆盖了 orchd/）："
-        "任务 worktree 是 git 纯净检出，缺文件即 done E999。请执行 "
-        + " ".join(["git", "add", "-f", *missing])
-        + " 后提交（-f 必需：忽略规则覆盖所致，非宿主失误）。"
-    )
+    # task-inventory-honesty（F2）：flat/unknown 与 container 用两套文案——
+    # flat 宿主不跟踪引擎完全合法（vendored 随安装器更新，不依赖 git 检出），
+    # 旧文案复用 container 的“缺文件即 E999 + git add -f”纯属误导，且与
+    # .orchd/.gitignore 的 /* 忽略契约自相冲突（-f 即覆盖本仓自立的忽略）。
     layout = "unknown"
     try:
         marker = orchd / ".layout.json"
@@ -279,14 +295,25 @@ def _check_engine_inventory(host: Path, orchd: Path) -> dict:
     except (OSError, ValueError):
         layout = "unknown"
     if layout == "container":
+        hint = (
+            "升级新增的引擎文件未入库（.orchd/.gitignore 覆盖了 orchd/）："
+            "任务 worktree 是 git 纯净检出，缺文件即 done E999。请执行 "
+            "git add -f .orchd/orchd/ 后提交（整目录加 -f，一次收敛全部新增；"
+            "-f 必需：忽略规则覆盖所致，非宿主失误）。"
+        )
         raise RuntimeError(
             "入库完整性断言失败：container 布局下 %d 个引擎文件在盘不在库%s：%s"
-            % (len(missing), "（worktree 纯净检出必缺文件）", ", ".join(missing))
+            % (len(missing), "（worktree 纯净检出必缺文件）", _shorten_list(missing))
             + "。" + hint
         )
+    hint = (
+        "flat/未知布局下 %d 个引擎文件在盘不在库，属合法状态，无需处理"
+        "（flat 宿主不跟踪 .orchd/orchd/，引擎随安装器更新；切勿强行入库"
+        "——那会覆盖本仓 .orchd/.gitignore 的忽略契约）：%s"
+        % (len(missing), _shorten_list(missing))
+    )
     try:
-        print(f"orchd ▸ [inventory] 警告：{len(missing)} 个引擎文件未入库："
-              f"{', '.join(missing)}", file=sys.stderr)
+        print(f"orchd ▸ [inventory] 提示：{hint}", file=sys.stderr)
     except OSError:
         pass
     return {"checked": True, "missing": missing, "warning": "flat_layout_untracked_engine",
@@ -316,6 +343,21 @@ def _assemble_assets(orchd: Path) -> None:
     _clean_pycache(orchd)
 
 
+def _next_step_text(orchd: Path, mode: str) -> str:
+    """安装下一步指引（task-intake-hint-phase）：按 ``_master.json`` 是否存在分流，
+    与 ``orchd/guide.py::first_time_guide(has_master)`` 同语义——新项目走
+    bootstrap → init，老项目（update 后 master 仍在）走 status / validate 正路。
+
+    注：安装器独立运行、无 orchd 依赖，故为语义同源（非代码同源），由
+    ``tests/test_intake_hint_phase.py`` 双边断言锁死一致（改一端即红）。
+    """
+    if (orchd / "_master.json").exists():
+        return ("python .orchd/__main__.py status 查看项目状态（或 validate 校验），"
+                "随后 request/claim 领取任务")
+    return ("python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
+            "（与 guidance first_time 卡片 steps 顺序一致）")
+
+
 def _install(host: Path, update: bool, force: bool) -> dict:
     """按目标状态执行安装，返回结果字典。"""
     orchd = host / ".orchd"
@@ -343,6 +385,7 @@ def _install(host: Path, update: bool, force: bool) -> dict:
     # roadmap 为 ROADMAP 处置记录（旧布局迁移 / 保留 / 模板）——结构化透出，无静默分支
     skeleton, roadmap = _mk_skeleton(orchd, host)
     gitignore = _write_orchd_gitignore(orchd)
+    version = _write_engine_version(orchd)
 
     agents_entry = _ensure_agents_entry(host)
     hooks_path = _ensure_repo_hooks(host)
@@ -360,11 +403,9 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "skeleton": skeleton,
         "roadmap": roadmap,
         "gitignore": gitignore,
+        "version": version,
         "inventory": inventory,
-        "next": (
-            "python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
-            "（与 guidance first_time 卡片 steps 顺序一致）"
-        ),
+        "next": _next_step_text(orchd, mode),
     }
 
 
@@ -507,6 +548,48 @@ def _roadmap_disposition(host: Path) -> tuple[str, dict]:
     )
     _log_roadmap_disposition(record)
     return "migrated_from_legacy", record
+
+
+def _resolve_engine_version() -> str:
+    """解析引擎源码版本（task-installer-hygiene，F1：版本可自证）。
+
+    三级回退（best-effort，永不抛异常）：已安装分发元数据 →
+    源码 git tag（``git describe --tags --always`` 于 RESOURCE_ROOT）→
+    ``0.0.0.dev0``。调用方落盘为 ``.orchd/VERSION``（安装收据），
+    ``--version`` 经该文件回退（见 orchd/cli/parser.py）。
+    """
+    try:
+        import importlib.metadata as _md
+
+        return _md.version("orchd")
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(RESOURCE_ROOT), "describe", "--tags", "--always"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        tag = (proc.stdout or "").strip()
+        if proc.returncode == 0 and tag:
+            return tag
+    except Exception:
+        pass
+    return "0.0.0.dev0"
+
+
+def _write_engine_version(orchd: Path) -> str:
+    """落盘 ``.orchd/VERSION``（幂等覆写：版本收据恒为本次安装源版本）。
+
+    Returns:
+        本次解析到的版本字符串（同 ``_resolve_engine_version``）。
+    """
+    version = _resolve_engine_version()
+    try:
+        (orchd / "VERSION").write_text(version + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return version
 
 
 def _write_orchd_gitignore(orchd: Path) -> str:

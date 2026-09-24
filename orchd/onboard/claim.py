@@ -29,6 +29,7 @@ from orchd.gitops import (
     run_guard,
 )
 from orchd.gitops_ops import make_event as _make_event, try_git_branch as _try_git_branch
+from orchd.line_ctx import resolve_task_branch_for
 from orchd.ledger import (
     Store,
     TaskDerived,
@@ -407,7 +408,7 @@ def _claim_write_event(
                 raise OrchdError(ErrorCode.E008, f"task_not_in_review: '{task_id}' status={status} review_phase={ts.review_phase if ts else None}", [{"task_id": task_id, "current_status": status, "review_phase": ts.review_phase if ts else None, "hint": f"任务未进入审查（当前 {status}），需 in_review 且 review_phase={ts.review_phase if ts else 'spec'} 再 claim"}])
             cur_phase = (ts.review_phase if ts else None) or "spec"
             if review_type and review_type != cur_phase:
-                raise OrchdError(ErrorCode.E007, f"phase_mismatch {cur_phase}", [{"task_id": task_id}])
+                raise OrchdError(ErrorCode.E007, f"phase_mismatch {cur_phase}", [{"task_id": task_id, "expected_phase": cur_phase, "got_phase": review_type, "current_status": status, "hint": f"审查阶段不匹配：任务处于 {cur_phase} 阶段，你指定的是 {review_type}（unified 单阶段须省略 --type；文档类单阶段直接进 code）。当前状态 {status}，需 in_review 再 claim"}])
             designated = task_def.get("reviewers", [])
             if agent_id not in designated and not _is_fingerprint_agent_id(agent_id):
                 raise OrchdError(ErrorCode.E007, f"not_designated_reviewer: '{agent_id}' 不在任务 '{task_id}' 的 reviewers 名单中", [{"task_id": task_id, "agent": agent_id, "reviewers": designated, "hint": "请使用名单内的 agent ID"}])
@@ -419,7 +420,10 @@ def _claim_write_event(
             is_self = _is_self_review_author(
                 _find_last_done_event(store, task_id, derived), agent_id, session_id
             )
-            if is_self and enforce_self_review_block:
+            # task-review-independence-enforce：任务级独立审查与全局开关 OR——
+            # 任一为 true 即 E016 硬阻断；缺省两者皆 false 保持仅标注行为不变。
+            _require_independent = bool(task_def.get("require_independent_review", False))
+            if is_self and (enforce_self_review_block or _require_independent):
                 raise OrchdError(ErrorCode.E016, "self_review", [{"task_id": task_id, "done_by": done_author}])
             if is_self:
                 is_self_review = True
@@ -671,7 +675,7 @@ def _claim_review_branch(
     def _diag() -> dict[str, Any]:
         if project_root is None:
             raise NotApplicableError("no root")
-        exists = branch_exists(project_root, f"task/{task_id}")
+        exists = branch_exists(project_root, resolve_task_branch_for(project_root, task_id))
         if exists is None:
             raise RuntimeError("git fail")
         if not exists:
@@ -747,7 +751,7 @@ def claim(
     pending_conflicts = [{"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by} for c in detect_file_conflict(state, tasks, task_def, include_pending=True) if c.claimed_by == "pending"]
     # task-amend-scope-add：claim 连带文件预警（与 claim_preview 共用 build_scope_warning 单一来源）
     scope_warning = build_scope_warning(task_def, project_root=project_root)
-    result = {"claimed": True, "task": task_def, "files_to_read": files_to_read, "files_to_edit": task_def.get("files_to_edit", []), "review_comments": _extract_review_comments(store, task_id, derived), "previous_changes": previous_changes, "branch": f"task/{task_id}", "pending_conflicts": pending_conflicts, "event_id": event["event_id"]}
+    result = {"claimed": True, "task": task_def, "files_to_read": files_to_read, "files_to_edit": task_def.get("files_to_edit", []), "review_comments": _extract_review_comments(store, task_id, derived), "previous_changes": previous_changes, "branch": resolve_task_branch_for(project_root, task_id), "pending_conflicts": pending_conflicts, "event_id": event["event_id"]}
     if scope_warning:
         result["scope_warning"] = scope_warning
     if role == "implementer" and worktree_path is not None:

@@ -43,6 +43,29 @@
             "two_phase"
           ],
           "description": "审查模式（review-unify-r2）：unified=单阶段一次 APPROVED 即 merge；two_phase=两阶段（spec→code）。缺省 two_phase（观察期兼容）。"
+        },
+        "default_line": {
+          "type": "string",
+          "minLength": 1,
+          "description": "默认线名（可选，须为 lines 的键；缺省取 lines 首个键）。多主干 line 规划，见 design/line-split-design-20260923.md。"
+        },
+        "lines": {
+          "type": "object",
+          "description": "多主干（line）登记：line 名 → {trunk}。缺省 = 单线（仅 default，trunk=main）。trunk 拓扑属契约「明确不冻结」项（docs/kernel-contract.md §3）。",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "trunk"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "trunk": {
+                "type": "string",
+                "minLength": 1,
+                "description": "该线的权威主干分支引用。"
+              }
+            }
+          }
         }
       }
     },
@@ -209,6 +232,11 @@
               "type": "string"
             },
             "description": "审查者 agent ID 列表。task-fp-schema-reviewers 起不再必填；新的身份模型由会话指纹 + 防自审判定，审查者不再预写（存量任务已清理，字段仅为向后兼容保留）。"
+          },
+          "require_independent_review": {
+            "type": "boolean",
+            "default": false,
+            "description": "可选。true 时该任务的审查必须异指纹：claim review 在 DONE 实现指纹 == 当前会话时抛 E016（与 config.enforce_self_review_block=true 同效）；request 将其从自审候选排除。缺省 false（仅 self_review_notice 标注）。不触碰 required 字段与既有枚举语义。"
           },
           "verify_command": {
             "type": "string",
@@ -386,6 +414,27 @@
             "default": [],
             "uniqueItems": true,
             "description": "附加来源列表（可选，task-idea-multi-source-attribution）。一个任务承接多个 idea 时，除主 source 外的次级引用列于此。格式与 source 相同，E025 按与 source 相同口径逐条校验；ideas-archive 归档匹配同时覆盖 source 与 additional_sources（任一命中即随任务完结归档）。加法式：不动既有单值 source 语义。"
+          },
+          "backport": {
+            "type": "object",
+            "description": "跨线回移元数据（可选，task-line-sync）：记录该任务由 line-sync 从源线提交回移而来。source_sha 为完整 commit sha（git rev-parse 归一）；source_line 为源线名。与 line-drill.json 的 backport 字段同构（审计/演练留痕）。",
+            "required": [
+              "source_sha",
+              "source_line"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "source_sha": {
+                "type": "string",
+                "minLength": 1,
+                "description": "源提交完整 sha。"
+              },
+              "source_line": {
+                "type": "string",
+                "minLength": 1,
+                "description": "源线名（project.lines 的键）。"
+              }
+            }
           }
         }
       }
