@@ -23,7 +23,7 @@ guide:
   - 与 amend 同受红线约束：只在**主工作树**（default 分支）执行，任务分支调用拒绝注册
 - **claim 前提**：处于 main 且工作区干净（**"干净"= 无已跟踪文件改动；untracked 工具/配置文件不阻塞**）；引擎从当前 HEAD 建分支，上个任务未 merge 归还会导致 base 错误
 - **审查者**：领取前确认处于对应 task 分支且工作区干净；审查对象是分支上的已提交 diff
-- **本地提交自主执行**：任务分支上的 `git commit` 是协议动作，agent 直接执行、无需管理员确认（纪律红线唯一豁免的手动 git 命令）；只提交协议范围内（files_to_edit）改动，不 push
+- **本地提交自主执行**：任务分支上的 `git commit` 是协议动作，agent 直接执行、无需管理员确认（纪律红线豁免之一的手动 git 命令；另一豁免为任务分支 `orchd git merge main` 受管出口，见 TL;DR）；只提交协议范围内（files_to_edit）改动，不 push
 - **不 push**：远端推送不在 agent 职责内，由项目管理员负责
 - **L3 pre-commit hook 生命周期**（2026-08-08 语义升级）：claim 时安装到真实仓库 `.git/hooks/pre-commit`，**任务活跃时任何分支**都校验 staged ⊆ files_to_edit ∪ exempt_files（堵住 main/幽灵分支越界提交实现内容）；任务未活跃（无 CLAIMED/REVIEW_CLAIMED，或已 DONE/RETRACT/REVIEW_SUBMITTED）→ 放行；`--no-verify` 可绕过。**固定资产豁免（完整枚举）**：`.orchd/_master.json`、`IDEAS.md`、`.orchd/IDEAS.md`、`ROADMAP.md`（宿主根唯一源、纳入 git）。注：`.orchd/ROADMAP.md` 已非合法形态，**不在豁免表**——提交该路径会被 E020 拦（防残留副本被当固定资产放行；双向用例见 tests/test_gitops.py::test_hook_rejects_legacy_roadmap_in_orchd 与 ::test_hook_exempts_roadmap_at_host_root）。**exempt_files 豁免（2026-08-08 新增）**：任务定义可声明 `exempt_files`（必要连带文件，如新增错误码连带更新的 `tests/test_errors.py` 断言），claim 安装期即随 hook 生效（staged 文件 ∈ exempt_files 放行）；豁免文件**引擎 ensure_committed 不兜底提交**——实现者须自行 git commit，done 后 `require_clean` E017 兜底。done 执行 verify_command 前临时卸载、verify 后重装（避免 verify 期间真实仓库 git 操作被误伤），done 末尾 / retract 真正卸载。**强制层生命周期（task-ref-tx-hook，2026-09-21）**：`reference-transaction` hook 与 pre-commit 同进退——claim 期安装，retract / force-status 卸载；任务正常完成（done→review→merge）后保持生效（无任务在跑时仓库仍处强制层，属承接既有语义，需知晓）；运行时产物（`.githooks/pre-commit`、`.githooks/reference-transaction`）在 `.gitignore` 忽略，git status 不显。
 - **多 worktree 并行（1.4，multi-worktree-m-p1，2026-08-22）**：仓库开多个 worktree 并行时——**任务 worktree 全生命周期由引擎自动管理**（claim 自动创建 + 绑定 `session-worktrees.json`、终态自动回收、孤儿惰性清理），agent **零 worktree 管理操作**；任务 worktree **独立 checkout 各自 `task/{id}` 分支**实现（互不干扰）；**agent 不碰 main**——merge 由引擎在**主工作树**内执行（`main_worktree_root` 定位，专用 merge-wt 已废弃删除，见 gitops_ops.try_git_merge），任务 worktree **永不 checkout main**（规避 git 单分支单 worktree checkout 硬限制）；账本（container 默认 `<容器>/.orchd-runtime/`，可 `ORCHD_HOME` 重定向；flat 维持 `.orchd/` 零回归）**全局共享**，各 worktree 的 agent 状态一致，并发写由**统一排他文件锁原语（ExclusiveFileLock）**兜底——存储层 `.lock` 基于 flock（内核托管，进程退出自动释放），append/checkpoint 写原子化 + E011 任务级忙度锁（agent 一次一任务）；并发 merge 以主工作树锁串行；依赖链保持完成级串行（E008）；单 worktree（默认 flat）不建独立任务 worktree，行为与以往完全一致（零回归）
@@ -34,7 +34,7 @@ guide:
 
 **承载方式（可持续性红线：git 体积不随事件总数膨胀）**：
 
-- 专用账本 ref `refs/heads/orchd/ledger`（本地 + 远端同名），**单提交**、`--force-with-lease` 推送——旧对象由 `git gc` 回收，git 体积收敛到「当前内容」而非「全部历史」；
+- 专用账本 ref `refs/heads/orchd/ledger`（本地 + 远端同名），**单提交**、`--force-with-lease` 推送——旧对象由 `git gc` 回收（机制描述，非执行指令），git 体积收敛到「当前内容」而非「全部历史」；
 - ref tree 只含两个文件，尺寸均有界：
   - `state.json` — 紧凑任务状态表，**O(任务数)**：每任务 `status / review_phase / claimed_by / claimed_session / review_claimed_at / attempt_count / updated_event_id`；
   - `delta.jsonl` — 自上次 `sync` 以来未归档事件尾，**有界于同步间隔**，`--compact` 归并入 state 后清空；
@@ -55,7 +55,7 @@ python .orchd/__main__.py sync --remote <name>  # 指定远端名（默认 origi
 - **pull-first + event_id 去重合并**：pull/compact 先 fetch 远端 ref，远端 `delta.jsonl` 中本地缺失事件按 `(timestamp)` 确定性稳定排序合并进本地账本，再重建 checkpoint；重复 pull/sync 幂等；
 - **并发仲裁**：两机对同一任务并发写入时，以合并后事件的确定性全局序为准（时间戳稳定排序 + event_id 去重），不丢他端事件；push 用 `--force-with-lease` CAS——远端被并行推进则拒绝，pull-first 重试兜底；
 - **首次 push 保守全量**：本地 marker（`.ledger_sync_marker.json`）缺失时全量推送，push 成功后记录末位事件 id，后续 push 仅推增量；
-- **gc 说明**：`orchd sync` 本身不触发 `git gc`；体积收敛依赖旧对象回收，可在合适时机手动执行 `git gc --prune=now`（或默认 expiration 策略），不改变远端 hook 行为。
+- **gc 说明**：`orchd sync` 本身不触发 `git gc`；体积收敛依赖 git 自动回收旧对象（默认 expiration 策略），不改变远端 hook 行为。**禁止手动执行 `git gc --prune=now`**（红线：禁破坏性 git，无豁免）。
 
 **触发纪律**：sync 为**显式**命令，agent 或人在需要跨设备共享进度时手动触发；不进入引擎热路径（claim/done/review 等不隐式调用）。
 

@@ -21,6 +21,7 @@ task-line-trunk：任务分支 fork / merge 目标 / 对账基线按**当前线*
 from __future__ import annotations
 
 import os
+import sys
 import re
 import subprocess
 import threading
@@ -748,6 +749,22 @@ def _run_union_verify(
     import tempfile
 
     if verify_command:
+        # F2（pass9 评审，task-pass9-union-verify-gate）：接入与 done/amend 路径
+        # 同源的危险命令门禁——本路径把任务提供的 verify_command 以 shell=True
+        # 在主工作区执行，此前完全绕过 verify_command_dangerous_reasons（同一
+        # 字符串走 done 被拦 E027、走 union 被执行）。对原始串（变量替换前）
+        # 同口径扫描：非零 reasons 即拒绝执行，返回 verify 失败 → 既有
+        # merge --abort → E015 链路；stderr 留痕供审计。
+        from orchd.spec import verify_command_dangerous_reasons
+
+        _dangerous = verify_command_dangerous_reasons(verify_command)
+        if _dangerous:
+            print(
+                "[orchd union-verify] verify_command 含 shell 注入风险，拒绝执行："
+                f"{_dangerous}",
+                file=sys.stderr,
+            )
+            return False
         # 替换 shell 变量为实际值，避免 Windows 下不兼容
         tmpdir = tempfile.gettempdir()
         cmd = verify_command.replace("${TMPDIR:-/tmp}", tmpdir)

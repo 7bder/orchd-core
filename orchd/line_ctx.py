@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -34,28 +36,61 @@ from orchd.line import (
 _CACHE: dict[str, tuple[int, int, Mapping[str, Any]]] = {}
 
 
+def _log_line_degrade(reason: str, context: dict[str, Any]) -> None:
+    """线解析降级留痕（pass8 F7 收口）。
+
+    master 缺失 / 不可解析时回退单线默认不再静默：stderr 落一条
+    ``orchd ▸ [line-degrade]`` 结构化行（与 session-lock 留痕同型）。
+    best-effort：任何异常静默跳过，不阻断回退主流程；健康仓库（master
+    可读）永不触发，零噪音。
+    """
+    try:
+        _reconfigure = getattr(sys.stderr, "reconfigure", None)
+        if callable(_reconfigure):
+            try:
+                _reconfigure(encoding="utf-8")
+            except (AttributeError, ValueError, OSError):
+                pass
+        record = {"action": reason, **context}
+        print(
+            f"orchd ▸ [line-degrade] {json.dumps(record, ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
 def _master_path(project_root: Path | str | None) -> Path | None:
     """解析 canonical ``_master.json`` 路径（本地优先 → 主工作树回退）；None → None。"""
     if project_root is None:
         return None
     try:
         from orchd.worktree import resolve_master_path_from_dir
-    except Exception:  # noqa: BLE001 - 环境异常一律降级单线默认
+    except Exception:  # noqa: BLE001 - 环境异常一律降级单线默认（已留痕）
+        _log_line_degrade("master_resolve_import_failed",
+                          {"project_root": str(project_root)})
         return None
     try:
         return resolve_master_path_from_dir(Path(project_root) / ".orchd")
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - 解析失败降级单线默认（已留痕）
+        _log_line_degrade("master_resolve_failed",
+                          {"project_root": str(project_root)})
         return None
 
 
 def _project_for(project_root: Path | str | None) -> Mapping[str, Any] | None:
     """加载 master 的 ``project`` 段（带 (mtime, size) 缓存）；不可用 → ``None``。"""
     path = _master_path(project_root)
-    if path is None or not path.is_file():
+    if path is None:
+        # _master_path 内部已对自身失败留痕（project_root 非空时）；此处不重复
+        return None
+    if not path.is_file():
+        _log_line_degrade("master_missing", {"master_path": str(path)})
         return None
     try:
         stat = path.stat()
     except OSError:
+        _log_line_degrade("master_stat_failed", {"master_path": str(path)})
         return None
     key = str(path)
     cached = _CACHE.get(key)
@@ -65,9 +100,11 @@ def _project_for(project_root: Path | str | None) -> Mapping[str, Any] | None:
         from orchd.spec import load_master
 
         project = load_master(path).project
-    except Exception:  # noqa: BLE001 - 解析失败按无配置处理（单线默认）
+    except Exception:  # noqa: BLE001 - 解析失败按无配置处理（单线默认，已留痕）
+        _log_line_degrade("master_parse_failed", {"master_path": str(path)})
         return None
     if not isinstance(project, Mapping):
+        _log_line_degrade("master_project_not_mapping", {"master_path": str(path)})
         return None
     _CACHE[key] = (stat.st_mtime_ns, stat.st_size, project)
     return project

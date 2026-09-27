@@ -392,7 +392,7 @@ acceptance_criteria:                    对应测试策略:
 
 **冲突预防规则**：如果两个任务逻辑上需要修改同一文件，要么建立 depends_on（串行），要么将共享修改提取为独立的上游任务。
 
-> **2026-08-08 语义更新**：`amend` 不再拒绝冲突注册（仅返回 `conflict_warnings` warning）。冲突硬边界在 `request` 依赖感知强制过滤——与 pending/claimed **非依赖**任务冲突的候选会被硬排除（`excluded_conflicts`），依赖链（祖先/子孙）上共享文件的任务放行（`conflict_with`）。因此本规则的意图由引擎在领取阶段自动执行：未按 depends_on 串行化的共享文件任务对，第二个将无法被领取（直至冲突解除）。
+> **2026-08-08 语义更新**：`amend` 不再拒绝冲突注册（仅返回 `conflict_warnings` warning）。冲突边界在 `request` 依赖感知强制过滤——与 **claimed** 非依赖任务冲突的候选会被硬排除（`excluded_conflicts`）；与 **pending** 非依赖任务冲突的候选为**软提示**（`candidate_conflicts` 注解 + 降权排序，不排除），依赖链（祖先/子孙）上共享文件的任务放行（`conflict_with`）。因此本规则的意图主要靠拆解期 depends_on 规划执行：未按 depends_on 串行化的共享文件任务对在**都还 pending** 时可以先后领取（引擎仅提示 + 降权），拆解者应按 §冲突预防规则主动串行化或合并；claimed 硬排除与在途 policy 分流仍由引擎强制（2026-09-27 对齐实现，task-pass9-conflict-docs-align）。
 >
 > **2026-09-12 更新（task-inflight-conflict-visibility）**：冲突视野补齐「**在途**」——分支上已有改动、尚未落 main 的任务（含 done / in_review / force-status 悬空态），以 **git 事实**判定而非状态字段（此前刚 done 未 merge 的任务会逃出视野，实测数十秒盲区）。在途重叠按 `config.conflict_policy` 分流：缺省 `warn` = 仅加 `conflict_with`（`source=inflight`）+ 降权排序，**不阻断**；`serialize` / `block` 才硬排除。因此**拆解期不必为"在途重叠"额外串行化**，串行化要求仍聚焦 claimed / pending 声明文件重叠；同时 `files_to_edit` / `exempt_files` 必须枚举具体文件路径（禁目录式声明与通配），否则冲突检测漏检、E010 误报。**形态硬校验（task-decl-dir-notation-guard，E003 拒绝注册）的覆盖面仅限 `files_to_edit` / `exempt_files`**——`files_to_read` 不受此约束（见 §6.2）。
 

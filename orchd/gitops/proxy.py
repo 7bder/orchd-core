@@ -57,7 +57,7 @@ from typing import Any
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops._const import _GIT_ENCODING, _GIT_ERRORS, _GIT_TIMEOUT
 from orchd.gitops.query import check_workspace_state
-from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+from orchd.line_ctx import resolve_trunk_for
 
 # ------------------------------------------------------------------
 # 分类表
@@ -115,6 +115,21 @@ CONDITIONAL_READ_FLAGS: dict[str, frozenset[str]] = {
     "notes": frozenset({"list", "show"}),
     "submodule": frozenset({"status", "summary"}),
     "reflog": frozenset({"show"}),
+}
+
+# 取值旗标：后随位置参数被该旗标成对消费（另支持 ``--flag=val`` 内联形态）。
+# 展示旗标（``-v/-vv/-l/--list`` 等）后跟裸名不属此列——裸名在 branch 下恒为
+# 创建语义（``branch -v mybranch`` 真建分支，pass8 F1），必须判写。
+_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "branch": frozenset({
+        "--contains", "--points-at", "--merged", "--no-merged",
+        "--format", "--sort", "--column",
+    }),
+    "tag": frozenset({
+        "--contains", "--points-at", "--merged", "--no-merged",
+        "--format", "--sort", "-n",
+    }),
+    "config": frozenset({"--get", "--get-all", "--get-regexp"}),
 }
 
 # 无参即只读列举的子命令（``git branch`` / ``git tag`` / ``git reflog``）
@@ -238,14 +253,17 @@ _WRITE_SUBCOMMANDS: dict[str, str] = {
 
 
 def _is_read_variant(subcommand: str, rest: list[str]) -> bool:
-    """双形态子命令的**只读形态**判定（task-proxy-read-strict，N4）。
+    """双形态子命令的**只读形态**判定（task-proxy-read-strict，N4；
+    pass8 F1 收口位置参数变体）。
 
-    fail-closed 三段式（任一不满足即写操作）：
+    fail-closed（任一不满足即写操作）：
     1. 所有 ``-`` 旗标必须命中只读白名单（未知旗标即拒绝）；
     2. 任何已知写动词/写旗标（``-d/-D/-m/add/push/--edit-description`` 等）
        出现即拒绝——位置参数不能假设中性；
-    3. 无旗标时：仅白名单动词本身可独立成读（如 ``stash list``）；裸位置
-       参数（``branch main`` 实为创建分支）一律拒绝。
+    3. 位置参数必须被取值旗标成对消费（``--points-at HEAD``、
+       ``--format=x`` 内联形态亦可；tag 的 ``-l/--list`` 后 pattern 除外）——
+       展示旗标（``-v/-vv/-l/--list`` 等）后跟裸名（``branch -v mybranch``
+       真建分支）一律拒绝；``--`` 之后一切皆位置参数。
 
     旧 ``any()`` 任一命中即放行，``branch -v --edit-description`` 等混合形态
     逃逸为只读，违背自身 fail-closed 承诺。无参列举保持原语义。
@@ -255,20 +273,53 @@ def _is_read_variant(subcommand: str, rest: list[str]) -> bool:
         return False
     if not rest:
         return subcommand in _BARE_READ_SUBCOMMANDS
+    value_flags = _VALUE_FLAGS.get(subcommand, frozenset())
+    tag_pattern = subcommand == "tag"
+    seen_list_flag = False
     has_flag = False
-    for arg in rest:
+    after_dashdash = False
+    i, n = 0, len(rest)
+    while i < n:
+        arg = rest[i]
+        if after_dashdash:
+            # ``--`` 之后一切皆位置参数 → 写操作
+            return False
         if arg == "--":
+            after_dashdash = True
+            i += 1
             continue
         if arg.startswith("-"):
             has_flag = True
-            if arg not in allowed:
+            name, eq, _val = arg.partition("=")
+            if name not in allowed:
                 return False
+            if eq and name not in value_flags:
+                # ``--flag=val`` 内联形态仅取值旗标可消费
+                return False
+            if name in ("-l", "--list"):
+                seen_list_flag = True
+            if name in value_flags and not eq:
+                # 成对消费后随位置参数；行末缺值时 git 以 HEAD 为缺省
+                # （``branch --merged`` 即查已合入 HEAD），保持放行；
+                # 被消费值不得以 `-` 开头（git 自身亦按旗标解析，防逃逸）。
+                if i + 1 < n and rest[i + 1].startswith("-"):
+                    return False
+                i += 2
+                continue
         elif arg in _WRITE_TOKENS:
             return False
         elif not has_flag and arg not in allowed:
             # 无旗标的裸位置参数：白名单动词（如 list）除外一律拒绝
             # （branch main / config user.name x 皆为写操作）。
             return False
+        elif tag_pattern and seen_list_flag:
+            # tag 的 list pattern（``tag -l v1*``）：展示查询，保持放行
+            pass
+        elif subcommand in ("branch", "tag", "config"):
+            # 展示旗标后跟裸名（branch -v mybranch 真建分支）一律拒绝；
+            # config 的取值须由 --get 系消费（上分支已处理），余者拒绝。
+            return False
+        i += 1
     return True
 
 
@@ -285,6 +336,27 @@ def _merge_passthrough_forms(trunk: str) -> tuple[tuple[str, ...], ...]:
 def _is_merge_passthrough(rest: list[str], trunk: str = "main") -> bool:
     """是否为受管 merge 出口精确形态（与当前分支无关，分支在执行层判定）。"""
     return tuple(rest) in _merge_passthrough_forms(trunk)
+
+
+# pass9 F17（task-pass9-gitops-read-boundary）：纯读族旗标黑名单——这些旗标让
+# 「只读」子命令产生执行 / 写文件副作用，命中即判写拒绝：
+# - --ext-diff：执行仓库配置/属性指定的外部 diff 驱动（任意命令执行面）；
+# - --output / -O：diff/log 输出重定向到任意路径（写文件面）。
+# 形态覆盖：--opt、--opt=val、-Oval（粘连）；``--`` 之后为 pathspec，扫描终止。
+# argv 列表透传本身无注入，其余读旗标保持开放（超集态不受影响）。
+_READ_DENY_NAMES = ("--ext-diff", "--output", "-O")
+
+
+def _has_read_denied_flag(rest: list[str]) -> bool:
+    for arg in rest:
+        if arg == "--":
+            return False
+        name = arg.split("=", 1)[0]
+        if name in _READ_DENY_NAMES:
+            return True
+        if name.startswith("-") and not name.startswith("--") and name.startswith("-O"):
+            return True
+    return False
 
 
 def classify_git_argv(argv: list[str] | None, trunk: str = "main") -> dict[str, Any]:
@@ -330,6 +402,17 @@ def classify_git_argv(argv: list[str] | None, trunk: str = "main") -> dict[str, 
             "reason": f"任务分支 merge {trunk} 精确形态是红线 #1 豁免二（受管出口）",
         }
     if subcommand in READ_ONLY_SUBCOMMANDS:
+        if _has_read_denied_flag(rest):
+            return {
+                "subcommand": subcommand,
+                "rest": rest,
+                "kind": "write",
+                "family": "write",
+                "reason": (
+                    f"只读子命令 {subcommand} 携带执行/写文件旗标"
+                    "（--ext-diff / --output / -O）：只读透传拒绝"
+                ),
+            }
         return {
             "subcommand": subcommand,
             "rest": rest,
@@ -504,7 +587,8 @@ def _proxy_commit(project_root: Path, args: list[str], cls: dict[str, Any]) -> d
     """任务分支 commit 放行（红线 #1 豁免一）；非任务分支 → E018。"""
     state = check_workspace_state(project_root)
     branch = state.get("branch")
-    task_prefix = resolve_task_branch_for(project_root, "")
+    # 单根命名空间（pass8 F1-A）：任务分支恒以 task/ 为根，全线通用常量
+    task_prefix = "task/"
     if not branch or not str(branch).startswith(task_prefix):
         raise OrchdError(
             ErrorCode.E018,
@@ -532,7 +616,8 @@ def _proxy_merge(project_root: Path, args: list[str], cls: dict[str, Any]) -> di
     """
     state = check_workspace_state(project_root)
     branch = state.get("branch")
-    task_prefix = resolve_task_branch_for(project_root, "")
+    # 单根命名空间（pass8 F1-A）：同 commit 豁免常量
+    task_prefix = "task/"
     if not branch or not str(branch).startswith(task_prefix):
         raise OrchdError(
             ErrorCode.E018,

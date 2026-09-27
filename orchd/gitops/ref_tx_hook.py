@@ -222,6 +222,9 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
 
     拿不到结论（非 git / 对象缺失 / git 不可用）时返回 True（**放行**）——强制层
     优先不打断引擎流程；非快进判定的兜底由 ``classify_update`` 的显式分支承担。
+    task-pass9-ref-tx-sync-hardening（pass9 F8）：indeterminate 时 stderr 留痕——
+    此前 git 出错/超时静默放行，非快进保护失效无迹可查；告警不改变放行语义
+    （fail-closed 会打断合法流程），只保证「保护失效」可观测。
     """
     import subprocess
 
@@ -231,12 +234,22 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
                 ["git", "-C", str(project_root), "merge-base", "--is-ancestor", old, new],
                 capture_output=True, timeout=15,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(
+                f"[orchd ref-tx] 非快进判定不可用（git 异常：{type(exc).__name__}），"
+                "本次放行（留痕）",
+                file=sys.stderr,
+            )
             return True
         if proc.returncode == 0:
             return True
         if proc.returncode == 1:
             return False
+        print(
+            f"[orchd ref-tx] 非快进判定不可用（git 退出码 {proc.returncode}），"
+            "本次放行（留痕）",
+            file=sys.stderr,
+        )
         return True
 
     return _check
@@ -285,6 +298,46 @@ def _resolve_default_branch(project_root: Path) -> str:
     return _FALLBACK_DEFAULT_BRANCH
 
 
+def _maybe_warn_unbaked_multiline(project_root: Path) -> None:
+    """多线已启用但 hook env 未烘焙时 stderr 留痕（可观测，不阻断）。
+
+    pass7 P1-4 残留收口：运行时不直读 project.lines 做判定（hook 最小依赖），
+    但“后启用多线未重装 → 回退单线口径”是静默的。在此 best-effort 探测并提示
+    重装，任何异常静默跳过，永不影响放行/拒绝 verdict。
+    """
+    if os.environ.get("ORCHD_LINE_TRUNK") or os.environ.get("ORCHD_LINE_TASK_PREFIX"):
+        return
+    try:
+        import json
+
+        candidates = [
+            project_root / ".orchd" / "_master.json",
+            project_root / "main" / ".orchd" / "_master.json",
+            project_root.parent / ".orchd" / "_master.json",
+            project_root.parent / "main" / ".orchd" / "_master.json",
+        ]
+        # task-pass9-ref-tx-sync-hardening（pass9 F19）：return 原在循环体内，
+        # 只检查首个可解析候选；改为扫描全部候选、命中即告警一次。
+        warned = False
+        for cand in candidates:
+            try:
+                raw = json.loads(cand.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            project = raw.get("project", {}) if isinstance(raw, dict) else {}
+            lines = project.get("lines", {}) if isinstance(project, dict) else {}
+            if isinstance(lines, dict) and lines and not warned:
+                print(
+                    "[orchd ref-tx] 多线项目但 ORCHD_LINE_TRUNK/PREFIX 未烘焙："
+                    "当前按单线回退判定，请重装 hook（orchd --agent）后再试",
+                    file=sys.stderr,
+                )
+                warned = True
+        return
+    except Exception:  # noqa: BLE001 - 观测通道永不抛错
+        return
+
+
 def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int:
     """hook 入口：返回 0 放行 / 1 拒绝（非零仅在 prepared 阶段有意义）。
 
@@ -304,6 +357,7 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int
     if not updates:
         return 0
     project_root = Path.cwd()
+    _maybe_warn_unbaked_multiline(project_root)
     # task-line-ref-tx-per-line：多线下命名空间前缀与 trunk 由**安装期烘焙 env** 提供
     # （未启用多线时不烘焙 → 与历史口径逐字一致，零额外 git 子进程）。
     line_prefix = os.environ.get("ORCHD_LINE_TASK_PREFIX") or TASK_PREFIX

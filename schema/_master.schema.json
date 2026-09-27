@@ -125,21 +125,29 @@
           "id": {
             "type": "string",
             "pattern": "^task-[a-z0-9-]+$",
-            "description": "任务 ID，格式 task-{name}。"
+            "description": "任务 ID，格式 task-{name}。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "name": {
             "type": "string",
             "minLength": 1,
-            "description": "任务名称。"
+            "description": "任务名称。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "brief": {
             "type": "string",
             "minLength": 1,
-            "description": "任务一句话描述。"
+            "description": "任务一句话描述。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "module": {
             "type": "string",
-            "description": "所属模块 ID，引用 modules[].id。"
+            "description": "所属模块 ID，引用 modules[].id。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "depends_on": {
             "type": "array",
@@ -147,13 +155,17 @@
               "type": "string"
             },
             "default": [],
-            "description": "上游任务 ID 列表，引用 tasks[].id。"
+            "description": "上游任务 ID 列表，引用 tasks[].id。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "estimated_hours": {
             "type": "number",
             "minimum": 0,
             "default": 1,
-            "description": "预估工时。"
+            "description": "预估工时。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "importance": {
             "enum": [
@@ -162,7 +174,9 @@
               "normal",
               "low"
             ],
-            "description": "显式重要性。缺省时由 orchd 基于下游阻塞数自动推导。"
+            "description": "显式重要性。缺省时由 orchd 基于下游阻塞数自动推导。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "difficulty": {
             "enum": [
@@ -170,7 +184,9 @@
               "medium",
               "high"
             ],
-            "description": "任务难度。"
+            "description": "任务难度。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "requires": {
             "type": "array",
@@ -178,7 +194,9 @@
               "type": "string"
             },
             "default": [],
-            "description": "执行该任务所需的能力标签。"
+            "description": "执行该任务所需的能力标签。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "acceptance_criteria": {
             "type": "array",
@@ -186,7 +204,9 @@
               "type": "string"
             },
             "minItems": 1,
-            "description": "验收标准列表，spec review 逐条对照。"
+            "description": "验收标准列表，spec review 逐条对照。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "files_to_read": {
             "type": "array",
@@ -216,7 +236,9 @@
                   "description": "一行摘要，帮助 agent 决定读取深度。"
                 }
               }
-            }
+            },
+            "x-amendable": true,
+            "x-terminal-attachable": false
           },
           "files_to_edit": {
             "type": "array",
@@ -224,29 +246,39 @@
               "type": "string"
             },
             "minItems": 1,
-            "description": "本任务将修改的文件列表，用于文件冲突检测。"
+            "description": "本任务将修改的文件列表，用于文件冲突检测。",
+            "x-amendable": true,
+            "x-terminal-attachable": false
           },
           "reviewers": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "审查者 agent ID 列表。task-fp-schema-reviewers 起不再必填；新的身份模型由会话指纹 + 防自审判定，审查者不再预写（存量任务已清理，字段仅为向后兼容保留）。"
+            "description": "审查者 agent ID 列表。task-fp-schema-reviewers 起不再必填；新的身份模型由会话指纹 + 防自审判定，审查者不再预写（存量任务已清理，字段仅为向后兼容保留）。",
+            "x-amendable": true,
+            "x-terminal-attachable": true
           },
           "require_independent_review": {
             "type": "boolean",
             "default": false,
-            "description": "可选。true 时该任务的审查必须异指纹：claim review 在 DONE 实现指纹 == 当前会话时抛 E016（与 config.enforce_self_review_block=true 同效）；request 将其从自审候选排除。缺省 false（仅 self_review_notice 标注）。不触碰 required 字段与既有枚举语义。"
+            "description": "可选。true 时该任务的审查必须异指纹：claim review 在 DONE 实现指纹 == 当前会话时抛 E016（与 config.enforce_self_review_block=true 同效）；request 将其从自审候选排除。缺省 false（仅 self_review_notice 标注）。不触碰 required 字段与既有枚举语义。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "verify_command": {
             "type": "string",
-            "description": "可选。done 时由 CLI 执行的客观验证命令，exit 0 才允许写 DONE。"
+            "description": "可选。done 时由 CLI 执行的客观验证命令，exit 0 才允许写 DONE。",
+            "x-amendable": true,
+            "x-terminal-attachable": true
           },
           "max_attempts": {
             "type": "integer",
             "minimum": 1,
             "default": 3,
-            "description": "审查打回最大次数，超过后 request 返回警告。"
+            "description": "审查打回最大次数，超过后 request 返回警告。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "deliverables": {
             "type": "object",
@@ -381,7 +413,9 @@
                   }
                 }
               }
-            ]
+            ],
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "exempt_files": {
             "type": "array",
@@ -390,7 +424,9 @@
             },
             "default": [],
             "uniqueItems": true,
-            "description": "必要连带豁免文件列表（可选）。声明任务实现必需但不在 files_to_edit 内的文件（如新增错误码连带更新的测试断言文件），E020 hook 校验豁免，引擎 ensure_committed 不兜底提交（须实现者自行 commit）。"
+            "description": "必要连带豁免文件列表（可选）。声明任务实现必需但不在 files_to_edit 内的文件（如新增错误码连带更新的测试断言文件），E020 hook 校验豁免，引擎 ensure_committed 不兜底提交（须实现者自行 commit）。",
+            "x-amendable": true,
+            "x-terminal-attachable": true
           },
           "source": {
             "type": [
@@ -398,12 +434,16 @@
               "null"
             ],
             "pattern": "^(idea|roadmap|debug):[a-z0-9-]+$",
-            "description": "任务来源（可选）。格式 ^(idea|roadmap|debug):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id；debug: 前缀标记外部来源手工注册的任务（无文件引用校验）。缺省无 source 时校验通过（向后兼容存量任务）。"
+            "description": "任务来源（可选）。格式 ^(idea|roadmap|debug):[a-z0-9-]+$——idea: 前缀引用 IDEAS.md 中 status 为 pending 的条目 id；roadmap: 前缀引用 ROADMAP.md 中 ## 版本章节头包含的规划 id；debug: 前缀标记外部来源手工注册的任务（无文件引用校验）。缺省无 source 时校验通过（向后兼容存量任务）。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
           },
           "verify_timeout_seconds": {
             "type": "integer",
             "minimum": 1,
-            "description": "verify_command 执行超时（秒，可选）。缺省回退引擎默认 _VERIFY_TIMEOUT=120。全量 pytest 慢机器/沙箱拦截场景可调大（如 300）。"
+            "description": "verify_command 执行超时（秒，可选）。缺省回退引擎默认 _VERIFY_TIMEOUT=120。全量 pytest 慢机器/沙箱拦截场景可调大（如 300）。",
+            "x-amendable": true,
+            "x-terminal-attachable": true
           },
           "additional_sources": {
             "type": "array",
@@ -413,7 +453,9 @@
             },
             "default": [],
             "uniqueItems": true,
-            "description": "附加来源列表（可选，task-idea-multi-source-attribution）。一个任务承接多个 idea 时，除主 source 外的次级引用列于此。格式与 source 相同，E025 按与 source 相同口径逐条校验；ideas-archive 归档匹配同时覆盖 source 与 additional_sources（任一命中即随任务完结归档）。加法式：不动既有单值 source 语义。"
+            "description": "附加来源列表（可选，task-idea-multi-source-attribution）。一个任务承接多个 idea 时，除主 source 外的次级引用列于此。格式与 source 相同，E025 按与 source 相同口径逐条校验；ideas-archive 归档匹配同时覆盖 source 与 additional_sources（任一命中即随任务完结归档）。加法式：不动既有单值 source 语义。",
+            "x-amendable": true,
+            "x-terminal-attachable": true
           },
           "backport": {
             "type": "object",
@@ -434,7 +476,9 @@
                 "minLength": 1,
                 "description": "源线名（project.lines 的键）。"
               }
-            }
+            },
+            "x-amendable": false,
+            "x-terminal-attachable": false
           }
         }
       }

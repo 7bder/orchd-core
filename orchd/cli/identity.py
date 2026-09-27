@@ -164,12 +164,14 @@ def _current_task_from_branch(project_root: Path) -> str | None:
     if proc.returncode != 0:
         return None
     branch = proc.stdout.strip()
-    if branch.startswith("task/"):
-        return branch[len("task/"):]
-    # task-line-diag-wiring：识别 {line}/task/{id}（多线命名空间）
-    if "/task/" in branch:
-        return branch.rsplit("/task/", 1)[1]
-    return None
+    # 单根命名空间反解（pass8 F1-A）：task/{id} -> id，task/{line}/{id} -> id；
+    # 旧 {line}/task/{id} 不再识别。
+    from orchd.line import parse_task_branch
+
+    parsed = parse_task_branch(branch)
+    if parsed is None:
+        return None
+    return parsed[1]
 
 
 def record_session_command(orchd_dir, command: str | None) -> None:

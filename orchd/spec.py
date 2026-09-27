@@ -296,9 +296,29 @@ def validate_structure(master: Master) -> list[ValidationError]:
 
     根据 _master.json 中的 ``schema_version`` 字段决定加载哪个版本的 schema：
     优先查找 ``schema/v{version}/_master.schema.json``，不存在时回退到默认 schema。
+    未知版本（当前支持 1..2，与 orchd/migrate.py 双边锁定）直接返回 E003，
+    不静默回退（fail-closed，W1-③版本闸门）。
     返回 E003 错误列表；合法时返回空列表。
+
+    加法式检查（task-pass9-hook-path-injection，pass9 评审 F1）：声明路径
+    （files_to_edit / exempt_files）控制字符检查——L3 pre-commit 钩子对声明
+    列表按行消费（静态列表与动态允许列表同为行式形态），声明含换行 / CR /
+    NUL 会让行式消费错位，换行路径可突破生成物注释行注入任意 shell 语句。
+    合法路径不可能包含控制字符，故归入 E003 结构校验（阻断级，fail-closed）。
     """
     version = master.raw.get("schema_version", 1)
+    if not isinstance(version, int) or version not in (1, 2):
+        return [
+            ValidationError(
+                code=ErrorCode.E003,
+                path="$.schema_version",
+                message=(
+                    f"unsupported schema_version: {version!r} "
+                    f"(supported 1..2; "
+                    f"run `orchd migrate` or upgrade engine)"
+                ),
+            )
+        ]
     validator = _build_validator(version)
     errors: list[ValidationError] = []
     for err in sorted(validator.iter_errors(master.raw),
@@ -320,6 +340,27 @@ def validate_structure(master: Master) -> list[ValidationError]:
                 path=json_path,
                 message=message,
             ))
+    # 声明路径控制字符检查（加法式，见 docstring）：非字符串交由上方 JSON
+    # Schema 判定类型，这里只拦「合法路径不可能出现的控制字符」。
+    for i, t in enumerate(master.tasks):
+        tid = t.get("id", "")
+        for decl_field in ("files_to_edit", "exempt_files"):
+            for j, p in enumerate(t.get(decl_field) or []):
+                if not isinstance(p, str):
+                    continue
+                for ch in ("\n", "\r", "\x00"):
+                    if ch in p:
+                        errors.append(
+                            ValidationError(
+                                code=ErrorCode.E003,
+                                path=f"$.tasks[{i}].{decl_field}[{j}]",
+                                message=(
+                                    f"task '{tid}': {field}[{j}] contains control "
+                                    f"character {ch!r} — declared paths are consumed "
+                                    "line-wise by the pre-commit hook "
+                                    "(fail-closed, pass9 review F1)"
+                                ),
+                            ))
     return errors
 
 
@@ -391,6 +432,25 @@ def validate_references(master: Master) -> list[ValidationError]:
                         path=f"$.tasks[{i}].depends_on[{j}]",
                         message=
                         f"depends_on references unknown task_id: '{dep}'",
+                    ))
+
+    # --- E005: default_line 须为 lines 的键（前移 line.py 运行时口径） ---
+    # pass7 P2-7 残留收口：line.py 已是执行点（非法 E005 硬拒），validate 在此
+    # 前移，同错早暴露。单线（无 lines）或未声明 default_line 时跳过。
+    project = master.raw.get("project", {}) if isinstance(master.raw, dict) else {}
+    if isinstance(project, dict):
+        lines = project.get("lines", {})
+        declared = project.get("default_line", "")
+        if isinstance(lines, dict) and lines and isinstance(declared, str) and declared:
+            if declared not in lines:
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E005,
+                        path="$.project.default_line",
+                        message=(
+                            f"default_line '{declared}' not found in "
+                            f"project.lines ({sorted(lines)})"
+                        ),
                     ))
 
     # --- E005: shared 文件存在性 ---
@@ -1426,7 +1486,7 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
     """
     message = (f"规划章节 ROADMAP §{sec['version']}（id: {sec['id']}）尚无 IDEAS 落地条目："
                "IDEAS.md 与 IDEAS-archive.md 均缺引用该章节的 detail；处置二选一——"
-               "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS pending；"
+               "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS study（待 confirm 升 pending）；"
                "② 若该版本已发布或已放弃，标记历史或移出 ROADMAP")
     try:
         from orchd.ledger import structured_error
@@ -1439,7 +1499,7 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
                 f"roadmap §{sec['version']}",
                 "hint":
                 (f"处置二选一：① 运行 `orchd roadmap-land {sec['version']}` 为该规划章节"
-                 "生成 IDEAS pending 落地条目（摄入协议：先落地再注册任务）；"
+                 "生成 IDEAS study 落地条目（摄入协议：先落地、confirm 升 pending 后再注册任务）；"
                  "② 若该版本已发布或已放弃，在 ROADMAP.md 将章节标题标记「历史」或移出"),
             }],
             None,

@@ -51,10 +51,14 @@ def _log_session_lock_degrade(action: str, payload: dict[str, Any]) -> None:
         action: 动作名（``gate_unavailable`` / ``acquire_failed``）。
         payload: 结构化条目（reason / error / gate_acquired / hint…）。
     """
-    try:
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError, OSError):
-        pass
+    # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
+    # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     try:
         record = {"action": action, **payload}
         print(
@@ -500,16 +504,19 @@ def session_lock_release(orchd_dir: Path) -> dict[str, Any]:
         flock.release()
     if not lock_path.exists():
         return {"released": True, "reason": "not_exists"}
-    # P2-6：删除标记前探测 flock 活性——他人仍持活锁时不得 unlink（flock-unlink 竞态：
-    # 同路径新 inode 会被新进程重新加锁，破坏互斥）。活锁跳过，仅 stale（无持有者）才删。
-    probe = _probe_session_lock_os_active(lock_path)
-    if probe.get("active"):
+    # P2-6 + task-pass9-session-lock-unlink（pass9 F10）：他人持活锁时不得
+    # unlink；stale 时在**持探测锁内** rename-aside 后删除——消除旧流程
+    # 「probe 释放 → unlink」间隙的分裂互斥竞态（flock-unlink TOCTOU）。
+    reclaim = _reclaim_stale_lock(lock_path)
+    if reclaim.get("held"):
         return {"released": False, "reason": "held_by_other"}
-    try:
-        _safe_delete(lock_path, orchd_dir)
+    if reclaim.get("reclaimed"):
         return {"released": True, "reason": "removed"}
-    except (OSError, IOError) as exc:
-        return {"released": False, "reason": "io_error", "error": str(exc)}
+    return {
+        "released": False,
+        "reason": "io_error",
+        "error": reclaim.get("error", "unknown"),
+    }
 
 
 def release_session_lock_if_owned(
@@ -588,6 +595,63 @@ def _probe_session_lock_os_active(lock_path: Path) -> dict[str, Any]:
     except OSError:
         pass
     return {"stale": True, "active": False}
+
+
+def _reclaim_stale_lock(lock_path: Path) -> dict[str, Any]:
+    """stale 判定 + 回收合一：**持有探测 flock 期间**完成删除。
+
+    task-pass9-session-lock-unlink（pass9 F10）：旧流程 probe 成功后先
+    unlock+close、调用方随后才 unlink——间隙内他进程可抢锁，随后 unlink 把
+    同路径互斥分裂成两个 inode（POSIX；Windows 因句柄占用 fail-safe）。
+    本 helper 持锁内 unlink（POSIX 经典 unlink-under-lock：他进程在窗口内
+    的 flock 请求必失败，互斥不再分裂）；Windows 下打开中的文件 unlink 报
+    共享冲突 → 降级为关闭 fd 后重试删除（保留既有 fail-safe 行为）。
+
+    Returns:
+        ``{"reclaimed": True}`` 已回收（含文件本就不存在的幂等 no-op）；
+        ``{"held": True}`` 他人持活锁，不得回收；
+        ``{"error": <str>}`` 打开/删除失败（保守不回收）。
+    """
+    import os as _os
+    from orchd.lockfile import _flock_op
+
+    if not lock_path.exists():
+        return {"reclaimed": True}
+    try:
+        fd = _os.open(str(lock_path), _os.O_RDWR)
+    except OSError as exc:
+        return {"error": str(exc)}
+    try:
+        _flock_op(fd, "lock_nb")
+    except (OSError, IOError):
+        # 获取失败 → 活锁（另一进程存活持有）
+        try:
+            _os.close(fd)
+        except OSError:
+            pass
+        return {"held": True}
+    unlinked = False
+    try:
+        _os.unlink(str(lock_path))  # 持锁内删除：他进程此刻 flock 必失败
+        unlinked = True
+    except OSError:
+        pass  # Windows：打开中的文件不可删 → 降级路径
+    try:
+        _flock_op(fd, "unlock")
+    except (OSError, IOError):
+        pass
+    try:
+        _os.close(fd)
+    except OSError:
+        pass
+    if unlinked:
+        return {"reclaimed": True}
+    # Windows 降级：fd 已关闭，重试删除（既有 fail-safe 行为；仍被占用则报错）
+    try:
+        _os.unlink(str(lock_path))
+    except OSError as exc:
+        return {"error": str(exc)}
+    return {"reclaimed": True}
 
 
 def _linked_worktree_names(main_root: Path) -> set[str] | None:
@@ -705,14 +769,11 @@ def reclaim_orphan_session_locks(
             continue
         if _worktree_alive(wt):
             continue
-        # 他人仍持活锁 → 不删（flock-unlink 竞态，与 _cleanup_stale_session_locks 一致）
-        if _probe_session_lock_os_active(p).get("active"):
+        # 他人仍持活锁 → 不删（pass9 F10：持探测锁内 rename-aside，窗口归零）
+        reclaim = _reclaim_stale_lock(p)
+        if not reclaim.get("reclaimed"):
             continue
-        try:
-            _safe_delete(p, orchd_dir)
-            cleaned.append(name)
-        except OSError:
-            pass
+        cleaned.append(name)
     return {"cleaned": cleaned}
 
 
@@ -805,14 +866,11 @@ def session_lock_check(
 
     # 新式 flock 活性锁：优先 OS 探活判定 stale（task-session-lock-autoclean）
     if data.get(_SESSION_LOCK_FLOCK_MARKER):
-        probe = _probe_session_lock_os_active(lock_path)
-        if probe.get("stale"):
-            # 原持锁进程已死：自动清理（best-effort），后续可重新获取
-            try:
-                _safe_delete(lock_path, orchd_dir)
-                cleaned = True
-            except (OSError, IOError):
-                cleaned = False
+        # pass9 F10：持探测锁内 rename-aside 后删除（窗口归零）；held/error
+        # 均保守判活锁（fail-safe：不误清他人锁）
+        reclaim = _reclaim_stale_lock(lock_path)
+        if reclaim.get("reclaimed"):
+            cleaned = True
             return {
                 "locked": False,
                 "reason": "stale_cleaned",

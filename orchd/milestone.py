@@ -30,10 +30,18 @@
         {"task_id": "...", "source_sha": "...",
          "target_line": "line-drill", "event": "..."}
       ],
+      "repo_head": "<演练时源仓库 HEAD（40-hex）>",
+      "drill_commit": "<clone 内演练配置提交（其父须为 repo_head）>",
+      "lifecycle": {"task_id": "...", "line": "line-drill",
+                    "completed": true, "merge_commit": "...",
+                    "verify": "tests/test_line_core.py"},
       "created_at": "2026-09-21T00:00:00+00:00"
     }
 
-``regressions`` 两线均 ``failed == 0`` 且 ``backport`` 非空（回移留痕）才算演练通过。
+``regressions`` 两线均 ``failed == 0``、``backport`` 非空、
+``lifecycle.completed`` 为 true（第二线真实 claim → done → review → merge）、
+``repo_head`` 在当前仓库可达且为 HEAD 祖先（演练过期即失效，防快照 + 防手写），
+才算演练通过。
 """
 
 from __future__ import annotations
@@ -402,6 +410,34 @@ def _m2_c1_release_per_line(ctx: MilestoneContext) -> tuple[bool, str, str]:
     return True, "发布脚本支持按线（--line / ORCHD_LINE）", ""
 
 
+def _attest_repo_head(project_root: Path, repo_head: object) -> str | None:
+    """演练源锚见证（pass8 F4）：repo_head 须为 40-hex 且在当前仓库可达、
+    为 HEAD 祖先；否则演练过期（仓库已推进）或产物系手写。
+
+    Returns:
+        None = 通过；否则为问题描述。git 不可用 / 非仓库一律判不通过
+        （见证无从谈起，不静默放行）。
+    """
+    if not isinstance(repo_head, str) or not re.fullmatch(r"[0-9a-f]{40}", repo_head):
+        return "演练缺有效的 repo_head 绑定（手写产物无源仓库锚点）"
+    try:
+        alimentare = subprocess.run(
+            ["git", "cat-file", "-e", repo_head], cwd=str(project_root),
+            capture_output=True, timeout=60,
+        )
+        if alimentare.returncode != 0:
+            return f"演练源锚不可达：{repo_head} 在当前仓库无此对象"
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", repo_head, "HEAD"],
+            cwd=str(project_root), capture_output=True, timeout=60,
+        )
+        if ancestor.returncode != 0:
+            return f"演练已过期：源锚 {repo_head} 非当前 HEAD 祖先，请重跑演练"
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return f"演练见证无法执行（{type(exc).__name__}）：请确认 git 可用后重跑演练"
+    return None
+
+
 def _m2_d1_drill_artifact(ctx: MilestoneContext) -> tuple[bool, str, str]:
     try:
         from orchd.ledger import resolve_store_dir
@@ -426,6 +462,23 @@ def _m2_d1_drill_artifact(ctx: MilestoneContext) -> tuple[bool, str, str]:
         return False, "演练缺少回移留痕（backport 为空）", (
             "回移必须留痕（源 sha + 目标线 + 事件），否则无法回答「这个修复在不在另一条线」"
         )
+    lifecycle = data.get("lifecycle")
+    if not isinstance(lifecycle, dict) or lifecycle.get("completed") is not True:
+        return False, "演练缺少第二线真实生命周期留痕", (
+            "第二线须真实跑通 claim → done → review → merge（D 组 hint 口径），"
+            "仅回归 + 回移不算达成；用 scripts/line_drill.py 重跑演练"
+        )
+    if not lifecycle.get("merge_commit"):
+        return False, "演练生命周期缺合入提交（merge_commit 为空）", (
+            "生命周期须以 merge 落码结束，否则 merge 语义未经演练；重跑演练"
+        )
+    if not data.get("drill_commit"):
+        return False, "演练缺 drill_commit 绑定（手写产物无演练提交锚点）", (
+            "用 scripts/line_drill.py 重跑演练（--no-lifecycle 产物判不通过）"
+        )
+    attest_issue = _attest_repo_head(ctx.project_root, data.get("repo_head"))
+    if attest_issue is not None:
+        return False, attest_issue, "用 scripts/line_drill.py 重跑演练"
     return True, f"演练产物在册（两线全绿，回移 {len(data.get('backport') or [])} 条）", ""
 
 
@@ -453,7 +506,7 @@ def _m2_f2_perf(ctx: MilestoneContext) -> tuple[bool, str, str]:
 def _m2_f3_naming(ctx: MilestoneContext) -> tuple[bool, str, str]:
     if _module_spec(LINE_MODULE) is None:
         return False, f"{LINE_MODULE} 未落地：单线默认命名口径无法判定", (
-            "line 能力落地后，单线模式任务分支名须保持 task/{id}（不得泄漏为 {line}/task/{id}）"
+            "line 能力落地后，单线模式任务分支名须保持 task/{id}（多线为 task/{line}/{id}）"
         )
     try:
         from orchd.line import resolve_task_branch_name

@@ -138,6 +138,29 @@ def _init_guide_routing_best_effort() -> None:
         except Exception:
             pass
 
+
+# E007 信封 argv 脱敏上限（task-pass9-cli-envelope-hygiene，pass9 F16）：
+# 命令行传入的密钥会随信封进入被捕获的日志——条数与总长双上限截断，
+# 截断以 marker 留痕，保留排障可用性（子命令与参数形态可见）。
+_E007_ARGV_MAX_ITEMS = 8
+_E007_ARGV_MAX_CHARS = 200
+_E007_ARGV_TRUNCATED = "…(truncated)"
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    total = 0
+    redacted: list[str] = []
+    for arg in argv[:_E007_ARGV_MAX_ITEMS]:
+        if total + len(arg) > _E007_ARGV_MAX_CHARS:
+            redacted.append(_E007_ARGV_TRUNCATED)
+            return redacted
+        redacted.append(arg)
+        total += len(arg)
+    if len(argv) > _E007_ARGV_MAX_ITEMS:
+        redacted.append(_E007_ARGV_TRUNCATED)
+    return redacted
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口。返回 exit code。
 
@@ -170,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             "error": {
                 "code": "E007",
                 "message": "invalid_usage: argparse 解析失败（非法参数或缺少必需参数）",
-                "details": [{"exit_code": code, "argv": list(sys.argv[1:])}],
+                "details": [{"exit_code": code, "argv": _redact_argv(list(sys.argv[1:]))}],
             }
         }
         resp = attach_error_guidance(resp, "E007", _find_orchd_dir())

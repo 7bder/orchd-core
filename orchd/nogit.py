@@ -29,9 +29,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
+from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
 
 # 快照存储根（默认 <project_root>/.orchd/snapshots，可用 ORCHD_SNAPSHOT_ROOT 覆盖）
@@ -90,8 +92,31 @@ def snapshot_store_root(project_root: Path) -> Path:
     return Path(project_root) / ".orchd" / SNAPSHOT_DIRNAME
 
 
+# pass9 F18（task-pass9-gitops-read-boundary）：快照路径段白名单。snapshot_dir
+# 按 task_id/label 拼目录，伪造含路径分隔符 / ``..`` 的 id 可逃逸快照根
+# （defense-in-depth：intake 层已验 slug，此处对快照存储边界复验）。
+_SNAPSHOT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _ensure_snapshot_segment(value: str, field: str) -> str:
+    if (
+        not value
+        or ".." in value
+        or not _SNAPSHOT_SEGMENT_RE.match(value)
+    ):
+        raise OrchdError(
+            ErrorCode.E007,
+            f"invalid_snapshot_segment: {field} 含非法字符（快照路径段仅允许 "
+            "字母/数字/点/下划线/连字符，且不得含 ..）",
+            [{"field": field, "value": value[:64]}],
+        )
+    return value
+
+
 def snapshot_dir(project_root: Path, task_id: str, label: str = "base") -> Path:
-    """某任务某标签的快照目录。"""
+    """某任务某标签的快照目录（task_id/label 经路径段校验，pass9 F18）。"""
+    _ensure_snapshot_segment(str(task_id), "task_id")
+    _ensure_snapshot_segment(str(label), "label")
     return snapshot_store_root(project_root) / task_id / label
 
 

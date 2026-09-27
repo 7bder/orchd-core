@@ -26,7 +26,7 @@
 3. **禁改范围外文件**：只读 files_to_read、只写 files_to_edit；不触 `.git/`；删文件前确认属验收范围。确需增删声明文件时回主工作树执行 amend 补登，不手改 _master.json。
 4. **禁绕过身份（自审三档）**：
    - 默认（enforce=false）：`self_review_notice` 标注仅提示，不阻断。
-   - `config.enforce_self_review_block=true`：E016 硬阻断。
+   - `config.enforce_self_review_block=true` 或任务级 `require_independent_review=true`（与全局开关 OR）：E016 硬阻断。
    - 单会话自托管确需自审时：须在 review comments 显式披露。
 5. **禁未提交即中断**：改动后必须提交（或报告未提交原因）才结束；session end 硬拦截，`--force` 可放行。
 6. **禁止自动摄入与自动写入**：intake 仅用户指定；灵感只 `idea propose` 记 study；confirm/drop 仅用户可执行。
@@ -70,6 +70,11 @@
 - 身份 = `ORCHD_SESSION_ID` 派生 12 位 hex 指纹；同对话不变，不同对话不同。
 - 归属 / 忙度 / 自审 / 锁所有权以指纹为主键；同 agent 不同 session 可并行领不同任务。
 - 自审口径（默认提示 / E016 / comments 披露）见红线 4 与 rules/session.md。
+
+## 摄入口令（统一管线）
+- 四句口令：先记下来 / 确认<slug> / 这条不做 / 拉出来先对一下再拆。
+- 对照卡：原文 / 现状 / 拆分 / 推断；confirm/drop 仅用户可执行。
+- 三硬界限：假设被改先问；共享文件默认 `depends_on`；单任务一次做完一次审完。
 
 ## 规则目录（见 rules/README.md）
 - 会话/claim → rules/session.md · 摄入 → rules/intake.md · verify → rules/verify.md

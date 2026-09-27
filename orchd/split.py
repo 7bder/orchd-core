@@ -70,67 +70,12 @@ def _validate_module_id(mod_id: str) -> str:
 from orchd.intake import _INTAKE_PRODUCT_FILES
 
 
-# M-2（2026-08-12 全面审计）：三处状态（claimed / done / in_review / 终态附加）
-# 共用同一"附加字段"白名单，避免 exempt_files / verify_timeout_seconds 在部分
-# 阶段被误拦导致语义不连贯。
-_AMEND_ATTACHABLE_FIELDS = frozenset({
-    "exempt_files", "verify_command", "verify_timeout_seconds", "reviewers",
-    # Bug #20c（2026-08-27）：files_to_edit / files_to_read 加入白名单，
-    # claimed 状态可修正无效路径（无需 force-status 回退 pending）。
-    "files_to_edit", "files_to_read",
-    # task-amend-additional-sources-field：additional_sources 属附加信息（溯源/
-    # 归档匹配，不改变任务作用域），claimed/终态均可补登——存量孤儿条目补挂到
-    # 已完成任务的合法 CLI 通道（此前直接编辑 _master.json 违反 no-direct-edit）。
-    "additional_sources",
-})
-_CLAIMED_WHITELIST_FIELDS = tuple(_AMEND_ATTACHABLE_FIELDS)
-
-# ── task-amend-terminal-drift-repair（2026-08-12）────────────────────────────
-# 终态任务（completed/cancelled）允许自动同步的"合法附加字段增量"：这些字段不改变
-# 任务语义/作用域，仅承载引擎/审查附加信息（e.g. 注册后补 exempt_files、跨平台化
-# verify_command）。其余字段变更仍触发 E007 终态保护。
-#
-# 核心字段集合由"任务全部 schema 字段 - 附加字段"推导，避免硬编码漂移。
-# Bug #20c（2026-08-27）：终态白名单排除 files_to_edit / files_to_read——
-# 已完成/取消的任务不应再改文件声明（仅 claimed/done/in_review 允许修正路径）。
-_TERMINAL_ATTACHABLE_FIELDS = _AMEND_ATTACHABLE_FIELDS - {
-    "files_to_edit", "files_to_read",
-}
-
-
-def _derive_task_schema_fields() -> frozenset[str]:
-    """从 schema/_master.schema.json 动态推导任务全部字段（P3.4 修复）。
-
-    读取 ``tasks[].properties`` 的键集合作为任务 schema 字段全集，避免硬编码
-    在 schema 演进（如新增字段）时静默漂移。schema 缺失 / 解析失败时回退到
-    内置字段集合（保守默认，保证进程不因 schema 文件异常而崩溃）。
-    """
-    schema_path = Path(__file__).resolve().parent.parent / "schema" / "_master.schema.json"
-    try:
-        data = json.loads(schema_path.read_text(encoding="utf-8"))
-        props = (
-            data.get("properties", {})
-            .get("tasks", {})
-            .get("items", {})
-            .get("properties", {})
-        )
-        if isinstance(props, dict) and props:
-            return frozenset(props.keys())
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        pass
-    # 回退：schema 演进前的内置字段集合
-    return frozenset({
-        "id", "name", "brief", "module", "depends_on", "estimated_hours",
-        "importance", "difficulty", "requires", "acceptance_criteria",
-        "files_to_read", "files_to_edit", "reviewers", "verify_command",
-        "max_attempts", "deliverables", "exempt_files", "source",
-        "verify_timeout_seconds",
-    })
-
-
-_TASK_SCHEMA_FIELDS = _derive_task_schema_fields()
-# 核心字段 = 全部字段 - 附加字段（含任一核心字段变更 → E007）
-_TERMINAL_CORE_FIELDS = _TASK_SCHEMA_FIELDS - _TERMINAL_ATTACHABLE_FIELDS
+# W1-④（task-schema-cutover）：字段集合唯一真源 = schema 注解，
+# 经 orchd/schema_policy.py 派生；本模块历史手写副本
+#（_AMEND_ATTACHABLE_FIELDS / _CLAIMED_WHITELIST_FIELDS /
+# _TERMINAL_ATTACHABLE_FIELDS / _TASK_SCHEMA_FIELDS /
+# _TERMINAL_CORE_FIELDS / _derive_task_schema_fields）已删除。
+from orchd.schema_policy import amendable_fields, terminal_attachable_fields
 
 # ── task-terminal-spec-revision-channel（2026-09-14）────────────────────────
 # 终态任务的**纯文本规格修订**通道：``amend --revise-terminal <task_id> --reason <文本>``。
@@ -349,10 +294,14 @@ def _log_amend_guard_degrade(entry: dict[str, Any]) -> None:
     Args:
         entry: 结构化降级条目（guard / severity / status / reason / error / hint）。
     """
-    try:
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError, OSError):
-        pass
+    # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
+    # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     try:
         print(
             f"orchd ▸ [amend-guard] {json.dumps(entry, ensure_ascii=False)}",
@@ -383,6 +332,17 @@ def _git_head_sha(project_root: Path | None) -> str | None:
     if proc.returncode != 0:
         return None
     return (proc.stdout or "").strip() or None
+
+
+def _is_new_test_file_path(fp: str) -> bool:
+    """声明路径是否为「待创建新测试文件」形态（task-pass9-amend-response-ux）。
+
+    tests/test_*.py 形态的缺失路径大概率是实现期才创建的新测试文件（惯例
+    「一个测试文件一个域」），存在性告警归为可忽略；其余形态走 typo_suspect
+    强提示。仅做形态判断，不做盘上校验。
+    """
+    normalized = fp.replace("\\", "/")
+    return normalized.startswith("tests/test_") and normalized.endswith(".py")
 
 
 def amend(
@@ -714,7 +674,7 @@ def amend(
                     for key in set(task) | set(old_task)
                     if task.get(key) != old_task.get(key)
                 }
-                if changed_fields <= set(_CLAIMED_WHITELIST_FIELDS):
+                if changed_fields <= amendable_fields():
                     # task-amend-scope-add：claimed 任务 files_to_edit 只增不删
                     # 添加遗漏连带文件允许，删除已声明文件拒绝（E007）
                     if "files_to_edit" in changed_fields:
@@ -743,13 +703,13 @@ def amend(
                         "fields": sorted(changed_fields),
                     })
                 else:
-                    _rejected = set(changed_fields) - set(_CLAIMED_WHITELIST_FIELDS)
+                    _rejected = set(changed_fields) - amendable_fields()
                     errors.append({
                         "task_id": tid,
                         "status": status,
                         "message": (
                             "claimed task only allows whitelist fields "
-                            f"{sorted(_CLAIMED_WHITELIST_FIELDS)}, "
+                            f"{sorted(amendable_fields())}, "
                             f"got {sorted(changed_fields)}"
                         ),
                         # task-spec-hygiene-flat-sweep AC2：AC 类字段被拒时附加
@@ -807,7 +767,7 @@ def amend(
                             })
                             continue
                     updated_tasks.append(tid)
-                elif remaining <= _TERMINAL_ATTACHABLE_FIELDS:
+                elif remaining <= terminal_attachable_fields():
                     updated_tasks.append(tid)
                     attachable_sync.append({
                         "task_id": tid,
@@ -897,7 +857,7 @@ def amend(
                 # files_to_read）。把新定义的附加字段全部还原为旧值后与旧定义
                 # 比对，相等才说明"只有白名单字段变了"。
                 normalized = dict(task)
-                for field in _AMEND_ATTACHABLE_FIELDS:
+                for field in amendable_fields():
                     if field in old_task:
                         normalized[field] = old_task.get(field)
                     else:
@@ -920,7 +880,7 @@ def amend(
                         key
                         for key in set(task) | set(old_task)
                         if task.get(key) != old_task.get(key)
-                    } - set(_AMEND_ATTACHABLE_FIELDS)
+                    } - amendable_fields()
                     errors.append({
                         "task_id": tid,
                         "status": status,
@@ -1059,6 +1019,11 @@ def amend(
         # task-decl-dir-notation-guard（AC4）：仅遍历本次新增/变更任务，
         # 存量任务不再产生 files_to_edit_path_not_found 告警（消除 121 个存量
         # 目录式声明每次 amend 刷屏）。
+        # task-pass9-amend-response-ux（pass9 UX-2）：按形态分流强提示——
+        # tests/test_*.py 形态大概率是待创建的新测试文件（可忽略）；其余路径
+        # 不存在且不像新测试文件 → 独立 typo_suspect 类（防笔误：实测
+        # task-pass9-union-verify-gate 注册期路径笔误直到 E020 提交被拦才暴露）。
+        # 不做硬阻断：合法新源文件声明与笔误结构上不可区分。
         for task in tasks:
             tid = task.get("id", "")
             if tid not in _changed_ids:
@@ -1066,16 +1031,26 @@ def amend(
             for field in ("files_to_edit", "exempt_files"):
                 for fp in task.get(field, []):
                     full = project_root / fp
-                    if not full.exists():
-                        conflict_warnings.append({
-                            "task_id": tid,
-                            "type": f"{field}_path_not_found",
-                            "file": fp,
-                            "message": (
-                                f"{field} 声明的路径 '{fp}' 在项目中不存在"
-                                f"。若为待创建新文件可忽略，否则请修正路径。"
-                            ),
-                        })
+                    if full.exists():
+                        continue
+                    is_test_like = _is_new_test_file_path(fp)
+                    conflict_warnings.append({
+                        "task_id": tid,
+                        "type": (
+                            f"{field}_new_test_file_pending" if is_test_like
+                            else f"{field}_path_typo_suspect"
+                        ),
+                        "file": fp,
+                        "message": (
+                            f"{field} 声明的路径 '{fp}' 在项目中不存在。"
+                            + (
+                                "新测试文件形态（tests/test_*.py）：实现时创建即可，可忽略。"
+                                if is_test_like else
+                                "路径不存在且不像新测试文件——请核对是否笔误"
+                                "（若确为待创建的新源文件可忽略）。"
+                            )
+                        ),
+                    })
 
         # task-decl-withdraw-channel：与上方「声明了但不存在的路径」对称的反向提示——
         # E-16（task-hostfix-pack-b）：仅当豁免**真冗余**（同任务 files_to_edit 内
@@ -1099,6 +1074,42 @@ def amend(
                             f"`orchd amend --task {tid} --remove-exempt-files {fp}` 撤回该声明。"
                         ),
                     })
+
+        # task-pass9-verify-path-guard（pass9 实测）：verify_command 内引用的 .py
+        # 路径不存在且不在本任务声明集 → typo_suspect 强提示。背景：addopts 强制
+        # xdist（-n auto）下，pytest/ruff 参数含不存在路径时 usage error 被整吞
+        # （exit 5 "no tests ran"，-n0 对照 exit 4 可见），笔误只能靠 done 失败
+        # 反推且报因不可读——注册期静态核对是唯一提前点。已声明路径（待创建的
+        # 新文件）不告警；不做硬阻断：合法新源文件与笔误结构上不可区分。
+        for task in tasks:
+            tid = task.get("id", "")
+            if tid not in _changed_ids:
+                continue
+            _verify_cmd = task.get("verify_command") or ""
+            if not _verify_cmd:
+                continue
+            _declared_paths = (
+                set(task.get("files_to_edit", []) or [])
+                | set(task.get("exempt_files", []) or [])
+            )
+            for _tok in _verify_cmd.split():
+                if not _tok.endswith(".py"):
+                    continue
+                if "$" in _tok or "=" in _tok or _tok.startswith("-"):
+                    continue  # 变量替换 / 内联旗标 / 选项不是文件路径
+                _ref = _tok.strip("\"'")
+                if (project_root / _ref).exists() or _ref in _declared_paths:
+                    continue
+                conflict_warnings.append({
+                    "task_id": tid,
+                    "type": "verify_command_path_typo_suspect",
+                    "file": _ref,
+                    "message": (
+                        f"verify_command 引用的路径 '{_ref}' 在项目中不存在且不在"
+                        "本任务声明中——请核对是否笔误（addopts 强制 xdist 下该"
+                        "错误会被整吞为 'no tests ran'；若确为待创建的新文件可忽略）。"
+                    ),
+                })
 
         # 重新生成所有 snapshot（目录名 = module_id）
         for module in modules:
@@ -1168,7 +1179,10 @@ def amend(
         "attachable_sync": attachable_sync,
         "terminal_decl_sync": terminal_decl_sync,
         "terminal_spec_revisions": terminal_text_revisions,
-        "unchanged_tasks": unchanged_tasks,
+        # task-pass9-amend-response-ux（pass9 UX-1）：只回计数与增量——完整 id
+        # 列表在 600 任务规模下单响应 40KB+，对 agent 是纯语境成本；增量
+        # （new/updated/removed）保持原样。
+        "unchanged_tasks_count": len(unchanged_tasks),
         "removed_tasks": removed_tasks,
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
         "exempted_terminal_warnings": _exempted_terminal_warnings,
@@ -1200,6 +1214,10 @@ def classify_dry_run_failure(
       （E028，verify_command 定义可能有误）。
     - ``expected_pending``：依赖实现产物、预期失败（如测试文件尚未由实现者
       创建、断言引用的实现文件不存在）→ 仅提示不阻断。
+    - ``no_tests_collected``（task-pass9-verify-path-guard）：exit 5 / 输出含
+      "no tests ran"——addopts 强制 xdist 下 verify_command 参数含不存在路径
+      时 usage error 被整吞，合法测试静默不跑。不阻断，但单独可见以提示
+      路径笔误核对。
 
     启发式判定（简单、可测）：
     - exit_code == 4（pytest usage error，cmd 语法错误）→ assertion_mismatch
@@ -1221,6 +1239,15 @@ def classify_dry_run_failure(
         "assertion_mismatch" 或 "expected_pending"。
     """
     stderr_l = (stderr or "").lower()
+
+    # task-pass9-verify-path-guard（pass9 实测）：exit 5 = pytest "no tests
+    # ran"——addopts 强制 xdist（-n auto）下，pytest/ruff 参数含不存在路径时
+    # usage error 被整吞（-n0 对照 exit 4 可见），合法测试静默不跑。给专项
+    # 分类（不阻断，与 expected_pending 同级），把「路径笔误」从
+    # expected_pending 的兜底误分类里拆出来单独可见。
+    if exit_code == 5 or "no tests ran" in (
+            stderr_l + " " + (stdout or "").lower()):
+        return "no_tests_collected"
 
     # 缺失路径/模块信号（pytest 收集错误）。pytest 引用不存在测试文件时真实
     # 输出为 "ERROR: file or directory not found"（且 exit_code==4），"file not

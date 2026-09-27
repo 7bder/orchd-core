@@ -840,6 +840,25 @@ def _verify_fail_error(
     elapsed: float,
 ) -> OrchdError:
     """构造 verify 非零退出的 E014 错误（含诊断增强出口）。"""
+    _output_l = (
+        _decode_subprocess_output(result.stdout).lower()
+        + " " + _decode_subprocess_output(result.stderr).lower()
+    )
+    _hint = (
+        "verify 失败可能因断言不匹配或环境问题；若为 pytest 超长执行，"
+        "按 SKILL.md 自检约定改用模块定向 verify_command；"
+        "若在 Windows 上 verify 失败，请确认已安装 Git Bash"
+        "（verify_command 以 POSIX 语法经 Git Bash 执行）"
+    )
+    # task-pass9-verify-path-guard（pass9 实测）：exit 5 = "no tests ran"——
+    # addopts 强制 xdist 下 verify_command 参数含不存在路径时 usage error 被
+    # 整吞，合法测试静默不跑。失败已发生，把根因 hint 顶到最前。
+    if result.returncode == 5 or "no tests ran" in _output_l:
+        _hint = (
+            "未收集到任何测试（exit 5）：核对 verify_command 路径拼写——"
+            "addopts 强制 xdist 下参数含不存在路径的 usage error 会被整吞"
+            "（task-pass9-verify-path-guard）；" + _hint
+        )
     return OrchdError(
         ErrorCode.E014,
         f"verify_command_failed: exit code {result.returncode} after {elapsed}s",
@@ -849,12 +868,7 @@ def _verify_fail_error(
             "elapsed_seconds": elapsed,
             "stderr": _decode_subprocess_output(result.stderr)[:500],
             "stdout": _decode_subprocess_output(result.stdout)[:300],
-            "hint": (
-                "verify 失败可能因断言不匹配或环境问题；若为 pytest 超长执行，"
-                "按 SKILL.md 自检约定改用模块定向 verify_command；"
-                "若在 Windows 上 verify 失败，请确认已安装 Git Bash"
-                "（verify_command 以 POSIX 语法经 Git Bash 执行）"
-            ),
+            "hint": _hint,
         }],
     )
 

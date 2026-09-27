@@ -762,6 +762,10 @@ def pull(
     """fetch 远端 ref → 远端 delta 合并进本地账本（event_id 去重）→ 重建 checkpoint。
 
     幂等：远端 delta 中本地已有的事件被跳过，重复 pull 无副作用。
+
+    信任边界（task-pass9-ref-tx-sync-hardening，pass9 F9）：远端事件按**可信输入**
+    处理，无签名 / 哈希链校验——单机可信协作假设与 2.0 演进要求见
+    ``docs/implementation-design.md`` §4.6「跨设备账本同步信任边界」。
     Returns:
         {pulled, local_events, remote, merged}：合并摘要；远端尚无 ref 时
         ``remote_ref`` 为 None。

@@ -89,6 +89,35 @@ def _is_lock_like_name(name: str) -> bool:
         fnmatch.fnmatch(base, pat.lstrip(".")) for pat in _LOCK_FILE_PATTERNS)
 
 
+def _pre_delete_lock_recheck(path: Path) -> str | None:
+    """删除前复检 flock 活性（DR-7 单一事实源，--fix 与 auto_clean 共用）。
+
+    检测与执行之间存在并发 claim / 准入写窗口，仍被持有说明存在活跃持有者
+    （会话刚起 / 准入写进行中）→ 本轮不删，留待下轮判定，绝不按旧快照误删
+    活动状态。非锁类名恒返回 None（可删）。
+
+    Returns:
+        None = 可删；否则为 skip 原因文案（含复检异常的 fail-closed 保守跳过）。
+    """
+    try:
+        from orchd.lockfile import ExclusiveFileLock
+
+        held_now = bool(
+            _is_lock_like_name(path.name)
+            and ExclusiveFileLock(path).check().get("held", False))
+        held_error = None
+    except Exception as exc:
+        # fail-closed（task-lock-probe-fail-closed）：复检本身异常
+        # （锁路径瞬断 / 权限异常）无法判定 → 保守视为持有并跳过删除。
+        held_now = True
+        held_error = f"{type(exc).__name__}: {exc}"
+    if not held_now:
+        return None
+    if held_error:
+        return f"删除前复检异常（{held_error}），保守视为持有，本轮跳过"
+    return "删除前复检发现锁仍被持有（并发窗口），本轮跳过"
+
+
 # 第三方生态锁文件白名单（DR-1）：这些是**项目源码资产**，与 orchd 运行时无关，
 # doctor 绝不 untrack / 删除（原实现按 ``*.lock`` 全量判定，会把它们越界销毁）。
 _THIRD_PARTY_LOCK_NAMES = frozenset({
@@ -594,6 +623,9 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
     # 曾遗留 13 个僵持 git 进程拖慢 checkout，而检测面长期无进程维度。
     checks.extend(_check_hung_git_processes())
 
+    # 7e) 契约漂移节（P5-②）：生成物新鲜度 + manifest checker 缺失
+    checks.extend(_check_contract_drift(project_root))
+
     return checks
 
 
@@ -725,6 +757,76 @@ def _check_hung_git_processes() -> list[dict[str, str]]:
         f"{detail}。确认僵持后人工清理：{kill}；doctor --fix 不自动杀进程。"
         "（会话僵死另有三套时钟：ledger 24h / doctor-session 30min / "
         "watchdog 认领 60min——本项只看 git 进程存活。）")]
+
+
+# 生成物目录（P5-②）：与 scripts/gen_contract_docs.py::GENERATORS 逐字三锁
+# （本元组 / GENERATORS 键 / docs/_generated 落盘文件，不一致即
+# tests/contract/test_doctor_drift.py 元测试变红）。
+_GENERATED_DOCS = (
+    "error-codes.md",
+    "commands.md",
+    "fields.md",
+    "events.md",
+    "statemachine.md",
+)
+
+_GENERATED_MARKER = "生成物，勿手改"
+
+
+def _check_contract_drift(project_root: Path) -> list[dict[str, str]]:
+    """契约漂移节（P5-②，只读）：生成物新鲜度 + manifest checker 缺失。
+
+    - 生成物：``docs/_generated/<name>`` 存在、非空、含生成物标记；
+      缺失/空/无标记 → fail（内容逐字新鲜度由 test 生成物断言 + CI
+      freshness 步骤覆盖，本节只守存在性结构）。
+    - manifest：``tests/contract/contract_manifest.py`` 中登记的测试文件
+      逐个存在；缺失 → fail。登记表解析用 AST 取字面量（不 import 测试包，
+      避免引擎依赖测试代码）。
+    """
+    import ast
+
+    root = Path(project_root)
+    problems: list[str] = []
+    manifest = root / "tests" / "contract" / "contract_manifest.py"
+    if not manifest.is_file():
+        return [_make_check(
+            "contract_drift", "ok",
+            "非契约开发仓（无 manifest 登记表），漂移节跳过")]
+    generated_dir = root / "docs" / "_generated"
+    for name in _GENERATED_DOCS:
+        path = generated_dir / name
+        if not path.is_file():
+            problems.append(f"生成物缺失：docs/_generated/{name}")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append(f"生成物不可读：docs/_generated/{name}（{exc}）")
+            continue
+        if not text.strip() or _GENERATED_MARKER not in text:
+            problems.append(f"生成物异常（空或无标记）：docs/_generated/{name}")
+    try:
+        tree = ast.parse(manifest.read_text(encoding="utf-8"))
+        referenced = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("tests/")
+        }
+        for rel in sorted(referenced):
+            if not (root / rel).is_file():
+                problems.append(f"checker 缺失：{rel}")
+    except (OSError, SyntaxError) as exc:
+        problems.append(f"登记表不可解析：{exc}")
+    if problems:
+        return [_make_check(
+            "contract_drift", "fail",
+            f"契约漂移 {len(problems)} 项：" + "；".join(problems[:5]) +
+            ("..." if len(problems) > 5 else ""))]
+    return [_make_check(
+        "contract_drift", "ok",
+        f"生成物 {len(_GENERATED_DOCS)} 个在册且带标记；manifest 登记测试文件齐备")]
 
 
 # checkpoint 滞后容忍行数（DR-14）：引擎按**写命令**惰性落盘 checkpoint，因此
@@ -2207,33 +2309,15 @@ def _doctor_fix_impl(
             continue
 
         try:
-            # DR-7：锁类文件（.session*.lock / .intake.lock 等）删除前**复检 flock
-            # 活性**——检测与执行之间存在并发 claim / 准入写窗口，仍被持有说明存在
-            # 活跃持有者（会话刚起 / 准入写进行中）→ 本轮不删，留待下轮判定，
-            # 绝不按旧快照误删活动状态。
-            try:
-                from orchd.lockfile import ExclusiveFileLock
-
-                held_now = bool(
-                    _is_lock_like_name(path.name)
-                    and ExclusiveFileLock(path).check().get("held", False))
-                held_error = None
-            except Exception as exc:
-                # fail-closed（task-lock-probe-fail-closed）：复检本身异常
-                # （锁路径瞬断 / 权限异常）无法判定 → 保守视为持有并跳过删除，
-                # skip 原因显式写入结果记录。
-                held_now = True
-                held_error = f"{type(exc).__name__}: {exc}"
-            if held_now:
+            # DR-7 单一事实源（_pre_delete_lock_recheck）：--fix 与 auto_clean
+            # 删除前共用同一 flock 复检，堵检测→执行并发窗口。
+            skip_reason = _pre_delete_lock_recheck(path)
+            if skip_reason is not None:
                 cleaned.append({
                     **item,
                     "skipped": "lock_held",
                     "backup": None,
-                    "reason": (
-                        f"删除前复检异常（{held_error}），保守视为持有，本轮跳过"
-                        if held_error else
-                        "删除前复检发现锁仍被持有（并发窗口），本轮跳过"
-                    ),
+                    "reason": skip_reason,
                 })
                 continue
             needs_commit = action == "git_rm_cached_then_delete"
@@ -2462,6 +2546,13 @@ def _auto_clean_item(project_root: Path,
             backup_root = (Path(project_root) / ".orchd" / ".doctor-backup" /
                            "residual" / f"{int(time.time())}")
             return _dispose_residual_dir(path, backup_root)
+        # DR-7 对齐（task-autoclean-recheck-align）：auto_clean 删除文件前同样
+        # 复检 flock 活性，与 --fix 共用 _pre_delete_lock_recheck 单一事实源；
+        # 跳过项以 (False, skipped) 返回，调用方归入 manual_notice（可见不静默）。
+        skip_reason = _pre_delete_lock_recheck(path)
+        if skip_reason is not None:
+            return False, {
+                **item, "skipped": "lock_held", "reason": skip_reason}
         _delete_file(path, project_root)
         return True, {**item, "disposition": "deleted"}
     except Exception as exc:

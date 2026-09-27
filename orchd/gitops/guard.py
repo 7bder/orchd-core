@@ -492,13 +492,18 @@ def _build_wrong_branch_hint(
 ) -> str:
     """构建 wrong_branch 错误的 hint（含 task branch worktree 位置指引）。"""
     expected = sorted(allowed_branches)
-    # task-line-guard-intake-wiring：任务分支族按线命名空间识别（task/{id} 或 {line}/task/{id}）
-    task_branches = [b for b in expected if b.startswith("task/") or "/task/" in b]
+    # 单根命名空间（pass8 F1-A）：任务分支恒以 task/ 为根；旧 {line}/task/{id}
+    # 不再识别（fail-closed）。
+    from orchd.line import parse_task_branch
+
+    task_branches = [b for b in expected if parse_task_branch(b) is not None]
     if not task_branches:
         return f"请先切换到 {' 或 '.join(expected)} 分支再执行 {command}"
     hint_parts = []
     for tb in task_branches:
-        task_id = tb.rsplit("/task/", 1)[1] if "/task/" in tb else tb[len("task/"):]
+        parsed = parse_task_branch(tb)
+        assert parsed is not None  # 来自 task_branches 过滤，不可达 None
+        task_id = parsed[1]
         # AC4（task-review-diagnostics-hardening）：worktree 目录名单一来源 =
         # worktree_hint(task_id)（内部使用 _task_wt_name），消除双前缀 fallback。
         # task_id 由分支名 task/<id> 截出后已含 task- 前缀，再拼 "task-" 会产出
@@ -535,7 +540,7 @@ def _build_wrong_branch_hint(
                 f"（可用 python .orchd/__main__.py restore --path <文件>）；"
                 f"引擎会在评审认领时自动切到 {tb}"
             )
-    non_task = [b for b in expected if not b.startswith("task/") and "/task/" not in b]
+    non_task = [b for b in expected if parse_task_branch(b) is None]
     if non_task:
         hint_parts.append(
             f"或切换到 {' 或 '.join(non_task)} 分支再执行 {command}"
@@ -574,7 +579,9 @@ def commit_hint_for_branch(branch: str | None) -> str:
     - 恒附幻影脏分支：内容零差异时勿补声明、无需提交（当前内容差分门禁下此类
       脏位本不应到达 E017，此为防御性指引，防旧引擎 / 边缘口径下的误动作）。
     """
-    if isinstance(branch, str) and (branch.startswith("task/") or "/task/" in branch):
+    from orchd.line import parse_task_branch as _parse_tb
+
+    if isinstance(branch, str) and _parse_tb(branch) is not None:
         action = (
             "请在任务分支内提交（git add + git commit，红线 #1 唯一豁免）"
             "或还原改动后重试"

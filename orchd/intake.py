@@ -261,7 +261,7 @@ def intake_commit(
 
 
 def _roadmap_land_entry(header: str, version: str, roadmap_rel: str, section_id: str) -> str:
-    """构造 ROADMAP 落地 IDEAS pending 条目（date 用运行日，标题取章节头）。
+    """构造 ROADMAP 落地 IDEAS study 条目（date 用运行日，标题取章节头）。
 
     ``section_id`` 来自 ROADMAP 章节的 ``id:`` 声明（``roadmap_land`` 已校验其
     存在，缺失时以 ``no_section_id`` 拒绝）——**必须写入条目** ``- id:`` 字段：
@@ -273,20 +273,36 @@ def _roadmap_land_entry(header: str, version: str, roadmap_rel: str, section_id:
     date = datetime.date.today().isoformat()
     return (
         f"## {date} {header}\n"
-        f"- status: pending\n"
+        f"- status: study\n"
         f"- id: {section_id}\n"
         f"- goal: 把 ROADMAP §{version} 规划内容落地拆解为具体任务并注册到 _master.json。\n"
         f"- idea: ROADMAP §{version}（{header}）落地。\n"
         f"- detail: {roadmap_rel} §{version}\n"
-        f"- notes: 由 orchd roadmap-land 生成（intake-dual-path），待摄入拆解为任务。\n"
+        f"- notes: 由 orchd roadmap-land 生成（intake-dual-path，study 待用户 confirm 升 pending 后再摄入拆解）。\n"
     )
+
+
+def _entry_id_exists(text: str, entry_id: str) -> bool:
+    """IDEAS 文本中是否存在 ``- id:`` 精确命中的条目（幂等判据共用）。
+
+    行级精确值比对（``- id:`` 与 ``id:`` 两种写法）；与
+    ``cli.commands.ideas`` 追记定位的同构扫描保持一致。注释示例内的
+    ``- id: <slug>`` 字面值永不等于真实 slug，无需预剔注释。
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if (s.startswith("- id:") and s[len("- id:"):].strip() == entry_id) or (
+            s.startswith("id:") and s[len("id:"):].strip() == entry_id
+        ):
+            return True
+    return False
 
 
 def roadmap_land(
     project_root: Path,
     version: str,
 ) -> dict[str, Any]:
-    """roadmap-land 落地：为 ROADMAP 规划章节生成 IDEAS pending 条目（intake-dual-path）。
+    """roadmap-land 落地：为 ROADMAP 规划章节生成 IDEAS study 条目（intake-dual-path）。
 
     双路径「有规划」入口：ROADMAP（意图层）→ 落地进 IDEAS（执行层）→ 摄入拆解 → 任务池。
 
@@ -369,10 +385,14 @@ def roadmap_land(
     if not sec["id"]:
         return {"landed": False, "reason": "no_section_id", "version": version}
 
-    # 3) 幂等：IDEAS 已有引用该章节的落地条目 → 跳过
+    # 3) 幂等：同一章节已落地 → 跳过。双判据（unified-intake-eng-roadmapland）：
+    # ① 章节 id 精确命中（- id: 主判据：重定基改版本号后 §字面失效时仍能认出）；
+    # ② §版本 字面命中（兼容存量无 id 条目；且与 E031「§版本文本即已落地」
+    # 判据对齐——E031 放行处 land 必跳过，两边不打架）。
+    # 仅查 IDEAS.md（与旧语义同文件；归档后重落与旧行为一致，不在此展开）。
     ideas = ws / "IDEAS.md"
     ideas_text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
-    if f"§{version}" in ideas_text:
+    if _entry_id_exists(ideas_text, sec["id"]) or f"§{version}" in ideas_text:
         return {
             "landed": False,
             "reason": "already_landed",
@@ -380,7 +400,7 @@ def roadmap_land(
             "hint": f"IDEAS.md 已有引用 ROADMAP §{version} 的落地条目",
         }
 
-    # 4) 生成 IDEAS pending 条目（追加到 IDEAS.md 末尾）—— 受准入写锁串行
+    # 4) 生成 IDEAS study 条目（追加到 IDEAS.md 末尾）—— 受准入写锁串行
     # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
     orchd_dir = _resolve_lock_orchd_dir(project_root)
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))

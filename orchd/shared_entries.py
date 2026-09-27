@@ -106,6 +106,24 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_cli_query.py",
         "tests/test_nogit_init_layout.py",
     ),
+    # 2026-09-27 task-pass9-shared-entry-registry（pass9 实测）：hook 生成物形态
+    # （case 模式 / scope-check 行）被 test_decl_dir_match_guards.py 的断言钉住，
+    # 改生成层而不跑它 = 断言漂移只能靠全量回归兜底（实测漏 3 条红）。生成行为
+    # 由三文件直接断言，改 hook.py 须全跑。
+    "orchd/gitops/hook.py": (
+        "tests/test_gitops.py",
+        "tests/test_decl_dir_match_guards.py",
+        "tests/test_hook_path_injection.py",
+    ),
+    # 2026-09-27 task-pass9-shared-entry-registry（pass9 实测）：session 锁回收/
+    # 探活链路被 test_concurrency.py 的 W-17 断言钉住；锁协议属高风险区（verify.md
+    # 第三环），改 session_lock.py 须全跑四个同域测试文件。
+    "orchd/gitops/session_lock.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
 }
 
 # 全局共享文件（形态 A）：影响面无法枚举的共享入口——改它影响**全量**用例，因此不存在

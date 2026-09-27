@@ -196,7 +196,12 @@ class FilesystemBackend(StorageBackend):
                                    separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, self.ledger_path)
+        # task-pass9-runtime-atomic-writes（pass9 F13）：与 save_checkpoint 同
+        # 硬化——经 _atomic_replace 获 L-8 WinError 5/32 句柄争用重试（惰性
+        # 导入避免 ledger → storage.filesystem import 环，同 save_checkpoint）。
+        from orchd.ledger import _atomic_replace
+
+        _atomic_replace(tmp_path, self.ledger_path)
 
     def load_checkpoint(self) -> dict[str, Any] | None:
         if not self.checkpoint_path.exists():

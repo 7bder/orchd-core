@@ -33,20 +33,20 @@ guide: {}
 
 | 情况 | 行为 |
 |---|---|
-| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **39 个**（`orchd/guide.py::_ERROR_GUIDANCE_TABLE` 全量覆盖 E001-E039，计数由 `tests/test_docs_single_source.py` 与 `orchd/errors.py` 双边锁定）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson stage --guidance-flaw` 上报缺陷，不自行处理 |
-| **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --resolved` 沉淀；未解决 → 停止报告 |
+| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **39 个**（全量覆盖 E001-E039；计数真锁 = `orchd/errors.py` ↔ `implementation-design.md` §2.4 ↔ `tests/test_docs_single_source.py`，guide 表另由 `tests/test_guide.py` 锁定）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson report --trigger <key> --symptom "..." --guidance-flaw` 上报缺陷，不自行处理 |
+| **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --task <id> --trigger <key> --symptom "..." --resolved` 沉淀；未解决 → 停止报告 |
 | **红线 14 纪律场景**（candidate=None / next_action=exit） | 维持不变：停止等待，**不**视为自愈 |
 
 - **补丁 1（关键）**：`_FALLBACK_ERROR_GUIDANCE`（"立即停止并报告"）**不算"明确指引"**，归入"无 guidance"→ 允许自愈。否则所有未映射错误码都有 fallback 指引，自愈永不触发，功能失效。
 - **补丁 2**：触发键不限于错误码，扩展为场景键（`command + step + symptom`），覆盖非错误码场景（平台问题、流程缺口、命令成功但结果异常）。
-- **补丁 3**：自愈"成功"需客观信号（verify 通过 / 后续命令成功），不靠 agent 自述；否则只能 `lesson report`（记问题），不能 `lesson stage --resolved`（记解法）。引擎侧交叉验证：done hook 对 `resolved=true` 条目回溯当前任务 verify 事件，不存在或 `exit_code ≠ 0` 则降级 `resolved=false` 并在 review 汇总标注。
+- **补丁 3**：自愈"成功"需客观信号（verify 通过 / 后续命令成功），不靠 agent 自述；否则只能 `lesson report`（记问题），不能 `lesson stage --task <id> --trigger <key> --symptom "..." --resolved`（记解法）。引擎侧交叉验证：done hook 对 `resolved=true` 条目回溯当前任务 verify 事件，不存在或 `exit_code ≠ 0` 则降级 `resolved=false` 并在 review 汇总标注。
 - **补丁 4（IDEAS vs lesson 边界）**：自愈中若判定根因为**引擎自身缺陷**（代码 bug / 状态机异常 / schema 不一致），应走 `idea` 命令 propose（进入任务管线），而非 `lesson stage`；lesson 仅承载**环境/平台/配置层面**应对经验（Windows 编码、git 配置差异、worktree 路径陷阱等），不承载引擎 bug 报告。
 
 ### 打点义务（6 条）
 
-1. 遇"无具体 guidance"错误且自愈成功 → `lesson stage --resolved`（以 verify 通过 / 后续命令成功为客观信号）。
-2. 遇"无具体 guidance"错误且未解决 → `lesson stage`（只记问题，`resolved=false`）。
-3. 遇"有具体 guidance 但判定不适用" → `lesson stage --guidance-flaw`（`resolved=false`，标记指引缺陷）。
+1. 遇"无具体 guidance"错误且自愈成功 → `lesson stage --task <id> --trigger <key> --symptom "..." --resolved`（以 verify 通过 / 后续命令成功为客观信号）。
+2. 遇"无具体 guidance"错误且未解决 → `lesson stage --task <id> --trigger <key> --symptom "..."`（只记问题，`resolved=false`）。
+3. 遇"有具体 guidance 但判定不适用" → `lesson report --trigger <key> --symptom "..." --guidance-flaw`（`resolved=false`，标记指引缺陷）。
 4. **收尾统一审核**：打点仅入暂存区，不实时入库；任务 done 时统一汇总，人工 `lesson review` 确认后入库（§8.6）。
 5. 仅对 **blocking 级**打点（warning 级按下方决策树三重信号判断；E030 例外，§5）。
 6. **补丁 4 边界**：自愈中若判定为引擎缺陷 → 走 `idea` 命令 propose，不 `lesson stage`；仅环境/平台/配置层面应对经验才 lesson 打点。
@@ -62,8 +62,8 @@ guide: {}
 
 触发上报判断后：
 
-- 已解决（verify 通过）→ `lesson stage --resolved`（记解法，P0 价值）。
-- 未深入解决 → `lesson stage`（记问题，标记"值得关注"）。
+- 已解决（verify 通过）→ `lesson stage --task <id> --trigger <key> --symptom "..." --resolved`（记解法，P0 价值）。
+- 未深入解决 → `lesson stage --task <id> --trigger <key> --symptom "..."`（记问题，标记"值得关注"）。
 
 > 来源可追溯：每条 lesson 记录 source（agent 指纹 / session / engine_version）；信任分级 `proposed`（未验证·参考）→ 人工 `resolve --approve` 后 `verified`（正式触发）；solution 只提示不代行。详见 `design/lesson-feedback-design-20260828.md`。
 
@@ -81,7 +81,7 @@ guide: {}
 | **C 手工 dict** | 代码里手拼 `{"code":"Exxx", ...}` 后 return | ❌ 否（需 structured_error 接线） | E021/E028/E030/E031/E032/E035 |
 | **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | E020 |
 
-**通道登记核对（2026-09-15，按 `ERROR_CODE_CHANNELS` 实测）**：A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）、B+C 双通道 2 码（E028/E031，同时出现在上表 B 批量校验与 C 手工 dict 通道）、A+B 双通道 3 码（E003/E005/E022）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
+**通道登记核对（指针式 2026-09-28 task-pass10-counts-pointers：实时以 `orchd/guide.py::ERROR_CODE_CHANNELS` 与 `orchd/errors.py` 为准，快照会过期）**：2026-09-15 快照 A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）→ 2026-09-28 快照 A 单通道 21 码（+E039）、B 单通道 8 码（+E037/E038）、B+C**：A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）、B+C 双通道 2 码（E028/E031，同时出现在上表 B 批量校验与 C 手工 dict 通道）、A+B 双通道 3 码（E003/E005/E022）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
 
 **E015 (merge_conflict) 已接入通道 A**（不再是死映射）：`done` 前置对账在 `orchd/onboard/lifecycle/core.py` 新增 `raise OrchdError(E015)` 位点（task-done-reconcile-main 挂载点①）；`orchd/review.py` 仍以手工 dict 挂 `result` 的 reason 路径保留。`ERROR_CODE_CHANNELS` 登记由空集改为 `{"A"}`。
 

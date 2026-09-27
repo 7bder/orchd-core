@@ -318,11 +318,11 @@ def merge_audit(
 
     root = Path(project_root)
 
-    # task-line-audit-guide-wiring：巡检按当前线解析（任务分支命名空间 + trunk）
-    from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+    # 单根命名空间（pass8 F1-A）：任务分支恒以 task/ 为根，全线通用
+    from orchd.line_ctx import resolve_trunk_for
 
     trunk = resolve_trunk_for(root)
-    branch_prefix = resolve_task_branch_for(root, "")  # "task/" 或 "{line}/task/"
+    branch_prefix = "task/"
 
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -348,8 +348,10 @@ def merge_audit(
     registered_ids = {t.get("id", "") for t in tasks}
     warnings: list[dict[str, Any]] = []
     try:
+        # for-each-ref 用裸前缀（无 *）：`*` 通配不跨 `/`（实证），裸前缀才含嵌套
+        # task/{line}/{id}；与 request.py _inflight_files 同口径
         refs = _git(
-            "for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch_prefix}*"
+            "for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch_prefix}"
         )
     except (subprocess.SubprocessError, OSError):
         return {"skipped": False, "warnings": warnings}

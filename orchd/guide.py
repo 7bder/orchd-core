@@ -1162,9 +1162,13 @@ def branch_context(
     if not branch:
         return None
     tip = _CMD_BRANCH_CTX_TIPS.get(command) if command else None
-    # task-line-audit-guide-wiring：识别 {line}/task/{id} 任务分支（多线命名空间）
-    if branch.startswith("task/") or "/task/" in branch:
-        tid = branch.rsplit("/task/", 1)[1] if "/task/" in branch else branch[len("task/"):]
+    # 单根命名空间反解（pass8 F1-A）：task/{id} 或 task/{line}/{id}；
+    # 旧 {line}/task/{id} 不再识别（fail-closed）。
+    from orchd.line import parse_task_branch
+
+    parsed = parse_task_branch(branch)
+    if parsed is not None:
+        tid = parsed[1]
         hint = (
             f"当前在任务分支 {branch}：实现/提交只在本分支，勿在主分支改动任务文件；"
             f"完成后 {_ENTRY_CMD} done 会自动切回主分支。"

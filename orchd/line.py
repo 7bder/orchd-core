@@ -7,7 +7,7 @@
 opt-in 增量语义（单线零回归）：
 
 - 未配置 ``project.lines`` ⇒ 唯一线 ``default``，trunk = ``main``；
-- 任务分支名 = ``task/{id}``（不得泄漏为 ``{line}/task/{id}``）。
+- 任务分支名前缀恒为 ``task/``（单根命名空间；多线为 ``task/{line}/{id}``）。
 
 M2 判据锚点（``orchd/milestone.py``）：
 
@@ -51,13 +51,15 @@ def _lines_config(project: ProjectConfig) -> dict[str, str]:
         if (
             not isinstance(name, str)
             or not name
+            or "/" in name
             or not isinstance(trunk, str)
             or not trunk
         ):
             raise OrchdError(
                 ErrorCode.E005,
                 f"project.lines 登记非法：line '{name}' 须形如 "
-                '{"trunk": "<分支名>"}（trunk 为非空字符串）',
+                '{"trunk": "<分支名>"}（trunk 为非空字符串，'
+                '线名不得含 /——保障 task/{line}/{id} 可反解',
                 [{"line": name, "spec": spec}],
             )
         config[name] = trunk
@@ -104,13 +106,20 @@ def resolve_line(project: ProjectConfig = None, env: Env = None) -> str:
     """当前线名。
 
     解析序：``ORCHD_LINE``（在册）→ ``project.default_line``（在册）→ 首个登记线；
-    单线模式恒 ``default``。``ORCHD_LINE`` 指向未登记线 → ``E005``（硬拒绝，不静默回退）。
+    单线模式恒 ``default``（含显式 ``ORCHD_LINE=default`` 别名，与 resolve_trunk
+    对称；pass8 F8）。``ORCHD_LINE`` 指向未登记线 → ``E005``（硬拒绝，不静默回退）。
     """
     config = _lines_config(project)
     environ = os.environ if env is None else env
     requested = environ.get(LINE_ENV_VAR)
     if isinstance(requested, str) and requested.strip():
         requested = requested.strip()
+        if not config:
+            # 单线模式：仅接受 default 别名（与 resolve_trunk /
+            # resolve_task_branch_name 同口径）；其余仍 E005
+            if requested == DEFAULT_LINE:
+                return DEFAULT_LINE
+            raise _unknown_line(requested, [DEFAULT_LINE])
         if requested not in config:
             raise _unknown_line(requested, sorted(config) or [DEFAULT_LINE])
         return requested
@@ -136,7 +145,11 @@ def resolve_trunk(line: str | None = None, project: ProjectConfig = None) -> str
 def resolve_task_branch_name(
     task_id: str, line: str | None = None, project: ProjectConfig = None
 ) -> str:
-    """任务分支名：单线 ``task/{id}``；多线 ``{line}/task/{id}``。未知 line → ``E005``。"""
+    """任务分支名：单线 ``task/{id}``；多线 ``task/{line}/{id}``。未知 line → ``E005``。
+
+    单根命名空间（pass8 F1 设计级修复）：旧 ``{line}/task/{id}`` 形态已废除。
+    trunk 分支 ``{line}`` 与其构成 git D/F 引用冲突（演练实证），``task/`` 前缀对全线恒成立。
+    """
     config = _lines_config(project)
     if not config:
         if line is not None and line != "" and line != DEFAULT_LINE:
@@ -145,4 +158,27 @@ def resolve_task_branch_name(
     target = line or _default_line_name(project, config)
     if target not in config:
         raise _unknown_line(target, sorted(config))
-    return f"{target}/task/{task_id}"
+    return f"task/{target}/{task_id}"
+
+TASK_BRANCH_ROOT = "task/"
+
+
+def parse_task_branch(branch: object) -> tuple[str | None, str] | None:
+    """任务分支反解 → ``(line|None, task_id)``；非任务分支 → None。
+
+    单根命名空间（pass8 F1 设计级修复）的唯一反解点：
+    ``task/{id}`` → ``(None, id)``；``task/{line}/{id}`` → ``(line, id)``。
+    id 字符集不含 ``/``（schema ``^task-[a-z0-9-]+$``），故末段恒为完整 id；
+    旧 ``{line}/task/{id}`` 形态不再识别（fail-closed：按非任务分支处置）。
+    """
+    if not isinstance(branch, str) or not branch.startswith(TASK_BRANCH_ROOT):
+        return None
+    rest = branch[len(TASK_BRANCH_ROOT):]
+    if not rest:
+        return None
+    if "/" not in rest:
+        return None, rest
+    line, _, tid = rest.partition("/")
+    if not line or not tid or "/" in tid:
+        return None
+    return line, tid

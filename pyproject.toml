@@ -43,10 +43,16 @@ orchd = [
 dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.0",
+    # pass9 F14（task-pass9-toolchain-alignment）：超时护栏与覆盖率此前未声明
+    # 也未安装——覆盖率不可测量、失控用例裸跑。声明即发版面契约，宿主须同步安装。
+    "pytest-timeout>=2.2",
+    "pytest-cov>=5.0",
     "setuptools-scm>=8.0",
     "build>=1.0",
     "ruff>=0.6",
-    "mypy>=1.10",
+    # pass8 F3：mypy 无上界则 CI 按现网最新版解析，新版错误码（如 union-attr）
+    # 可把绿染红；上界 <2（2.x 为下一代，升级须专项评估）。
+    "mypy>=1.10,<2",
 ]
 
 [tool.ruff]

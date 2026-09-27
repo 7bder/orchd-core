@@ -329,10 +329,14 @@ def _log_hook_skip(action: str, payload: dict[str, Any]) -> None:
     调用方 ``onboard/claim.py::claim`` 目前丢弃 hook_install 返回值，故在此落一条
     stderr 审计行，避免跳过被静默吞掉。
     """
-    try:
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError, OSError):
-        pass
+    # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
+    # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     try:
         record = {"action": action, **payload}
         print(f"orchd ▸ [hook] {json.dumps(record, ensure_ascii=False)}", file=sys.stderr)
@@ -377,19 +381,20 @@ def _baked_hook_endpoints(project_root: Path) -> tuple[str | None, str | None]:
 
 
 def _line_ref_tx_env(project_root: Path) -> tuple[str | None, str | None]:
-    """多线下强制层需要的命名空间前缀与 trunk；**单线 → (None, None)**。
+    """多线下强制层需要的 trunk；**单线 → (None, None)**。
 
-    task-line-ref-tx-per-line：单线不烘焙（生成物与历史逐字一致、零额外成本）；
-    多线烘焙 ``refs/heads/{line}/task/`` 与线 trunk，使引擎向第二线 trunk 的受管
-    merge 与线内任务分支提交被强制层正确放行。
+    task-line-ref-tx-per-line：单线不烘焙（生成物与历史逐字一致、零额外成本）。
+    pass8 F1-A 单根命名空间后任务前缀恒为 ``refs/heads/task/``（全线通用，
+    强制层常量 ``TASK_PREFIX`` 即此值），烘焙仅携带**当前线 trunk**，供强制层
+    判定第二线 trunk 受管 merge。
     """
     try:
-        from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
+        from orchd.line import is_multi_line
+        from orchd.line_ctx import _project_for, resolve_trunk_for
 
-        prefix_rel = resolve_task_branch_for(project_root, "")  # "task/" 或 "{line}/task/"
-        if prefix_rel == "task/":
+        if not is_multi_line(_project_for(project_root)):
             return None, None
-        return "refs/heads/" + prefix_rel, resolve_trunk_for(project_root)
+        return "refs/heads/task/", resolve_trunk_for(project_root)
     except Exception:  # noqa: BLE001 - best-effort，失败退回单线口径
         return None, None
 
@@ -671,25 +676,30 @@ def hook_install(
 
     # 生成 hook 脚本内容（shell 逻辑 + 运行时动态解析；回退用静态列表）
     # 顶部注释保留绑定任务与文件清单（可读性 / 既有断言兼容，不参与正常路径判定）。
-    files_list = "\n".join(f"#   {f}" for f in files_to_edit)
+    # 注释行展示转义（pass9 F1）：注释体除换行外皆惰性，声明含换行会把注释断行、
+    # 断行后的内容成为可执行语句行——渲染为字面 \n 保住「每行都是注释」不变量
+    # （声明层另由 validate_structure E003 fail-closed 拒绝控制字符路径）。
+    def _comment_display(path: str) -> str:
+        return path.replace("\n", "\\n")
+
+    files_list = "\n".join(f"#   {_comment_display(f)}" for f in files_to_edit)
     if exempt:
         files_list += "\n# Exempt files:"
-        files_list += "\n" + "\n".join(f"#   {f}" for f in exempt)
+        files_list += "\n" + "\n".join(f"#   {_comment_display(f)}" for f in exempt)
     # 回退路径（无 task/<id> 分支）用的静态允许列表：文件名单引号转义（防 shell 注入）
     # 目录式声明感知：精确相等 + 目录前缀匹配（orchd/cli/ → orchd/cli/*）
-    # 注意：case 模式中目录前缀部分用双引号包裹（防空格），* 在引号外作为通配符
+    # 注意（pass9 F1）：case 模式中目录前缀部分同样单引号包裹、* 在引号外作通配符——
+    # 单引号内 $ / 反引号 / " 均为字面量，双引号形态下它们会被展开（注入面）
     def _scope_check_lines(paths):
         lines = []
         for f in paths:
             q = _shell_quote(f)
+            # 目录式声明：精确相等（目录名本身）或前缀匹配（目录下文件）
+            lines.append(f'            if [ "$FILE" = {q} ]; then IN_SCOPE=yes; fi')
             if f.endswith("/"):
-                # 目录式声明：精确相等（目录名本身）或前缀匹配（目录下文件）
-                lines.append(f'            if [ "$FILE" = {q} ]; then IN_SCOPE=yes; fi')
-                # 双引号包裹路径前缀，* 在引号外作通配符
-                dq = f.replace("'", "'\''")
-                lines.append(f'            case "$FILE" in "{dq}"*) IN_SCOPE=yes ;; esac')
-            else:
-                lines.append(f'            if [ "$FILE" = {q} ]; then IN_SCOPE=yes; fi')
+                # 单引号字面量前缀 + 引号外 * 通配（POSIX case：引号包裹的
+                # 模式段按字面匹配，未包裹段保持通配）
+                lines.append(f'            case "$FILE" in {q}*) IN_SCOPE=yes ;; esac')
         return "\n".join(lines)
     files_check = _scope_check_lines(files_to_edit)
     exempts_check = _scope_check_lines(exempt)
@@ -720,15 +730,17 @@ def hook_install(
             "            fi\n"
             "        fi"
         )
+    # 越界提示展示（pass9 F1）：printf 固定格式 + 单引号逐参——双引号内嵌路径
+    # 会让 $ / 反引号在每次越界输出时执行（该段在 E020 拒绝分支对所有提交者运行）
     static_allowed_echo = "\n".join(
-        f'        echo "  - {f}"' for f in files_to_edit
+        f"        printf '  - %s\\n' {_shell_quote(f)}" for f in files_to_edit
     )
     # 无豁免时不输出 Exempt files 标题行（保持与无 exempt_files 行为一致）
     static_exempt_header = (
         '        echo "Exempt files for this task:"\n' if exempt else ""
     )
     static_exempt_echo = "\n".join(
-        f'        echo "  - {f}"' for f in exempt
+        f"        printf '  - %s\\n' {_shell_quote(f)}" for f in exempt
     )
     bound_task = _shell_quote(task_id)
 

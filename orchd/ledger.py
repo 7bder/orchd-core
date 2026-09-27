@@ -34,6 +34,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    REVIEW_SUBMITTED_TARGETS,
+    TRANSITION_TABLE,
+    normalize_event,
+    validate_event,
+)
 from orchd.errors import ErrorCode, OrchdError, to_json_response
 from orchd.lockfile import ExclusiveFileLock, _depth_registry, _flock_op, read_locked_text
 
@@ -396,6 +402,24 @@ def _atomic_replace(
     )
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """session 运行时文件的原子写（task-pass9-runtime-atomic-writes，pass9 F13）。
+
+    与 checkpoint / 事件文件同一硬化等级：tmp + fsync + _atomic_replace（含
+    L-8 Windows 句柄争用重试）+ 目录项 fsync。此前 session 四处写为裸
+    write_text，崩溃窗口会产生半截 JSON，读侧 json.loads 以 E999 逃逸——
+    最常写的活性文件硬化反而最弱。tmp 名带 pid：session 文件无锁保护，
+    同会话并行进程各写各的 tmp，replace 原子决胜，不会互写撕裂。
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
 @dataclass
 class TaskDerived:
     """从 ledger 单次扫描得到的 per-task 派生信息（H2，2026-08-13 性能审核）。
@@ -532,15 +556,17 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     if home:
         return Path(home)
     # task-14-worktree-lifecycle：仅 container 布局 → 布局级 runtime 根（共享账本默认）
-    try:
-        from orchd.worktree import read_layout
+    # task-pass9-ledger-lock-root（pass9 F3）：不再套 except Exception——布局标记
+    # 读取的异常处理收敛在 read_layout（缺失/损坏 → None，flat 回退）；此处若仍
+    # 有异常逸出（如标记 JSON 结构非对象触发 AttributeError）属非预期故障，必须
+    # 上抛（fail-closed）：账本根解析是系统真相源的路径决策，静默回退本地
+    # .orchd 会让 container 布局的并发进程分裂成两个账本。
+    from orchd.worktree import read_layout
 
-        marker = read_layout(orchd_dir)
-        if marker is not None and marker.get("layout") == "container":
-            main_wt = Path(marker["main_worktree"])
-            return main_wt.parent / ".orchd-runtime"
-    except Exception:
-        pass
+    marker = read_layout(orchd_dir)
+    if isinstance(marker, dict) and marker.get("layout") == "container":
+        main_wt = Path(marker["main_worktree"])
+        return main_wt.parent / ".orchd-runtime"
     return orchd_dir
 
 
@@ -745,7 +771,7 @@ def _touch_session_last_seen(orchd_dir: Path) -> None:
         if not data.get("active"):
             return
         data["last_seen"] = datetime.now(timezone.utc).isoformat()
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     except (OSError, ValueError):
         return
 
@@ -778,7 +804,7 @@ def session_start(
     }
     path = _session_runtime_path(orchd_dir, identity["session_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     return {
         **data,
         "path": str(path),
@@ -855,7 +881,7 @@ def session_current(orchd_dir: Path) -> dict[str, Any]:
         )
     now = datetime.now(timezone.utc).isoformat()
     data["last_seen"] = now
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     return {**data, "path": str(path), "current": True}
 
 
@@ -912,7 +938,7 @@ def session_end(
             **force_bypass,
             "at": data["ended_at"],
         }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     return {**data, "path": str(path), "ended": True}
 
 
@@ -1345,27 +1371,12 @@ def intake_lock_acquire(
         threadlock.release()
         raise
     # 诊断标记（best-effort，非互斥依据）：供 intake_lock_check 报障
+    # （pass9 F15：显式 utf-8——Windows cp936 默认下含中文路径/Agent 名即乱码）
     try:
         lock.write_text(
             json.dumps({"agent_id": agent_id, "timestamp": str(time.time()),
-                        "path": str(canonical)}, ensure_ascii=False) + "\n"
-        )
-    except OSError:
-        pass
-    # 迁移孤儿回收（task-audit-lock-residue-reclaim AC2）：账本根重定向
-    # （container / ORCHD_HOME）时清理 flat→container 迁移后旧路径
-    # ``<main>/.orchd/.intake.lock`` 残留，best-effort 不阻断准入。
-    try:
-        reclaim_orphan_intake_locks(orchd_dir)
-    except Exception:
-        pass
-    return {"acquired": True, "agent_id": agent_id,
-            "path": str(canonical), "_lock": lock}
-    # 诊断标记（best-effort，非互斥依据）：供 intake_lock_check 报障
-    try:
-        lock.write_text(
-            json.dumps({"agent_id": agent_id, "timestamp": str(time.time()),
-                        "path": str(canonical)}, ensure_ascii=False) + "\n"
+                        "path": str(canonical)}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
         )
     except OSError:
         pass
@@ -1443,20 +1454,29 @@ def intake_lock_release(lock: dict[str, Any]) -> None:
         return
     entry["refcount"] -= 1
     if entry["refcount"] <= 0:
+        entry["refcount"] = 0
         try:
             lk.release()
         except (OSError, IOError):
             pass
-        _intake_lock_registry.pop(canonical, None)
         _mark_intake_lock_released(canonical, lock)
-        # task-concurrent-amend-lost-update：随 flock 一并释放线程层（配对 acquire
-        # 侧的 threadlock.acquire；重入中（refcount>0）不释放）。
-        _tl = entry.get("threadlock")
-        if _tl is not None:
-            try:
-                _tl.release()
-            except Exception:
-                pass
+    # 条目留注册表（不 pop）：等待线程在阻塞前已取到本 entry 引用；
+    # pop 会使其工作在 detached entry 上，其 release 因查无注册而走
+    # early-return 漏放 RLock——3+ 线程争用即 strand 等待者（E012）。
+    # entry 体积极小（每锁路径一个）且 flock 释放后不占 fd，保留无害。
+    # task-concurrent-amend-lost-update 的 2 线程用例恰好躲过此坑
+    # （第二完成者后无等待者），4 线程并发 propose 实测撞出。
+    # 线程层 RLock 与 acquire 一一配对（task-pass9-ledger-lock-root，pass9 F4）：
+    # acquire 每次调用恰 acquire 一次 RLock（重入分支亦然，:1303 无条件获取），
+    # release 必须**每次**释放一次——原先仅在 refcount 归零时释放，嵌套场景
+    # （init → bootstrap_container）净漏一层计数，其他线程等满超时误报 E012
+    # 而 flock 实际空闲。
+    _tl = entry.get("threadlock")
+    if _tl is not None:
+        try:
+            _tl.release()
+        except Exception:
+            pass
 
 
 def reclaim_orphan_intake_locks(orchd_dir: Path) -> dict[str, Any]:
@@ -1519,42 +1539,42 @@ def intake_lock_clear(orchd_dir: Path) -> dict[str, Any]:
 # task-storage-port-adapter-split：FilesystemBackend 已迁至 orchd.storage.filesystem。
 
 
-# 跃迁白矩阵（task-audit-ledger-state-machine-dedup）：事件类型 → 允许的当前状态
-# 集合。仅约束「会改变状态」的事件；目标状态 == 当前状态（幂等 self-transition，
-# 如两阶段审查 spec APPROVED 后任务仍 in_review、REVIEW_READY(code) 再次到来）
-# 永远合法。FORCE_STATUS（强制逃生口，支持 cancelled→pending 复活 / claimed→
-# completed）、RETRACT（回滚）、REVIEW_CLAIMED（非状态跃迁）不受矩阵约束。
+# 跃迁白矩阵（W2-③派生自 contracts.TRANSITION_TABLE 的只读视图，
+# 禁止手写分叉；task-audit-ledger-state-machine-dedup 的原始语义保持）：
+# 事件类型 → 允许的当前状态集合。仅约束「会改变状态」的事件；目标状态 ==
+# 当前状态（幂等 self-transition，如两阶段审查 spec APPROVED 后任务仍
+# in_review、REVIEW_READY(code) 再次到来）永远合法。FORCE_STATUS（强制逃生口，
+# 支持 cancelled→pending 复活 / claimed→completed）、RETRACT（回滚）、
+# REVIEW_CLAIMED（非状态跃迁）不受矩阵约束。
 _TRANSITION_WHITELIST: dict[str, frozenset[str]] = {
-    "CLAIMED": frozenset({"pending"}),
-    "DONE": frozenset({"claimed"}),
-    "REVIEW_READY": frozenset({"done", "in_review"}),
-    "REVIEW_SUBMITTED": frozenset({"in_review"}),
+    etype: entry["allowed_from"]
+    for etype, entry in TRANSITION_TABLE.items()
+    if entry["gated"] and entry["allowed_from"]
 }
 # 不受白矩阵约束的事件类型（引擎逃生口 / 回滚 / 非状态跃迁）
-_UNGATED_TRANSITIONS = frozenset({"FORCE_STATUS", "RETRACT", "REVIEW_CLAIMED"})
+_UNGATED_TRANSITIONS = frozenset({
+    etype for etype, entry in TRANSITION_TABLE.items() if not entry["gated"]
+})
 
 
 def _event_target_status(event: dict[str, Any]) -> str | None:
-    """推导事件将设置的目标状态；不改变状态或不受约束的事件返回 None（跳过校验）。"""
+    """推导事件将设置的目标状态；不改变状态或不受约束的事件返回 None（跳过校验）。
+
+    W2-③：静态映射读 contracts.TRANSITION_TABLE，REVIEW_SUBMITTED 读
+    REVIEW_SUBMITTED_TARGETS；未知类型 / 未知 verdict 返回 None（沿旧语义）。
+    """
     etype = event.get("type", "")
     if etype in _UNGATED_TRANSITIONS:
         return None
-    if etype == "CLAIMED":
-        return "claimed"
-    if etype == "DONE":
-        return "done"
-    if etype == "REVIEW_READY":
-        return "in_review"
+    entry = TRANSITION_TABLE.get(etype)
+    if entry is None:
+        return None
     if etype == "REVIEW_SUBMITTED":
         verdict = event.get("verdict", "")
-        rt = event.get("review_type")
         if verdict == "CHANGES_REQUESTED":
             return "pending"
-        if verdict == "APPROVED" and (rt == "code" or rt is None):
-            return "completed"
-        if verdict == "APPROVED" and rt == "spec":
-            return "in_review"  # self-transition，放行
-    return None
+        return REVIEW_SUBMITTED_TARGETS.get((verdict, event.get("review_type")))
+    return entry["target"]
 
 
 def validate_transition(
@@ -1718,7 +1738,19 @@ class Store:
         ``replay()`` 与 ``validate_transition`` 放在加锁之前，未持锁调用方存在
         check-then-act 窗口：两个进程各自基于陈旧状态通过校验后串行落盘，后者
         写入的是非法跃迁（校验形同虚设）。
+
+        W2-②（task-event-append-gate）：入口先做事件契约 fail-closed 校验
+        （``contracts.events``）：归一化后校验，未知类型 / 缺 required 字段
+        抛 E003、事件不落盘。校验读归一化副本，落盘仍用生产者原字典
+        （replay 派生语义逐字节一致）。
         """
+        violations = validate_event(normalize_event(event))
+        if violations:
+            raise OrchdError(
+                ErrorCode.E003,
+                "event_contract_violated: " + "; ".join(violations),
+                [{"violations": violations}],
+            )
         task_id = event.get("task_id", "")
         target = _event_target_status(event)
         held = (
@@ -2227,11 +2259,13 @@ class Store:
         L-3（2026-09-15）：入口先做**序列级软校验**（:meth:`_record_soft_violation`）
         ——只观测收集、不阻断也不改变下方派生结果，供 sync 合并响应暴露
         「跨设备双认领」类语义冲突。
+
+        W2-③：各分支只写字段副作用；状态赋值统一收敛到末尾的转移表推导
+        （:func:`_event_target_status`），分支内不得再手写 ``ts.status``。
         """
         self._record_soft_violation(event, ts)
         etype = event.get("type", "")
         if etype == "CLAIMED":
-            ts.status = "claimed"
             ts.claimed_by = event.get("agent_id")
             ts.claimed_session = event.get("session_id")
             ts.review_phase = None
@@ -2241,11 +2275,9 @@ class Store:
             ts.review_self_review = False
 
         elif etype == "DONE":
-            ts.status = "done"
             ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
 
         elif etype == "REVIEW_READY":
-            ts.status = "in_review"
             ts.review_phase = event.get("review_type")
             ts.review_claimed_by = None
             ts.review_claimed_session = None
@@ -2271,7 +2303,6 @@ class Store:
                     # （事件无 review_type 字段）APPROVED → 任务彻底完成；
                     # 老事件含 review_type: spec 仍按两阶段语义（仅 spec 通过，
                     # 等待 code），保持 checkpoint 与历史一致。
-                    ts.status = "completed"
                     ts.review_phase = None
                     ts.review_claimed_by = None
                     ts.review_claimed_session = None
@@ -2294,7 +2325,6 @@ class Store:
                 # 注意：不重置 attempt_count——attempt_count 累计「打回次数」，
                 # 供 request 的 max_attempts 上限警告（exceeded_max_attempts）；
                 # 仅 force-status pending 才重置计数（人工恢复手段）。
-                ts.status = "pending"
                 ts.claimed_by = None
                 ts.claimed_session = None
                 ts.review_phase = None
@@ -2355,6 +2385,12 @@ class Store:
                 # v4：人工强制完成无审查事件来源，自审标记一并清零（避免残留
                 # 上一轮的 True 被误读为「本次完成系自审通过」）
                 ts.review_self_review = False
+
+        # W2-③：集中状态赋值（转移表推导；None = 无状态变更）。
+        # FORCE_STATUS 分支已自行设置 ts.status（目标推导对其返回 None）。
+        target_status = _event_target_status(event)
+        if target_status is not None:
+            ts.status = target_status
 
     # ------------------------------------------------------------------
     # Checkpoint

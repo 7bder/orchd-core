@@ -58,10 +58,14 @@ def _log_decl_withdraw(
         payload["branch_overlap"] = branch_overlap
         payload["hint"] = ("被撤回的声明仍出现在该任务分支改动集中：撤回会使 review 期 E010 "
                            "声明完整性反向告警，请确认是否应先处理该分支再撤回")
-    try:
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError, OSError):
-        pass
+    # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
+    # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
+    _reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     try:
         print(
             f"orchd ▸ [amend-decl] {json.dumps(payload, ensure_ascii=False)}",
@@ -325,7 +329,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """增量更新 snapshot，依据状态约束矩阵过滤变更。
 
     CLI 参数: args.master — master 文件路径（默认 .orchd/_master.json）。
-    返回: 变更摘要字典（new_tasks / updated_tasks / unchanged_tasks / removed_tasks），
+    返回: 变更摘要字典（new_tasks / updated_tasks / unchanged_tasks_count / removed_tasks），
     成功后附加 commit 字段（best-effort 自动提交 master 与 IDEAS.md，不阻塞）；
     新增/变更任务若声明 verify_command，附加 verify_dry_run 字段（试跑结果仅提示、不阻断注册）。
     """
@@ -467,7 +471,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     patch_timeout = getattr(args, "verify_timeout_seconds", None)
     # task-spec-hygiene-flat-sweep AC3：reviewers / files_to_read 补登（覆写语义；
     # 名单/阅读域是整体替换，None=缺席不改，空列表=清空；两者本就在
-    # split._AMEND_ATTACHABLE_FIELDS 内，claimed/终态附加通道可补登）。
+    # schema_policy.amendable_fields 内，claimed/终态附加通道可补登）。
     patch_reviewers = getattr(args, "reviewers", None)
     patch_files_to_read = getattr(args, "files_to_read", None)
     if patch_task is not None:
@@ -588,7 +592,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         if patch_timeout is not None:
             # task-verify-timeout-amend-channel：任务级 verify 预算通道（默认 120s 不变）。
             # 与 --verify-command 同属 patch 语义（可同一次调用组合生效）；claimed /
-            # done / in_review 状态均可 patch——`split._AMEND_ATTACHABLE_FIELDS`
+            # done / in_review 状态均可 patch——`schema_policy.amendable_fields`
             # 为单一事实源，该字段已在白名单内（前置校验在写盘之前完成）。
             target["verify_timeout_seconds"] = _validate_verify_timeout_patch(
                 patch_task, patch_timeout)
@@ -625,6 +629,44 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         if t.get("id", "") not in existing_tasks
         or existing_tasks.get(t.get("id", "")) != t
     ]
+
+    # N1（task-latent-f7f8n1）：无快照 amend fail-fast。快照（mod-*/spec.json）
+    # 是 gitignored 派生数据，不随 clone 走；无快照时全量任务被判新并逐个
+    # dry-run（580 任务 × 30s = 马拉松，演练实证）。此时直接 E007 阻断并指引，
+    # 不进入 dry-run；空 master（无任务）不受影响。
+    if master.tasks and not list(store_root.glob("mod-*/spec.json")):
+        _ledger_lines = 0
+        try:
+            if store.ledger_exists():
+                _ledger_lines = store.ledger_line_count()
+        except Exception:
+            _ledger_lines = 0
+        if _ledger_lines > 0:
+            raise OrchdError(
+                ErrorCode.E007,
+                "missing_snapshot: 未找到任何 mod-*/spec.json 快照，但账本非空 "
+                "（快照疑似被手动删除，违反红线 #9 不得手改运行时文件），"
+                "amend 已阻断，未写入任何内容",
+                [{
+                    "store_root": str(store_root),
+                    "ledger_lines": _ledger_lines,
+                    "hint": ("快照为派生数据但账本有状态，不可 init 覆盖；"
+                             "请按 rules/recovery.md 上报处置（doctor 诊断），"
+                             "不要手动重建快照"),
+                }],
+            )
+        raise OrchdError(
+            ErrorCode.E007,
+            "missing_snapshot: 未找到任何 mod-*/spec.json 快照，无法判定变更集 "
+            "（快照不入库，clone 后须先 init 重建，否则全量任务会被误判为新任务 "
+            "并逐个 dry-run），amend 已阻断，未写入任何内容",
+            [{
+                "store_root": str(store_root),
+                "task_count": len(master.tasks),
+                "hint": ("请先执行 python .orchd/__main__.py init 重建快照后重试 "
+                         "amend"),
+            }],
+        )
 
     # task-terminal-spec-revision-channel：纯文本修订不改 verify_command → 重跑 dry-run
     # 无信息量；且目标任务的**存量** E024/E027（历史定义缺 --basetemp / 含不安全段）
@@ -913,12 +955,13 @@ def _amend_roundtrip_applicable(
 
     - ``--task`` 补丁通道：裸 amend / ``--register`` / ``--revise-terminal`` 不走
       往返——注册与终态文本修订超出「附加字段补丁域」，属补丁越域；
-    - 当前分支为任务分支（``task/{id}`` 或 ``{line}/task/{id}``）；
+    - 当前分支为任务分支（单根命名空间 ``task/`` 下，``task/{id}`` 或
+      ``task/{line}/{id}``）；
     - 非 container 布局的独立任务 worktree（flat / 降级）——container 下任务
       worktree 走既有「cd 主工作树」路径，零回归。
 
     说明：附加字段补丁域由 CLI 暴露面天然限定（全部 ⊆
-    ``split._AMEND_ATTACHABLE_FIELDS``），实际矩阵仍由 ``split.amend`` 强制执行；
+    ``schema_policy.amendable_fields``），实际矩阵仍由 ``split.amend`` 强制执行；
     本判据只决定「是否走往返」，不放宽 amend 允许集。
     """
     if patch_task is None:
@@ -927,7 +970,9 @@ def _amend_roundtrip_applicable(
         return False
     if getattr(args, "revise_terminal", None) is not None:
         return False
-    if not (caller_branch.startswith("task/") or "/task/" in caller_branch):
+    from orchd.line import parse_task_branch
+
+    if parse_task_branch(caller_branch) is None:
         return False
     # container 布局的任务 worktree 是 linked worktree（``git rev-parse --git-dir``
     # 含 ``worktrees/``）——不触发往返，走既有「cd 主工作树」E007 路径（零回归）。
@@ -1272,7 +1317,7 @@ def register(sub) -> None:
                    action="extend",
                    default=None,
                    help="覆写 reviewers 名单（整体替换；空值即清空。不在 claimed 白名单"
-                   "之外——reviewers 本就在 _AMEND_ATTACHABLE_FIELDS 内，claimed/终态"
+                   "之外——reviewers 本就在 schema_policy.amendable_fields 内，claimed/终态"
                    "附加通道可补登）")
     p.add_argument("--files-to-read",
                    nargs="*",

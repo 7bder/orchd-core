@@ -4,7 +4,8 @@
   - _cmd_full_regression: full-regression 命令（全量回归并记录 last_pass_commit）
   - _cmd_layout_migrate: layout-migrate 命令（flat → container 布局迁移）
   - _cmd_intake: intake 命令（提交摄入产物并校验状态合法性）
-  - _cmd_roadmap_land: roadmap-land 命令（ROADMAP 规划章节 → IDEAS pending 落地）
+  - _cmd_roadmap_land: roadmap-land 命令（ROADMAP 规划章节 → IDEAS study 落地）
+  - _cmd_migrate: migrate 命令（W1-③ schema 版本前移，加法式幂等）
 
 3a 阶段说明：本模块是 misc 域的目标落点。当前 cli.py（legacy）仍
 保留同名函数为运行时主实现（兼容层透传 / monkeypatch 打点依赖），
@@ -109,7 +110,7 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         }, 1
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(project_root),
-        capture_output=True, text=True,
+        capture_output=True, encoding="utf-8", errors="replace",
     ).stdout.strip()
     payload = {
         "last_pass_commit": head,
@@ -194,10 +195,30 @@ def _cmd_ledger_compact(args) -> dict:
     return store.compact_archive(dry_run=bool(getattr(args, "dry_run", False)))
 
 
+def _cmd_migrate(args) -> dict:
+    """schema 版本前移（W1-③，停服迁移通道）。
+
+    CLI 参数: args.path（master 文件，默认 canonical 主工作树
+    .orchd/_master.json）；args.dry_run（只算计划，不写文件）；
+    args.retreat（回退到最早版本，回滚通道）。
+    返回: 迁移摘要（from_version / to_version / changed / dry_run）。
+    只改 schema_version（加法式），账本零触碰；回滚 = retreat 回 1。
+    """
+    from orchd.migrate import migrate_master_file
+    from orchd.worktree import resolve_master_path_from_dir
+
+    orchd_dir = _find_orchd_dir()
+    default = resolve_master_path_from_dir(orchd_dir)
+    target = Path(getattr(args, "path", None) or default)
+    return migrate_master_file(
+        target,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        retreat=bool(getattr(args, "retreat", False)),
+    )
+
+
 def _cmd_git(args) -> dict:
     """git 写操作代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截。
-
-    CLI 参数: args.git_args（``argparse.REMAINDER``，git 参数原样透传）。
     返回: 代理载荷——只读子命令透传执行；任务分支 ``commit`` 放行；无 git 模式
           降级（``commit`` 推进 committed 快照，其余 no-op）。
     异常: 写操作被拒 → E007（红线 #1/#2）；``commit`` 不在任务分支 → E018。
@@ -235,8 +256,8 @@ def register(sub) -> None:
     p = sub.add_parser("intake", help="提交摄入产物（IDEAS.md + 宿主根 ROADMAP.md + .orchd/_master.json）并校验状态合法性；被 gitignore 忽略的路径由 commit 层剔除")
     p.set_defaults(func=_cmd_intake)
 
-    # roadmap-land（2026-08-15 intake-dual-path）：ROADMAP 规划章节 → IDEAS pending 落地
-    p = sub.add_parser("roadmap-land", help="为 ROADMAP 规划章节生成 IDEAS pending 落地条目")
+    # roadmap-land（2026-08-15 intake-dual-path）：ROADMAP 规划章节 → IDEAS study 落地
+    p = sub.add_parser("roadmap-land", help="为 ROADMAP 规划章节生成 IDEAS study 落地条目")
     p.add_argument("version", help="规划章节版本（如 1.3，匹配 ROADMAP ## 版本 章节头）")
     p.set_defaults(func=_cmd_roadmap_land)
 
@@ -252,6 +273,16 @@ def register(sub) -> None:
     p.add_argument("--dry-run", action="store_true",
                    help="只计算搬运计划，不写任何文件")
     p.set_defaults(func=_cmd_ledger_compact)
+
+    # migrate（W1-③）：schema 版本前移（加法式，幂等；--dry-run 只算计划）
+    p = sub.add_parser(
+        "migrate",
+        help="schema 版本前移至最新（只改 schema_version，账本零触碰；--dry-run 只算计划）",
+    )
+    p.add_argument("--path", default=None, help="master 文件，默认 canonical 主工作树 .orchd/_master.json")
+    p.add_argument("--dry-run", action="store_true", help="只计算迁移计划，不写文件")
+    p.add_argument("--retreat", action="store_true", help="回退到最早版本（回滚通道）")
+    p.set_defaults(func=_cmd_migrate)
 
     # git 代理（task-git-write-proxy）：红线 #1/#2 引擎化拦截
     p = sub.add_parser(

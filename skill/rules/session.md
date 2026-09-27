@@ -16,7 +16,7 @@ guide:
 > 原 .orchd/SKILL.md「Session 开始」「接管中断 agent 任务」「工作优先级」及 WORKER implementer workflow 的 claim 细节，外置自 task-skill-hub-refactor。
 
 ## Session 开始：状态检查（必做）
-1. `git status` + `git branch --show-current` + `python .orchd/__main__.py status`
+1. `git status` + `git branch --show-current` + `python .orchd/__main__.py status`（均为只读诊断，不写仓库）
 2. 有在握实现任务（本 agent ID 的 claimed 任务）→ 回到对应 `task/{task_id}` 分支继续
 3. 无在握任务 → 确认处于 main 且工作区干净，再走下面的优先级流程
 

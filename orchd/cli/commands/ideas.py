@@ -55,6 +55,19 @@ def register(sub):
     _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
     _p.set_defaults(func=_cmd_idea_drop)
 
+    _p = idea_sub.add_parser("append", help="按 - id: 定位条目并追加时间戳 notes 行（替代手改 IDEAS.md）")
+    _p.add_argument("--id", required=True, help="条目 - id: 字段精确值（可用 ideas list 查询）")
+    _p.add_argument("--notes", required=True, help="追记内容（自动加 UTC 时间戳前缀写入）")
+    _p.set_defaults(func=_cmd_idea_append)
+
+    # ideas 一级命令组（unified-intake-eng-ideas）：只读盘点，补齐 intake
+    # not_found hint 引用的 ideas list 断链（此前被引用但不存在）。
+    p = sub.add_parser("ideas", help="IDEAS 台账只读盘点")
+    ideas_sub = p.add_subparsers(dest="ideas_action", required=True)
+
+    _p = ideas_sub.add_parser("list", help="列出全部条目（title/id/status，只读 JSON）")
+    _p.set_defaults(func=_cmd_ideas_list)
+
 
 def _cmd_ideas_archive(args) -> dict:
     """手动触发 IDEAS 自动归档（一次性回填存量条目 + 后续可手动触发）。
@@ -108,3 +121,174 @@ def _cmd_idea_drop(args) -> dict:
 
     orchd_dir = _find_orchd_dir()
     return idea_drop(orchd_dir.parent, args.title)
+
+
+def _strip_idea_html_comments(text: str) -> str:
+    """剔除 IDEAS.md 头部 HTML 注释（含格式示例），只留真实条目。
+
+    intake 摄入协议前置过滤口径：HTML 注释块内的 ``## `` 行是格式示例，
+    不是条目——list 输出供 agent 解析，必须与摄入口径一致。
+    """
+    import re
+
+    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+
+
+def ideas_list(project_root) -> dict[str, Any]:
+    """列出 IDEAS.md 全部条目（只读：无锁、无提交、任意分支可用）。
+
+    Args:
+        project_root: 仓库根目录。
+
+    Returns:
+        ``{"ideas": [{"title", "id", "status"}], "count": n}``，永不抛异常；
+        IDEAS.md 缺失 / 不可读 → 空列表（可解析的零结果，而非错误）。
+    """
+    from orchd.ideas import parse_ideas
+    from orchd.ledger import resolve_workspace_root
+
+    try:
+        ws = resolve_workspace_root(Path(project_root))
+        ideas = ws / "IDEAS.md"
+        if not ideas.exists():
+            return {"ideas": [], "count": 0}
+        text = ideas.read_text(encoding="utf-8")
+    except (OSError, IOError, UnicodeDecodeError):
+        return {"ideas": [], "count": 0}
+    entries = parse_ideas(_strip_idea_html_comments(text))
+    items = [
+        {"title": e["title"], "id": e["id"], "status": e["status"]}
+        for e in entries
+    ]
+    return {"ideas": items, "count": len(items)}
+
+
+def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
+    """按 ``- id:`` 定位条目并追加时间戳 notes 行（idea append 域函数）。
+
+    写操作：与 propose / confirm 共用 ``.intake.lock`` 准入写锁（锁内
+    读-改-写 + 提交，手改 IDEAS 绕锁的 TOCTOU 在此不存在）；追记行用
+    ``- notes追记`` 键（parse_ideas 只认 ``- notes:``，历史追记不干扰
+    notes 语义与孤儿巡检）。
+
+    Args:
+        project_root: 仓库根目录。
+        entry_id: 条目 ``- id:`` 精确值。
+        notes: 追记内容（原文写入，调用方保证单行语义）。
+
+    Returns:
+        成功 ``{"appended": True, "id", "commit"}``；未命中
+        ``{"appended": False, "reason": "not_found", ...}``；前置守卫失败
+        同 propose 口径（not_on_main / dirty_workspace）。
+    """
+    from orchd.gitops import ensure_committed
+    from orchd.intake import (
+        _atomic_write_text,
+        _intake_guard,
+        _resolve_lock_orchd_dir,
+    )
+    from orchd.ledger import (
+        resolve_workspace_root,
+        intake_lock_acquire,
+        intake_lock_release,
+        resolve_agent_id,
+    )
+
+    project_root = Path(project_root)
+    guard_err = _intake_guard(project_root)
+    if guard_err is not None:
+        return {"appended": False, **{k: v for k, v in guard_err.items() if k != "committed"}}
+
+    import datetime
+
+    orchd_dir = _resolve_lock_orchd_dir(project_root)
+    lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
+    try:
+        ws = resolve_workspace_root(project_root)
+        ideas = ws / "IDEAS.md"
+        if not ideas.exists():
+            return {
+                "appended": False,
+                "reason": "not_found",
+                "id": entry_id,
+                "hint": "IDEAS.md 不存在或无该 id 条目，先 python .orchd/__main__.py ideas list 查看条目 id。",
+            }
+        text = ideas.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        end = None
+        for i, line in enumerate(lines):
+            if not line.strip().startswith("## "):
+                continue
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("## "):
+                j += 1
+            for k in range(i + 1, j):
+                s = lines[k].strip()
+                if (
+                    (s.startswith("- id:") and s[len("- id:"):].strip() == entry_id)
+                    or (s.startswith("id:") and s[len("id:"):].strip() == entry_id)
+                ):
+                    end = j
+                    break
+            if end is not None:
+                break
+        if end is None:
+            return {
+                "appended": False,
+                "reason": "not_found",
+                "id": entry_id,
+                "hint": "未找到 - id: 为该值的条目，先 python .orchd/__main__.py ideas list 查看条目 id。",
+            }
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        new_lines = lines[:end] + [f"- notes追记 {stamp}: {notes}"] + lines[end:]
+        _atomic_write_text(ideas, "\n".join(new_lines) + "\n")
+
+        commit = ensure_committed(
+            project_root,
+            [str(ideas)],
+            f"chore(idea): orchd idea append — {entry_id}",
+        )
+        result: dict[str, Any] = {
+            "appended": True,
+            "id": entry_id,
+            "commit": commit,
+        }
+        if commit.get("performed") is False and commit.get("reason") != "no_changes":
+            result["commit_warning"] = {
+                "reason": commit.get("reason"),
+                "message": (
+                    f"idea append commit 未执行（{commit.get('reason')}）：IDEAS.md 改动"
+                    "可能未入库，请人工核对"
+                ),
+            }
+        return result
+    finally:
+        intake_lock_release(lk)
+
+
+def _cmd_ideas_list(args) -> dict:
+    """列出 IDEAS.md 全部条目（ideas list，只读 JSON）。
+
+    CLI 参数: 无。
+    返回: ``{"ideas": [...], "count": n}``（stdout 纯 JSON，agent 可直接解析）。
+    """
+    orchd_dir = _find_orchd_dir()
+    return ideas_list(orchd_dir.parent)
+
+
+def _cmd_idea_append(args) -> dict:
+    """按 - id: 追记 notes（idea append，持锁 + 提交）。
+
+    CLI 参数: args.id / args.notes。
+    返回: 追记结果字典（appended / id / commit）；未命中时附顶层 error 键，
+    退出码非零（task-cli-exit-honesty，E-15）。
+    """
+    orchd_dir = _find_orchd_dir()
+    result = idea_append(orchd_dir.parent, args.id, args.notes)
+    if not result.get("appended"):
+        result["error"] = {
+            "code": "idea_rejected",
+            "reason": result.get("reason", "unknown"),
+            "hint": result.get("hint", ""),
+        }
+    return result

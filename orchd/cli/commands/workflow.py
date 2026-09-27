@@ -222,7 +222,7 @@ def claim_preview(
         "exempt_files": task_def.get("exempt_files", []),
         "verify_command": task_def.get("verify_command", ""),
         # cwd 预期：实现 claim 须在 main，审查 claim 须在 task 分支（两者规则相反）
-        "cwd_expected": "main（主工作树）" if role == "implementer" else f"task/{task_id}（任务 worktree）",
+        "cwd_expected": "main（主工作树）" if role == "implementer" else f"task/{task_id} 或 task/{{line}}/{task_id}（任务 worktree）",
     }
     # task-review-comments-gate-and-stale-timeout（D）：预览阶段只透出意见条数，
     # 不摆正文（token 克制）；完整意见仅在 claim --confirm 返回体的 review_comments

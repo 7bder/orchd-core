@@ -2198,10 +2198,14 @@ def _log_recycle(records: list[dict[str, Any]]) -> None:
         # W-13：Windows 控制台 stderr 常为 gbk，审计留痕含中文/箭头/路径时会被
         # 乱码或直接抛 UnicodeEncodeError（留痕不可读＝审计失效）→ 输出前把
         # stderr 切到 UTF-8（幂等；不支持 reconfigure 的载体静默跳过）。
-        try:
-            sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-        except (AttributeError, ValueError, OSError):
-            pass
+        # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
+        # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
+        _reconfigure = getattr(sys.stderr, "reconfigure", None)
+        if callable(_reconfigure):
+            try:
+                _reconfigure(encoding="utf-8")
+            except (AttributeError, ValueError, OSError):
+                pass
         for rec in records:
             print(f"orchd ▸ [回收] {json.dumps(rec, ensure_ascii=False)}", file=sys.stderr)
     except Exception:
