@@ -243,6 +243,19 @@ def retract(
     if project_root:
         hook_uninstall(project_root)
 
+    # 生命周期终态收敛（task-pass9-lifecycle-release-invariant）：retract 属放弃
+    # 路径——先写事件后尽力恢复，切换失败降级为 stranded 明细不阻断（放弃正是
+    # 解困动作，不得被 git 故障堵死）；历史滞留由读侧自愈兜底消化。
+    release_info: dict[str, Any] | None = None
+    if project_root:
+        from orchd.gitops.guard import release_task_lifecycle
+
+        release_info = release_task_lifecycle(
+            store, project_root,
+            task_id=task_id, agent_id=agent_id,
+            command="retract", mode="abandon",
+        )
+
     result = {
         "retracted": True,
         "retracted_events": retracted_events,
@@ -250,6 +263,10 @@ def retract(
         "new_status": new_state.get(task_id, TaskState()).status,
         "disposition": disposition,
     }
+    if release_info is not None:
+        result["checked_out_main"] = release_info.get("checked_out_main")
+        if release_info.get("stranded"):
+            result["stranded"] = release_info["stranded"]
     if unbind_result is not None:
         result["unbind"] = unbind_result
     if integrity_warnings:
@@ -542,6 +559,19 @@ def force_status(
     finally:
         store.release_lock()
 
+    # 生命周期终态收敛（task-pass9-lifecycle-release-invariant）：force-status 同属
+    # 放弃/强制路径，abandon 模式尽力恢复主工作树 trunk 基线（best-effort 不阻断
+    # 控制面；失败降级为 stranded 明细透出）。
+    release_info: dict[str, Any] | None = None
+    if project_root:
+        from orchd.gitops.guard import release_task_lifecycle
+
+        release_info = release_task_lifecycle(
+            store, project_root,
+            task_id=task_id, agent_id=agent_id,
+            command="force-status", mode="abandon",
+        )
+
     result = {
         "forced": True,
         "task_id": task_id,
@@ -549,6 +579,10 @@ def force_status(
         "new_status": target_status,
         "reason": reason,
     }
+    if release_info is not None:
+        result["checked_out_main"] = release_info.get("checked_out_main")
+        if release_info.get("stranded"):
+            result["stranded"] = release_info["stranded"]
     # W-5：completed 逃生隐含的落码结果透出（merged / already_in_main / None）。
     if target_status == "completed" and merge_state is not None:
         result["merge"] = merge_state

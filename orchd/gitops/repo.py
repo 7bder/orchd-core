@@ -10,6 +10,11 @@ D/R 口径契约（kernel-contract INV-1）：
   为 git 结果的超集（只可能更严、绝不漏检）——已知且有意保留的边界。
 
 调用迁移见 task-repo-migration-callsites；本模块只建不管迁。
+
+task-rename-declaration-deadlock-fix：``changed_paths`` 新增 ``no_renames``
+关键字（缺省 False，零回归）；GitBackend 透传给 ``_git_diff_names``（重命名
+展开为删 + 增，与 delete-parity 口径一致）；SnapshotBackend 接受但忽略
+（manifest 差分天然展开，字节级折叠保持）。
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ class RepositoryBackend(ABC):
         self.project_root = Path(project_root)
 
     @abstractmethod
-    def changed_paths(self, task_id: str) -> list[str]:
+    def changed_paths(self, task_id: str, *, no_renames: bool = False) -> list[str]:
         """返回任务相对基线的变更路径集合（口径见模块 docstring）。"""
         raise NotImplementedError
 
@@ -44,10 +49,10 @@ class GitBackend(RepositoryBackend):
     def backend_name(self) -> str:
         return "git"
 
-    def changed_paths(self, task_id: str) -> list[str]:
+    def changed_paths(self, task_id: str, *, no_renames: bool = False) -> list[str]:
         from orchd.worktree import _git_diff_names
 
-        return _git_diff_names(self.project_root, task_id)
+        return _git_diff_names(self.project_root, task_id, no_renames=no_renames)
 
 
 class SnapshotBackend(RepositoryBackend):
@@ -65,10 +70,11 @@ class SnapshotBackend(RepositoryBackend):
     def backend_name(self) -> str:
         return "snapshot"
 
-    def changed_paths(self, task_id: str) -> list[str]:
+    def changed_paths(self, task_id: str, *, no_renames: bool = False) -> list[str]:
         from orchd.nogit import manifest_changed_paths, read_manifest
         from orchd.nogit import hash_tree, snapshot_dir
 
+        del no_renames  # 快照 manifest 差分天然展开（删+增），无需开关
         base = read_manifest(snapshot_dir(self.project_root, task_id, self.label))
         if base is None:
             return []

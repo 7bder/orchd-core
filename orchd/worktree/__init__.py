@@ -1,0 +1,126 @@
+"""orchd.worktree 包：布局/绑定/生命周期/回收/清剪/诊断六域。
+
+由 orchd/worktree.py 单文件拆分：对外导入面与旧模块逐名一致（兼容 re-export），
+调用方零改动。
+"""
+
+
+from orchd.worktree.bindings import (
+    _BINDINGS_FILENAME,
+    _TASK_WT_PREFIX,
+    _task_wt_name,
+    worktree_hint,
+    task_branch_head,
+    branch_reflog_tip,
+    _reflog_file_tip,
+    bindings_path,
+    load_bindings,
+    _save_bindings,
+    _backup_corrupt_bindings,
+    bind_task_wt,
+    unbind_task_wt,
+    resolve_task_root,
+    resolve_task_branch,
+    guard_task_root,
+)
+
+from orchd.worktree.layout import (
+    _LAYOUT_MARKER,
+    _CONTAINER_MAIN_DIR,
+    _RUNTIME_DIR,
+    _TRASH_DIR,
+    _LAYOUT_VERSION,
+    _JUNK_NAMES,
+    _JUNK_PREFIXES,
+    _TOOL_DIR_NAMES,
+    _is_junk_entry,
+    _LEDGER_RUNTIME_FILES,
+    _move_ledger_runtime_files,
+    _GIT_TIMEOUT,
+    marker_path,
+    read_layout,
+    write_layout,
+    _git_toplevel,
+    _git_common_dir,
+    _is_git_tracked_path,
+    _auto_detect_layout,
+    _build_layout,
+    detect_layout,
+    detect_container_root_cwd,
+    nearest_git_root,
+    find_orchd_dir_within_git_boundary,
+    resolve_canonical_project_root,
+    resolve_master_path,
+    resolve_master_path_from_dir,
+    resolve_declaration_source,
+    _default_master,
+    bootstrap_container,
+    _rollback_layout_migration,
+    _intake_lock_filename,
+    layout_migrate,
+    _layout_migrate_impl,
+)
+
+from orchd.worktree.prune import (
+    _cleanup_container_root_junk,
+    prune_orphans,
+)
+
+from orchd.worktree.diagnosis import (
+    _git_diff_names,
+    task_branch_files,
+    main_worktree_dirty_overlap,
+    _is_flat_task_branch,
+    is_current_task_branch,
+    missing_declared_branch_files,
+    diagnose_missing_branch_files,
+    actual_changes_conflict,
+)
+
+from orchd.worktree.lifecycle import (
+    _engine_manifest,
+    _propagate_vendored_engine,
+    _task_branch_divergence,
+    _recreate_task_wt_from_base,
+    _check_stale_baseline,
+    _propagate_container_marker,
+    _MASTER_IGNORE_PATTERNS,
+    _git_minor_version,
+    _suppress_task_master_copy,
+    _master_suppression_entry,
+    _merge_vendored_engine_entry,
+    ensure_task_wt,
+    _read_main_worktree_head,
+    _check_main_head_unchanged,
+    _restore_main_head,
+    _worktree_registered_paths,
+    _is_effective_worktree,
+    _cleanup_stale_task_wt,
+    _verify_task_wt,
+)
+
+from orchd.worktree.recycle import (
+    _recycle_actor,
+    _QUIET_TRUTHY,
+    _recycle_quiet,
+    _log_recycle,
+    _TX_STEPS,
+    _RECYCLE_JOURNAL_DIRNAME,
+    _recycle_journal_path,
+    _tx_journal_read,
+    _tx_journal_write,
+    _tx_journal_clear,
+    _tx_mark_step_done,
+    _tx_fact_wt_gone,
+    _tx_fact_branch_gone,
+    _tx_fact_unbound,
+    _tx_prune_registry,
+    _task_status_for_recycle,
+    _classify_remove_failure,
+    _tx_step_remove_worktree,
+    _tx_step_delete_branch,
+    _tx_step_unbind,
+    remove_task_wt,
+    _cleanup_stale_session_locks,
+    _rmtree_force,
+)

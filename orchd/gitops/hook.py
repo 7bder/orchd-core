@@ -843,6 +843,9 @@ fi
 # 只能到 done 期才被 E010 拦下（红线 #3 提交层结构性缺口）。done 侧
 # _git_diff_names 无 --diff-filter（含 D），--name-only 对 R 默认显示目标路径；
 # 此处同义（无 --no-renames），两侧对同一 git 改动得到同一路径集合。
+# task-rename-declaration-deadlock-fix：两侧同加 --no-renames，重命名展开为
+# 删（旧路径）+ 增（新路径)——声明旧路径者走删除态口径（提交删除态后保持声明），
+# 新路径按新增判定；折叠口径下旧路径 path_not_found 死锁（done 侧实证）。
 # R2-9a：`-z` 不可省略——不加时 core.quotePath（默认 true）把非 ASCII / 含特殊
 # 字符路径转义为八进制引号串，再被 for 按空白拆词，合法 in-scope 文件被误拦 E020
 # （对照 orchd/gitops/cleanup.py::unmerged_paths 的 -z 写法）。
@@ -854,7 +857,7 @@ STAGED_TMP="${{TMPDIR:-/tmp}}/orchd-hook-staged-$$"
 ALLOWED_TMP="${{TMPDIR:-/tmp}}/orchd-hook-allowed-$$"
 trap 'rm -f "$STAGED_TMP" "$ALLOWED_TMP"' EXIT
 trap 'exit 130' INT TERM HUP
-if ! git diff --cached --name-only -z > "$STAGED_TMP" 2>/dev/null; then
+if ! git diff --cached --name-only --no-renames -z > "$STAGED_TMP" 2>/dev/null; then
     echo "[orchd E020] staged 列表获取失败（git diff 异常）→ best-effort 放行（未校验范围，禁止静默）" >&2
     exit 0
 fi

@@ -20,7 +20,6 @@ from orchd.errors import ErrorCode, OrchdError
 # 已收敛到 orchd.gitops（专用 git 判定模块）；共享辅助 make_event 仍自
 # orchd.gitops_ops 导入。
 from orchd.gitops import (
-    checkout_default_strict,
     get_head_commit,
     guard_review_write,
     hook_uninstall,
@@ -826,13 +825,22 @@ def _review_submit_impl(
             pending_code_event = event
 
         elif verdict == "CHANGES_REQUESTED":
-            # 打回前强约束切回默认分支(main/master)，避免工作区滞留 task/{id} 分支、
-            # 后接 agent 认领时报 E018。切换失败抛 E018/E017 → 不写事件、任务仍
-            # in_review、审查 claim 保留，reviewer 处理后重试即可（与 done 强约束一致）。
+            # 打回前经统一终态收敛恢复默认分支（task-pass9-done-review-finalizer-unify）：
+            # strict 模式切换失败抛 E018/E017 → 不写事件、任务仍 in_review、审查 claim
+            # 保留，reviewer 处理后重试即可（与 done 强约束一致）。
             if project_root:
-                result["checked_out_main"] = checkout_default_strict(
-                    project_root, command="review"
+                from orchd.gitops.guard import (
+                    compat_checked_out_main,
+                    release_task_lifecycle,
                 )
+
+                _rel = release_task_lifecycle(
+                    store, project_root, task_id=task_id, agent_id=agent_id,
+                    command="review", mode="strict",
+                )
+                _compat = compat_checked_out_main(_rel)
+                if _compat is not None:
+                    result["checked_out_main"] = _compat
             store.append_event(event)
             result["task_status"] = "pending"
             result["back_to_pool"] = True

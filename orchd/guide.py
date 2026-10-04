@@ -1640,7 +1640,7 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     # （与 _review_step_guidance 的 unified 分支口径一致）。
     ("E016", "自审被阻断：当前会话已实现 {task_id}，需换会话/身份重新 claim --task {task_id} --confirm（相位无关），或由他人审查", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
     ("E017", "工作区脏：先提交/清理未提交改动，再重试", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
-    ("E018", "分支错误：确认处于正确分支", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
+    ("E018", "分支错误：确认处于正确分支；主工作树滞留 task/{id} 且该任务已放弃/无活跃认领时，重新 claim 将自动恢复 trunk 基线（implementer_trunk_restore），或走 force-status + amend 受管往返", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
     ("E019", "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
     ("E020", "范围外提交：只改 files_to_edit 声明文件", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
     ("E021", "身份不匹配：确认 ORCHD_SESSION_ID 与认领者一致，必要时重连", ("rules/session.md",), f"{_ENTRY_CMD} status --text", "suggest", "manual-action"),

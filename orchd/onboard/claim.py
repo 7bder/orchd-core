@@ -235,8 +235,16 @@ def _claim_precheck(
             from orchd.gitops.guard import _reviewer_auto_checkout
             auto_checkout = _reviewer_auto_checkout(
                 store, project_root, task_id, agent_id, degraded_guards)
+    trunk_restore: dict[str, Any] | None = None
+    if role == "implementer" and project_root:
+        # task-pass9-lifecycle-release-invariant：implementer claim 滞留自愈（读侧
+        # 兜底）——主工作树滞留 task/{id} 且该任务无活跃认领时自动恢复 trunk
+        # 基线；仍活跃则不动，交 _guard_claim 按既有语义 E018。
+        from orchd.gitops.guard import _implementer_ensure_trunk
+        trunk_restore = _implementer_ensure_trunk(
+            store, project_root, agent_id=agent_id, degraded=degraded_guards)
     _guard_claim(project_root, role=role, task_id=task_id, orchd_dir=store.orchd_dir, agent_id=agent_id, degraded=degraded_guards)
-    return task_def, role, session_id, degraded_guards, auto_checkout
+    return task_def, role, session_id, degraded_guards, auto_checkout, trunk_restore
 
 
 def _claim_setup_worktree(
@@ -721,7 +729,7 @@ def claim(
     enforce_self_review_block: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
-    task_def, role, session_id, degraded_guards, auto_checkout = _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block)
+    task_def, role, session_id, degraded_guards, auto_checkout, trunk_restore = _claim_precheck(store, tasks, agent_id, task_id, role, project_root, review_type, enforce_self_review_block)
     event, state, derived, integrity_warnings, is_self_review = _claim_write_event(store, tasks, agent_id, task_id, task_def, role, session_id, review_type, enforce_self_review_block, project_root, force=force)
     worktree_path = None
     degraded_warning = None
@@ -766,6 +774,10 @@ def claim(
         # task-review-auto-checkout：引擎自动切分支与 checked_out_main 往返对称，
         # 认领响应显式挂载（账本另有 reason=auto_branch_prepare 的 AMEND 事件）。
         result["checked_out_task_branch"] = auto_checkout.get("checked_out")
+    if trunk_restore is not None:
+        # task-pass9-lifecycle-release-invariant：滞留自愈透出（与 checked_out_task_branch
+        # / checked_out_main 往返对称）。
+        result["checked_out_trunk"] = trunk_restore.get("checked_out_trunk")
     if role == "implementer" and project_root:
         from orchd.worktree import detect_layout
         layout = detect_layout(project_root)

@@ -173,12 +173,18 @@ def _done_impl(
     # 6) 全量回归（task-full-regression-gate-r2：默认关闭，仅 config 显式 true 时跑）
     full_regression = _maybe_full_regression(store, files_to_edit, project_root)
 
-    # 7) 强切回默认分支（写事件前，task-done-switch-main）
+    # 7) 终态收敛：done 写事件前恢复主工作树 trunk 基线
+    #    （task-pass9-done-review-finalizer-unify：经 release_task_lifecycle
+    #    strict 统一出口；checked_out_main 响应形状经 compat 保持兼容）。
     checked_out_main = None
     if project_root:
         # 延迟导入避免循环依赖
-        from orchd.onboard import _checkout_default_strict
-        checked_out_main = _checkout_default_strict(project_root)
+        from orchd.gitops.guard import compat_checked_out_main, release_task_lifecycle
+
+        checked_out_main = compat_checked_out_main(release_task_lifecycle(
+            store, project_root, task_id=task_id, agent_id=agent_id,
+            command="done", mode="strict",
+        ))
 
     # 7.5) task-engine-cli-friction-fix：切回主工作树后 os.chdir，保证同进程
     #      内 done 后的后续操作（如 status 检查）不因 cwd 指向已回收的任务 worktree

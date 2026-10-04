@@ -332,7 +332,10 @@ def _guard_out_of_scope(
                 )
             from orchd.gitops.repo import for_project
 
-            actual_modified = for_project(project_root).changed_paths(task_id)
+            # task-rename-declaration-deadlock-fix：重命名展开口径（删+增），
+            # 与 delete-parity/E020 hook 同口径，不死锁
+            actual_modified = for_project(project_root).changed_paths(
+                task_id, no_renames=True)
         from orchd.pool import _is_path_covered
         allowed_list = list(allowed)
         return [f for f in actual_modified if not any(_is_path_covered(a, f) for a in allowed_list)]
