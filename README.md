@@ -77,36 +77,42 @@ git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.
 
 ## 快速教程：5 分钟跑通第一个任务
 
-两种方式任选其一：**对话版**把一段话发给 agent 自动跑完（推荐）；**手动版**自己敲命令，适合理解原理。
+两种方式任选其一：**对话版**用自然语言指挥 agent 自动跑完（推荐）；**手动版**自己敲命令，适合看清每步背后的机制。
 
 ### 方式 A：Agent 对话版（推荐）
 
-把安装、初始化、第一个任务全流程交给 agent 自己完成。
+orchd 的日常用法不是敲命令，而是**用自然语言指挥 agent**：你说 "要什么"，agent 翻译成 CLI 动作，引擎兜底。7 个 "方向盘" 覆盖完整闭环：
 
-① **放需求**：准备一份需求文档，或用一句话口头描述；
 
-② **发指令**：把下面这段发给任意 agent（Claude Code / Qoder / Codex / …）：
+
+| 业务流程 | 你对 agent 说的话   | agent 背后的 CLI                    |
+| ---- | -------------- | -------------------------------- |
+| 接入   | 把 orchd 接入这个项目 | git clone + install.py + 读 SKILL |
+| 拆解   | 初始化项目，把需求拆成任务  | bootstrap → validate → init      |
+| 领任务  | 领一个任务开始做       | request → claim --confirm        |
+| 交付   | 做完了            | done（自动 verify → 进审查）            |
+| 审查合入 | 审一下，通过就合       | review（spec → code）→ 自动 merge    |
+| 看进度  | 现在到哪了          | status / show                    |
+| 换人   | 换你接着干          | 读 SKILL → status → 从断点续          |
+
+一次完整的对话大概是这样的：
 
 
 
 ```
-把 orchd 接入当前项目并引导：
-git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
-装好后读 .orchd/SKILL.md 进入工作流。初始化项目：bootstrap 输出分解套件，
-按 architect 模板把需求拆成 .orchd/_master.json，validate 通过后 init。
-然后 request 领第一个任务，claim 实现，done 报告完成。
-需求文档在：<path/to/requirements.md>
+你：把 orchd 接入这个项目，初始化，按这份需求文档拆任务。
+agent：安装 → bootstrap → 拆解 → validate → init，回报任务清单。
+你：任务 3 先做，领它。
+agent：claim task-3（自动建分支）→ 开始实现。
+你：做完了，提交审查。
+agent：done → 进入审查。
+你：审吧，通过就合。
+agent：review APPROVED → 引擎自动 merge → completed。
+你：明天换个 agent 继续。
+agent：读 SKILL → status → 从断点接着干。
 ```
 
-③ **只做两件事**：
-
-
-
-* 确认候选任务：agent 领任务前先展示预览（两段式 `claim --confirm`），你点头它才开工；
-
-* 裁决审查结论：实现完进入审查，由你（或你指定的审查者）提交结论，APPROVED 后引擎自动 merge 入 main。
-
-④ **换 agent 接续**：任何时刻把同一段话发给新 agent，它读 SKILL + `status` 找到断点继续，进度不丢。
+> 想亲眼看清每一步背后的命令？看下面的「方式 B：手动版」—— 同一流程的两种视角。
 
 ### 方式 B：手动版（自己动手）
 
