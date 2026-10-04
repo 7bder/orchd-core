@@ -77,9 +77,42 @@ git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.
 
 ## 快速教程：5 分钟跑通第一个任务
 
+两种方式任选其一：**对话版**把一段话发给 agent 自动跑完（推荐）；**手动版**自己敲命令，适合理解原理。
+
+### 方式 A：Agent 对话版（推荐）
+
+把安装、初始化、第一个任务全流程交给 agent 自己完成。
+
+① **放需求**：准备一份需求文档，或用一句话口头描述；
+
+② **发指令**：把下面这段发给任意 agent（Claude Code / Qoder / Codex / …）：
+
+
+
+```
+把 orchd 接入当前项目并引导：
+git clone https://github.com/7bder/orchd-core.git && python orchd-core/install.py . --agent --cleanup
+装好后读 .orchd/SKILL.md 进入工作流。初始化项目：bootstrap 输出分解套件，
+按 architect 模板把需求拆成 .orchd/_master.json，validate 通过后 init。
+然后 request 领第一个任务，claim 实现，done 报告完成。
+需求文档在：<path/to/requirements.md>
+```
+
+③ **只做两件事**：
+
+
+
+* 确认候选任务：agent 领任务前先展示预览（两段式 `claim --confirm`），你点头它才开工；
+
+* 裁决审查结论：实现完进入审查，由你（或你指定的审查者）提交结论，APPROVED 后引擎自动 merge 入 main。
+
+④ **换 agent 接续**：任何时刻把同一段话发给新 agent，它读 SKILL + `status` 找到断点继续，进度不丢。
+
+### 方式 B：手动版（自己动手）
+
 从安装到第一个任务合入，整条路径可复制。核心口诀：**每一步看命令响应的&#x20;**`guidance`**&#x20;提示**—— 引擎会告诉你下一步做什么，不用记命令。
 
-### 第 0 步：安装
+#### 第 0 步：安装
 
 按「[快速开始](#快速开始)」装好，验证：
 
@@ -89,7 +122,7 @@ git clone https://gitee.com/QQ7bder/orchd-core.git && python orchd-core/install.
 python .orchd/__main__.py --version
 ```
 
-### 第 1 步：初始化项目（BOOTSTRAP）
+#### 第 1 步：初始化项目（BOOTSTRAP）
 
 人放一份需求文档；agent 负责拆解（`bootstrap` 会输出 schema + architect 模板 + 拆解指南）：
 
@@ -102,7 +135,7 @@ python .orchd/__main__.py validate .orchd/_master.json  # 校验任务清单（�
 python .orchd/__main__.py init                          # 初始化快照 + 账本 → 项目就绪
 ```
 
-### 第 2 步：跑第一个任务
+#### 第 2 步：跑第一个任务
 
 
 
@@ -127,7 +160,7 @@ python .orchd/__main__.py done                          # 报告完成：自动�
 >
 >  真正执行。
 
-### 第 3 步：审查与合入
+#### 第 3 步：审查与合入
 
 
 
@@ -137,7 +170,7 @@ python .orchd/__main__.py review --task <id> ...        # 提交审查结论（A
 # code APPROVED → 引擎自动 merge 入 main → completed
 ```
 
-### 第 4 步：换人接续
+#### 第 4 步：换人接续
 
 任何时刻换一个 agent（甚至换平台、换 LLM）接着做：
 
@@ -150,7 +183,7 @@ python .orchd/__main__.py review --task <id> ...        # 提交审查结论（A
 # ③ 从断点继续（claim / done / review 由 guidance 导航）
 ```
 
-### 卡住时
+#### 卡住时
 
 
 
