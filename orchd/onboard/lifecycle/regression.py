@@ -19,7 +19,7 @@ from orchd.gitops_ops import (
     decode_subprocess_output as _decode_subprocess_output,
     verify_output_summary as _verify_output_summary,
 )
-from orchd.ledger import Store
+from orchd.ledger import Store, _write_text_atomic
 from orchd.subproc import run_shell
 from orchd.worktree import resolve_master_path as _master_path
 
@@ -70,10 +70,14 @@ def _maybe_full_regression(
         # 并行度收敛到 -n 8（本机 16 核的一半），加 --max-worker-restart 兜底
         # worker 崩溃自动重启，避免主进程等僵尸 worker 挂死。
         # 日常 pytest 路径不受影响（多 agent 并发跑各自 numbered tmpdir）。
+        # basetemp 按平台选临时根：Windows 用 C:/Temp，POSIX 用 /tmp——硬编码 Windows
+        # 路径时 Linux 把 ``C:/Temp/...`` 当相对路径、父目录不存在，xdist getbasetemp
+        # 直接 INTERNALERROR（FileNotFoundError），全量回归恒失败。
+        _fr_tmp_root = "C:/Temp" if sys.platform == "win32" else "/tmp"
         reg_cmd = (
             f'"{sys.executable}" -m pytest tests/ -q -n 8 '
             f'--max-worker-restart=5 '
-            f'--basetemp=C:/Temp/orchd-fr-baseline-$$'
+            f'--basetemp={_fr_tmp_root}/orchd-fr-baseline-$$'
         )
         reg_result = run_shell(reg_cmd, str(project_root), _FULL_REGRESSION_TIMEOUT)
         reg_elapsed = round(time.monotonic() - reg_started, 1)
@@ -166,7 +170,7 @@ def _record_done_run(store: Store, payload: dict[str, Any]) -> None:
         record["at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         data["last_done_run"] = record
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_text_atomic(path, _json.dumps(data, ensure_ascii=False, indent=2))
     except OSError:
         pass
 

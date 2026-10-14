@@ -155,6 +155,8 @@ def _done_impl(
     #      verify_command 必须含其登记的既有测试——否则「只跑自己新写的测试」会让既有断言
     #      静默变红并随双审入库（2026-09-19 一夜三次：prepush-tag-gate / cli-json-envelope
     #      / canonical-root-dedup）。刻意早于 verify 执行：缺口是静态可判定的，先判先省。
+    #      无 project_root 时同样执行：函数内 changed 回退声明的 files_to_edit（纯函数可判
+    #      registry 规则），形态 A 的基线判定在无 project_root 时自行跳过（fail-open）。
     _guard_shared_entry_coverage(
         project_root, task_def, task_id, files_to_edit, degraded_guards
     )
@@ -306,6 +308,14 @@ def _done_precheck(
     return task_def, files_to_edit, degraded_guards
 
 
+# 受管出口单一生成源（task-guidance-hint-managed-git-form AC2）：任务分支同步 main
+# 的唯一合法命令串（rules/git.md 红线 #1 豁免二的精确形态）。与 amend_patch_cmd
+# 同构的单源纪律——hint/文案引用本常量，禁止在他处再贴字面量拼装；存量字面量
+# （guide.py E015 词条 / proxy.py / review.py / gitops_ops.py 的既有提示）属各自
+# 任务的既有交付，本常量自本任务起作为新增文案的唯一起点。
+MANAGED_MERGE_MAIN_CMD = "orchd git merge main"
+
+
 def _check_base_freshness(
     project_root: Path | None,
     task_id: str,
@@ -324,9 +334,10 @@ def _check_base_freshness(
 
     - main 未推进 / 任务分支不存在 / 无文件交集 / 可干净合并 → **放行**（由 code
       APPROVED 的 merge 兜底；可干净快进的任务分支不阻断，是为避免 deadlock——
-      实现者无合法手段在 done 前手动 merge main，落后但无冲突就应允许 done）；
-    - main 推进且与 task 实际改动**同文件冲突** → 阻断，返回含「请先 merge main 并
-      重跑 verify」hint 的 E015，早发现避免 review 期 E015。
+      实现者在 done 前不得手动 merge main（红线 #1；唯一合法同步出口是任务分支上的
+      受管命令，见 :data:`MANAGED_MERGE_MAIN_CMD`），落后但无冲突就应允许 done）；
+    - main 推进且与 task 实际改动**同文件冲突** → 阻断，返回含「请先经受管出口
+      同步 main 并重跑 verify」hint 的 E015，早发现避免 review 期 E015。
 
     git 故障等异常 → best-effort 降级为 degraded_guard，不阻断 done（零回归）。
     仅只读探测，不产生任何 git 写操作；与 reconcile 互补——本闸口聚焦「冲突即拦」，
@@ -368,8 +379,9 @@ def _check_base_freshness(
             "branch": resolve_task_branch_for(project_root, task_id),
             "files": rec.get("files") or [],
             "hint": (
-                "任务分支落后 main 且同文件冲突，请先 merge main 解决冲突并重跑 "
-                "verify；完成后重试 done，避免带陈旧基线提交后续 review 期暴露 drift"
+                "任务分支落后 main 且同文件冲突：在任务分支执行受管出口 "
+                f"{MANAGED_MERGE_MAIN_CMD} 解决冲突并 commit，随后重跑 verify 并重试 "
+                "done，避免带陈旧基线提交后续 review 期暴露 drift"
             ),
         }],
     )
@@ -439,7 +451,7 @@ def _uncommitted_changes(project_root: Path) -> list[str]:
 
 
 def _guard_shared_entry_coverage(
-    project_root: Path,
+    project_root: Path | None,
     task_def: dict[str, Any],
     task_id: str,
     files_to_edit: list[str],
@@ -756,6 +768,30 @@ def _reconcile_before_verify(
     )
 
 
+def _current_head(project_root: Path | None) -> str | None:
+    """best-effort 取当前 HEAD sha（verify 记录的**同源锚**）。
+
+    task-review-verify-at-head：DONE 存证与「按 HEAD 复跑」记录都带本值，
+    两侧比对才判得出「存证与所审内容是否同源」。取锚失败（非 git 仓库 / git
+    不可用）返回 None——**不得因此阻断 done**：锚缺失时比对侧 fail-open，
+    行为退化为改动前，比把整条 done 打崩更安全。
+
+    Args:
+        project_root: 仓库/工作树根目录；None 直接返回 None。
+
+    Returns:
+        HEAD 的完整 sha 字符串；取不到时 None。
+    """
+    if project_root is None:
+        return None
+    try:
+        from orchd.gitops.query import get_head_commit
+
+        return get_head_commit(project_root)
+    except Exception:
+        return None
+
+
 def _run_verify(
     store: Store,
     task_def: dict[str, Any],
@@ -796,6 +832,10 @@ def _run_verify(
             }],
         )
 
+    # task-review-verify-at-head AC1：先取 HEAD 锚再执行——锚代表「本次 verify
+    # 所覆盖的代码状态」。没有锚就无从判断后续存证与所审内容是否同源（旧行为
+    # 下「补交一笔改动再送审」可绕过机器复跑，正是因为存证里只有 cwd）。
+    verify_head = _current_head(project_root)
     started = time.monotonic()
     try:
         # 通过包模块获取 run_shell（使测试 monkeypatch 传导到本模块）
@@ -819,6 +859,9 @@ def _run_verify(
             # task-done-root-resolution AC4：记录 verify 实际执行位置（cwd），
             # reviewer 可仅凭 DONE 事件的 verify 摘要辨识 verify 跑在哪个工作树。
             "cwd": str(project_root),
+            # AC1：DONE 存证落 HEAD 锚。取不到（git 不可用）时为 None，比对侧
+            # 见「无锚」即 fail-open，行为退化为改动前（不告警、不阻断）。
+            "head": verify_head,
         }
         return verify_record, None
     except subprocess.TimeoutExpired as exc:
@@ -837,6 +880,84 @@ def _run_verify(
             return None, early
         raise _verify_timeout_error(verify_cmd, task_id, verify_timeout, elapsed,
                                     partial_out)
+
+
+def rerun_verify_at_head(
+    task_def: dict[str, Any],
+    task_id: str,
+    project_root: Path | None,
+) -> dict[str, Any] | None:
+    """按**当前**代码状态复跑 verify_command（task-review-verify-at-head AC2）。
+
+    DONE 时跑的那一次 verify 只覆盖 DONE 那一刻的代码；审查认领前若又补交了
+    提交，机器视角里那份存证就成了「凭空引用」。本函数产出一份**当前**状态下
+    的同构记录，与 DONE 存证并列，让「补交的改动」重新回到机器验证范围内。
+
+    与 :func:`_run_verify` 的三处刻意差异（本函数服务审查侧，不服务 done）：
+    - **不写事件、不做假失败消除**（early_done）：只产出一份记录，不改状态机；
+    - **失败/超时不抛** ``OrchdError``：复跑是**注解**不是门禁，失败只降级为
+      ``ok=False``（超时带 ``timeout`` 字段），由调用方决定呈现方式（本卡口径：
+      告警而非阻断，故不得打断「边审边补交」）；
+    - 记录带 ``head`` 锚（与 DONE 存证同构），供两侧比对。
+
+    Args:
+        task_def: 任务定义（取 ``verify_command`` 与可选 ``verify_timeout_seconds``）。
+        task_id: 任务 id（诊断字段；本函数不校验其状态）。
+        project_root: 复跑目录，**须为任务 worktree**（container 布局下审查由
+            主工作树发起 → 由调用方经 ``_resolve_review_worktree`` 解析后再传入，
+            否则 verify 会跑在错误的目录里）。
+
+    Returns:
+        与 DONE 存证同构的记录（``ok`` / ``exit_code`` / ``elapsed_seconds`` /
+        ``output_summary`` / ``cwd`` / ``head``）；超时返回 ``ok=False`` 记录；
+        仅当 ``project_root`` 缺失或任务无 ``verify_command`` 时返回 None。
+    """
+    verify_cmd = task_def.get("verify_command")
+    if not verify_cmd or project_root is None:
+        return None
+    # 封顶单次 verify 硬预算（rules/verify.md:13）：任务级 verify_timeout_seconds
+    # 可配到 600s，但复跑发生在**审查认领**里，不是门禁点——一次认领最多只吃
+    # 120s，不得让审查动作被一条拖长的 verify 挂住。
+    verify_timeout = min(
+        task_def.get("verify_timeout_seconds") or _VERIFY_TIMEOUT, _VERIFY_TIMEOUT)
+    started = time.monotonic()
+    try:
+        # 经包模块取 run_shell：使测试 monkeypatch 传导到本模块
+        from orchd.onboard import run_shell as _run_shell
+
+        result = _run_shell(verify_cmd, str(project_root), verify_timeout)
+        elapsed = round(time.monotonic() - started, 1)
+        return {
+            "ok": result.returncode == 0,
+            "exit_code": result.returncode,
+            "elapsed_seconds": elapsed,
+            "output_summary": _verify_output_summary(result.stdout, result.stderr),
+            "cwd": str(project_root),
+            "head": _current_head(project_root),
+        }
+    except subprocess.TimeoutExpired as exc:
+        elapsed = round(time.monotonic() - started, 1)
+        partial = (exc.stdout or b"") if hasattr(exc, "stdout") else b""
+        return {
+            "ok": False,
+            "timeout": verify_timeout,
+            "elapsed_seconds": elapsed,
+            "output_summary": _verify_output_summary(partial, b""),
+            "cwd": str(project_root),
+            "head": _current_head(project_root),
+        }
+    except Exception as exc:
+        # 复跑是**注解**不是门禁：任何失败都不得逸出（OSError / 执行器内部异常
+        # 等）。claim 侧虽由 run_guard 兜底，但本函数可被别处复用——让每个调用
+        # 点都记得包 guard 是靠不住的约定，故在此就地降级成一条 ok=False 记录。
+        elapsed = round(time.monotonic() - started, 1)
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_seconds": elapsed,
+            "cwd": str(project_root),
+            "head": _current_head(project_root),
+        }
 
 
 def _verify_fail_error(
@@ -921,10 +1042,9 @@ def _verify_failure_early_done(
     """
     fresh_state = store.replay()
     cur_ts = fresh_state.get(task_id)
-    if cur_ts is not None and cur_ts.status != "claimed":
-        prior_done = _find_last_done_event(store, task_id)
-    else:
-        prior_done = None
+    if cur_ts is None or cur_ts.status == "claimed":
+        return None
+    prior_done = _find_last_done_event(store, task_id)
     if prior_done is None:
         return None
     return {
@@ -950,9 +1070,11 @@ def _commit_and_verify_integrity(
 ) -> dict[str, Any] | None:
     """S-A2 阶段 4：锁外自动提交 + 4 个完整性门禁（均 fail-closed）编排器。
 
-    自动提交范围限定任务声明的 files_to_edit，失败/跳过不影响状态机；随后按序执行
-    三个独立门禁函数（声明 diff / 零残留 / 越界）+ L1 干净校验。每个门禁跑不起来时
-    fail-closed 阻断并留痕。对外仅返回 commit_result（与重构前一致）。
+    自动提交范围 = 合并后的文件清单 files_to_edit ∪ exempt_files（本函数的 commit_files），
+    失败/跳过不影响状态机；扩展仅限提交范围，declared_diff / zero_residual / out_of_scope
+    仍以声明的 files_to_edit 为准。随后按序执行三个独立门禁函数（声明 diff / 零残留 /
+    越界）+ L1 干净校验。每个门禁跑不起来时 fail-closed 阻断并留痕。对外仅返回
+    commit_result（与重构前一致）。
     """
     commit_message = changes_description or task_def.get(
         "name", f"orchd: done {task_id}"
@@ -986,6 +1108,7 @@ def _commit_and_verify_integrity(
             and commit_result.get("reason") in ("commit_timeout", "commit_failed")
         )
         if hard_failed and exc.code is ErrorCode.E017:
+            assert commit_result is not None
             base_detail = exc.details[0] if exc.details else {}
             raise OrchdError(
                 ErrorCode.E017,
@@ -1015,7 +1138,10 @@ def _done_auto_commit(
 ) -> dict[str, Any] | None:
     """锁外 best-effort 自动提交（verify 通过后、写 DONE 事件前）。
 
-    提交范围限定任务声明的 files_to_edit，失败/跳过不影响状态机。
+    提交范围 = 调用方传入的文件清单：done 侧由 :func:`_commit_and_verify_integrity`
+    合并 files_to_edit ∪ exempt_files 后传入（本形参名沿用 files_to_edit，但不等于任务
+    声明集合）。失败/跳过不影响状态机；扩展仅限提交范围，declared_diff / zero_residual /
+    out_of_scope 仍以 files_to_edit 为准（越界 E020）。
 
     A0b / 单目录无 git（task-nogit-single-dir-pivot）：「提交」= 推进主目录
     committed 快照（:func:`orchd.nogit.take_snapshot`），不经 git commit；
@@ -1066,6 +1192,7 @@ def _write_done_event(
             )
 
         claimed_by = ts.claimed_by
+        assert claimed_by is not None
         author_mismatch = claimed_by != agent_id
         attempt_count = ts.attempt_count + 1
         done_event = _make_event(

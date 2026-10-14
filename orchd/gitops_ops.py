@@ -44,7 +44,7 @@ from orchd.gitops import (
     main_worktree_root,
     unmerged_paths,
 )
-from orchd.ledger import generate_event_id, resolve_session_identity
+from orchd.ledger import _write_bytes_atomic, generate_event_id, resolve_session_identity
 # task-line-trunk：任务生命周期 git 写动作的 trunk / 分支名按**当前线**解析
 # （单线零回归：未配置 project.lines 时恒为 main / task/{id}）。
 from orchd.line_ctx import resolve_task_branch_for, resolve_trunk_for
@@ -590,7 +590,10 @@ def try_delete_task_branch(project_root: Path, task_id: str) -> bool:
         return False
 
 
-def _read_task_verify_command(project_root: Path, task_id: str) -> str | None:
+def _read_task_verify_command(
+    project_root: Path, task_id: str,
+    degraded: list[dict[str, Any]] | None = None,
+) -> str | None:
     """从 _master.json 读取任务的 verify_command（best-effort，失败返回 None）。
 
     task-master-path-resolver-convergence：master **路径解析**统一走
@@ -599,12 +602,38 @@ def _read_task_verify_command(project_root: Path, task_id: str) -> str | None:
     :func:`main_worktree_root` canonical 化（口径不一）——container 布局下
     project_root 可能是任务 worktree（副本被抑制）→ 取不到 verify_command，
     union 合并静默降级为逐文件 pytest。
+
+    task-degraded-trace-visibility：读失败不再纯静默 ``pass``——经
+    :func:`orchd.gitops.guard.record_degraded_guard`（``guard="verify_command_read"``，
+    E030 / warning）写入 ``degraded`` 供响应携带（``degraded_guards``）。
+    降级语义不变：仍返回 None 由调用方按既有 fallback 逐文件验证
+    （不升级为阻断，也不改成跳过）。
     """
     try:
         from orchd.worktree import resolve_master_path_from_dir
 
         master_path = resolve_master_path_from_dir(Path(project_root) / ".orchd")
         if not master_path.exists():
+            if degraded is not None:
+                from orchd.gitops.guard import (
+                    GUARD_STATUS_NOT_APPLICABLE,
+                    record_degraded_guard,
+                )
+
+                record_degraded_guard(
+                    degraded,
+                    guard_name="verify_command_read",
+                    status=GUARD_STATUS_NOT_APPLICABLE,
+                    reason=(
+                        f"master 不存在（{master_path}）：union verify_command "
+                        "无从读取，已降级为逐文件验证"
+                    ),
+                    context={"task_id": str(task_id)},
+                    hint=(
+                        "确认主工作树 _master.json 存在且任务已注册；"
+                        "本次已按既有 fallback 逐文件验证，不阻断"
+                    ),
+                )
             return None
         import json
         with open(master_path, "r", encoding="utf-8") as f:
@@ -612,8 +641,23 @@ def _read_task_verify_command(project_root: Path, task_id: str) -> str | None:
         for t in master.get("tasks", []):
             if t.get("id") == task_id:
                 return t.get("verify_command")
-    except Exception:
-        pass
+    except Exception as exc:
+        if degraded is not None:
+            from orchd.gitops.guard import GUARD_STATUS_FAILED, record_degraded_guard
+
+            err = f"{type(exc).__name__}: {exc}".strip()[:300]
+            record_degraded_guard(
+                degraded,
+                guard_name="verify_command_read",
+                status=GUARD_STATUS_FAILED,
+                reason=f"verify_command 读取失败，已降级为逐文件验证：{err}",
+                context={"task_id": str(task_id)},
+                error=err,
+                hint=(
+                    "master 解析/读取异常，本次已按既有 fallback 逐文件验证；"
+                    "确认 _master.json 可读后重试"
+                ),
+            )
     return None
 
 
@@ -701,7 +745,7 @@ def _try_union_merge_conflicts(
                 merged_content = rf.read()
             target = workdir / rel
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(merged_content)
+            _write_bytes_atomic(target, merged_content)
         finally:
             for p in (base_path, ours_path, theirs_path):
                 try:
@@ -797,13 +841,18 @@ def _run_union_verify(
 
 
 def try_auto_resolve_conflict(
-    project_root: Path, task_id: str
+    project_root: Path, task_id: str,
+    degraded: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """L3：merge 冲突自动化解——恢复 main → 分支 merge main 预演 → 自动合并或返回清单。
 
     全部 git 操作在**主工作树**内以 ``git -C`` 执行（``git rev-parse --git-common-dir``
     定位；flat 单会话即 project_root，零回归），任务 worktree 永不 checkout main。
     merge-wt 已废弃。
+
+    task-degraded-trace-visibility：union 前取 verify_command 失败经 ``degraded``
+    留痕（``guard="verify_command_read"``，见 :func:`_read_task_verify_command`），
+    降级语义不变（仍按既有 fallback 逐文件验证）。
 
     Returns:
         ``{"resolved": True}``：自动化解成功（main 已含任务分支实现）。
@@ -845,7 +894,7 @@ def try_auto_resolve_conflict(
             union_ok = False
             if files and all(_is_tests_only_file(f) for f in files):
                 # AC2：读取任务 spec 的 verify_command 供 union 后验证
-                _verify_cmd = _read_task_verify_command(project_root, task_id)
+                _verify_cmd = _read_task_verify_command(project_root, task_id, degraded)
                 union_ok = _try_union_merge_conflicts(workdir, files, _verify_cmd)
             if not union_ok:
                 run(workdir, "merge", "--abort")
@@ -924,6 +973,17 @@ def merge_tree_supported() -> bool:
 def _split_nonempty_lines(text: str | None) -> list[str]:
     """按行切分并丢弃空行（git ``--name-only`` 输出的通用解析）。"""
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def _split_nul(text: str | None) -> list[str]:
+    """按 NUL 切分 git ``-z`` 输出（丢弃空项、不做 strip——文件名可含空格）。
+
+    ``-z`` 是取路径的**唯一无损通道**（task-pass13-p3-pack-recheck ①）：不加时
+    ``core.quotePath``（默认 true）会把非 ASCII / 含特殊字符的路径转义为
+    ``"\\346\\226\\207..."``，位于同一 diff 的集合交集会**漏判**（冲突检测误判
+    no_overlap 而静默放行）；git ``-z`` 以 NUL 分隔、路径原样不转义。
+    """
+    return [chunk for chunk in (text or "").split("\0") if chunk]
 
 
 def resolve_task_worktree(
@@ -1074,19 +1134,19 @@ def reconcile_with_main(
     base = mb.stdout.strip()
 
     # 2) trunk 自 merge-base 以来的改动（空 → trunk 未推进 → 零成本跳过）
-    trunk_diff = _run(["diff", "--name-only", base, trunk])
+    trunk_diff = _run(["diff", "--name-only", "-z", base, trunk])
     if trunk_diff is None or trunk_diff.returncode != 0:
         return result
-    trunk_files = _split_nonempty_lines(trunk_diff.stdout)
+    trunk_files = _split_nul(trunk_diff.stdout)
     if not trunk_files:
         result.update(reason="no_main_advance", clean=True)
         return result
 
     # 3) 本任务分支的实际改动；与 trunk 推进文件无交集 → 零成本跳过
-    task_diff = _run(["diff", "--name-only", base, branch])
+    task_diff = _run(["diff", "--name-only", "-z", base, branch])
     if task_diff is None or task_diff.returncode != 0:
         return result
-    if not (set(trunk_files) & set(_split_nonempty_lines(task_diff.stdout))):
+    if not (set(trunk_files) & set(_split_nul(task_diff.stdout))):
         result.update(reason="no_overlap", clean=True)
         return result
 

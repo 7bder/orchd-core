@@ -42,6 +42,12 @@ pytest_tmp_*/
 # 引擎忽略它（resolve_roadmap_path 不读 .orchd/ 内副本）。
 .orchd/*
 !.orchd/_master.json
+# 终态任务**定义**归档（task-master-archive-write-channel）：与 _master.json 同
+# 入库口径——它必须随仓库分发，否则 CI 新克隆无法回读历史任务定义，且「终态
+# 集合可脱离运行时账本复算」的判据不成立（这正是本归档通道存在的理由）。
+!.orchd/_master-archive.json
+!.orchd/_full_regression.json
+!.orchd/test_baseline.json
 !.orchd/shared/
 !.orchd/IDEAS.md
 !.orchd/IDEAS-archive.md
@@ -94,6 +100,13 @@ orchd-dashboard/
 .orchd-runtime-backup-*/
 _e020_tests_extract.txt
 $null
+# 容器账本根与测试 sqlite 库（task-runtime-list-migration-backups；侧车收敛见
+# task-gitignore-sidecar-canonical）：未跟踪的引擎运行时库与测试夹具产物，
+# 人工 git add -A 不得入库。侧车后缀 single-source 即本通配：
+# -shm（共享内存）/ -wal（预写日志）/ -journal（回滚日志）等一律覆盖，新增后缀
+# 无需改本行；改回本名即漏侧车（守卫 tests/test_packaging.py 钉住）。
+.orchd-runtime/
+tests/fixtures/_ledger.sqlite3*
 
 # 大版本审查报告（review/：2026-09-10 全维度审查，总览 + 4 篇分维度 + 并行 agent 报告）
 # 未跟踪的审查过程产物，暂不入库；文件保留在本地，需留档时再复制入 docs/

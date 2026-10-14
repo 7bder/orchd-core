@@ -85,12 +85,12 @@ agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈�
 - **E021 豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021 `identity_mismatch` warning。
 - **指纹 vs 具名身份**：宿主受管自动化会话用指纹作身份锚定；具名 agent 身份（如 `marvis-1`、`workbuddy-1`）用于人工可追溯场景。
 
-## 会话 TTL 与在握任务（task-e033-ttl-docs，三套时钟一次说清）
+## 会话 TTL 与在握任务（task-e033-ttl-docs；task-session-zombie-ttl-single-source 起 doctor 不再有独立时钟）
 
 - **ledger 会话 TTL（24h）**：`last_seen` 超过 TTL（默认 24h = 1440min，`ORCHD_SESSION_TTL_MIN` 可覆盖）→ 惰性过期为 E033（reason=session_expired），判定即生效、不删文件；`last_seen` 仅写命令续命，只读命令不碰。
-- **doctor 僵尸判定（30min）**：session 运行时文件 mtime 超 30min（`_SESSION_TTL_SECONDS=1800`）即判僵尸（巡检口径，与 ledger 的 24h 是两套时钟）。
+- **doctor 僵尸判定（与 ledger 同源，不再是第二套时钟）**：`sessions/*.json` 判死直接复用 `ledger.is_session_expired`（`last_seen` 超 `session_ttl_minutes()`），文件 **mtime 不参与判定**——mtime 只被写命令刷新，长只读阶段（跑全量测试、复核取证）会让活会话的 mtime 老化，是假信号。另有两条活性豁免：① 该 session 正持 `.session*.lock` 的 live flock（flock 由内核托管，强于任何时间戳）；② 存在身份读不出的活锁（他进程持锁）时整轮放弃判定，宁漏清不误删。`active=false`（会话已正常 `end`）视为可回收。**历史缺陷**：doctor 曾自带 1800s（30min）死 TTL 且只看 mtime，与 ledger 的 1440min 相差 48 倍 ⇒ 空闲超 30min 但账本仍判活的会话身份文件被自动清洁真删（`zombie_session` ∈ `_AUTO_CLEAN_TYPES`，真删无备份），随后引擎命令 E033 `session_identity_missing`，而账本里该 session 的 CLAIMED 事件仍在，只能回读账本取回 token 才续上。
 - **watchdog 在途判定（60min）**：claimed / in_review 超 60min 无进展即 stuck 上报。
 - **在握任务不因 session 过期自动回收**：过期仅报告（`stale_sessions` / `stale_claims`，reason=missing_runtime/inactive/session_expired），默认不释放；需接管时显式 `--takeover`（经 `force-status → pending`），回池后重新 claim。
 - **一键取号**：`python .orchd/__main__.py session start` 返回 token，执行其 `inject_action`（PowerShell：`$env:ORCHD_SESSION_ID="<token>"`；bash：`export ORCHD_SESSION_ID="<token>"`）即完成注入；`session current` 复用 token，无需重复 start。
-- **读路径顺手卫生**：`status` / `watchdog` 会清理 TTL 过期 session 文件与 orphan session lock——久置未操作后会话消失属正常，直接重 `session start` 即可（勿当事故）。
+- **读路径顺手卫生**：`status` / `watchdog` 会清理**账本判死**（`last_seen` 超 TTL 或 `active=false`）的 session 文件与 orphan session lock——久置未操作后会话消失属正常，直接重 `session start` 即可（勿当事故）。活跃会话（TTL 内或持 live flock）的身份文件不会被顺手清掉。
 - **自审降级与分级策略**（task-self-review-independence-policy，D7 裁定；task-review-independence-enforce 落地字段级强制）：实现 + 审查可在同一指纹下完成，引擎在认领结果附 `self_review_notice`、request 候选标注 `is_self_review`，不参与任何流程决策；决策权在人（调度者）。线上版可设 `_master.json config.enforce_self_review_block=true` 恢复 E016 硬阻断（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审。**字段级强制（B1，task-review-independence-enforce 已落地，不再是“建议”）**：任务 `require_independent_review=true` 时 E016 硬阻断 + request 排除，与全局开关 OR——调度者给高危任务置该字段即获强制异指纹。**自审时必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。

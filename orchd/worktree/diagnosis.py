@@ -42,7 +42,7 @@ def _git_diff_names(project_root: Path, task_id: str, *,
 
         base = (f"{resolve_trunk_for(project_root)}..."
                 f"{resolve_task_branch_for(project_root, task_id)}")
-        args = ["git", "diff", "--name-only"]
+        args = ["git", "diff", "--name-only", "-z"]
         if no_renames:
             args.append("--no-renames")
         args.append(base)
@@ -55,7 +55,9 @@ def _git_diff_names(project_root: Path, task_id: str, *,
             timeout=_GIT_TIMEOUT,
         )
         if proc.returncode == 0:
-            return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            # -z：NUL 分隔、路径原样不转义（task-pass13-p3-pack-recheck ①：
+            # 不加 -z 时 core.quotePath 会把非 ASCII 路径转义，E010 增强判定漏检）。
+            return [p for p in proc.stdout.split("\0") if p]
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return []

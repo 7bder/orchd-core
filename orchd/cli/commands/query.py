@@ -115,8 +115,8 @@ def _cmd_doctor(args):
             dry_run=dry_run,
             backup_dir=Path(backup_dir) if backup_dir else None,
         )
-        # 退出码语义（脚本化感知残留）：dry-run 有可清项 → 1；--fix 有失败 → 1；
-        # 否则 0。与只读模式「有 fail 项 → 1」保持一致。
+        # 退出码语义（脚本化感知残留）：dry-run 有可清项 → 1；--fix 有失败或
+        # 有复检跳过未清项 → 1；否则 0。与只读模式「有 fail 项 → 1」保持一致。
         exit_code = 0
         if dry_run:
             cleanable = (
@@ -126,7 +126,7 @@ def _cmd_doctor(args):
             )
             if cleanable > 0:
                 exit_code = 1
-        elif result.get("errors"):
+        elif result.get("errors") or result.get("skipped_clean"):
             exit_code = 1
         return result, exit_code
 
@@ -165,29 +165,52 @@ def _format_audit_text(audit: dict) -> str:
         return repr(audit)[:500]
 
 
-@_cli_skeleton
-def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
+@_cli_skeleton(with_archived=True)
+def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict | None:
     """获取全局状态快照或单任务详情。
 
     CLI 参数: args.task（可选，任务 ID）、args.text（--text，人类可读表格输出）、
     args.all（--all，显示全量任务含终态；默认仅活跃任务）、
     args.audit_merge（--audit-merge，附加只读 merge 巡检）。
     返回: 全局状态字典或单任务详情字典；若 --text 模式则直接打印表格并返回 None。
+
+    归档回读合并（task-master-archive-readback-merge）：本命令是**唯一**开启
+    ``with_archived=True`` 的入口（``show`` 委托本函数故自动覆盖），使
+    ``summary.total`` 保持全量、``status --all`` 与 ``status <已归档-id>`` 仍可见
+    历史任务；并顺带修掉一个回归——``merge_audit`` 的 ``registered_ids`` 取自同一
+    tasks 列表，合并后 ``task/<已归档-id>`` 分支不再被误判为幽灵分支
+    （``unregistered_task_branch``）。其余命令（request/pool/watchdog/
+    milestone-check）保持活跃定义视角。
     """
     from orchd.ledger import stale_review_claims
     from orchd.report import intake_audit, merge_audit, revive_audit, status, task_integrity_audit
     # 红线 8（R3）：status 前置校验运行时文件完整性（只读告警，不阻断）
     integrity_warnings = store.check_integrity()
+    # task-replay-command-scoped-once：单命令内 replay 只算一次，显式穿透给
+    # report.status / stale_review_claims / status_guidance_text / 会话碰撞告警
+    # （均只读消费同一 snapshot），避免同命令 3-4 次全解析。不引入 Store 级 memo
+    # （守 M2 性能冻结令「只做提/并/删，不新增缓存机制」）。
+    state = store.replay()
+    phase_flag = getattr(args, "phase", False)
+    active_phase = None
+    if phase_flag:
+        # 活跃阶段单一真源在 onboard.request，CLI 层（非 report 依赖反向）计算后传入
+        from orchd.onboard.request import active_task_phase
+
+        active_phase = active_task_phase(tasks, state)
     result = status(
         store, tasks, project=master.project, text=args.text, task_id=args.task,
         project_root=orchd_dir.parent,
         active_only=not getattr(args, "all", False),
+        state=state,
+        phase=phase_flag,
+        active_phase=active_phase,
     )
     # W-2 僵尸审查认领：status 读路径浮现超时未提交的审查认领（同 request 判定），
     # 让"任何一次状态查看"都能暴露僵局，不依赖后续再发 request。
     if not args.text:
         try:
-            _stale = stale_review_claims(store.replay())
+            _stale = stale_review_claims(state)
         except Exception:
             _stale = {}
         if _stale:
@@ -198,7 +221,9 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
     if not args.text:
         exclude = args.task or _current_task_from_branch(orchd_dir.parent)
-        collision = _session_collision_warning(agent_id, store, exclude_task_id=exclude)
+        collision = _session_collision_warning(
+            agent_id, store, exclude_task_id=exclude, state=state
+        )
         if collision:
             result["session_collision_warning"] = collision
     if integrity_warnings:
@@ -253,7 +278,7 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             # status 命令前置必有 master → has_master=True（空项目时显示 empty_project 而非 first_time）
             # review-unify-r2：传 review_mode，引导文字按模式分流（模板路径不影响文字，但保持一致）
             review_mode = resolve_review_mode(store.orchd_dir)
-            table += status_guidance_text(store.replay(), tasks, has_master=True,
+            table += status_guidance_text(state, tasks, has_master=True,
                                            review_mode=review_mode)
         except Exception:
             pass  # 引导失败静默跳过，不影响表格输出
@@ -343,6 +368,8 @@ def register(sub) -> None:
                    help="附加复活巡检：扫描 ledger 中 completed→pending 的强制复活操作，列告警（只读）")
     p.add_argument("--audit-task", action="store_true",
                    help="附加任务完整性巡检：merged 任务的历史缺失/残留（main 残留 + 分支 diff 缺失声明文件，只读）")
+    p.add_argument("--phase", action="store_true",
+                   help="附加阶段聚合视图：每阶段 total/completed/active/pending 计数与活跃阶段标记（活跃阶段经 request.active_task_phase 单一真源计算）")
     p.set_defaults(func=_cmd_status)
 
     # show（task-audit-hint-show）：单任务卡面直达，`status <task-id>` 别名。

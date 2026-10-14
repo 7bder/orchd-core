@@ -33,7 +33,7 @@ guide: {}
 
 | 情况 | 行为 |
 |---|---|
-| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **39 个**（全量覆盖 E001-E039；计数真锁 = `orchd/errors.py` ↔ `implementation-design.md` §2.4 ↔ `tests/test_docs_single_source.py`，guide 表另由 `tests/test_guide.py` 锁定）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson report --trigger <key> --symptom "..." --guidance-flaw` 上报缺陷，不自行处理 |
+| **有具体可执行 guidance**（`ERROR_GUIDANCE` 命中的 **40 个**（全量覆盖 E001-E040；计数真锁 = `orchd/errors.py` ↔ `implementation-design.md` §2.4 ↔ `tests/test_docs_single_source.py`，guide 表另由 `tests/test_guide.py` 锁定）+ 场景指引） | 严格按提示执行，无自行尝试空间；判定指引不适用 → `lesson report --trigger <key> --symptom "..." --guidance-flaw` 上报缺陷，不自行处理 |
 | **无具体 guidance**（fallback、E999、非错误码场景） | 允许 agent 分析自愈；自愈成功（verify 通过 / 后续命令成功）→ `lesson stage --task <id> --trigger <key> --symptom "..." --resolved` 沉淀；未解决 → 停止报告 |
 | **红线 14 纪律场景**（candidate=None / next_action=exit） | 维持不变：停止等待，**不**视为自愈 |
 
@@ -74,16 +74,43 @@ guide: {}
 
 ### 四条错误产生通道
 
-| 通道 | 产生方式 | 是否经 attach_error_guidance | 典型码（登记口径以 `orchd/guide.py::ERROR_CODE_CHANNELS` 为唯一真源） |
+| 通道 | 产生方式 | 是否经 attach_error_guidance | 全部码（登记口径以 `orchd/guide.py::ERROR_CODE_CHANNELS` 为唯一真源，本表由 `tests/test_guide.py::TestChannelRegistry` 四通道**双向**核对） |
 |---|---|---|---|
-| **A 异常** | `raise OrchdError`，冒泡到 cli 统一处理器 | ✅ 是 | E001-E002/E007-E019/E025/E027/E033/E034/E036（含 E015；**E003/E005/E022 为 A+B 双通道**；E004/E006 不在 A） |
-| **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | E004/E006/E023/E024/E026/E028/E029/E031（+ 双通道 E003/E005/E022） |
-| **C 手工 dict** | 代码里手拼 `{"code":"Exxx", ...}` 后 return | ❌ 否（需 structured_error 接线） | E021/E028/E030/E031/E032/E035 |
-| **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | E020 |
+| **A 异常** | `OrchdError` 实例构造后冒泡（raise；builder 先构造再返回也算） | ✅ 是 | 27 码：E001/E002/E003/E005/E007-E019（去 E020）/E022/E025/E027/E028/E029/E030/E033/E034/E036/E039 |
+| **B 批量校验** | spec.py ValidationError 被 validate/intake 收集成数组 | ❌ 否（需 annotate_validation_items 接线） | 14 码：E003/E004/E005/E006/E022/E023/E024/E025/E026/E027/E029/E030/E037/E038 |
+| **C 手工 dict** | `structured_error("Exxx", …)` 或手拼 `{"code":"Exxx", …}` 后 return | ❌ 否（需 structured_error 接线） | 8 码：E007/E015/E021/E028/E030/E031/E032/E035 |
+| **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | 2 码：E017（审查期实现者冻结）/E020（越界提交） |
 
-**通道登记核对（指针式 2026-09-28 task-pass10-counts-pointers：实时以 `orchd/guide.py::ERROR_CODE_CHANNELS` 与 `orchd/errors.py` 为准，快照会过期）**：2026-09-15 快照 A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）→ 2026-09-28 快照 A 单通道 21 码（+E039）、B 单通道 8 码（+E037/E038）、B+C**：A 单通道 20 码（E001/E002/E007-E019/E025/E027/E033/E034/E036，E015 已接入）、B 单通道 6 码（E004/E006/E023/E024/E026/E029）、B+C 双通道 2 码（E028/E031，同时出现在上表 B 批量校验与 C 手工 dict 通道）、A+B 双通道 3 码（E003/E005/E022）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
+**通道登记核对（指针式 2026-09-28 task-pass10-counts-pointers：实时以 `orchd/guide.py::ERROR_CODE_CHANNELS` 与 `orchd/errors.py` 为准，快照会过期）**：2026-10-06 快照（pass13 §11-8b 按实测更正登记表后）A 单通道 16 码（E001/E002/E008-E014/E016/E018/E019/E033/E034/E036/E039）、B 单通道 8 码（E004/E006/E023/E024/E026/E037/E038/E040）、C 单通道 4 码（E021/E031/E032/E035）、D 单通道 1 码（E020）；双/多通道码：A+B 6 码（E003/E005/E022/E025/E027/E029）、A+C 3 码（E007/E015/E028）、A+D 1 码（E017）、A+B+C 1 码（E030）。本快照由 `tests/test_docs_single_source.py::TestRedLineSummaryLock` 的通道计数判据锁死（判据从登记表实时取数）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
 
-**E015 (merge_conflict) 已接入通道 A**（不再是死映射）：`done` 前置对账在 `orchd/onboard/lifecycle/core.py` 新增 `raise OrchdError(E015)` 位点（task-done-reconcile-main 挂载点①）；`orchd/review.py` 仍以手工 dict 挂 `result` 的 reason 路径保留。`ERROR_CODE_CHANNELS` 登记由空集改为 `{"A"}`。
+**通道码的「一码双面」**（pass13 §11-8b 实测，读表时别当成矛盾）：E028/E029/E030 同属
+`WARNING_CODES`（B 通道批量校验里是 warning，不阻断），但在 A 通道是**硬阻断**——
+`orchd/cli/commands/control.py:576/:879` 与 `orchd/worktree/recycle.py:247` 直接
+`raise OrchdError` 拒绝注册/拒绝回收。因此「在 WARNING_CODES 里」不等于「运行时不阻断」。
+该矛盾已由 pass13 §11-8a 闭环：`exit_type` 与阻断性解耦——五分法词汇的生产真源是
+`orchd/guide.py::_VALID_EXIT_TYPES` / `EXIT_TYPE_ACTION_MEANING`（每档写明是否隐含不阻断），
+`continue` 的准入条件是「该码**无**通道 A」；判据 `tests/test_guide.py::TestExitTypeContract`
+的 `test_blocking_capable_codes_not_continue`（含 A 者不得 continue）与
+`test_dual_faced_codes_state_blocking_face`（一码双面者 recovery 须写明 A 通道阻断面）
+实时从本登记表取数，新增此类码未定档即红。旧判据「WARNING_CODES ⇒ continue」已删除。
+另：`orchd/cli/__init__.py:193` 把 argparse 解析失败也装进 E007 封套（E007 名义是
+invalid_state），属复用既有码的既存口径，本表如实登记 C 通道，语义是否恰当另议。
+
+**E015 (merge_conflict) 双通道**（历史：曾是「登记有码、通道空集」的死映射，
+task-done-reconcile-main 接入 A 后改为 `{"A"}`，pass13 §11-8b 实测再补 C）：
+A = `done` 前置对账在 `orchd/onboard/lifecycle/core.py`
+`raise OrchdError(E015)`（挂载点①）；C = `orchd/review.py:1009`
+经 `structured_error("E015", …)` 把指引挂到 `result["error"]`（该处源码注释自称「通道 D」，
+与通道定义不符，属文档假陈述，登记在 pass13 §11 第 11 项待修）。
+指引出口（pass13 §11-8a）：E015 的 `command` 由裸 `git status`（只诊断）改为受管出口
+`python .orchd/__main__.py git merge main`（受管通道，仅任务分支放行）；
+`exit_type=exec-command`——该 command 即解除阻塞的动作本体，禁手写 `git merge`、禁强推。
+
+**非枚举兜底码**：`E999`（`orchd/cli/__init__.py:253` 意外异常封套）不在 `ErrorCode`
+枚举内（E001–E040 无空洞是锁死的契约），由 `orchd/guide.py::OUT_OF_ENUM_CODES`
+单独登记 code→位点，`tests/test_guide.py::TestChannelRegistry::test_channel_c_registered_equals_measured`
+校验其位点真实存在。
+
 
 ### 被占场景 SOP（E009 / E011）
 

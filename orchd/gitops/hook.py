@@ -41,6 +41,7 @@ _REPO_HOOKS_DIR = ".githooks"
 _HOOK_PY_RESOLVER = """\
 import json
 import os
+import subprocess
 import sys
 
 # 强制 UTF-8 输出：hook 其余部分（MSYS sh echo）产出 UTF-8，若此处按 Windows
@@ -56,6 +57,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 _common = (sys.argv[1] or ".git").replace("\\\\", "/")
 _task = sys.argv[2]
+_ref = sys.argv[3] if len(sys.argv) > 3 else ""
 if _common == ".git":
     _root = "."
 elif _common.endswith("/.git"):
@@ -63,19 +65,124 @@ elif _common.endswith("/.git"):
 else:
     _root = os.path.dirname(_common) or "."
 _master = os.path.join(_root, ".orchd", "_master.json")
-try:
-    with open(_master, encoding="utf-8") as _fh:
-        _data = json.load(_fh)
-except Exception as _exc:
-    print("[orchd E020] 动态解析失败：无法读取 %s：%s" % (_master, _exc), file=sys.stderr)
-    sys.exit(2)
-_match = [t for t in (_data.get("tasks") or []) if t.get("id") == _task]
+
+
+def _load_tasks(_text):
+    _parsed = json.loads(_text)
+    _tbl = _parsed.get("tasks") if isinstance(_parsed, dict) else None
+    if not isinstance(_tbl, list):
+        raise ValueError("tasks 表缺失")
+    return _tbl
+
+
+# task-hook-flat-resolver：权威来源 = default 分支 blob（git show <ref>:.orchd/_master.json）。
+# flat 任务分支的物理 .orchd/_master.json 是 claim 时快照，main 上 amend 补登后陈旧，
+# 读它会把已补登的合法文件误判越界（E020）。与命令侧
+# orchd/worktree/layout.py::resolve_declaration_source 同源：blob 不可读 → 回退本地
+# 检出 + degraded 留痕（不静默，也不整体放行）。
+_tasks = None
+if _ref:
+    try:
+        _proc = subprocess.run(
+            ["git", "-C", _root, "show", _ref + ":.orchd/_master.json"],
+            capture_output=True, encoding="utf-8", errors="replace",
+        )
+        if _proc.returncode == 0 and (_proc.stdout or "").strip():
+            _tasks = _load_tasks(_proc.stdout)
+        else:
+            print(
+                "[orchd E020] 动态解析降级：git show %s:.orchd/_master.json 不可读"
+                "（%s）→ 回退本地检出" % (_ref, (_proc.stderr or "").strip()[:200]),
+                file=sys.stderr,
+            )
+    except Exception as _exc:
+        print(
+            "[orchd E020] 动态解析降级：git show 异常（%s）→ 回退本地检出" % _exc,
+            file=sys.stderr,
+        )
+if _tasks is None:
+    try:
+        with open(_master, encoding="utf-8") as _fh:
+            _tasks = _load_tasks(_fh.read())
+    except Exception as _exc:
+        print("[orchd E020] 动态解析失败：无法读取 %s：%s" % (_master, _exc), file=sys.stderr)
+        sys.exit(2)
+_match = [t for t in _tasks if t.get("id") == _task]
 if not _match:
     print("[orchd E020] 动态解析失败：%s 中无任务 %s" % (_master, _task), file=sys.stderr)
     sys.exit(3)
 for _p in list(_match[0].get("files_to_edit") or []) + list(_match[0].get("exempt_files") or []):
     if _p:
         print(_p)
+"""
+
+
+# 无 jsonl 时查任务态/审查态的内嵌 python（task-hook-sqlite-python-fallback）。
+# 由 hook 以 heredoc 方式调用：argv = [task_id, engine_dir]，stdout 输出两行
+# （任务态 / 审查态，取值为事件类型、EMPTY 或 NO_LEDGER）；失败写 stderr 并
+# 返回非零，shell 侧落回既有保守分支。file 部署走 grep 快路径，不经过此处。
+# 三态语义（task-hook-no-ledger-triage，根因：EMPTY 与"无账本"不可混同——旧
+# 实现无载体即保守拦截，回退若一律报 EMPTY 会把该保证冲成放行）：
+# - 事件类型：载体中有该任务的最新相关事件；
+# - EMPTY：载体存在但该任务无相关事件（非活跃 → 放行，与 grep 无命中同语义）；
+# - NO_LEDGER：账本根无任何载体（jsonl / sqlite 库 / 归档均缺失；查询前判定，
+#   不构造 Store、不建库）→ shell 保守按活跃处理（与旧无-ledger 分支同语义）。
+# 约束（与 _HOOK_PY_RESOLVER 同源）：经 hook 模板 f-string 插入，故体内不得含
+# 花括号（用 % 格式化）；TASK_ID 只经 argv 传递，不做模板插值（注入面）。
+# 引擎导入不依赖 hook cwd（含 orchd 包与否）：先把安装期烘入的 engine_dir 插到
+# sys.path 首位再 import（目录搬移/缺失则导入失败 → 非零退出 → 保守分支）。
+_HOOK_PY_LEDGER_STATE = """\
+import sys
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", newline="\\n")
+    except Exception:
+        pass
+_baked = sys.argv[2] if len(sys.argv) > 2 else ""
+if _baked and _baked not in sys.path:
+    sys.path.insert(0, _baked)
+try:
+    from orchd.ledger import Store, resolve_store_dir
+    from orchd.storage import ARCHIVE_FILENAME
+    from pathlib import Path
+except Exception as _exc:
+    print("[orchd E020] ledger-state 查询不可用（引擎导入失败）：%s" % _exc, file=sys.stderr)
+    sys.exit(4)
+_task = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    _sdir = resolve_store_dir(Path(".orchd"))
+    _has = False
+    for _name in ("_ledger.jsonl", "_ledger.sqlite3", ARCHIVE_FILENAME):
+        if (_sdir / _name).is_file():
+            _has = True
+            break
+    if not _has:
+        print("NO_LEDGER")
+        print("NO_LEDGER")
+        sys.exit(0)
+    _store = Store(Path(".orchd"))
+    _events = _store.backend.read_events()
+except SystemExit:
+    raise
+except Exception as _exc:
+    print("[orchd E020] ledger-state 查询失败：%s" % _exc, file=sys.stderr)
+    sys.exit(5)
+_task_types = ("CLAIMED", "REVIEW_CLAIMED", "DONE", "RETRACT", "REVIEW_SUBMITTED")
+_review_types = ("REVIEW_CLAIMED", "REVIEW_SUBMITTED", "RETRACT")
+_last_task = "EMPTY"
+_last_review = "EMPTY"
+for _ev in _events:
+    if not isinstance(_ev, dict):
+        continue
+    if _ev.get("task_id") != _task:
+        continue
+    _t = _ev.get("type")
+    if _t in _task_types:
+        _last_task = _t
+    if _t in _review_types:
+        _last_review = _t
+print(_last_task)
+print(_last_review)
 """
 
 
@@ -184,6 +291,27 @@ def _is_same_hooks_dir(project_root: Path, value: str, target: Path) -> bool:
         return False
 
 
+def _absolute_hooks_value(target: Path) -> str:
+    """把仓库自带 hooks 目录渲染为 ``core.hooksPath`` 的**绝对**配置值。
+
+    git 对相对 ``core.hooksPath`` 按**当前工作树顶层**解析：``git worktree add`` 出的
+    链接工作树里没有 ``.githooks/`` 目录 ⇒ git 找不到 hook 文件时**静默跳过**
+    （fail-open），E020 提交范围门禁与 reference-transaction 强制层在任务工作树内
+    双双失效。绝对值对所有工作树一致可达，故出厂一律写绝对值（``as_posix()``，
+    不带引号）。
+    """
+    return target.resolve().as_posix()
+
+
+def _write_hooks_path(root: Path, value: str) -> dict[str, Any] | None:
+    """写入 ``core.hooksPath``；成功返回 ``None``，失败返回结构化报错。"""
+    proc = _run_git(root, ["config", "core.hooksPath", value])
+    if proc.returncode != 0:
+        return {"configured": False, "reason": "config_failed",
+                "error": proc.stderr.strip()}
+    return None
+
+
 def _ensure_hooks_path(
     project_root: Path,
     hooks_dir: str = _REPO_HOOKS_DIR,
@@ -195,15 +323,26 @@ def _ensure_hooks_path(
     同步保护）不会生效，质量门禁形同虚设。安装流程与本模块的 hook 安装期各调用
     一次，把它自动打开。
 
+    写入值必须是**绝对路径**（task-worktree-hooks-path-reachability）：git 把相对
+    ``core.hooksPath`` 按当前工作树顶层解析，链接工作树内没有该相对目录时 git 静默
+    不执行 hook。实测（git 2.55，同一仓库同一 hook 内容）：值 = ``.githooks``（相对）
+    时主工作树提交触发 hook、``git worktree add`` 出的链接工作树提交**不触发**；
+    值 = ``<repo>/.githooks``（绝对）时两者都触发。任务工作树正是本引擎 L3 强制层
+    的主战场，故相对值形态等于「交付一套只在主工作树生效的门禁」。
+
     决策表（永不抛异常）：
 
     - 非 git 仓库 → ``reason="not_a_git_repo"``，不动；
-    - 仓库内无 ``hooks_dir`` 目录 → ``reason="hooks_dir_missing"``，不动；
-    - ``core.hooksPath`` 未设置 / 空 → 设为 ``hooks_dir``（相对仓库根），
-      ``reason="set"``；
-    - 已指向同一目录（相对或等价绝对路径）→ 幂等不写，``reason="already_set"``；
-    - 指向其他路径（用户显式自定义）→ **不改写**，``reason="custom_hooks_path"``
-      并附 ``hint`` 提示手动改法。
+    - 仓库内无 ``hooks_dir`` 目录 → ``reason="hooks_dir_missing"``，不动（此时
+      hook 落 ``.git/hooks``，该目录全工作树共享，天然可达）；
+    - ``core.hooksPath`` 未设置 / 空 → 设为**绝对**目标，``reason="set"``；
+    - 已指向同一目录且为**绝对**值 → 幂等不写，``reason="already_set"``；
+    - 已指向同一目录但为**相对**值 → 升级为绝对值，
+      ``reason="upgraded_to_absolute"``（``configured=True``）；
+    - 已为绝对值但目标目录不存在，而其末级目录名就是 ``hooks_dir``（仓库被移动/
+      改名后强制层静默死的形态）→ 改写为当前绝对目标，``reason="reinstalled_stale"``；
+    - 指向其他路径（用户显式自定义，如 ``.husky``）→ **不改写**，
+      ``reason="custom_hooks_path"`` 并附 ``hint`` 提示手动改法。
 
     本函数只新增"写配置"动作；:func:`_get_hooks_dir` 的既有解析语义（相对/绝对/
     缺省回退 ``.git/hooks``）不变。
@@ -220,22 +359,51 @@ def _ensure_hooks_path(
         return {"configured": False, "reason": "hooks_dir_missing",
                 "hooks_dir": hooks_dir}
     current = _read_hooks_path(root)
+    absolute_target = _absolute_hooks_value(target)
     if current is None:
-        proc = _run_git(root, ["config", "core.hooksPath", hooks_dir])
-        if proc.returncode != 0:
-            return {"configured": False, "reason": "config_failed",
-                    "error": proc.stderr.strip()}
-        return {"configured": True, "reason": "set", "hooks_path": hooks_dir}
+        failure = _write_hooks_path(root, absolute_target)
+        if failure is not None:
+            return failure
+        return {"configured": True, "reason": "set", "hooks_path": absolute_target}
     if _is_same_hooks_dir(root, current, target):
-        return {"configured": False, "reason": "already_set", "hooks_path": current}
+        if _is_absolute_hooks_path(current):
+            return {"configured": False, "reason": "already_set", "hooks_path": current}
+        # 相对等价值：目录对，可达性错——升级为绝对值（不改指向、只改形态）
+        failure = _write_hooks_path(root, absolute_target)
+        if failure is not None:
+            return failure
+        return {
+            "configured": True,
+            "reason": "upgraded_to_absolute",
+            "hooks_path": absolute_target,
+            "previous": current,
+        }
+    if (
+        _is_absolute_hooks_path(current)
+        and not Path(current).is_dir()
+        and Path(current).name == hooks_dir
+    ):
+        # 陈旧绝对值：仓库被移动或改名后原路径已不存在，而末级目录名仍是仓库自带
+        # hooks 目录名 → 属于「曾经指向本仓库、现已失效」，重写为当前绝对目标。
+        # 末级名不匹配（.husky 等宿主目录）一律走 custom 分支，不改写。
+        failure = _write_hooks_path(root, absolute_target)
+        if failure is not None:
+            return failure
+        return {
+            "configured": True,
+            "reason": "reinstalled_stale",
+            "hooks_path": absolute_target,
+            "previous": current,
+        }
     return {
         "configured": False,
         "reason": "custom_hooks_path",
         "hooks_path": current,
-        "expected": hooks_dir,
+        "expected": absolute_target,
         "hint": (
             f"core.hooksPath 已自定义为 {current}（非仓库自带 {hooks_dir}）：保持不动、"
-            f"未改写；如需改为仓库自带 hooks，执行 git config core.hooksPath {hooks_dir}"
+            f"未改写；如需改为仓库自带 hooks，执行 git config core.hooksPath"
+            f" {absolute_target}"
         ),
     }
 
@@ -316,7 +484,9 @@ def _write_hook_file(path: Path, content: str) -> None:
     独立成函数的目的：① 写入动作是「自检通过后」的唯一出口，便于审计；
     ② 给落盘层留可替换的接缝（测试可据此模拟截断 / 污染写入，验证回读校验）。
     """
-    path.write_text(content, encoding="utf-8", newline="\n")
+    from orchd.ledger import _write_text_atomic
+
+    _write_text_atomic(path, content)
     path.chmod(0o755)
 
 
@@ -673,6 +843,15 @@ def hook_install(
     # 账本路径在安装期按布局解析并烘入模板（task-hook-ledger-container-fix）
     ledger_abs = _resolve_ledger_path(project_root)
     ledger_q = _shell_quote(ledger_abs)
+    # task-hook-flat-resolver：install 期解析 default 分支名并烘入 hook，供动态解析
+    # 走 `git show <ref>:.orchd/_master.json`（与命令侧 resolve_declaration_source 同源，
+    # 分支名经 get_default_branch 解析，缺失回退 "main"）。
+    try:
+        from orchd.gitops.query import get_default_branch
+        default_ref = get_default_branch(project_root) or "main"
+    except Exception:
+        default_ref = "main"
+    default_ref_q = _shell_quote(default_ref)
 
     # 生成 hook 脚本内容（shell 逻辑 + 运行时动态解析；回退用静态列表）
     # 顶部注释保留绑定任务与文件清单（可读性 / 既有断言兼容，不参与正常路径判定）。
@@ -743,6 +922,10 @@ def hook_install(
         f"        printf '  - %s\\n' {_shell_quote(f)}" for f in exempt
     )
     bound_task = _shell_quote(task_id)
+    # sqlite 回退查询的引擎根（task-hook-sqlite-python-fallback）：运行时 hook 的
+    # python 内联把该目录插到 sys.path 后再 import orchd（hook cwd 未必含 orchd 包）；
+    # 目录搬移/缺失则查询失败 → 保守分支，不抛错。
+    engine_q = _shell_quote(str(Path(__file__).resolve().parent.parent.parent))
 
     hook_content = f"""#!/bin/sh
 {_HOOK_MARKER} (auto-generated, do not edit)
@@ -782,11 +965,14 @@ fi
 # BOUND_TASK：安装期绑定任务（静态列表的归属）。3a 快路径仅在
 # “分支任务 == 绑定任务”时生效——不一致时静态列表与动态真值无关，
 # 预检命中会误放行（fail-open，2026-09-18 全量回归实证）。
+# 反解与 orchd/line.py::parse_task_branch 同源：id 字符集不含斜杠，
+# 故末段恒为完整 id（shell 长前缀删除形态，删至最后一个斜杠）；单线 task/<id>
+# 下与旧切片同值。
 BOUND_TASK={bound_task}
 BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
 case "$BRANCH" in
     task/*)
-        TASK_ID="${{BRANCH#task/}}"
+        TASK_ID="${{BRANCH##*/}}"
         SCOPE_MODE=dynamic
         ;;
     "")
@@ -797,7 +983,7 @@ case "$BRANCH" in
     *)
         TASK_ID={bound_task}
         SCOPE_MODE=bound
-        echo "[orchd E020] 分支 '$BRANCH' 非 task/<id> → 回退绑定任务 {task_id}（best-effort）" >&2
+        echo "[orchd E020] 分支 '$BRANCH' 非 task/<id> 或 task/<line>/<id> → 回退绑定任务 {task_id}（best-effort）" >&2
         ;;
 esac
 
@@ -817,9 +1003,54 @@ if [ -f "$LEDGER" ]; then
             ;;
     esac
 else
-    # 无 ledger（异常环境）→ **不静默放行**（task-hook-ledger-container-fix AC2）：
-    # stderr 留痕并保守按「任务活跃」处理，继续走后续范围校验（fail-closed 方向）。
-    echo "[orchd E020] ledger 未找到（$LEDGER）→ 保守按任务活跃处理（继续范围校验）" >&2
+    # 无 jsonl 文件（sqlite 部署 / 异常环境）：python 回退查 Store
+    # （task-hook-sqlite-python-fallback）。file 部署走上面的 grep 快路径，
+    # 此处只在 jsonl 缺失时执行；判定语义（活跃→继续 / 非活跃→放行）与 grep
+    # 路径逐字一致。解释器探针与第 4 步动态解析同模式；查询失败（无解释器 /
+    # 引擎不可导入 / Store 异常）→ 沿旧语义保守按活跃处理并留痕。
+    _LS_OK=no
+    _PY_TASK=EMPTY
+    _PY_REVIEW=EMPTY
+    ORCHD_PY_LS=""
+    for _CAND in python python3 py; do
+        if command -v "$_CAND" >/dev/null 2>&1; then
+            ORCHD_PY_LS="$_CAND"
+            break
+        fi
+    done
+    if [ -z "$ORCHD_PY_LS" ]; then
+        echo "[orchd E020] ledger 未找到（$LEDGER）且无可用 python → 保守按任务活跃处理（继续范围校验）" >&2
+    else
+        _LS_RAW=$("$ORCHD_PY_LS" - "$TASK_ID" {engine_q} <<'ORCHD_HOOK_LEDGER'
+{_HOOK_PY_LEDGER_STATE}ORCHD_HOOK_LEDGER
+)
+        if [ $? -ne 0 ]; then
+            echo "[orchd E020] ledger-state 回退查询失败 → 保守按任务活跃处理（继续范围校验）" >&2
+        else
+            _PY_TASK=$(printf '%s\\n' "$_LS_RAW" | sed -n '1p' | tr -d '\\r')
+            _PY_REVIEW=$(printf '%s\\n' "$_LS_RAW" | sed -n '2p' | tr -d '\\r')
+            if [ -z "$_PY_TASK" ]; then _PY_TASK=EMPTY; fi
+            if [ -z "$_PY_REVIEW" ]; then _PY_REVIEW=EMPTY; fi
+            # NO_LEDGER（账本无载体：无 jsonl/db/归档）≠ EMPTY（载体在但任务无事件）：
+            # 前者沿旧语义保守按活跃处理（fail-closed），后者按非活跃放行。
+            if [ "$_PY_TASK" = "NO_LEDGER" ] || [ "$_PY_REVIEW" = "NO_LEDGER" ]; then
+                echo "[orchd E020] ledger 未找到（$LEDGER）且账本无载体 → 保守按任务活跃处理（继续范围校验）" >&2
+            else
+                _LS_OK=yes
+            fi
+        fi
+    fi
+    if [ "$_LS_OK" = "yes" ]; then
+        case "$_PY_TASK" in
+            *CLAIMED*|*REVIEW_CLAIMED*)
+                # 任务活跃，继续校验（与 grep 路径同语义）
+                ;;
+            *)
+                # 任务未活跃（无 CLAIMED/REVIEW_CLAIMED，或已 DONE/RETRACT/REVIEW_SUBMITTED）→ 放行
+                exit 0
+                ;;
+        esac
+    fi
 fi
 
 # 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件是 REVIEW_CLAIMED
@@ -834,6 +1065,20 @@ if [ -f "$LEDGER" ]; then
             exit 1
             ;;
     esac
+else
+    # 无 jsonl 且 python 回退成功时，用回退查到的审查态做同等冻结判定
+    # （task-hook-sqlite-python-fallback）；回退不可用时沿旧语义跳过
+    # （步骤 1 已保守按活跃处理并留痕）。
+    if [ "$_LS_OK" = "yes" ]; then
+        case "$_PY_REVIEW" in
+            *REVIEW_CLAIMED*)
+                echo "orchd E017: review in progress, commit blocked on $BRANCH"
+                echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
+                echo "To bypass: git commit --no-verify"
+                exit 1
+                ;;
+        esac
+    fi
 fi
 
 # 3) 获取 staged 文件列表（相对路径）
@@ -901,6 +1146,10 @@ fi
 #     当前分支的动态真值无关，命中即误放行（fail-open）。
 #     固定资产同样先行覆盖（与第 4 步 case 同表），否则每个含固定资产的提交
 #     都回退动态解析，快路径永不命中。
+#     task-hook-flat-resolver 收界：静态列表是 claim 时快照，动态真源现为 default
+#     分支 blob；claimed 任务 amend 只增不删（split.py 约束），故 static ⊆ blob，
+#     静态命中 ⟹ blob 亦放行，快路径不与 dynamic 基线分裂（补登文件不在静态列表
+#     → _SC_MISS → 回落 dynamic/blob 判定）。
 _SC_SKIP_RESOLVER=no
 if [ "$SCOPE_MODE" = "dynamic" ] && [ "$TASK_ID" = "$BOUND_TASK" ]; then
     _SC_MISS=""
@@ -935,7 +1184,7 @@ if [ "$SCOPE_MODE" = "dynamic" ] && [ "$_SC_SKIP_RESOLVER" != "yes" ]; then
         echo "[orchd E020] （python / python3 / py 均不可用）→ best-effort 放行（未校验范围，禁止静默）" >&2
         exit 0
     fi
-    _ALLOWED_RAW=$("$ORCHD_PY" - "$COMMON" "$TASK_ID" <<'ORCHD_HOOK_PY'
+    _ALLOWED_RAW=$("$ORCHD_PY" - "$COMMON" "$TASK_ID" {default_ref_q} <<'ORCHD_HOOK_PY'
 {_HOOK_PY_RESOLVER}ORCHD_HOOK_PY
 )
     if [ $? -ne 0 ]; then

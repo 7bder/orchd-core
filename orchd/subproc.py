@@ -36,6 +36,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -69,7 +70,7 @@ def _is_git_for_windows_bash(bash_path: str) -> bool:
 
 def find_bash() -> str | None:
     """定位 Windows 上的 Git Bash；POSIX 平台返回 None（用 shell=True 即可）。"""
-    if os.name != "nt":
+    if sys.platform != "win32":
         return None
     for cand in _GIT_BASH_CANDIDATES:
         if os.path.isfile(cand):
@@ -273,7 +274,7 @@ def plan_execution(cmd: str) -> tuple[str, str]:
           Git Bash（此时由 :func:`run_shell` 落到 ``shell=True``），``actual_cmd``
           为原命令，翻译从未发生。
     """
-    if os.name != "nt" or find_bash() is None:
+    if sys.platform != "win32" or find_bash() is None:
         return ("bash", cmd)
 
     staged = cmd
@@ -329,7 +330,7 @@ def _kernel32() -> Any:
     if not _KERNEL32_READY:
         _KERNEL32_READY = True
         win_dll = getattr(ctypes, "WinDLL", None)
-        if os.name == "nt" and win_dll is not None:
+        if sys.platform == "win32" and win_dll is not None:
             try:
                 dll = win_dll("kernel32", use_last_error=True)
                 dll.CreateJobObjectW.restype = ctypes.c_void_p
@@ -418,7 +419,7 @@ def _terminate_tree(proc: subprocess.Popen, *, job: int | None, own_group: bool)
     if job is not None:
         _terminate_job(job)
     if proc.poll() is None:
-        if os.name == "nt":
+        if sys.platform == "win32":
             _taskkill_tree(proc.pid)
         elif own_group:
             # getattr 而非直接属性访问：killpg / getpgid / SIGKILL 仅在 POSIX 存在，
@@ -477,13 +478,13 @@ def run_shell(cmd: str, cwd: str, timeout: float) -> subprocess.CompletedProcess
         # /d 跳过 cmd AutoRun，避免宿主自定义脚本污染执行结果。
         spawn["args"] = f"cmd /d /c {actual}"
     else:
-        bash = find_bash() if os.name == "nt" else None
+        bash = find_bash() if sys.platform == "win32" else None
         if bash:
             spawn["args"] = [bash, "-c", actual]
         else:
             spawn["args"] = actual
             spawn["shell"] = True
-        if os.name != "nt":
+        if sys.platform != "win32":
             # POSIX 自建会话 / 进程组：超时可整组终止，与 Windows 杀树语义对齐。
             # 注意组内进程的自杀风险——只有 `start_new_session=True` 时本进程才不在该组，
             # 故 `own_group` 与之一一对应。
@@ -493,7 +494,7 @@ def run_shell(cmd: str, cwd: str, timeout: float) -> subprocess.CompletedProcess
     proc = subprocess.Popen(**spawn)
     # 挂进 Job Object：必须在进程启动后立刻做（子进程启动期 fork 出的后代仍会入 Job，
     # 因为入 Job 的子进程其后代自动继承成员身份）。
-    job = _attach_job(proc.pid) if os.name == "nt" else None
+    job = _attach_job(proc.pid) if sys.platform == "win32" else None
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:

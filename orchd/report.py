@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.ledger import Store, TaskState, resolve_workspace_root
@@ -99,11 +100,22 @@ def merge_ack(project_root: Path, task_id: str, reason: str) -> dict[str, Any]:
         "reason": reason,
     }
     acks[task_id] = entry
-    # 原子写：tmp + os.replace（写后回读确认，失败可审计）
+    # 原子写：tmp + os.replace（写后回读确认，失败可审计）。
+    # 耐久档（task-os-replace-hardening-io-batch 批次 1b）：tmp 写入 → flush +
+    # fsync → ``ledger._atomic_replace``（WinError 5/32 有界重试，耗尽抛结构化
+    # E007）→ ``_fsync_dir(父目录)``；写后回读防线原样保留且未被绕过。
+    # 文本形态（indent=2 / ensure_ascii=False / 无尾换行）原样保留；惰性导入
+    # 与本仓其余耐久站统一（替换入口在账本源头 spy）。
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(acks, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(acks, ensure_ascii=False, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, path)
+    _fsync_dir(path.parent)
     if load_merge_acks(project_root).get(task_id) != entry:
         raise OSError("merge-acks 写入回读不一致")
     return {"acked": True, "task_id": task_id, **entry}
@@ -117,6 +129,9 @@ def status(
     task_id: str | None = None,
     project_root: Path | None = None,
     active_only: bool = True,
+    state: dict[str, Any] | None = None,
+    phase: bool = False,
+    active_phase: str | None = None,
 ) -> dict[str, Any]:
     """全局状态快照；给定 task_id 时返回单任务详情。
 
@@ -127,6 +142,9 @@ def status(
         active_only: 仅输出活跃任务（status ∈ pending/claimed/done/in_review），
             终态 completed/cancelled 默认隐藏（task-status-active-only）。
             传 False 回退全量。summary.total 恒为全量任务数，另增 active（活跃数）。
+        state: 可选的预计算 replay 状态（task-replay-command-scoped-once）。单命令
+            链路内多个消费者共用同一 snapshot 时由调用方传入，避免重复全解析；
+            缺省 None → 自行 ``store.replay()``（既有调用点零回归）。
 
     Returns:
         JSON 结构：project + tasks[] + summary（total + active + 六状态计数）；
@@ -135,7 +153,8 @@ def status(
     Raises:
         OrchdError E005: task_id 在 master 中不存在。
     """
-    state = store.replay()
+    if state is None:
+        state = store.replay()
     # 复活标记（task-force-status-revive-audit）：扫描 ledger 检测 completed→pending
     # 复活操作，对曾被复活的任务附加 revive_marker（reason+evidence_sha+时间），
     # 正常任务不附加（零误伤）。
@@ -216,7 +235,7 @@ def status(
         counts[s] = counts.get(s, 0) + 1
         # task-status-active-only：默认仅输出活跃任务（非终态），
         # 终态 completed/cancelled 在 tasks[] 中隐藏；summary 计数不受影响。
-        if active_only and s in ("completed", "cancelled"):
+        if active_only and s in TERMINAL_STATUSES:
             continue
         entry: dict[str, Any] = {
             "task_id": tid,
@@ -245,7 +264,7 @@ def status(
         ),
         **counts,
     }
-    result = {
+    result: dict[str, Any] = {
         "project": dict(project) if project else {},
         "tasks": task_statuses,
         "summary": summary,
@@ -275,9 +294,17 @@ def status(
 
     if text:
         result["_text"] = _format_text(result)
-        ac = result.get("auto_clean")
-        if ac:
-            result["_text"] += _format_auto_clean_text(ac)
+        ac_text: Any = result.get("auto_clean")
+        if ac_text:
+            result["_text"] += _format_auto_clean_text(ac_text)
+
+    # task-phase-status-aggregate：阶段聚合视图（仅 --phase 时附加，零回归）
+    if phase:
+        agg = phase_aggregate(tasks, state, active_phase)
+        result["active_phase"] = agg["active_phase"]
+        result["phases"] = agg["phases"]
+        if text:
+            result["_text"] += _format_phase_text(agg["phases"], agg["active_phase"])
 
     return result
 
@@ -301,6 +328,11 @@ def merge_audit(
     - 进行中（pending / claimed / done / in_review）任务分支不告警。
     - 未注册任务的幽灵分支（agent 绕过 claim 手动建的分支）：立即告警
       （unregistered_task_branch），含分支名与差异摘要。
+    - 落地任务 CHANGELOG 在册（task-merge-audit-changelog-landing-gate，见
+      :func:`_changelog_landing_gaps`）：自上个发布标签以来已落地但未在
+      ``CHANGELOG.md`` 在册的任务 id → ``changelog_landed_task_missing``
+      warning（含 id 列表与文件路径）。**只告警、不阻断**——合入侧拦截会造成
+      「本卡自己的 CHANGELOG 行未写就合不进来」的死锁口。
     只读：不执行 merge/checkout/reset/commit/push。非 git 仓库、无 main
     分支或 git 不可用时返回 skipped 说明，不抛异常。
 
@@ -319,6 +351,7 @@ def merge_audit(
     root = Path(project_root)
 
     # 单根命名空间（pass8 F1-A）：任务分支恒以 task/ 为根，全线通用
+    from orchd.line import parse_task_branch
     from orchd.line_ctx import resolve_trunk_for
 
     trunk = resolve_trunk_for(root)
@@ -369,7 +402,14 @@ def merge_audit(
                 merged_branches.add(name)
 
     for branch in branch_names:
-        tid = branch[len("task/"):] if branch.startswith("task/") else branch
+        # 单一真源（task-branch-parse-single-source）：经 line.parse_task_branch
+        # 反解（task/{id} -> id；task/{line}/{id} -> id）；不可解析回退旧切片
+        # （逐字节零回归；将来 parse 改实现此处自动跟随）。
+        _parsed = parse_task_branch(branch)
+        if _parsed is not None:
+            tid = _parsed[1]
+        else:
+            tid = branch[len("task/"):] if branch.startswith("task/") else branch
         if tid not in registered_ids:
             # 未注册幽灵分支：agent 绕过 claim 手动建的分支，立即告警
             warnings.append({
@@ -379,7 +419,7 @@ def merge_audit(
             })
             continue
         ts = state.get(tid)
-        if not ts or ts.status not in ("completed", "cancelled"):
+        if not ts or ts.status not in TERMINAL_STATUSES:
             continue  # 进行中任务的分支不告警
         ahead = _ahead(branch)
         if ts.status == "cancelled":
@@ -414,7 +454,17 @@ def merge_audit(
     # 附加 resolve_sha（task 分支 tip）；main 已包含该 sha（git merge-base
     # --is-ancestor 为真，即手工补 merge 已落地）→ 不再告警（resolve_sha 无效
     # 或缺失的旧事件维持告警，人工核对兜底）。
-    branch_ids = {b[len("task/"):] for b in branch_names if b.startswith("task/")}
+    # 同上经 parse_task_branch 反解为任务 id 集合（不可解析回退旧切片，
+    # 非分线输出与现状逐字节一致）。
+    branch_ids = set()
+    for _b in branch_names:
+        _p = parse_task_branch(_b)
+        if _p is not None:
+            branch_ids.add(_p[1])
+        elif _b.startswith("task/"):
+            branch_ids.add(_b[len("task/"):])
+        else:
+            branch_ids.add(_b)
     resolve_sha_by_task: dict[str, str] = {}
     try:
         for ev in store.backend.read_events():
@@ -443,7 +493,75 @@ def merge_audit(
                         "且 task 分支已删除，无法从分支差异核对；"
                         "请人工确认 main 是否含实现",
             })
+
+    # 落地任务须在 CHANGELOG 在册（task-merge-audit-changelog-landing-gate）：
+    # 判据真源 = gitops.query 的两个真源函数（不自建 git 遍历、不复制判据），
+    # 命中只并入 warnings（注解层）——不进窄口径拦截分支：拦截会让「本卡自己的
+    # CHANGELOG 行尚未写」变成「合不进来」的死锁口。
+    warnings.extend(_changelog_landing_gaps(root))
     return {"skipped": False, "warnings": warnings}
+
+
+def _changelog_landing_gaps(project_root: Path) -> list[dict[str, Any]]:
+    """『落地任务须在 CHANGELOG 在册』的缺行清单（只读，恒不阻断）。
+
+    真源（**禁**自建 git 遍历、**禁**复制 CHANGELOG 判据）：
+    - ``orchd.gitops.query.previous_release_tag``：锚 = 上一发版 tag；
+    - ``orchd.gitops.query.landed_task_ids_since``：落地集 = ``锚..HEAD`` 的
+      first-parent 历史（merge 提交 / 实现提交 / 括号引用三种形态）。
+
+    与 ``tests/test_docs_drift_batch.py::TestChangelogCutoverCompleteness``
+    同源同口径（交叉断言见 ``tests/test_report.py``：替换任一真源后两侧结论必须
+    一致，防判据分叉）。在册判定按漂移用例逐字同口径：``task_id not in
+    CHANGELOG.md 全文``（已发版任务记在版本节即合规，未发版任务须在 Unreleased）。
+
+    存在意义（本卡根因）：该判据此前只在**全量套件**里跑，CI 不可达期间 5 张卡
+    同日合入造成的缺行漂移静默累积 9 天；接入每次合入必跑的 merge 审计后，漂移
+    在合入当时即可见，不必等下一次全量。
+
+    降级（best-effort，绝不抛异常出界）：无 tag / 落地集为空（锚缺失时「缺行」
+    无从定义）/ git 不可读 → 返回空；``CHANGELOG.md`` 不可读 → 单列
+    ``changelog_unreadable`` 留痕（仍不阻断）。
+
+    Args:
+        project_root: 仓库根目录（git 命令 cwd，与 :func:`merge_audit` 一致）。
+
+    Returns:
+        warning 项列表（0 或 1 项），由 :func:`merge_audit` 并入 warnings。
+    """
+    from orchd.gitops import query as _query
+
+    prev = _query.previous_release_tag(project_root)
+    if not prev:
+        return []
+    landed = _query.landed_task_ids_since(project_root, prev)
+    if not landed:
+        return []
+    changelog = Path(project_root) / "CHANGELOG.md"
+    try:
+        text = changelog.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError ⊂ **ValueError**，不在 OSError 内：只捕 OSError 会让
+        # 非 UTF-8 的 CHANGELOG 把异常抛到调用方——而 `status --audit-merge`
+        # 对 merge_audit 无 try 保护，会整条命令以 exit 1 失败。降级留痕。
+        return [{
+            "reason": "changelog_unreadable",
+            "path": str(changelog),
+            "message": (f"CHANGELOG.md 不可读（{type(exc).__name__}: {exc}）"
+                        "——『落地任务在册』检查降级，需人工核对"),
+        }]
+    missing = [tid for tid in landed if tid not in text]
+    if not missing:
+        return []
+    return [{
+        "reason": "changelog_landed_task_missing",
+        "path": str(changelog),
+        "task_ids": missing,
+        "message": (f"自 {prev} 以来 {len(missing)} 张落地任务未在 CHANGELOG.md 在册"
+                    f"（不阻断合入，但须补记）：{', '.join(missing)}"),
+        "hint": ("在 CHANGELOG.md 的 [Unreleased] 分区为上述 id 各补一行语义化条目"
+                 "（判据真源：orchd.gitops.query.landed_task_ids_since）"),
+    }]
 
 
 def _is_ancestor_of_main(project_root: Path, sha: str) -> bool:
@@ -765,6 +883,88 @@ def _aggregate_top(
     else:
         agg["by_type"] = {}
     return agg
+
+
+# 阶段聚合：活跃态由 total - completed - pending 派生，不另立集合常量。
+
+
+def _task_phase_status(task: dict[str, Any], state: dict[str, Any]) -> str:
+    """任务在 replay state 中的状态；未 claim（无 ledger 条目）视为 pending。"""
+    ts = state.get(task.get("id", ""))
+    return ts.status if ts else "pending"
+
+
+def phase_aggregate(
+    tasks: list[dict[str, Any]],
+    state: dict[str, Any],
+    active_phase: str | None = None,
+) -> dict[str, Any]:
+    """按 phase 分组输出每阶段 total / completed / active / pending 计数。
+
+    阶段顺序按 tasks[] 中 phase 首次出现序（与 active_task_phase 同序）。
+    分组口径复用 ``_aggregate_top`` 的 group_key 机制（phase 取 tasks[].phase，
+    缺省归中立 None）；每阶段 ``total`` 直接取 ``_aggregate_top`` 同参 ``by_type``
+    （AC3 口径复用，不手写第二套分组循环）。
+
+    **活跃阶段单一真源**：``active_phase`` 由调用链经
+    ``orchd.onboard.request.active_task_phase`` 计算并传入；本函数**不自行判定**
+    活跃阶段——report.py 依赖方向禁止 import onboard，且保证 orchd/ 内活跃阶段
+    判定唯一真源不被复制到 report 侧（AC1 / 单一真源）。中立（无 phase）任务
+    不进入 phases 聚合数组（phases 是「阶段」视图），其计数仍体现在 summary /
+    tasks[] 段，不改变既有结构（AC5 零回归）。
+    """
+    order: list[str] = []
+    for t in tasks:
+        ph = t.get("phase")
+        if ph and ph not in order:
+            order.append(ph)
+    # 复用 _aggregate_top 的 group_key 口径（与 _aggregate_top 同参）
+    groups = _aggregate_top(
+        tasks, group_key=lambda t: t.get("phase") or None
+    )["by_type"]
+    phases: list[dict[str, Any]] = []
+    for ph in order:
+        total = groups.get(ph, 0)
+        if total == 0:
+            continue
+        group_tasks = [t for t in tasks if t.get("phase") == ph]
+        completed = sum(
+            1 for t in group_tasks
+            if _task_phase_status(t, state) in TERMINAL_STATUSES
+        )
+        pending = sum(
+            1 for t in group_tasks
+            if _task_phase_status(t, state) == "pending"
+        )
+        active = total - completed - pending
+        phases.append({
+            "phase": ph,
+            "total": total,
+            "completed": completed,
+            "active": active,
+            "pending": pending,
+        })
+    return {"active_phase": active_phase, "phases": phases}
+
+
+def _format_phase_text(
+    phases: list[dict[str, Any]],
+    active_phase: str | None,
+) -> str:
+    """--text 模式下的阶段聚合可读表格（活跃阶段标 *）。"""
+    if not phases:
+        return "\n[phases] (none)\n"
+    lines = ["[phases]"]
+    lines.append(
+        f"  {'phase':<12}{'total':>6}{'completed':>11}{'active':>8}{'pending':>9}"
+    )
+    for ph in phases:
+        mark = " *" if ph["phase"] == active_phase else ""
+        lines.append(
+            f"  {ph['phase'] + mark:<14}{ph['total']:>6}"
+            f"{ph['completed']:>11}{ph['active']:>8}{ph['pending']:>9}"
+        )
+    return "\n" + "\n".join(lines) + "\n"
 
 
 def _auto_clean_disposition_summary(

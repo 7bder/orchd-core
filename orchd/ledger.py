@@ -36,6 +36,8 @@ from typing import Any
 
 from orchd.contracts.events import (
     REVIEW_SUBMITTED_TARGETS,
+    TASK_STATUSES,
+    TERMINAL_STATUSES,
     TRANSITION_TABLE,
     normalize_event,
     validate_event,
@@ -392,6 +394,7 @@ def _atomic_replace(
         "atomic_replace_failed: 目标运行时文件被占用，重试耗尽",
         [
             {
+                "reason": "atomic_replace_failed",
                 "tmp": str(tmp_path),
                 "target": str(target_path),
                 "retries": attempts,
@@ -418,6 +421,60 @@ def _write_text_atomic(path: Path, text: str) -> None:
         os.fsync(f.fileno())
     _atomic_replace(tmp, path)
     _fsync_dir(path.parent)
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """字节目标点的原子写（与 :func:`_write_text_atomic` 同档）。
+
+    供写 bytes 的耐久目标点收敛（合并结果回写、文件搬运等）：tmp + flush +
+    fsync + ``_atomic_replace``（含 WinError 5/32 重试）+ 目录 fsync。
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+# --------------------------------------------------------- 行式台账文本原语（T4a）
+# task-idea-archive-hardening：IDEAS.md / IDEAS-archive.md 是**行式**台账，
+# 「自由文本拼进一行」与「读盘兜底」两件事此前在别处各写一遍，漏一处就出界
+# （实测：归档件读有兜底、主文件读没有；四个自由文本入口只有一个收敛了换行）。
+# 收敛到本层的理由是依赖方向而非归属偏好：``orchd/ideas.py`` 已模块级导入
+# ``orchd.intake``，任何放在 ideas 的共用物都会让 intake 反向导入成环；而
+# ideas / intake / cli.commands.ideas 三者都已依赖 ledger（见
+# .orchd/shared/conventions.md 依赖方向），落此层零新增依赖边。
+
+
+def single_line(text: str) -> str:
+    """把文本折成单行（所有空白与换行归并为单个空格）。
+
+    行式台账的安全网：``- 归档裁决:`` / ``- notes追记:`` / ``- 论证:`` / ``## 标题``
+    四处都是「前缀 + 自由文本拼一行」，输入里一个换行就能伪造出假小节标题，并让按
+    ``- id:`` 的判重读到空 id（实测探针：归档件 ``##`` 头 1→2）。归一在**写入点**
+    完成，调用方无需记得检查。
+    """
+    return " ".join(text.split())
+
+
+def read_text_or_error(path: Path) -> tuple[str, str | None]:
+    """按 UTF-8 读文本；失败返回 ``("", "read_error")``，**绝不抛异常**。
+
+    覆盖两类实测坏形态：非 UTF-8 文件（``UnicodeDecodeError``）与目录形路径
+    （``IsADirectoryError`` / ``PermissionError``，均属 ``OSError``）。此前同一形状
+    的兜底只在归档件读那处写了、主文件读那处没写，于是 ``idea_archive_decision``
+    的「永不抛异常」docstring 失实、CLI 落到 E999 出界（task-idea-archive-hardening）。
+
+    失败用 ``""`` 而非 ``None`` 承载文本：调用方一律先看第二个返回值再决定处置，
+    用 ``""`` 可免去每处 ``str | None`` 收窄（且空文件与失败在业务上从不混用——
+    看到 ``read_error`` 的调用方当场结构化拒绝，不会去读文本）。
+    """
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (OSError, IOError, UnicodeDecodeError):
+        return "", "read_error"
 
 
 @dataclass
@@ -568,6 +625,85 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
         main_wt = Path(marker["main_worktree"])
         return main_wt.parent / ".orchd-runtime"
     return orchd_dir
+
+
+def ledger_status_available(store_dir: Path) -> bool:
+    """账本状态可读性的**单一真源**（后端无关）：事件载体非空才算可用。
+
+    卡 2（task-terminal-exemption-availability）：``validate`` 的终态豁免降级、
+    脚本侧 ``verify_registry_paths._ledger_status_available``（转发本函数）与声明
+    门禁的 skip 谓词共用同一判定，禁写第二份。
+
+    判据：``_ledger.jsonl`` 非空 / 归档件非空 / ``_ledger.sqlite3`` 的 ``events``
+    表有活跃事件 / ``_checkpoint.json`` **可解析为非空对象**（checkpoint 是合法
+    状态载体：``Store.replay`` 能从中重建任务状态）。判定实质是「状态可重建」，
+    故排除的是**空载体**（构造即建库的空库、0 字节 jsonl、空对象 checkpoint），
+    而非某个载体类型——空载体判成可用会让 ``replay()`` 返回空、终态集合变空，
+    进而把终态任务的历史缺陷整片误报（CI 新克隆实测 E037×16）。
+    修正记录：task-ledger-status-checkpoint-carrier（不得按类型排除 checkpoint）。
+
+    Args:
+        store_dir: 账本根（:func:`resolve_store_dir` 的返回值）。
+
+    Returns:
+        事件载体非空为 ``True``；其余（含任何读取异常）为 ``False``
+        （fail-closed：调用方据此走**显式降级**，而非当作可用后误报）。
+    """
+    from orchd.storage import ARCHIVE_FILENAME
+
+    try:
+        ledger = store_dir / "_ledger.jsonl"
+        if ledger.is_file() and ledger.stat().st_size > 0:
+            return True
+        archive = store_dir / ARCHIVE_FILENAME
+        if archive.is_file() and archive.stat().st_size > 0:
+            return True
+        sqlite_path = store_dir / "_ledger.sqlite3"
+        if sqlite_path.is_file() and _sqlite_has_state(sqlite_path):
+            return True
+        # checkpoint 是**合法**状态载体（`Store.replay` 可从中重建任务状态，实测见
+        # tests/test_gate_ci_wiring.py::TestLedgerStatusIsReadFromEngine 的夹具）：
+        # 只按「内容非空」排除空载体，不按载体类型排除
+        # （task-ledger-status-checkpoint-carrier 修正过度收紧）。注意 sqlite 后端下
+        # checkpoint 落在 meta 表而非该文件，故上一个分支必须同时看 meta。
+        return _checkpoint_has_state(store_dir / "_checkpoint.json")
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _checkpoint_has_state(path: Path) -> bool:
+    """file 后端的 checkpoint 是否含非空状态（0 字节 / 非法 JSON / 空对象 ``{}`` → False）。"""
+    import json as _json
+
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(data)
+
+
+def _sqlite_has_state(path: Path) -> bool:
+    """库内是否存在可重建状态（只读 URI 连接：不建库、不迁移）。
+
+    两条通道任一非空即算「状态可重建」：``events`` 表有活跃事件；或 ``meta`` 表有键
+    ——sqlite 后端的 checkpoint 经 ``save_checkpoint`` 落 meta 表，此时 events 为空
+    但状态仍在（实测 tests/test_gate_ci_wiring.py::TestLedgerStatusIsReadFromEngine
+    的夹具正是此形态）。**构造即建库的空库**（events 与 meta 均 0 行）必须判
+    ``False``——「载体存在 ≠ 状态可重建」的关键样本。读失败一律 ``False``（fail-closed）。
+    """
+    import sqlite3
+
+    try:
+        with sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True) as conn:
+            (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+            if int(n) > 0:
+                return True
+            (m,) = conn.execute("SELECT COUNT(*) FROM meta").fetchone()
+            return int(m) > 0
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return False
 
 
 def resolve_review_mode(orchd_dir: Path) -> str:
@@ -1636,23 +1772,98 @@ def latest_rework_scope(store: "Store", task_id: str) -> str | None:
     return scope
 
 
+#: 存储后端选择环境变量（task-sqlite-cutover-default，B-max 切默认）。
+#: 取值 ``sqlite``（缺省，行为与 ROADMAP v1.4.6 P1 一致）/ ``file``（显式回滚
+#: 路径，行为与切默认前完全一致）/ 非法非空值：结构化 E007（拼写错误不得静默回退）。
+_STORAGE_BACKEND_ENV = "ORCHD_STORAGE_BACKEND"
+
+
+def resolve_backend_kind() -> str:
+    """归一化 ``ORCHD_STORAGE_BACKEND`` 取值（缺省 ``sqlite``）。
+
+    doctor 两处分发与 :func:`_select_backend` 共用此单一源，避免缺省判定散落：
+    未设 / 空 / ``sqlite`` → ``sqlite``；``file`` 与非法非空值原样返回由调用方分流。
+    """
+    return os.environ.get(_STORAGE_BACKEND_ENV, "sqlite").strip().lower() or "sqlite"
+
+
+def _select_backend(orchd_dir: Path, *, readonly: bool = False) -> StorageBackend:
+    """按 ``ORCHD_STORAGE_BACKEND`` 选择存储后端（缺省 SqliteBackend）。
+
+    - 未设 / 空 / ``sqlite``：SqliteBackend；触发条件收敛到
+      ``SqliteBackend.needs_migration``（jsonl 在场、无备份、库内物理表空，
+      一次性 ``import_jsonl`` 迁移，幂等；成功后存量文件改名备份，失败分两种：
+      导入失败 best-effort 保留 jsonl 可重试，备份改名失败抛 E007——不给
+      "库里有数、文件里是旧数"的分裂部署开绿灯）。
+    - ``file``：FilesystemBackend（显式回滚路径；与切默认前行为完全一致）。
+    - 其他非空值：结构化 E007（拼写错误不得静默回退）。
+    - ``readonly=True``（task-readonly-no-migrate）：跳过迁移分支——
+      只读入口（doctor / check_repo）经此构造，绝不建库 / 导入 / 改名。
+      其中库文件缺失时回退文件后端直读 jsonl（读零副作用，数据不少看）；
+      库存在时以 ``mode=ro`` 打开已迁移库。
+    """
+    kind = resolve_backend_kind()
+    store_dir = resolve_store_dir(orchd_dir)
+    if kind == "file":
+        return FilesystemBackend(store_dir)
+    if kind == "sqlite":
+        from orchd.storage.sqlite import SqliteBackend
+
+        if readonly and not (store_dir / "_ledger.sqlite3").is_file():
+            return FilesystemBackend(store_dir)
+        backend = SqliteBackend(store_dir, readonly=readonly)
+        if readonly:
+            return backend
+        try:
+            # task-migration-store-lock：迁移全程持 store 文件锁（双检）——
+            # 两进程同时首开同一账本根时串行化，判空与导入不再交错双插。
+            # 仅迁移待定（jsonl 在、无备份）时才取锁，常规构造零额外等待。
+            if backend.needs_migration():
+                backend.acquire_lock()
+                try:
+                    if backend.needs_migration():
+                        backend.import_jsonl()
+                finally:
+                    backend.release_lock()
+        except OrchdError:
+            # 备份 E007 必须透出（fail-closed）：数据已入库，此时留陈旧文件即
+            # "库里有数、文件里是旧数"的分裂部署；导入本身的失败仍 best-effort。
+            # （import_jsonl 仅备份步骤抛 OrchdError，见其 docstring。）
+            raise
+        except Exception:
+            pass  # best-effort：迁移失败保留 jsonl，后续命令可重试
+        return backend
+    raise OrchdError(
+        ErrorCode.E007,
+        f"storage_backend_unknown: ORCHD_STORAGE_BACKEND={kind!r} 非法",
+        [{"env": _STORAGE_BACKEND_ENV, "value": kind,
+          "allowed": ["file", "sqlite"],
+          "hint": "取值仅 file / sqlite（缺省 sqlite）"}],
+    )
+
+
 class Store:
     """事件存储引擎，封装 ledger / checkpoint / lock 的全部 I/O。
 
-    通过 :class:`StorageBackend` 访问底层存储，默认使用 :class:`FilesystemBackend`
-    （行为与路径和改造前完全一致）。可注入自定义后端以支持 ORCHD_HOME 重定向、
-    并行化 / 远程化等场景。
+    通过 :class:`StorageBackend` 访问底层存储，默认使用 SqliteBackend
+    （B-max 切默认；显式 ``ORCHD_STORAGE_BACKEND=file`` 切回文件后端）。
+    可注入自定义后端以支持 ORCHD_HOME 重定向、并行化 / 远程化等场景。
     """
 
-    def __init__(self, orchd_dir: Path, backend: StorageBackend | None = None) -> None:
-        """初始化 Store，默认使用 :class:`FilesystemBackend`。
+    def __init__(self, orchd_dir: Path, backend: StorageBackend | None = None,
+                 *, readonly: bool = False) -> None:
+        """初始化 Store，默认使用 SqliteBackend（经 :func:`_select_backend`）。
 
         Args:
             orchd_dir: ``.orchd`` 根目录（master 目录，含 ``_master.json`` +
                 ``shared/``，走 git）。账本根由此目录经 :func:`resolve_store_dir`
                 解析（ORCHD_HOME 设置时重定向到外部目录）。
-            backend: 可选的存储后端；缺省时按 ``resolve_store_dir(orchd_dir)``
-                构造 FilesystemBackend。
+            backend: 可选的存储后端；缺省时按 ``ORCHD_STORAGE_BACKEND``
+                选择（缺省 sqlite，显式 file 回滚）。
+            readonly: 只读模式（task-readonly-no-migrate）——缺省后端构造
+                不建库、不迁移（转给 :func:`_select_backend`）；显式注入的
+                ``backend`` 保持原样（调用方自备只读后端）。doctor 等只读
+                入口经此读取已迁移部署，目录零副作用。
 
         派生路径（委托给 backend，账本根 = ORCHD_HOME 或 orchd_dir）：
             - ``ledger_path``:     ``<账本根>/_ledger.jsonl``，事件追加日志。
@@ -1662,26 +1873,28 @@ class Store:
         ``_file_lock`` 为 ExclusiveFileLock 原语实例，未持锁时 ``_lock_fd`` 为 None。
         """
         self.orchd_dir = orchd_dir
-        self.backend = backend or FilesystemBackend(resolve_store_dir(orchd_dir))
+        self.backend = backend or _select_backend(orchd_dir, readonly=readonly)
         # H4（2026-08-13）：ledger 行数内存计数器。None = 未校准（惰性，
         # 首次 _current_line_count() 时以实际文件行数为准）；append 成功后
         # 已校准则 +1。避免每次写 checkpoint 全文件数行（O(L) → O(1)）。
         # 注：orchd 命令均为短进程，写路径（append → update_checkpoint）
         # 在文件锁内完成，校准必发生在 append 之后，故内存计数准确。
         self._line_count: int | None = None
+        # replay 违规收集列表：显式注解，避免 mypy 从首次空列表赋值推断出空类型。
+        self._replay_violations: list[dict[str, Any]] = []
 
     # 路径属性 / 锁 fd 转发到 backend（保持既有调用方与测试兼容）
     @property
     def ledger_path(self) -> Path:
-        return self.backend.ledger_path
+        return self.backend.ledger_path  # type: ignore[attr-defined]
 
     @property
     def checkpoint_path(self) -> Path:
-        return self.backend.checkpoint_path
+        return self.backend.checkpoint_path  # type: ignore[attr-defined]
 
     @property
     def lock_path(self) -> Path:
-        return self.backend.lock_path
+        return self.backend.lock_path  # type: ignore[attr-defined]
 
     @property
     def _lock_fd(self) -> Any | None:
@@ -1754,7 +1967,7 @@ class Store:
         task_id = event.get("task_id", "")
         target = _event_target_status(event)
         held = (
-            self.backend._file_lock._fd is not None
+            self.backend._file_lock._fd is not None  # type: ignore[attr-defined]
             or str(self.lock_path.resolve()) in _depth_registry
         )
         if not held:
@@ -1835,7 +2048,11 @@ class Store:
                 return 0, {}, set()
             warnings.warn("checkpoint 解析失败，回退全量 replay", stacklevel=2)
             tasks = self.replay_full()
-            # 返回一个特殊标记让调用方知道已全量 replay
+            # 返回一个特殊标记让调用方知道已全量 replay。写标记前先接触即纠
+            # （task-counter-cache-reconcile code 审查返修）：total_lines 必须
+            # 取实体口径——漂移值会让调用方把已重放的头部事件二次喂入（漂小）
+            # 或跳过未读增量（漂大）。
+            self.reconcile_counters()
             total_lines = self._count_ledger_lines()
             return total_lines, tasks, set()
         # task-ledger-archive-compact：compact 中断恢复。journal 存在说明上次
@@ -1847,6 +2064,9 @@ class Store:
             if compact_journal_path(
                     resolve_store_dir(self.orchd_dir)).is_file():
                 tasks = self.replay_full()
+                # journal 在场的三写中断态与漂移并存时，兜底总行数同样须取
+                # 实体口径（code 审查返修，封口同上一分支）。
+                self.reconcile_counters()
                 total_lines = self._count_ledger_lines()
                 return total_lines, tasks, set()
         except Exception:
@@ -1895,7 +2115,12 @@ class Store:
         return tasks
 
     def check_integrity(self) -> list[dict[str, Any]]:
-        """校验 ledger 与 checkpoint 一致性（红线 8，R3，只读，不自动修复）。
+        """校验 ledger 与 checkpoint 一致性（红线 8，R3）。
+
+        「只读」口径（task-counter-cache-reconcile D3 修订）：**事件实体与
+        checkpoint 数据只读、不自动修复**；唯一允许的写是计数缓存的接触即
+        纠归位（reconcile，不触碰任何事件/checkpoint 内容）——比较基准恒取
+        实体口径，缓存漂移不再被误报成篡改。
 
         检测手改运行时文件（``_ledger.jsonl`` / ``_checkpoint.json``）的篡改：
         1. checkpoint.``ledger_line`` 必须 <= 实际 ledger 行数（ledger 被截断 /
@@ -1929,7 +2154,13 @@ class Store:
             }, self.orchd_dir))
             return warnings_list
 
-        actual = self._count_ledger_lines()
+        # 归因收窄（task-counter-cache-reconcile D3）：先经接触即纠再比较——
+        # 可写通道把漂移持久归位，只读通道至少取到实体真值。纯计数漂移
+        # 不再参与「篡改」审判；下方 ledger_line > actual 仅在实体真实缺行
+        # 时触发（V2' 实锤形态：事件体完好、旧逻辑拿撒谎缓存报 E030）。
+        rec = self.reconcile_counters()
+        truth = rec.get("to")
+        actual = self._count_ledger_lines() if truth is None else int(truth)
         # task-ledger-archive-compact：journal 感知。中断崩溃的三写残留与"篡改"
         # 不可区分对待——前者重跑即愈，后者须人工核对，故以 distinct 代码分流。
         try:
@@ -1979,6 +2210,11 @@ class Store:
             }, self.orchd_dir))
         if isinstance(ckpt_version, int) and ckpt_version != _CHECKPOINT_SCHEMA_VERSION:
             return warnings_list
+        if checkpoint.get("bootstrap_tasks") is not None:
+            # 快照基（task-sync-compact-bootstrap-from-state）：tasks 含本地物理
+            # 事件无法派生的派生态（compact 清空了转录前缀），前缀比对在此不适用；
+            # 强行比对会对每个新设备恒报 E030「疑似被篡改」（红线 8 假阳性）。
+            return warnings_list
 
         try:
             derived = self._replay_prefix(ledger_line)
@@ -2026,7 +2262,7 @@ class Store:
                 self.backend.read_events()
             entries = [
                 _attach_structured_guidance(dict(raw), self.orchd_dir)
-                for raw in list(self.backend.corrupt_lines or [])
+                for raw in list(self.backend.corrupt_lines or [])  # type: ignore[attr-defined]
             ]
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
@@ -2043,6 +2279,41 @@ class Store:
             }, self.orchd_dir)]
         return entries
 
+    def reconcile_counters(self) -> dict[str, Any]:
+        """计数缓存对账唯一入口（task-counter-cache-reconcile D2）。
+
+        委托后端 :meth:`StorageBackend.recalibrate_event_count`：
+
+        - 缓存与实体重算一致 → ``{"drift": False}``；
+        - 漂移且可写 → 持久归位（D4 观测键随写累计），并同步归位本实例
+          内存层 ``_line_count``（**两层缓存一并治**），返回
+          ``{"drift": True, "recalibrated": True, "from": …, "to": …, "history": …}``；
+        - 漂移但只读通道（doctor / readonly 后端）→ 遵守只读红线不写回，
+          返回 ``recalibrated: False`` 且 ``to`` 携实体真值，供消费方改用作
+          比较口径——漂移被命名，不再是「篡改」判据的一部分。
+
+        对账只动计数缓存与观测键，**绝不触碰事件实体**（红线）。
+        """
+        detail = self.backend.recalibrate_event_count()
+        if detail is None:
+            return {"drift": False}
+        repaired = bool(detail.get("repaired"))
+        if repaired and self._line_count is not None:
+            self._line_count = detail["to"]
+        out: dict[str, Any] = {
+            "drift": True,
+            "recalibrated": repaired,
+            "from": detail.get("from"),
+            "to": detail.get("to"),
+        }
+        if repaired:
+            out["history"] = self.backend.counter_reconcile_stats()
+        return out
+
+    def counter_reconcile_stats(self) -> dict[str, Any]:
+        """计数缓存纠偏累计与末次明细（D4 观测面，纯读）。"""
+        return self.backend.counter_reconcile_stats()
+
     def _current_line_count(self) -> int:
         """返回 ledger 当前行数（H4 缓存 + L-13 锁内校准契约）。
 
@@ -2058,7 +2329,7 @@ class Store:
         if self._line_count is not None:
             return self._line_count
         held = (
-            self.backend._file_lock._fd is not None
+            self.backend._file_lock._fd is not None  # type: ignore[attr-defined]
             or str(self.lock_path.resolve()) in _depth_registry
         )
         if held:
@@ -2066,7 +2337,7 @@ class Store:
             return self._line_count
         try:
             # 非阻塞尝试（只读路径不得因并发写而阻塞）
-            self.backend._file_lock.acquire(blocking=False)
+            self.backend._file_lock.acquire(blocking=False)  # type: ignore[attr-defined]
         except OrchdError:
             self._line_count = self._count_ledger_lines()
             return self._line_count
@@ -2074,7 +2345,7 @@ class Store:
             self._line_count = self._count_ledger_lines()
         finally:
             try:
-                self.backend._file_lock.release()
+                self.backend._file_lock.release()  # type: ignore[attr-defined]
             except (OSError, IOError):
                 pass
         return self._line_count
@@ -2145,7 +2416,8 @@ class Store:
             self._apply_event(event, tasks[task_id])
 
     def _rebuild_after_retract(
-        self, tasks: dict[str, TaskState], retracted: set[str]
+        self, tasks: dict[str, TaskState], retracted: set[str],
+        base: dict[str, TaskState] | None = None,
     ) -> None:
         """RETRACT 后从头全量重建任务状态。
 
@@ -2161,7 +2433,24 @@ class Store:
         来一次 retract 触发重建时，checkpoint 前的 retract 集合若缺失就会
         静默错乱状态）。
         """
+        # base 必须在 clear 之前取副本：调用方可能把同一个字典同时当作 tasks 与
+        # base（就地重建入口即如此），先 clear 会把基也清空。
+        snapshot = dict(base) if base is not None else None
         tasks.clear()
+        # 快照基（task-sync-compact-bootstrap-from-state）：物理账本可能不含
+        # compact 清空的转录前缀，其派生态只能来自快照。① 调用方显式传入 base
+        # （合并重建路径——那时 checkpoint 已是「重建中」的哨兵，靠不住）；
+        # ② 否则回退读现存 checkpoint 的 bootstrap_tasks 快照基（replay 路径——那时
+        # checkpoint 仍是真快照）。
+        if snapshot is not None:
+            tasks.update(snapshot)
+        else:
+            ckpt = self.backend.load_checkpoint() or {}
+            raw_base = ckpt.get("bootstrap_tasks")
+            if isinstance(raw_base, dict):
+                for tid, ts in raw_base.items():
+                    if isinstance(ts, dict):
+                        tasks[tid] = TaskState.from_dict(ts)
         all_events = self._read_ledger_lines(from_line=1)
         # 先完整收集所有 RETRACT 的目标事件 ID，再应用事件（两遍扫描）
         for event in all_events:
@@ -2199,7 +2488,7 @@ class Store:
         status = ts.status
         invariant: str | None = None
         reason = ""
-        if status in ("completed", "cancelled") and etype in (
+        if status in TERMINAL_STATUSES and etype in (
             "CLAIMED", "DONE", "REVIEW_READY", "REVIEW_SUBMITTED",
         ):
             # 终态后推进优先判定（比「缺活跃认领」更精确：终态本身就是最强判据）
@@ -2250,7 +2539,9 @@ class Store:
             - ``REVIEW_CLAIMED``   : reviewer 认领审核，设置 ``review_claimed_by``。
             - ``REVIEW_SUBMITTED`` : 审核结果提交。``APPROVED``(code) → ``completed``；
                                     ``CHANGES_REQUESTED`` → 回退 ``pending``。
-            - ``FORCE_STATUS``     : 强制覆盖状态到指定值，附带相关字段重置逻辑。
+            - ``FORCE_STATUS``     : 强制覆盖状态到指定值，附带相关字段重置逻辑；
+                                    ``target_status`` 不在 :data:`TASK_STATUSES`
+                                    内时不写入（记 UserWarning，派生态保持不变）。
 
         RETRACT 由调用方 :meth:`_apply_events` 在进入本方法前拦截（活跃路径触发
         全量重建、重建路径仅记录），此处只处理状态跃迁事件。跃迁合法性由白矩阵
@@ -2351,7 +2642,23 @@ class Store:
             # 强制状态覆盖：根据 target_status 重置关联字段，
             # 确保派生状态与被强制设置的状态保持一致
             target = event.get("target_status", "pending")
-            ts.status = target
+            if not isinstance(target, str) or target not in TASK_STATUSES:
+                # 与未知 REVIEW_SUBMITTED verdict 同口径（B5）：replay 是纯派生路径，
+                # 无 store/响应可挂 E030，故记进程级 warning 并**保持派生态不变**——
+                # 非法 target_status 不再静默写进运行态（target=None 让下方字段分支
+                # 整体 no-op，等价于该事件对状态无影响）。
+                # 判据是 TASK_STATUSES（六态词表）而不是人工白名单 FORCE_TARGET_STATUSES：
+                # 引擎自写的 FORCE_STATUS 允许 in_review（review.py:1232 终审残留回退）。
+                warnings.warn(
+                    f"unknown FORCE_STATUS target_status {target!r} for task "
+                    f"{event.get('task_id', '?')} "
+                    f"(event {event.get('event_id', '?')}) "
+                    f"(legal: {sorted(TASK_STATUSES)}), status unchanged",
+                    UserWarning, stacklevel=2,
+                )
+                target = None
+            if target is not None:
+                ts.status = target
             if target == "pending":
                 # 回退到待认领：清空所有执行和审核相关字段
                 ts.attempt_count = 0
@@ -2420,6 +2727,10 @@ class Store:
         """
         if retracted is None:
             retracted = self._collect_retracted_event_ids()
+        # 写前对账封口（task-counter-cache-reconcile D2）：计数缓存必须先
+        # 接触即纠再落 ``ledger_line``——否则漂移被焊进下一份快照、自我
+        # 传染（check_integrity 随后会把假基准判成「篡改」，V2' 实锤形态）。
+        self.reconcile_counters()
         # H4：行数由内存计数器提供（O(1)），不再全文件数行
         total_lines = self._current_line_count()
         # P2-10 / 1.4.1：稳态用增量 state（O(tail)）；仅 checkpoint schema 版本落后
@@ -2442,6 +2753,11 @@ class Store:
         }
         if retracted:
             checkpoint["retracted"] = sorted(retracted)
+        # 快照基随重写保留、且**不更新其值**（task-sync-compact-bootstrap-from-state）：
+        # 它必须恒为 pre-compact 原始快照——若被本函数的合成态覆盖，重建时
+        # 「base + 重放全部物理事件」会把已折入 base 的事件二次应用。
+        if prev.get("bootstrap_tasks") is not None:
+            checkpoint["bootstrap_tasks"] = prev["bootstrap_tasks"]
 
         self.backend.save_checkpoint(checkpoint)
 
@@ -2510,7 +2826,7 @@ class Store:
         state = self.replay_full()
         terminal = {
             tid for tid, ts in state.items()
-            if ts.status in ("completed", "cancelled")
+            if ts.status in TERMINAL_STATUSES
         }
         events = self._read_ledger_lines(from_line=1)
         arch, _ = read_archive_events(store_dir)
@@ -2521,8 +2837,9 @@ class Store:
             eid = ev.get("event_id", "")
             if eid and eid in arch_ids:
                 moved.append(ev)
-                if ev.get("task_id"):
-                    moved_tasks.add(ev.get("task_id"))
+                _tid = ev.get("task_id")
+                if isinstance(_tid, str):
+                    moved_tasks.add(_tid)
                 continue
             tid = ev.get("task_id", "")
             if tid and tid not in terminal:
@@ -2562,7 +2879,7 @@ class Store:
         }), encoding="utf-8")
         try:
             write_archive_events(store_dir, moved)
-            self.backend.replace_active_events(suffix)
+            self.backend.replace_active_events(suffix)  # type: ignore[attr-defined]
             self.update_checkpoint(
                 {tid: ts for tid, ts in state.items()},
                 self._collect_retracted_event_ids(),
@@ -2635,7 +2952,9 @@ class Store:
                 aid = event.get("agent_id")
                 if aid:
                     # 正序遍历后者覆盖 → (tid, aid) 保持「最近一次」的 baseline
-                    info.review_baselines[(tid, aid)] = event.get("baseline_sha")
+                    _baseline_sha = event.get("baseline_sha")
+                    if isinstance(_baseline_sha, str):
+                        info.review_baselines[(tid, aid)] = _baseline_sha
         return info
 
     # ------------------------------------------------------------------
@@ -2643,8 +2962,22 @@ class Store:
     # ------------------------------------------------------------------
 
     def ledger_exists(self) -> bool:
-        """检查 ledger 文件是否存在，用于判断项目是否已初始化过事件流。"""
-        return self.ledger_path.exists()
+        """账本是否存在（三载体先判，无后端副作用）。
+
+        task-sqlite-robustness-batch：直接判 ``_ledger.jsonl`` /
+        ``_ledger.sqlite3`` / 共享归档任一存在——不再经后端构造即建库的
+        sqlite 语义恒真（此前新建 Store 即 True，无账本状态不可检测，
+        12 处 ``if not ledger_exists`` 守卫退化为读空列表）。
+        """
+        try:
+            store_dir = resolve_store_dir(self.orchd_dir)
+        except Exception:
+            store_dir = Path(self.orchd_dir)
+        return (
+            (store_dir / "_ledger.jsonl").is_file()
+            or (store_dir / "_ledger.sqlite3").is_file()
+            or (store_dir / "_ledger.archive.jsonl").is_file()
+        )
 
     def ledger_line_count(self) -> int:
         """返回 ledger 文件的总行数（即事件总数），用于进度展示和 checkpoint 对齐。"""

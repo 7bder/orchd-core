@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +163,60 @@ def _redact_argv(argv: list[str]) -> list[str]:
     return redacted
 
 
+# ------------------------------------------------------------------
+# task-test-store-isolation-guard（批次 3b）：测试会话写命令 fail-fast。
+# ------------------------------------------------------------------
+# ORCHD_TEST_STORE=1（tests/conftest.py 会话 fixture 以非 monkeypatch 方式安装）时，
+# 若命令解析出的账本根**不在系统临时目录下**，说明测试隔离已失效（典型：用例调
+# monkeypatch.undo() 连带撤掉 conftest 的 cwd 隔离）——此时**写命令**一律拒绝，防静默
+# 污染真实主工作树的共享账本 / _master.json。只读命令放行；判定 fail-closed（不在只读
+# 白名单即视为写命令）。路径判定失败 best-effort 放行，不误伤正常会话。
+_READ_ONLY_COMMANDS = frozenset({
+    "status", "show", "pool", "watchdog", "doctor", "validate",
+    "request", "context-digest", "check", "ideas-list",
+    "session-current", "lesson-list", "lesson-show",
+})
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except Exception:
+        return True  # 判定失败 best-effort 放行（不误伤正常会话）
+    return resolved == root_resolved or root_resolved in resolved.parents
+
+
+def _guard_test_store(command: str) -> None:
+    """测试会话（ORCHD_TEST_STORE=1）下，写命令禁指向非临时目录的账本根。"""
+    if os.environ.get("ORCHD_TEST_STORE") != "1":
+        return
+    if command in _READ_ONLY_COMMANDS:
+        return
+    from orchd.ledger import resolve_store_dir
+
+    orchd_dir = _find_orchd_dir()
+    if orchd_dir is None:
+        return
+    store_root = Path(resolve_store_dir(orchd_dir))
+    temp_root = Path(tempfile.gettempdir())
+    if _is_within(store_root, temp_root):
+        return
+    raise OrchdError(
+        ErrorCode.E036,
+        "test_store_guard: 测试会话（ORCHD_TEST_STORE=1）下写命令拒绝指向非临时目录的"
+        "账本根（疑似测试隔离失效，防污染真实主工作树共享账本 / _master.json）",
+        [{
+            "command": command,
+            "store_root": str(store_root),
+            "temp_root": str(temp_root),
+            "hint": ("用例若调用 monkeypatch.undo() 会连带撤掉 conftest 的 cwd 隔离；"
+                     "请改用精确 setattr 单点还原（勿整体 undo()），或对被隔离的写命令"
+                     "打 uses_real_cwd 标记并注明理由"),
+        }],
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口。返回 exit code。
 
@@ -187,13 +243,33 @@ def main(argv: list[str] | None = None) -> int:
         code = exc.code if isinstance(exc.code, int) else 2
         if code == 0:
             raise
-        from orchd.guide import attach_error_guidance
+        from orchd.guide import _ENTRY_CMD, attach_error_guidance
 
+        # invalid_usage 分流（task-e007-invalid-usage-split）：argparse 封套带
+        # reason + 子命令感知的 --help hint（沿 restore 站点的 hint 惯例），供
+        # attach_error_guidance 把恢复面分流到 usage 面——不得套状态机模板
+        # （占位符外漏 + 指错文档）。子命令取本次调用 argv（直调 main([...]) 时
+        # sys.argv 是宿主进程的，不得用），首个非旗标 token。
+        eff_argv = list(argv) if argv is not None else list(sys.argv[1:])
+        raw_argv = _redact_argv(eff_argv)
+        sub = next(
+            (a for a in raw_argv
+             if isinstance(a, str) and not a.startswith("-")
+             and a != _E007_ARGV_TRUNCATED),
+            "",
+        )
+        usage_hint = (
+            f"参数非法或缺参：先看 `{_ENTRY_CMD} {sub} --help` 合法参数面"
+            f"（stderr 已保留 argparse 原文），再重组命令" if sub else
+            f"参数非法或缺参：先看 `{_ENTRY_CMD} --help`"
+            f"（stderr 已保留 argparse 原文），再重组命令"
+        )
         resp: dict[str, Any] = {
             "error": {
                 "code": "E007",
                 "message": "invalid_usage: argparse 解析失败（非法参数或缺少必需参数）",
-                "details": [{"exit_code": code, "argv": _redact_argv(list(sys.argv[1:]))}],
+                "details": [{"exit_code": code, "argv": raw_argv,
+                             "reason": "invalid_usage", "hint": usage_hint}],
             }
         }
         resp = attach_error_guidance(resp, "E007", _find_orchd_dir())
@@ -210,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
     command = _command_name(args)
     try:
         _reject_container_root_cwd()   # 纪律护栏：容器根拒绝（E036）
+        _guard_test_store(command)     # 纪律护栏：测试会话写命令禁指向真实账本（E036）
         try:
             # 会话命令记录（task-ref-tx-hook-cost）：E035 colliding_command
             # 数据源；best-effort，不阻断主流程。

@@ -51,8 +51,10 @@ dev = [
     "build>=1.0",
     "ruff>=0.6",
     # pass8 F3：mypy 无上界则 CI 按现网最新版解析，新版错误码（如 union-attr）
-    # 可把绿染红；上界 <2（2.x 为下一代，升级须专项评估）。
-    "mypy>=1.10,<2",
+    # 可把绿染红；上界收紧到 <3。2026-10-08 专项评估结论（task-mypy-2x-strict-core）：
+    # 本仓实测 mypy 2.x 不比 1.x 严——去 override 后 1.10.0=77 错、2.3.1/2.4.0=73 错，
+    # 无新增错误类，故升级到 2.x。
+    "mypy>=2.4,<3",
 ]
 
 [tool.ruff]
@@ -106,7 +108,6 @@ ignore = [
 "orchd/cli/commands/workflow.py" = ["E501"]
 "orchd/cli/identity.py" = ["E501"]
 "orchd/cli/parser.py" = ["E501"]
-"orchd/doctor.py" = ["E501"]
 "orchd/errors.py" = ["E501"]
 "orchd/gitops/hook.py" = ["E501"]
 "orchd/gitops/query.py" = ["E501"]
@@ -201,21 +202,10 @@ markers = [
 #   orchd.ledger_sync ........ 1  (StorageBackend 缺 orchd_dir attr)
 #   orchd.cli.commands.init .. 2  (__iadd__ 类型不符)
 #
-# 收紧路线（按模块移除 overrides 的顺序，由易到难）：
-#   ① orchd.ledger_sync ✅（task-quality-debt-and-ci 已移除）→ ② orchd.doctor ✅
-#   → ③ orchd.pool ✅ → ④ orchd.cli._util
-#   → ⑤ orchd.cli.skeleton → ⑥ orchd.report → ⑦ orchd.split → ⑧ orchd.review
-#   → ⑨ orchd.ledger → ⑩ orchd.worktree → ⑪ orchd.lessons → ⑫ orchd.guide
-#   → ⑬ orchd.onboard.*（最后，union-attr 多）→ ⑭ orchd.cli.commands.*
-#   （cli 层大量 untyped 回调 + 动态类型，留到最后；收紧时同步给 _cli_skeleton
-#    补 Callable 泛型或 # type: ignore 局部标注）
-#
-# 已移除的三个模块当前处于强类型检查（无 ignore_errors，task-quality-debt-and-ci）：
-#   - orchd.ledger_sync：_store_runtime_root 经 isinstance(FilesystemBackend) 收窄
-#     backend.orchd_dir（StorageBackend 接口不暴露该属性；非文件系统后端抛 RuntimeError）
-#   - orchd.doctor：_load_master_task_ids 的 set 推导改显式 isinstance(str) 过滤
-#   - orchd.pool：claimed_files 中 state.get 复用变量加显式 `TaskState | None` 注解
-# 其余 17 个 override 按上述收敛路线逐个移除，每移除一个须保证 mypy 全绿一次。
+# 收紧路线已走完（2026-10-08，task-mypy-2x-strict-core / -guide-and-cli-skeleton /
+# -cli-commands / -onboard 四批承接）：全部 [[tool.mypy.overrides]] ignore_errors
+# 已移除，orchd/ 现为全量强类型检查，`python -m mypy orchd/` 直接守门。
+# 上列「存量错误基线」为历史记录（收敛前），不再维护——当前真源即 mypy 实跑。
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
@@ -223,74 +213,5 @@ disallow_untyped_defs = false
 warn_unused_ignores = false
 warn_redundant_casts = false
 # 仅对 orchd/ 做类型检查；scripts/ 与 tests/ 由 lint 门禁覆盖且 untyped 较多。
-
-[[tool.mypy.overrides]]
-module = "orchd.ledger"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-
-module = "orchd.guide"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.split"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.review"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-
-module = "orchd.lessons"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.worktree"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-
-module = "orchd.report"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli._util"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli.skeleton"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.onboard"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.onboard.claim"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.onboard.control"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.onboard.lifecycle.core"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli.commands.init"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli.commands.control"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli.commands.query"
-ignore_errors = true
-
-[[tool.mypy.overrides]]
-module = "orchd.cli.commands.workflow"
-ignore_errors = true
+# 2026-10-08（task-mypy-strict-onboard，mypy 收紧路线终点）：全部 ignore_errors
+# override 已移除，orchd/ 现为全量强类型检查——任何新类型错误将直接红。

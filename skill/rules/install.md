@@ -2,19 +2,19 @@
 # 显式未路由（安装协议走 BOOTSTRAP 专道，不进 guidance 场景）
 guide: {}
 ---
-# 安装规则（Agent 无感安装协议 + BOOTSTRAP mode）
+# 安装规则（Agent 无感安装协议 + 初始化阶段）
 
-> TL;DR: ① BOOTSTRAP 自启动安装流程 ② --cleanup 安装后自动删除克隆源（无痕安装） ③ 安装/claim 流程自动启用仓库自带 `.githooks`（`core.hooksPath` 是本地配置、不随 clone 传播；已自定义为其他路径则仅提示不改写）
+> TL;DR: ① 初始化阶段自启动安装流程 ② --cleanup 安装后自动删除克隆源（无痕安装） ③ 安装/claim 流程自动启用仓库自带 `.githooks`（`core.hooksPath` 是本地配置、不随 clone 传播，**写入绝对值**——相对值在链接工作树内静默失效；已自定义为其他路径则仅提示不改写）
 
 > 低频块外置自 `.orchd/SKILL.md`（task-skill-as-entry-docs，2026-08-15）：SKILL 仅留一句指针，本文件承载全文，零信息丢失。
 > 适用场景：新项目首次进入（项目无 `.orchd/`）时阅读；已有 `.orchd/` 的项目无需每次读本文件。
 
 ## Agent 无感安装协议（task-121-docs，2026-08-15）
 
-检测到**项目无 `.orchd/`**（BOOTSTRAP 前置）时，agent 按**通用协议**自行完成 orchd-core 安装，无需等待人或平台专属 skill 插件：
+检测到**项目无 `.orchd/`**（初始化阶段前置）时，agent 按**通用协议**自行完成 orchd-core 安装，无需等待人或平台专属 skill 插件：
 1. `git clone` orchd-core 源码仓库（通用安装协议见 `release/README.md`）。
 2. 运行安装器 `python orchd-core/install.py <宿主路径> --agent --cleanup`（`--agent` 输出纯 JSON，便于无人值守解析；`--cleanup` 安装成功后自动删除克隆源 `orchd-core/`，宿主根零残留）。
-3. 安装器组装出宿主 `.orchd/`（vendored 引擎 + 资源 + SKILL + 零根入口 + `shared/`/`proposals/` 骨架），随后进入下方 BOOTSTRAP 模式。
+3. 安装器组装出宿主 `.orchd/`（vendored 引擎 + 资源 + SKILL + 零根入口 + `shared/`/`proposals/` 骨架），随后进入下方初始化阶段。
 
 > 约定：**不写平台专属 skill 插件**（如 `.claude/`、`.cursor/` 定制），统一走该通用安装协议，保证跨平台一致性。已存在 `.orchd/` 时如需升级，用 `python install.py <宿主路径> --update`（保留宿主数据；需保留克隆源以便升级则不加 `--cleanup`）。
 
@@ -47,14 +47,18 @@ guide: {}
 
 | 仓库状态 | 处置 |
 |---|---|
-| 非 git 仓库 / 仓库内无 `.githooks/` | 不动（`not_a_git_repo` / `hooks_dir_missing`） |
-| `core.hooksPath` 未设置或为空 | 自动设为 `.githooks`（相对仓库根，多 worktree 下各自生效） |
-| 已指向 `.githooks`（相对或等价绝对路径） | 幂等跳过，不重复改写 |
+| 非 git 仓库 / 仓库内无 `.githooks/` | 不动（`not_a_git_repo` / `hooks_dir_missing`；此时 L3 hook 落全工作树共享的 `.git/hooks`，天然可达） |
+| `core.hooksPath` 未设置或为空 | 自动设为 `.githooks` 的**绝对路径** |
+| 已指向 `.githooks` 且为绝对路径 | 幂等跳过，不重复改写（`already_set`） |
+| 已指向 `.githooks` 但为**相对**路径 | 升级为绝对路径（`upgraded_to_absolute`，只改形态不改指向） |
+| 已为绝对路径但目录不存在、末级名是 `.githooks`（仓库被移动 / 改名） | 重写为当前绝对目标（`reinstalled_stale`） |
 | 已指向其他路径（用户显式自定义） | **不改写**，仅提示手动改法；不覆盖用户配置 |
 
-处置结果见安装 JSON 的 `hooks_path` 字段（`reason` ∈ `set` / `already_set` / `custom_hooks_path` / `hooks_dir_missing` / `not_a_git_repo`）；非 `--agent` 模式另在 stdout 打印一行人类可读提示。
+> **为什么必须绝对**：git 把**相对** `core.hooksPath` 按**当前工作树顶层**解析。`git worktree add` 出的链接工作树里没有 `.githooks/` 目录时，git **静默跳过** hook（fail-open）——实测（git 2.55，同一仓库同一 hook 内容）：相对值下主工作树提交触发 hook、链接工作树提交**不触发**；绝对值下两者都触发。orchd 的任务实现正发生在链接工作树，故相对值等于交付一套「对任务分支不存在」的 L3 强制层（E020 提交范围门 + `reference-transaction`）。旧文档把相对值写成多 worktree 下的正确形态，与实测相反，已更正（task-worktree-hooks-path-reachability）。
 
-**claim 期兜底**：任务 `claim` 安装 L3 pre-commit hook 前，引擎执行同一检查（`orchd/gitops/hook._ensure_hooks_path`，best-effort，先于 hooks 目录解析），保证 pre-commit 落到 `core.hooksPath` 指向的目录而非回退 `.git/hooks`；结果附在 `hook_install` 返回的 `hooks_path` 字段。既有 hooksPath 解析语义（相对 → 相对仓库根 / 绝对 → 原样 / 缺省 → `.git/hooks`）不变。
+处置结果见安装 JSON 的 `hooks_path` 字段（`reason` ∈ `set` / `already_set` / `upgraded_to_absolute` / `reinstalled_stale` / `custom_hooks_path` / `hooks_dir_missing` / `not_a_git_repo`）；非 `--agent` 模式另在 stdout 打印一行人类可读提示。
+
+**claim 期兜底**：任务 `claim` 安装 L3 pre-commit hook 前，引擎执行同一检查（`orchd/gitops/hook._ensure_hooks_path`，best-effort，先于 hooks 目录解析），保证 pre-commit 落到 `core.hooksPath` 指向的目录而非回退 `.git/hooks`；结果附在 `hook_install` 返回的 `hooks_path` 字段。既有 hooksPath **读取**语义（相对 → 相对仓库根 / 绝对 → 原样 / 缺省 → `.git/hooks`）不变；**写入**一律为绝对值，并会把已有的相对等价值升级掉（`upgraded_to_absolute`）——安装器与引擎两处实现同语义，调整须同步。
 
 **owner-aware 跳过（task-hook-owner-aware-install）**：`core.hooksPath` 可能指向宿主自定义目录（`.husky` / lint-staged 等），此时该目录下的 `pre-commit` 是**宿主自有文件**。安装前按生成物首部归属标记（`# orchd L3 pre-commit hook`）探测，只动本引擎生成物：
 
@@ -69,15 +73,18 @@ guide: {}
 **手动启用（未走安装器时）**：
 
 ```bash
-git config core.hooksPath .githooks     # 相对仓库根；每台机器 / 每个 clone 各需设置一次
-git config --get core.hooksPath         # 校验
+# 绝对路径形态：相对值在链接工作树内静默失效（见上方「为什么必须绝对」）
+git config core.hooksPath "$(git rev-parse --show-toplevel)/.githooks"
+git config --get core.hooksPath         # 校验：应为绝对路径，且该目录存在
 ```
+
+Windows 下同样用正斜杠（`c:/path/to/repo/.githooks`）；每台机器 / 每个 clone 各需设置一次。
 
 > `core.hooksPath` 属本地配置，不入库、不共享；若仓库已自定义为别的 hooks 目录，请沿用自定义目录，不要强行改为 `.githooks`。
 
-## BOOTSTRAP mode (first agent in a new project)
+## 初始化阶段 (first agent in a new project)
 
 1. Read `requirements.md`; run `python .orchd/__main__.py bootstrap` — outputs master schema, architect prompt, decomposition guide
 2. Create `.orchd/_master.json` following the schema (write `.orchd/shared/architecture.md` + `conventions.md` before validate if `shared` declared, E005)
 3. Run `python .orchd/__main__.py validate`, then `python .orchd/__main__.py init` (snapshots + empty ledger)
-4. Project ready. Exit. Next session enters WORKER mode automatically.
+4. Project ready. Exit. Next session enters 日常阶段 automatically.

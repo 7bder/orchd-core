@@ -24,14 +24,14 @@ def _task_properties() -> dict:
 
 
 def amendable_fields() -> frozenset[str]:
-    """amend 声明域可补登字段（对标 split._AMEND_ATTACHABLE_FIELDS）。"""
+    """amend 声明域可补登字段（真源：schema 的 ``x-amendable`` 注解）。"""
     return frozenset(
         name for name, prop in _task_properties().items() if prop.get("x-amendable")
     )
 
 
 def terminal_attachable_fields() -> frozenset[str]:
-    """终态可附加字段（对标 split._TERMINAL_ATTACHABLE_FIELDS）。"""
+    """终态可附加字段（真源：schema 的 ``x-terminal-attachable`` 注解）。"""
     return frozenset(
         name
         for name, prop in _task_properties().items()
@@ -40,5 +40,5 @@ def terminal_attachable_fields() -> frozenset[str]:
 
 
 def task_schema_fields() -> frozenset[str]:
-    """任务全部 schema 字段（对标 split._TASK_SCHEMA_FIELDS）。"""
+    """任务全部 schema 字段（真源：``properties.tasks.items.properties`` 键集）。"""
     return frozenset(_task_properties().keys())

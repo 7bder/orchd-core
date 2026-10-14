@@ -17,7 +17,8 @@
 - **pull-first + event_id 去重合并**：pull/compact 先 fetch 远端 ref，把远端
   ``delta.jsonl`` 中本地缺失事件合并进本地账本（按 ``(timestamp, event_id)``
   确定性排序），再重建 checkpoint；重复 pull/sync 幂等。
-- 本地 ``_ledger.jsonl`` 始终保留完整审计（跨设备事件按确定性全局序归并）。
+- 本地账本始终保留完整审计（文件后端载体为 ``_ledger.jsonl``；跨设备事件按
+  确定性全局序归并）。
 
 git 承载的文件不支持动态建路径；ref 名与文件名均为固定常量。
 """
@@ -34,16 +35,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import validate_event
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
 from orchd.ledger import (
     _CHECKPOINT_SCHEMA_VERSION,
-    _atomic_replace,
+    _event_target_status,
     _fsync_dir,
-    FilesystemBackend,
+    _write_text_atomic,
     Store,
+    TaskState,
     event_sort_key,
+    resolve_store_dir,
+    review_claim_age_s,
+    review_stale_timeout_s,
+    validate_transition,
 )
+from orchd.storage import read_archive_events
 
 # 专用账本 ref（本地 + 远端同名）
 ORCHD_LEDGER_REF = "refs/heads/orchd/ledger"
@@ -54,6 +62,37 @@ _REF_DELTA = "delta.jsonl"
 
 # 本地同步 marker（账本根下，运行时状态不入 git）
 _SYNC_MARKER_NAME = ".ledger_sync_marker.json"
+
+# ref tree 内 state.json 的快照格式版本（build_state 写入；新设备 bootstrap 校验，
+# task-sync-compact-bootstrap-from-state）：加法式演进——补字段不提升版本。
+_STATE_SCHEMA_VERSION = 1
+
+# 入站整类拒收的事件类型（task-sync-inbound-force-gate，P0-3 修法②）：
+# FORCE_STATUS 是**本地人工动作**——要人显式二次确认，语义绑定本机上下文
+# （分支 / worktree / 锁），跨机复制等于把一端的人工善后强加给另一端；它在
+# TRANSITION_TABLE 里 target=None，旧实现因此完全绕过跃迁校验（伪造终态静默落盘的
+# 入口）。拒收走既有 rejected 明细 + E030 告警通道，不静默丢弃。
+# task-sync-inbound-retract-authz：RETRACT 移出整类拒收，改窄口径放行（见
+# ``_inbound_retract_verdict``）——入站只认本地可验证的时间事实（目标认领已
+# 超时），不认入站署名与 admin（口径单一真源见
+# ``docs/system-design-online.md`` §3.6）。
+_INBOUND_LOCAL_ONLY_TYPES = frozenset({"FORCE_STATUS"})
+
+# 入站拒收的判定基准二分（task-sync-push-kept-events 返工轮）：
+#   absolute —— **同一引擎版本下**与设备无关地非法（非 dict / 契约违约 / 本地专用
+#     类型），因此可以从共享 ref 的 delta 载体里剔除，不必让每台 push 过的设备反复
+#     携带同一枚垃圾事件；
+#   relative —— 只对**本机**派生态或**本机**账本非法（跃迁白矩阵、RETRACT 窄口径），
+#     对状态落后的另一端可能完全合法，故只能本机不入账，不得据本机判定删掉他端
+#     需要的转录项（否则一台设备获得了删除另一台设备历史事件的权力）。
+# 「同一引擎版本」这个限定不是客套：``contract:`` 里含 ``unknown event type``
+# （``orchd/contracts/events.py``），而 ``docs/compat-policy.md`` 许可新增事件类型——
+# 升级窗口内旧引擎会把新类型判成 absolute 并把它从共享转录里删掉。跨版本收紧另立
+# idea 讨论，本模块的口径以此处为准。
+# 分类真源就是 ``_validate_inbound_events`` 里各条拒收点自带的 basis 键；下游只读该
+# 键，禁止用 reason 字符串前缀嗅探重造一套分类。
+_INBOUND_REJECT_ABSOLUTE = "absolute"
+_INBOUND_REJECT_RELATIVE = "relative"
 
 # 远端默认名
 _DEFAULT_REMOTE = "origin"
@@ -71,16 +110,16 @@ _SYNC_LOCK_WAIT_SECS = 300
 
 
 def _store_runtime_root(store: Store) -> Path:
-    """账本根路径（marker/lock 与 ledger/checkpoint 同级目录）。
+    """账本根路径（marker/lock 与 ledger 载体同级目录，后端无关）。
 
-    ``StorageBackend`` 接口不含 ``orchd_dir``（仅 :class:`FilesystemBackend`
-    在构造时持有），这里用 ``isinstance`` 收窄类型以获得该属性
-    （mypy 收紧路线：orchd.ledger_sync 首个移除 ignore_errors）。
+    marker（``.ledger_sync_marker.json``）与 sync 锁（``.sync.lock``）是账本根下
+    的普通文件，不经 StorageBackend 端口——经 :func:`resolve_store_dir` 由
+    ``store.orchd_dir`` 解析，与各后端构造时传入的目录同一来源
+    （task-sync-sqlite-backend-support，B-max 阶段 3：此前按
+    ``isinstance FilesystemBackend`` 硬拒非文件后端，现 marker/lock 本就与
+    载体形态无关，判定改为与后端无关的目录解析）。
     """
-    backend = store.backend
-    if not isinstance(backend, FilesystemBackend):
-        raise RuntimeError(f"不支持的非文件系统存储后端: {type(backend).__name__}")
-    return backend.orchd_dir
+    return resolve_store_dir(store.orchd_dir)
 
 
 def _marker_path(store: Store) -> Path:
@@ -101,7 +140,8 @@ def _load_marker(store: Store) -> dict[str, Any]:
 def _save_marker(store: Store, last_pushed_event_id: str | None) -> None:
     path = _marker_path(store)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    _write_text_atomic(
+        path,
         json.dumps(
             {
                 "last_pushed_event_id": last_pushed_event_id,
@@ -110,7 +150,6 @@ def _save_marker(store: Store, last_pushed_event_id: str | None) -> None:
             ensure_ascii=False,
             indent=1,
         ) + "\n",
-        encoding="utf-8",
     )
 
 
@@ -376,7 +415,10 @@ def build_state(store: Store) -> dict[str, Any]:
 
     每任务字段：status / attempt_count / updated_event_id + 非空可选字段
     （review_phase / claimed_by / claimed_session / review_claimed_at /
-    review_self_review）。
+    review_self_review / review_claimed_by / review_claimed_session /
+    merge_warning）。后三项由 task-sync-compact-bootstrap-from-state 补齐：
+    新设备 bootstrap 以本快照为**唯一**派生态来源（远端 delta 已被 compact
+    置空），缺项即静默丢状态，故字段集须与 ``TaskState`` 对齐。
     ``updated_event_id`` 为该任务最近一次事件 id（正序扫描后者覆盖）。
     """
     state = store.replay()
@@ -395,32 +437,48 @@ def build_state(store: Store) -> dict[str, Any]:
             "updated_event_id": last_event.get(tid),
         }
         for key in ("review_phase", "claimed_by", "claimed_session",
-                    "review_claimed_at", "review_self_review"):
+                    "review_claimed_at", "review_self_review",
+                    "review_claimed_by", "review_claimed_session",
+                    "merge_warning"):
             val = getattr(ts, key, None)
             if val:
                 entry[key] = val
         tasks[tid] = entry
     return {
-        "schema_version": 1,
+        "schema_version": _STATE_SCHEMA_VERSION,
         "generated_at":
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tasks": tasks,
     }
 
 
-def _parse_delta_events(text: str | None) -> list[dict[str, Any]]:
-    """解析 delta.jsonl 文本为事件列表（空/None → 空列表，坏行跳过）。"""
+def _parse_delta_events(text: str | None) -> tuple[list[dict[str, Any]], int]:
+    """解析 delta.jsonl 文本为事件列表（空/None → 空列表）。
+
+    非 dict 行（坏 JSON / 数字 / 字符串 / 数组 / null）显式跳过并计数，
+    不再让 AttributeError 从 ``_merge_events_detailed`` 的 ``ev.get``
+    逃逸导致整批同步中止。
+
+    Returns:
+        ``(events, malformed_skipped)``：事件列表与跳过的脏行数。
+    """
     if not text or not text.strip():
-        return []
+        return [], 0
     events: list[dict[str, Any]] = []
+    skipped = 0
     for line in text.splitlines():
         if not line.strip():
             continue
         try:
-            events.append(json.loads(line))
+            obj = json.loads(line)
         except ValueError:
+            skipped += 1
             continue
-    return events
+        if not isinstance(obj, dict):
+            skipped += 1
+            continue
+        events.append(obj)
+    return events, skipped
 
 
 def _event_fingerprint(ev: dict[str, Any]) -> str:
@@ -584,12 +642,19 @@ def _write_sentinel_checkpoint(store: Store) -> None:
         store: 目标 Store。
     """
     try:
-        store.backend.save_checkpoint({
+        payload: dict[str, Any] = {
             "ledger_line": 0,
             "schema_version": _CHECKPOINT_SCHEMA_VERSION,
             "tasks": {},
             "sentinel": "ledger_rewrite_in_progress",
-        })
+        }
+        # 快照基随哨兵原样存续（task-sync-compact-bootstrap-from-state）：重建尾部的
+        # update_checkpoint 以「现存 checkpoint」判定是否保留它，哨兵若抹掉它，
+        # 基就在重建过程中丢失、下一次重建退回空基 replay_full。
+        prev_ckpt = store.backend.load_checkpoint() or {}
+        if prev_ckpt.get("bootstrap_tasks") is not None:
+            payload["bootstrap_tasks"] = prev_ckpt["bootstrap_tasks"]
+        store.backend.save_checkpoint(payload)
     except (OSError, OrchdError):
         pass
 
@@ -600,36 +665,435 @@ def _rebuild_local_ledger(store: Store, events: list[dict[str, Any]]) -> int:
     ledger 为事件审计唯一权威：重写保留全部事件、仅规范化确定性全局序，
     随后 replay_full → update_checkpoint 重建快照（O(任务数) checkpoint）。
 
-    落盘序列（L-1，与 ``save_checkpoint`` 同款）：
-    ``write → flush → fsync →（哨兵 checkpoint）→ _atomic_replace → 父目录 fsync``
+    写路径走 StorageBackend 端口（task-sync-sqlite-backend-support，B-max
+    阶段 3）：``replace_active_events`` 全量替换活跃事件（文件后端原子重写
+    活跃文件，sqlite 后端单事务重建事件表并同步计数器）——旧实现在此处做 raw
+    文件手术（拼 jsonl → tmp → ``_atomic_replace`` 到 ``ledger_path``），在
+    sqlite 下会把合并事件写进读侧不可见的遗留 jsonl（静默丢数据），故此前整
+    个 sync 对非文件后端 E007 硬拒。端口化后双后端同一语义。
+
+    落盘序列（L-1）：（哨兵 checkpoint）→ 端口替换 → 父目录 fsync
     → ``update_checkpoint``。要点：
-    - 无 flush/fsync 时掉电可致 0 字节账本（丢全部历史），故 tmp 写完即 fsync；
     - replace 前写哨兵 → 中途崩溃只会触发全量 replay，不会「旧行号 + 新账本」错配；
-    - replace 走 ``_atomic_replace``（L-8：Windows 句柄争用有界重试，耗尽抛 E007）。
+    - 端口替换内部保证原子（文件 tmp+replace / sqlite 单事务），父目录 fsync
+      保住目录项持久化（与旧序列同耐久）；
+    - 崩溃后 checkpoint 停在哨兵（0 行）→ replay 必从第 1 行全量重放。
+
+    归档前缀不得入活跃段（task-sync-rebuild-active-suffix）：入参 ``events`` 是
+    **逻辑**事件流（读侧 = 归档前缀 + 活跃后缀，见 ``StorageBackend.read_events``
+    的 ``filesystem`` 实现），而 ``replace_active_events`` 的契约只接**活跃后缀**
+    （口径真源 ``orchd/storage/__init__.py``），两后端均按「归档解析数 + 本次重插
+    数」记逻辑总数。喂全量会把归档段再写进活跃载体，于是后端计数器把归档事件
+    重复计入（HEAD 实测 archive=10 / merged=12 时 ``event_count()`` 由 12 变 22），
+    而读侧按 event_id 去重仍只见 12 条——计数器与 ``read_events()`` 背离、
+    ``read_events(from, to)`` 窗口起点错位（HEAD 实测窗口只返回归档段尾部，其后的
+    活跃后缀整段不见）。事件本身不丢（全量 ``replay_full()`` 恒可见）；增量
+    ``replay()`` 的回退触发只以 ``orchd/ledger.py::_load_checkpoint``（:1909）
+    所列两支为准（checkpoint 解析失败回退支、compact journal 在位支，
+    :1926-:1948），本文件不断言第三支。故此处按归档 event_id
+    **集合**切出活跃后缀（不按位置切片：合并序下归档与活跃事件可交错），并把 H4
+    计数器落到「归档解析数 + 活跃后缀数」，与 ``Store.compact_archive`` 的同名赋值
+    同口径（``_line_count = len(moved) + len(suffix)``，见 ``orchd/ledger.py``）——
+    ``_line_count`` 语义是**逻辑总数**，不是活跃行数。
+
+    bootstrap 快照接力（task-sync-compact-bootstrap-from-state）：本地事件流可能
+    只是「compact 之后的新事件」（新设备 bootstrap 后本地账本为空，之后 pull 到
+    的事件不带 pre-compact 前缀）。此时从空基 ``replay_full()`` 重建会冲掉快照
+    派生态，故先取现存 checkpoint 的 ``bootstrap_tasks``（快照基键，普通
+    checkpoint 无此键）：命中则以该 pre-compact 原始快照为
+    ``_rebuild_after_retract`` 的基叠加本地事件；否则维持原 ``replay_full()``
+    语义。
 
     Returns:
-        本地事件总数。
+        本地逻辑事件总数（归档解析数 + 活跃后缀数）。
     """
-    store.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    if events:
-        lines = "".join(
-            json.dumps(ev, ensure_ascii=False, separators=(",", ":")) + "\n"
-            for ev in events)
-    else:
-        lines = ""
-    tmp = store.ledger_path.with_suffix(".sync.tmp")
-    # 保持既有文本模式写入语义（编码/换行不变），仅补 flush + fsync
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(lines)
-        f.flush()
-        os.fsync(f.fileno())
+    root = _store_runtime_root(store)
+    root.mkdir(parents=True, exist_ok=True)
+    # 基必须在写哨兵**之前**取——哨兵会把 checkpoint 覆盖成空快照。判据是
+    # checkpoint 的 `bootstrap_tasks`（快照基），**不是** ledger_line==0：接力重建
+    # 自身会把 ledger_line 抬到物理行数，用行号判定只能护住首次承载内容的 pull。
+    # 另一关键：基恒取**原始快照** `bootstrap_tasks`，而不是会被 update_checkpoint
+    # 改写的合成态 `tasks`——否则「base + 重放全部物理事件」会把已折入 base 的事件
+    # 二次应用，正确性就静默依赖「事件类型幂等」这条不变量。
+    prev_ckpt = store.backend.load_checkpoint() or {}
+    carry: dict[str, TaskState] = {}
+    raw_base = prev_ckpt.get("bootstrap_tasks")
+    if isinstance(raw_base, dict):
+        carry = {tid: TaskState.from_dict(ts)
+                 for tid, ts in raw_base.items() if isinstance(ts, dict)}
     _write_sentinel_checkpoint(store)
-    _atomic_replace(tmp, store.ledger_path)
-    _fsync_dir(store.ledger_path.parent)
-    store._line_count = len(events)
-    state = store.replay_full()
+    archived, _ = read_archive_events(root)
+    archived_ids = {ev.get("event_id") for ev in archived if ev.get("event_id")}
+    active_suffix = [ev for ev in events if ev.get("event_id") not in archived_ids]
+    store.backend.replace_active_events(active_suffix)
+    _fsync_dir(root)
+    store._line_count = len(archived) + len(active_suffix)
+    if carry:
+        # 快照基 + 本地事件：走 _rebuild_after_retract 的「两遍扫描 + 以 base 为基」
+        # 语义（而非 _apply_events：它遇 RETRACT 会递归重建并从空基重放，快照仍会
+        # 被冲）。此时 replace 已写完，物理账本即合并后的本地事件。
+        state = carry
+        store._replay_violations = []
+        store._rebuild_after_retract(state, set(), base=carry)
+    else:
+        state = store.replay_full()
     store.update_checkpoint(state)
-    return len(events)
+    return store._line_count
+
+
+def _bootstrap_local_from_state(
+    store: Store,
+    remote_state: dict[str, Any],
+    local_events: list[dict[str, Any]],
+    remote_delta: list[dict[str, Any]],
+    state_error: str | None,
+) -> dict[str, Any]:
+    """新设备 bootstrap：由远端 ``state.json`` 构造本地 checkpoint（口径①）。
+
+    task-sync-compact-bootstrap-from-state。触发形态：另一端 push 后执行
+    ``compact``（远端 ``delta.jsonl`` 被置空），此后加入的新设备 ``pull`` 只能
+    拿到空 delta——本地账本 0 条事件、派生态全空，而 ``state.json`` 此前只被
+    用于响应回显。本函数把该快照落到本地 checkpoint，使 ``replay()`` 由快照
+    起步、后续增量事件照常参与 replay：
+
+    - **不伪造事件**：只写 checkpoint（``ledger_line=0`` 表示本地尚无事件），
+      事件转录保持纯净；后续事件既参与纯 ``replay()``，也在合并重建路径
+      （``_rebuild_local_ledger``，见其「bootstrap 快照接力」段）里以本快照为基
+      叠加——否则首次承载内容的增量 pull 会把快照派生态冲掉；
+    - **fail-closed**：仅在「远端 delta 为空 + 本地无事件 + state 可解析且
+      ``schema_version`` 受支持 + tasks 形状合法」时写入；任一不满足即返回
+      ``applied=False`` + 结构化 reason，**不落半态**；
+    - **幂等**：重复 pull 重写同一快照，派生态不变。
+
+    已知边界（如实声明）：``state.json`` 是派生快照，不含 RETRACT 集合与事件级
+    审计（本函数不写 ``retracted``），新设备的撤回集合由后续增量事件补齐；远端
+    快照自身的正确性由 compact 端负责（本函数不做跨端交叉校验）。
+
+    Args:
+        store: 本地 Store（调用方须已持账本锁）。
+        remote_state: 远端 ``state.json`` 解析结果（非 dict 时传空 dict）。
+        local_events: 本地现存逻辑事件（判「本地是否已有账本内容」）。
+        remote_delta: 本轮远端 delta（非空即走增量路径，不进 bootstrap）。
+        state_error: ``state.json`` 解析失败的分类（None 表示可解析）。
+
+    Returns:
+        ``{"applied": bool, "tasks": int, "reason": str | None}``。
+    """
+    if state_error is not None:
+        return {"applied": False, "tasks": 0, "reason": state_error}
+    if remote_delta:
+        return {"applied": False, "tasks": 0, "reason": "delta_present"}
+    if local_events:
+        return {"applied": False, "tasks": 0, "reason": "local_events_present"}
+    if not remote_state:
+        return {"applied": False, "tasks": 0, "reason": "no_remote_state"}
+    version = remote_state.get("schema_version")
+    if version != _STATE_SCHEMA_VERSION:
+        return {"applied": False, "tasks": 0,
+                "reason": "state_schema_unsupported",
+                "schema_version": version}
+    raw_tasks = remote_state.get("tasks")
+    if not isinstance(raw_tasks, dict):
+        return {"applied": False, "tasks": 0, "reason": "state_tasks_malformed"}
+    snapshot: dict[str, dict[str, Any]] = {}
+    try:
+        for tid, ts in raw_tasks.items():
+            if isinstance(tid, str) and isinstance(ts, dict):
+                snapshot[tid] = TaskState.from_dict(ts).to_dict()
+    except (TypeError, ValueError, KeyError):
+        return {"applied": False, "tasks": 0,
+                "reason": "state_task_fields_malformed"}
+    if not snapshot:
+        return {"applied": False, "tasks": 0, "reason": "state_tasks_empty"}
+    store.backend.save_checkpoint({
+        "ledger_line": 0,
+        "schema_version": _CHECKPOINT_SCHEMA_VERSION,
+        "tasks": snapshot,
+        # 快照基（task-sync-compact-bootstrap-from-state）：携带 **pre-compact
+        # 原始快照**，供重建路径以它为基叠加物理事件、完整性校验豁免前缀比对。
+        # 它必须恒为「原始」——update_checkpoint / 哨兵只保留、绝不更新其值，
+        # 否则 base 会掺进本地事件的派生态，与「重放全部物理事件」二次应用。
+        "bootstrap_tasks": snapshot,
+    })
+    return {"applied": True, "tasks": len(snapshot), "reason": None}
+
+
+def _claim_stale_timeout_s() -> float:
+    """CLAIMED 超时阈值（复用本地 E034 判据，避免二套阈值）。
+
+    延迟导入 orchd.onboard.control 规避模块加载期依赖环（control 处于更高层）。
+    """
+    from orchd.onboard.control import claim_stale_timeout_s
+
+    return claim_stale_timeout_s()
+
+
+def _trunc(value: Any, limit: int = 200) -> Any:
+    """拒收明细回显截断（_parse_delta_events 无体积上限，防超长字段灌响应）。"""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "…"
+    return value
+
+
+def _inbound_retract_verdict(
+    ev: dict[str, Any], by_id: dict[str, dict[str, Any]]
+) -> tuple[bool, str]:
+    """入站 RETRACT 窄口径判定（task-sync-inbound-retract → task-sync-inbound-retract-authz）。
+
+    口径 A（2026-10-08 用户裁决，来源 idea:sync-inbound-trust-hygiene / pass16 P2-6）：
+    **入站授权只取本地可验证的时间事实**——目标为 ``CLAIMED`` / ``REVIEW_CLAIMED``
+    且已超阈值才放行，其余一律拒收。原「作者本人或 ``admin``」两条分支已删：
+
+    - ``ev.agent_id`` 取自**入站事件自身**，``target.agent_id`` 虽取自本地账本，
+      但共享 ref 的 ``delta.jsonl`` 原样携带 CLAIMED 事件的 ``agent_id``
+      （``_write_ledger_ref`` 写的就是事件流），署名对任何能读该 ref 的对端都是
+      公开的 ⇒ 两条分支用的都是可自证、可预知的凭据，不是授权；
+    - 本地那条 ``E034`` 归属守卫（``orchd/onboard/control.py::retract``）比的是
+      **会话身份**（由 session 机制约束），与入站不同源，此前 docstring 称
+      「镜像本地守卫」并不成立；本地仍认 ``admin`` 属既有留账（control.py 注释
+      记为 P2-11，根治需 Registry 认证机制），本卡只收窄入站侧，不对称的理由与
+      代价写进 ``docs/system-design-online.md`` §3.6。
+
+    代价与自愈路径（与边界声明同口径，勿写成「自动解」）：对端**未超时**的自撤认
+    会被拒收，本端该认领停在 ``claimed``，直至超阈值后经僵尸接管通道
+    （``.orchd/rules/session.md`` 接管 SOP 第 4 步，即本函数的 ``stale_claim``
+    分支）或人工 ``force-status`` 处置；接管与人工动作都可被 report 的 stale-claim
+    检测观测。``admin`` 的跨机纠正实际走 ``force_status`` → ``FORCE_STATUS``，
+    而后者入站**整类拒收**（见 ``_INBOUND_LOCAL_ONLY_TYPES``），故删去 ``admin``
+    分支不削减任何当前可达功能。
+
+    Returns:
+        ``(allowed, reason)``。
+    """
+    target_eid = ev.get("target_event_id")
+    target = by_id.get(target_eid) if isinstance(target_eid, str) else None
+    if target is None:
+        return False, f"target_not_found: {target_eid!r}"
+    if target.get("type") == "FORCE_STATUS":
+        return False, "cannot_retract_force_status"
+    ttype = target.get("type")
+    age = review_claim_age_s(target.get("timestamp"))
+    if ttype == "REVIEW_CLAIMED" and age is not None and age >= review_stale_timeout_s():
+        return True, "stale_review_claim"
+    if ttype == "CLAIMED" and age is not None and age >= _claim_stale_timeout_s():
+        return True, "stale_claim"
+    return False, (
+        f"not_authorized: target '{target_eid}' owned by "
+        f"'{target.get('agent_id')}', retractor '{ev.get('agent_id')}' "
+        "（入站授权只认目标已超时）"
+    )
+
+
+def _validate_inbound_events(
+    local_events: list[dict[str, Any]],
+    new_remote: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """入站校验：远端增量逐事件过契约 + 跃迁白矩阵（fail-closed 逐条丢弃）。
+
+    与写路径（``Store.append_event``）同判据，但语义为「丢弃 + 明细」而非抛错：
+    - ``validate_event`` 直接作用于原始事件（不做 ``normalize_event``——缺 ``v``
+      必须拒收，而不是被补缺省放行）；
+    - ``_event_target_status`` + ``validate_transition`` 相对合并序下的运行状态
+      校验（运行状态由本地事件按序派生、全 pending 起点；通过的远端事件即时
+      应用状态，后续远端事件基于最新状态校验——伪造 DONE 被丢弃后不再污染
+      合法 CLAIMED 的判定）；
+    - ``FORCE_STATUS``（见 ``_INBOUND_LOCAL_ONLY_TYPES``）**整类拒收**：本地人工
+      动作（要人二次确认），不跨机复制；且它在转移表里 ``target=None``，放行等于
+      跳过跃迁校验（历史缺陷：伪造 ``completed`` 静默落盘后，此后合法 CLAIMED 被
+      E007 永久拒绝）。本地事件流仍由 ``_track`` 按其 ``target_status`` 派生运行状态，
+      拒收只作用于远端增量；
+    - ``RETRACT`` **窄口径放行**（task-sync-inbound-retract-authz，见
+      ``_inbound_retract_verdict`` 与 ``docs/system-design-online.md`` §3.6）：
+      只认目标认领已超时的时间事实（``CLAIMED`` / ``REVIEW_CLAIMED`` 分走
+      ``claim_stale_timeout_s`` / ``review_stale_timeout_s`` 阈值），不认入站
+      署名与 ``admin``；其余拒收。
+      放行的 RETRACT 经 ``_track`` 应用到派生态（目标事件从 applied 移除并重算），
+      使本端回到「无活跃认领」；
+    - 非 dict 输入（正常经 ``_parse_delta_events`` 已过滤，此处纵深兜底）拒收。
+
+    非法事件逐条丢弃 + 明细返回，不抛错、不中止整库合并（可用性语义不变）。
+
+    Returns:
+        ``(kept, rejected)``：保留事件与拒收明细
+        （``event_id`` / ``type`` / ``task_id`` / ``reason`` / ``basis``）。``basis``
+        取 ``absolute``（同一引擎版本下与设备无关地非法，可自共享转录剔除）或
+        ``relative``（只对本机非法，必须继续携带），是 push 组 delta 排除面的唯一真源。
+    """
+    status: dict[str, str] = {}
+    # task-sync-inbound-retract：放行的 RETRACT 要应用到派生态，否则后续合法
+    # CLAIMED 被跃迁校验误拒（目标认领撤销后本端应回 pending）。按 task 维护
+    # 已应用（未被撤回）事件序，RETRACT 时移除目标事件并重算该任务状态。
+    applied: dict[str, list[dict[str, Any]]] = {}
+
+    def _recompute(tid: str) -> None:
+        st = "pending"
+        for e in applied.get(tid, []):
+            if e.get("type") == "FORCE_STATUS":
+                ts = e.get("target_status", "pending")
+                st = ts if isinstance(ts, str) else "pending"
+            else:
+                tgt = _event_target_status(e)
+                if tgt is not None:
+                    st = tgt
+        status[tid] = st
+
+    def _track(ev: dict[str, Any]) -> None:
+        tid = ev.get("task_id")
+        if not tid or not isinstance(tid, str):
+            return
+        if ev.get("type") == "RETRACT":
+            target_eid = ev.get("target_event_id")
+            applied[tid] = [
+                e for e in applied.get(tid, [])
+                if e.get("event_id") != target_eid
+            ]
+            _recompute(tid)
+            return
+        applied.setdefault(tid, []).append(ev)
+        if ev.get("type") == "FORCE_STATUS":
+            target_status = ev.get("target_status", "pending")
+            status[tid] = (target_status if isinstance(target_status, str)
+                           else "pending")
+            return
+        target = _event_target_status(ev)
+        if target is not None:
+            status[tid] = target
+
+    # 事件按 event_id 索引：供入站 RETRACT 解析被撤目标（本地 + 已保留远端）。
+    by_id: dict[str, dict[str, Any]] = {}
+    for local_ev in local_events:
+        if isinstance(local_ev, dict):
+            # task-ledger-sync-mypy-index-fix：取出并 isinstance 收窄为 str——
+            # `.get()` 静态类型为 Any|None，`if local_ev.get(...)` 只证真值不收窄，
+            # 直接索引 dict[str, ...] 触发 mypy [index] 红（event_id 契约恒为 str）。
+            _ev_id = local_ev.get("event_id")
+            if isinstance(_ev_id, str) and _ev_id:
+                by_id[_ev_id] = local_ev
+            _track(local_ev)
+
+    kept: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    dict_remote: list[dict[str, Any]] = []
+    for remote_ev in new_remote:
+        if not isinstance(remote_ev, dict):
+            rejected.append({
+                "event_id": None,
+                "type": None,
+                "task_id": None,
+                "reason": "not_a_dict: 远端事件不是 JSON 对象",
+                "basis": _INBOUND_REJECT_ABSOLUTE,
+            })
+            continue
+        dict_remote.append(remote_ev)
+    for ev in sorted(dict_remote, key=event_sort_key):
+        eid = ev.get("event_id")
+        etype = ev.get("type")
+        tid = ev.get("task_id")
+        violations = validate_event(ev)
+        if violations:
+            rejected.append({
+                "event_id": eid,
+                "type": etype,
+                "task_id": tid,
+                "reason": "contract: " + "; ".join(violations),
+                "basis": _INBOUND_REJECT_ABSOLUTE,
+            })
+            continue
+        if etype in _INBOUND_LOCAL_ONLY_TYPES:
+            # 整类拒收（本地人工动作不跨机复制）：不入 kept、不 _track，
+            # 明细挂 E030 的 rejected_events，避免伪造终态静默污染后续判定。
+            # task-sync-inbound-retract：仅 FORCE_STATUS 仍整类拒收；RETRACT 走
+            # 下方窄口径（_inbound_retract_verdict）。
+            rejected.append({
+                "event_id": eid,
+                "type": etype,
+                "task_id": tid,
+                "reason": (
+                    "local_only: 本地人工动作不跨机复制，整类拒收"
+                    f"（target_status={_trunc(ev.get('target_status'))!r}）"
+                ),
+                "basis": _INBOUND_REJECT_ABSOLUTE,
+                "target_status": _trunc(ev.get("target_status")),
+            })
+            continue
+        if etype == "RETRACT":
+            allowed, verdict_reason = _inbound_retract_verdict(ev, by_id)
+            if not allowed:
+                rejected.append({
+                    "event_id": eid,
+                    "type": etype,
+                    "task_id": tid,
+                    "reason": f"retract_narrow: {verdict_reason}",
+                    "basis": _INBOUND_REJECT_RELATIVE,
+                    "target_event_id": _trunc(ev.get("target_event_id")),
+                })
+                continue
+            if eid:
+                by_id[eid] = ev
+            _track(ev)
+            kept.append(ev)
+            continue
+        target = _event_target_status(ev)
+        if tid and target:
+            try:
+                validate_transition(
+                    ev.get("type", ""),
+                    status.get(tid, "pending") if isinstance(tid, str)
+                    else "pending",
+                    target,
+                )
+            except OrchdError as exc:
+                rejected.append({
+                    "event_id": eid,
+                    "type": etype,
+                    "task_id": tid,
+                    "reason": f"transition: {exc.message}",
+                    "basis": _INBOUND_REJECT_RELATIVE,
+                })
+                continue
+        if eid:
+            by_id[eid] = ev
+        _track(ev)
+        kept.append(ev)
+    return kept, rejected
+
+
+def _count_inbound_rejected(warnings: list[dict[str, Any]]) -> int:
+    """从合并告警中汇总入站校验拒收数（调用方结果字段用）。"""
+    total = 0
+    for warning in warnings:
+        context = warning.get("inbound_validation")
+        if isinstance(context, dict):
+            total += int(context.get("rejected", 0) or 0)
+    return total
+
+
+def _inbound_rejected_ids(warnings: list[dict[str, Any]]) -> set[str]:
+    """从合并告警中取**绝对非法**拒收事件的 event_id 集合（push 组 delta 排除用）。
+
+    与 :func:`_count_inbound_rejected` 同一明细源（E030 的
+    ``inbound_validation.rejected_events``，构造点见 ``_reconcile_local``）——计数与
+    点名共用一份真源，不另设第二套判定。
+
+    只点名 ``basis == "absolute"`` 那批（同一引擎版本下与设备无关地非法：非 dict /
+    契约违约 / 本地专用类型）。``relative``（跃迁白矩阵、RETRACT 窄口径）的判定基准是本机派生态
+    与本机账本，同一事件对状态落后的另一端完全合法——按它删共享转录，等于给一台
+    设备删除另一台设备历史事件的权力。条目缺 ``basis`` 键（旧告警、手构明细）一律
+    按 relative 处理：不确定就继续携带，转录完整性优先于净化。
+    """
+    ids: set[str] = set()
+    for warning in warnings:
+        context = warning.get("inbound_validation")
+        if not isinstance(context, dict):
+            continue
+        for entry in context.get("rejected_events") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("basis") != _INBOUND_REJECT_ABSOLUTE:
+                continue
+            if entry.get("event_id"):
+                ids.add(str(entry["event_id"]))
+    return ids
 
 
 def _reconcile_local(
@@ -653,10 +1117,54 @@ def _reconcile_local(
         source: 触发来源（pull / push / compact），写入告警上下文。
 
     Returns:
-        ``(merged_events, warnings)``；warnings 含 id 碰撞告警与相抵重建告警。
+        ``(merged_events, warnings)``；warnings 含 id 碰撞告警、相抵重建告警、
+        入站校验拒收告警（E030，拒收明细挂 ``inbound_validation``）。
     """
-    merged, collisions = _merge_events_detailed(local_events + new_remote)
+    kept_remote, inbound_rejected = _validate_inbound_events(
+        local_events, new_remote)
+    merged, collisions = _merge_events_detailed(local_events + kept_remote)
     warnings: list[dict[str, Any]] = list(collisions)
+    # 接触即纠接入（task-counter-cache-reconcile D2）：既存计数漂移进入本
+    # 汇聚点即归位并留 info 级痕——幂等分支（merged == local）原先对漂移完全
+    # 静默（V3 实锤形态），此后每次 sync 都是纠偏触点。与下方 counter_drift
+    # 重建告警正交：那条比「缓存 vs 去重逻辑流」（承载重复探测），本条比
+    # 「缓存 vs 实体物理数」（缓存归位），两层哨兵各司其职。
+    rec = store.reconcile_counters()
+    if rec.get("drift"):
+        warnings.append({
+            "code": "counter_recalibrated",
+            "severity": "info",
+            "source": source,
+            "message": (
+                "sync 接触即纠：计数缓存漂移 "
+                f"{rec.get('from')} → 实体真值 {rec.get('to')} 已归位"
+                if rec.get("recalibrated") else
+                "计数缓存漂移 "
+                f"{rec.get('from')} ≠ 实体 {rec.get('to')}——"
+                "当前为只读通道未归位，可写进程接触即自愈"
+            ),
+            "counter_recalibrate": {
+                "from": rec.get("from"),
+                "to": rec.get("to"),
+                "repaired": bool(rec.get("recalibrated")),
+            },
+        })
+    if inbound_rejected:
+        warnings.append({
+            "code":
+            ErrorCode.E030.name,
+            "severity":
+            "warning",
+            "message": (f"sync 入站校验拒收 {len(inbound_rejected)} 条非法远端事件"
+                        "（逐条丢弃，整库合并继续）"),
+            "source":
+            source,
+            "inbound_validation": {
+                "rejected": len(inbound_rejected),
+                "kept": len(kept_remote),
+                "rejected_events": inbound_rejected,
+            },
+        })
     if merged == local_events:
         # 未触发重建也要刷新软校验观测（L-3）：合并结果与本地一致时仍可能存在
         # 序列级违规（例如远端冲突事件被 event_id 去重丢弃，但冲突本身值得暴露）
@@ -677,6 +1185,36 @@ def _reconcile_local(
             })
         # 内含 replay_full → 顺带采集序列级软校验违规
         _rebuild_local_ledger(store, merged)
+
+        # 计数不变量（task-sync-rebuild-active-suffix）：后端持久计数器与读侧逻辑流
+        # 必须同数——活跃段重复承载归档前缀时，event_count 把归档事件二次计入，而
+        # read_events 按 event_id 去重掩盖了它，两者当场背离。重建后立刻核对，不等
+        # 下一个进程（或另一台设备）去发现。只在重建分支查：幂等重复合并不落盘，
+        # 无需为此多付一遍读侧成本。
+        _counted = store.backend.event_count()
+        _read_len = len(store.backend.read_events())
+        if _counted != _read_len:
+            _archive_n = len(read_archive_events(_store_runtime_root(store))[0])
+            warnings.append({
+                "code":
+                ErrorCode.E030.name,
+                "severity":
+                "warning",
+                "message": (
+                    f"sync 重建后计数背离：后端 event_count={_counted} 与 "
+                    f"len(read_events())={_read_len} 不符"
+                    "（活跃段疑似重复承载归档前缀，读侧靠 event_id 去重掩盖）"
+                ),
+                "source":
+                source,
+                "counter_drift": {
+                    "archive_events": _archive_n,
+                    "active_events": _counted - _archive_n,
+                    "logical_total": _read_len,
+                    "backend_event_count": _counted,
+                    "read_events_len": _read_len,
+                },
+            })
 
     # L-3（task-ledger-replay-visibility）：replay 序列级软校验违规汇总——只告警、
     # 不阻断、不改派生状态，以结构化字段（violations）挂在 warning 上，随 sync
@@ -763,9 +1301,11 @@ def pull(
 
     幂等：远端 delta 中本地已有的事件被跳过，重复 pull 无副作用。
 
-    信任边界（task-pass9-ref-tx-sync-hardening，pass9 F9）：远端事件按**可信输入**
-    处理，无签名 / 哈希链校验——单机可信协作假设与 2.0 演进要求见
-    ``docs/implementation-design.md`` §4.6「跨设备账本同步信任边界」。
+    信任边界（task-pass9-ref-tx-sync-hardening，pass9 F9）：远端事件无签名 /
+    哈希链校验（单机可信协作假设与 2.0 演进要求见
+    ``docs/implementation-design.md`` §4.6「跨设备账本同步信任边界」），但入库前
+    逐事件过入站校验（``_validate_inbound_events``：契约 + 跃迁白矩阵，非法逐条
+    丢弃 + E030 可观测计数，不中止整库合并）。
     Returns:
         {pulled, local_events, remote, merged}：合并摘要；远端尚无 ref 时
         ``remote_ref`` 为 None。
@@ -783,13 +1323,32 @@ def pull(
                 store.ledger_line_count() if store.ledger_exists() else 0,
                 "remote_ref":
                 None,
+                "bootstrap": {
+                    "applied": False,
+                    "tasks": 0,
+                    "reason": "no_remote_ref",
+                },
                 "note":
                 f"远端 '{remote}' 尚无 {ORCHD_LEDGER_REF} ref",
             }
         delta_text = _read_ref_file(project_root, "FETCH_HEAD", _REF_DELTA)
         state_text = _read_ref_file(project_root, "FETCH_HEAD", _REF_STATE)
-        remote_delta = _parse_delta_events(delta_text)
+        remote_delta, malformed_skipped = _parse_delta_events(delta_text)
         missing_id_count = _inject_deterministic_ids(remote_delta)
+        # 远端快照解析分类：非 dict / 不可解析分别留痕，供 bootstrap 判据返回
+        # 结构化 reason（正常 pull 里它仍只是回显摘要的来源）。
+        remote_state: dict[str, Any] = {}
+        state_error: str | None = None
+        if state_text:
+            try:
+                parsed_state = json.loads(state_text)
+            except (json.JSONDecodeError, ValueError):
+                state_error = "state_unparsable"
+            else:
+                if isinstance(parsed_state, dict):
+                    remote_state = parsed_state
+                else:
+                    state_error = "state_not_object"
         # 阶段 2（持账本锁，短暂）：本地快照 + 合并重建（网络段已在锁外完成）
         with _ledger_section(store):
             local_events = store.backend.read_events() if store.ledger_exists(
@@ -806,14 +1365,23 @@ def pull(
                                                           local_events,
                                                           new_remote,
                                                           source="pull")
-        remote_state = json.loads(state_text) if state_text else {}
+            # 新设备 bootstrap（task-sync-compact-bootstrap-from-state）：远端
+            # delta 已被 compact 置空时，用远端 state 快照建本地 checkpoint，
+            # 否则新设备派生态全空。判据与写入细节见 _bootstrap_local_from_state。
+            bootstrap = _bootstrap_local_from_state(store, remote_state,
+                                                    local_events,
+                                                    remote_delta, state_error)
         result: dict[str, Any] = {
             "performed": True,
             "pulled": len(new_remote),
             "remote_events_without_id": missing_id_count,
+            "remote_malformed_skipped": malformed_skipped,
+            "remote_rejected":
+            _count_inbound_rejected(reconcile_warnings),
             "local_events": len(merged),
             "remote_ref": ORCHD_LEDGER_REF,
             "remote": _state_summary(remote_state),
+            "bootstrap": bootstrap,
         }
         if reconcile_warnings:
             result["warnings"] = reconcile_warnings
@@ -836,8 +1404,9 @@ def push(
 
     流程（pull-first）：
     1. fetch 远端 ref；远端 delta 中本地缺失事件合并进本地账本（去重重建）；
-    2. 本地新事件 = marker 之后的本地事件；新 delta = 远端存量 delta ∪ 本地新事件
-       （去重），确保不丢他端尚未 compact 的事件尾；
+    2. 本地新事件 = marker 之后的本地事件；新 delta = 远端存量 delta（剔除本次被判
+       ``basis=absolute`` 的入站拒收事件，relative 类继续携带）∪ 本地新事件（去重），
+       确保不丢他端尚未 compact 的事件尾；
     3. 从合并后本地账本重算 state.json（O(任务数)）；
     4. 单提交 tree（state.json + delta.jsonl），``--force-with-lease`` 推送。
     push 成功后更新本地 marker 为本地最后事件 id。
@@ -849,8 +1418,9 @@ def push(
         remote_delta: list[dict[str, Any]] = []
         expected_sha: str | None = None
         missing_id_count = 0
+        malformed_skipped = 0
         if has_remote:
-            remote_delta = _parse_delta_events(
+            remote_delta, malformed_skipped = _parse_delta_events(
                 _read_ref_file(project_root, "FETCH_HEAD", _REF_DELTA))
             missing_id_count = _inject_deterministic_ids(remote_delta)
             expected_sha = _fetch_head_sha(project_root)
@@ -878,8 +1448,20 @@ def push(
             mark = _load_marker(store)
             local_after = _events_after(local_events,
                                         mark.get("last_pushed_event_id"))
+            # 被**绝对判非法**的入站拒收事件不得再被 republish（task-sync-push-kept-events）：
+            # 合并侧已逐条判过（_validate_inbound_events），此处只排除其中 basis=absolute
+            # 那批（同一引擎版本下与设备无关地非法）。两条边界都得守住：
+            # ① 不对 remote_delta 全集重跑判据——本地状态领先于转录时，合法旧事件会被判
+            #    invalid_transition（如 done --CLAIMED--> claimed）而遭踢出 delta；
+            # ② 也不排除 basis=relative 那批——它只对本机派生态/本机账本非法，对状态落后
+            #    的他端完全合法，删它就是让一台设备删掉另一台设备的历史事件。
+            rejected_ids = _inbound_rejected_ids(reconcile_warnings)
+            kept_remote_delta = (
+                [ev for ev in remote_delta
+                 if ev.get("event_id") not in rejected_ids]
+                if rejected_ids else remote_delta)
             delta, delta_collisions = _merge_events_detailed(local_after +
-                                                             remote_delta)
+                                                             kept_remote_delta)
             reconcile_warnings.extend(delta_collisions)
 
             violations_snapshot = store.replay_violations
@@ -899,6 +1481,9 @@ def push(
             "pushed_delta": pushed,
             "remote_delta_merged": len(new_remote),
             "remote_events_without_id": missing_id_count,
+            "remote_malformed_skipped": malformed_skipped,
+            "remote_rejected":
+            _count_inbound_rejected(reconcile_warnings),
             "local_events": len(merged),
             "commit": commit_sha,
             "delta_events": len(delta),
@@ -934,8 +1519,9 @@ def compact(
         remote_delta: list[dict[str, Any]] = []
         expected_sha: str | None = None
         missing_id_count = 0
+        malformed_skipped = 0
         if has_remote:
-            remote_delta = _parse_delta_events(
+            remote_delta, malformed_skipped = _parse_delta_events(
                 _read_ref_file(project_root, "FETCH_HEAD", _REF_DELTA))
             missing_id_count = _inject_deterministic_ids(remote_delta)
             expected_sha = _fetch_head_sha(project_root)
@@ -972,6 +1558,9 @@ def compact(
             "compacted_delta": len(remote_delta) + 0,
             "merged_from_remote": len(new_remote),
             "remote_events_without_id": missing_id_count,
+            "remote_malformed_skipped": malformed_skipped,
+            "remote_rejected":
+            _count_inbound_rejected(reconcile_warnings),
             "local_events": len(merged),
             "commit": commit_sha,
             "state_tasks": len(state.get("tasks", {})),
@@ -1006,7 +1595,7 @@ def status_remote(
         state_text = _read_ref_file(project_root, "FETCH_HEAD", _REF_STATE)
         delta_text = _read_ref_file(project_root, "FETCH_HEAD", _REF_DELTA)
         state = json.loads(state_text) if state_text else {}
-        delta = _parse_delta_events(delta_text)
+        delta, delta_malformed = _parse_delta_events(delta_text)
         return {
             "performed":
             True,
@@ -1018,6 +1607,8 @@ def status_remote(
             _state_summary(state),
             "delta_events":
             len(delta),
+            "delta_malformed_skipped":
+            delta_malformed,
             "local_events":
             store.ledger_line_count() if store.ledger_exists() else 0,
         }

@@ -150,6 +150,13 @@
             "x-amendable": false,
             "x-terminal-attachable": false
           },
+          "phase": {
+            "type": "string",
+            "pattern": "^\\S(?:.*\\S)?$",
+            "description": "任务所属执行阶段（阶段串行工作流用，非必填）。与评审阶段正交，也与 module / line 正交；缺省视为中立，不参与阶段推进判定。",
+            "x-amendable": false,
+            "x-terminal-attachable": false
+          },
           "depends_on": {
             "type": "array",
             "items": {

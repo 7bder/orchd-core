@@ -145,17 +145,22 @@ def _guard_failed(
         context=context,
         hint=hint,
     )
-    raise OrchdError(
-        error_code,
-        f"guard_failed: 门禁 {guard_name} 校验故障，fail-closed 拒绝放行",
-        [{
-            **entry,
-            "hint": hint or (
-                "门禁没跑起来 ≠ 校验通过：请重试本命令；持续失败请检查 git 可用性、"
-                "仓库规模或杀毒软件实时扫描，确认环境无异常后人工重试"
-            ),
-        }],
-    ) from exc
+    message = f"guard_failed: 门禁 {guard_name} 校验故障，fail-closed 拒绝放行"
+    details = [{
+        **entry,
+        "hint": hint or (
+            "门禁没跑起来 ≠ 校验通过：请重试本命令；持续失败请检查 git 可用性、"
+            "仓库规模或杀毒软件实时扫描，确认环境无异常后人工重试"
+        ),
+    }]
+    # task-channel-a-severity-param-raise ②：本处原为
+    # ``raise OrchdError(error_code, ...)``（参数化）——通道 A 扫描器按字面码枚举，
+    # 该形态不被识别（全库唯一一处参数化 raise）。取值域经调用链证明恰为
+    # {E018, E030}（run_guard 默认 E030；_probe_guard_workspace_state 传 E018），
+    # 故显式分派为两个字面码站点使登记表可见；语义与文案零变化。
+    if error_code == ErrorCode.E018:
+        raise OrchdError(ErrorCode.E018, message, details) from exc
+    raise OrchdError(ErrorCode.E030, message, details) from exc
 
 
 def run_guard(

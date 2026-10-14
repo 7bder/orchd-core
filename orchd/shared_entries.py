@@ -68,6 +68,7 @@ task-e039-escape-hatch-bypass-fix，pass6 Q-1）：
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -124,7 +125,54 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_session_lock_acquire_respect.py",
         "tests/test_session_lock_unlink_race.py",
     ),
+    # task-caliber-residue-and-surface-gate：CLI 注册面与命令模块入表。此前
+    # 「改子命令却忘把对拍测试放进 verify」只能靠 verify.md 的散文约束——E039 不会拦，
+    # 因为这两处根本不在表里（`idea archive` 上线时手册行 help 与 parser 漂移就是这么漏的）。
+    "orchd/cli/parser.py": (
+        "tests/test_docs_single_source.py",
+        "tests/test_cli_contract.py",
+    ),
+    "orchd/cli/commands/ideas.py": (
+        "tests/test_cli_ideas.py",
+        "tests/test_docs.py",
+    ),
 }
+
+# ``orchd/cli/commands/`` 下**显式豁免**入表的模块（task-caliber-residue-and-surface-gate）：
+# ``{仓库相对 POSIX 路径: 理由}``。豁免必须在此写明理由——新增命令文件若不决策（既不登记
+# 也不豁免）即由 :func:`cli_command_modules_unaccounted` 判红。这些模块的对外面没有独立
+# 行为测试，其 help 文案与命令名由 tests/test_docs.py 的 AST 守卫 + tests/test_cli_contract.py
+# 的名字集对拍覆盖（通用门），故不逐个登记成"改它就要求跑某个专属测试"。
+CLI_COMMAND_MODULE_EXEMPT: dict[str, str] = {
+    "orchd/cli/commands/__init__.py": "仅注册顺序表（_REGISTER_ORDER），无独立行为面",
+    "orchd/cli/commands/check.py": "只读体检命令，对外面由通用门（help AST + 名字集对拍）覆盖",
+    "orchd/cli/commands/control.py": "事件写入类命令，行为面由 tests/test_cli_workflow.py 覆盖",
+    "orchd/cli/commands/lessons.py": "经验回灌命令组，行为面由 tests/test_lessons*.py 覆盖",
+    "orchd/cli/commands/line.py": "分线只读命令，对外面由通用门覆盖",
+    "orchd/cli/commands/misc.py": "零散运维命令，对外面由通用门覆盖",
+    "orchd/cli/commands/query.py": "只读查询命令，对外面由通用门覆盖",
+    "orchd/cli/commands/session.py": "会话命令组，行为面由 tests/test_session*.py 覆盖",
+    "orchd/cli/commands/sync.py": "账本同步命令，行为面由 tests/test_sync*.py 覆盖",
+    "orchd/cli/commands/workflow.py": "任务流程命令组，行为面由 tests/test_cli_workflow.py 覆盖",
+}
+
+
+def cli_command_modules_unaccounted(commands_dir: Path) -> list[str]:
+    """``commands_dir`` 下既未登记进 ``SHARED_ENTRY_TESTS`` 也不在豁免集内的模块。
+
+    完备性判据（task-caliber-residue-and-surface-gate AC4）：新命令文件必须**做出决定**
+    ——登记入表（则改它就必须把登记测试放进 verify_command，否则 E039 拦）或写进
+    :data:`CLI_COMMAND_MODULE_EXEMPT` 并给出理由。两者都不做即非空列表 ⇒ 判红。
+    返回值用仓库相对 POSIX 路径（与登记表键同口径）。
+    """
+    unaccounted: list[str] = []
+    repo_root = commands_dir.resolve().parents[2]  # <root>/orchd/cli/commands → <root>
+    for path in sorted(commands_dir.glob("*.py")):
+        rel = path.resolve().relative_to(repo_root).as_posix()
+        if rel in SHARED_ENTRY_TESTS or rel in CLI_COMMAND_MODULE_EXEMPT:
+            continue
+        unaccounted.append(rel)
+    return unaccounted
 
 # 全局共享文件（形态 A）：影响面无法枚举的共享入口——改它影响**全量**用例，因此不存在
 # 「断言它的有限测试文件集合」可登记。对这些文件，门禁退一步要求 verify_command 的 pytest

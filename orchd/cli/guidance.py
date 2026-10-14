@@ -18,6 +18,7 @@ from typing import Any
 # 3a 收尾（task-split-cli-remove-legacy）：直接从子包导入，替代 legacy 延迟委托
 from orchd.cli._util import _find_orchd_dir
 from orchd.cli.identity import _resolve_agent_id
+from orchd.contracts.events import TERMINAL_STATUSES
 
 
 def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") -> Any:
@@ -147,7 +148,7 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
                 _recycled = False
                 try:
                     _ts = state.get(focus_tid) if focus_tid else None
-                    _recycled = _ts is not None and _ts.status in ("completed", "cancelled")
+                    _recycled = _ts is not None and _ts.status in TERMINAL_STATUSES
                 except Exception:
                     _recycled = False
                 if _recycled:

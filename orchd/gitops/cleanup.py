@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
@@ -25,7 +26,7 @@ def _os_delete_file(path: Path) -> bool:
         ``True`` 文件已直接删除；``False`` 底层删除失败。
     """
     try:
-        if os.name == "nt":
+        if sys.platform == "win32":
             import ctypes
 
             # 清只读属性后删除（Windows 只读文件 DeleteFileW 会失败）
@@ -65,7 +66,7 @@ def _os_delete_tree(path: Path) -> bool:
         # 递归删子项（失败静默，由目录删除失败统一返回 False）
         for child in path.iterdir():
             _os_delete_tree(child)
-        if os.name == "nt":
+        if sys.platform == "win32":
             import ctypes
 
             # 清只读属性后删空目录（Windows 只读目录 RemoveDirectoryW 失败）

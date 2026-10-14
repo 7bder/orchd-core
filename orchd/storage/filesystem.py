@@ -173,6 +173,10 @@ class FilesystemBackend(StorageBackend):
 
         compact 只搬运不删除逻辑事件，故总数在压实前后不变； doctor 的
         checkpoint_consistency 与 H4 计数器沿用本口径，无需改动。
+
+        契约（task-counter-cache-reconcile D1）：本后端**无持久计数缓存**——
+        每次调用即实体重算，返回值恒为真值；端口默认
+        ``recalibrate_event_count() is None`` 即此语义（无缓存可纠）。
         """
         from orchd.storage import archive_event_count
 
@@ -248,3 +252,13 @@ class FilesystemBackend(StorageBackend):
     def release_lock(self) -> None:
         """释放文件锁（ExclusiveFileLock 原语，depth 到 0 才真正释放）。"""
         self._file_lock.release()
+
+    def ledger_exists(self) -> bool:
+        """账本文件是否存在。"""
+        return self.ledger_path.exists()
+
+    def create_empty_ledger(self) -> str | None:
+        """创建空账本文件（幂等）；返回创建的工件名。"""
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger_path.touch()
+        return self.ledger_path.name

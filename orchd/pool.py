@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.ledger import Store, TaskState
 
 # importance 权重映射
@@ -200,7 +201,7 @@ def build_pool(
         for dep_id in deps:
             dep_ts = state.get(dep_id)
             dep_status = dep_ts.status if dep_ts else "pending"
-            if dep_status not in ("completed", "cancelled"):
+            if dep_status not in TERMINAL_STATUSES:
                 deps_satisfied = False
                 break
         if not deps_satisfied:

@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
 from orchd.gitops import (
     GUARD_FAIL_CLOSED,
@@ -114,8 +115,12 @@ def _branch_degraded_guard(task_id: str, branch_state: dict[str, Any]) -> dict[s
 
 
 # brief/acceptance_criteria 中常见文件路径模式（task-amend-scope-add 连带文件预警）。
+# task-claim-ghost-dot-strip（批次 4a）：前导点必须随匹配保留——旧形态对
+# ".orchd/IDEAS.md" 从 "orchd" 起匹配，捕获串丢前导点，(project_root/"orchd/IDEAS.md")
+# 不存在 → 把真实存在的 .orchd/... 报成幽灵。`(?<![\w.])\.?` 保证只在前导点前的字符
+# 非词字符/非点时（字符串首 / 空白 / 引号 / 括号）才起匹配，且把该点纳入捕获串。
 _SCOPE_FILE_RE = re.compile(
-    r"(?:orchd|tests|scripts|docs|rules|templates|design)/[\w./-]+\.(?:py|md|json|yaml|yml|txt)"
+    r"(?<![\w.])\.?(?:orchd|tests|scripts|docs|rules|templates|design)/[\w./-]+\.(?:py|md|json|yaml|yml|txt)"
 )
 
 
@@ -203,7 +208,7 @@ def _claim_precheck(
     project_root: Path | None,
     review_type: str | None,
     enforce_self_review_block: bool,
-) -> tuple[dict[str, Any], str, str | None, list[dict[str, Any]], dict[str, Any] | None]:
+) -> tuple[dict[str, Any], str, str | None, list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
     # task-flat-decl-authority：task_def 经 resolve_declaration_source 解析
     # （flat 下从 main blob 读权威声明，防任务分支本地副本陈旧）。
     degraded_guards: list[dict[str, Any]] = []
@@ -274,7 +279,7 @@ def _claim_setup_worktree(
                 })
             worktree_path = str(Path(project_root).resolve())
             try:
-                bind_task_wt(resolve_store_dir(store.orchd_dir), task_id, worktree_path)
+                bind_task_wt(resolve_store_dir(store.orchd_dir), task_id, Path(worktree_path))
             except Exception as exc:  # pragma: no cover - 绑定失败降级留痕
                 degraded_guards.append({"guard": "bind_task_wt", "task_id": task_id, "error": str(exc), "hint": "binding failed, degraded"})
             return worktree_path, degraded_warning
@@ -291,9 +296,30 @@ def _claim_setup_worktree(
         files_to_edit = task_def.get("files_to_edit", [])
         if files_to_edit:
             hook_install(project_root, task_id, files_to_edit, exempt_files=task_def.get("exempt_files"))
+        # pass13 §11-9 甲案：旧布局经验库迁移接进 claim 的「工作树就绪」段。此前
+        # ``migrate_lessons_to_runtime`` **零生产调用者**（全仓只命中 doctor.py 的提示
+        # 文本与 tests），container 重定向后旧布局 lessons*.jsonl 成孤儿 ⇒ lookup 恒 0、
+        # guidance 注入空转。函数本体已具备安全前提：幂等（目标已存在不覆盖、保留行序）、
+        # 只在账本根重定向生效时扫描（flat 返回 reason=flat_no_redirect 零操作）、持
+        # lessons.lock 且拿不到锁 reason=lock_busy 绝不清阻塞——故可放热路径。
+        # fail-open：迁移异常一律经 degraded_guards 留痕（与同段 bind_task_wt /
+        # master_suppression 同形），绝不因观测性动作阻塞认领，也不得静默吞掉。
+        try:
+            from orchd.migrate import migrate_lessons_to_runtime
+
+            migrate_lessons_to_runtime(store.orchd_dir)
+        except Exception as exc:
+            degraded_guards.append({
+                "guard": "lessons_migrate",
+                "task_id": task_id,
+                "error": str(exc),
+                "hint": "旧布局经验库迁移失败，已降级留痕（不阻塞 claim；可手工运行 "
+                        "python -c \"from orchd.migrate import migrate_lessons_to_runtime; "
+                        "migrate_lessons_to_runtime('.orchd')\"）",
+            })
         if worktree_path is not None:
             try:
-                bind_task_wt(resolve_store_dir(store.orchd_dir), task_id, worktree_path)
+                bind_task_wt(resolve_store_dir(store.orchd_dir), task_id, Path(worktree_path))
             except Exception as exc:
                 degraded_guards.append({"guard": "bind_task_wt", "task_id": task_id, "error": str(exc), "hint": "binding failed, degraded"})
             # task-master-single-copy：master 副本抑制现在是唯一权威机制（worktree
@@ -458,7 +484,7 @@ def _claim_write_event(
                     )
             for dep_id in task_def.get("depends_on", []):
                 dep_ts = state.get(dep_id)
-                if (dep_ts.status if dep_ts else "pending") not in ("completed", "cancelled"):
+                if (dep_ts.status if dep_ts else "pending") not in TERMINAL_STATUSES:
                     raise OrchdError(ErrorCode.E008, f"dependency_not_met: '{task_id}' blocked_by {dep_id} status={dep_ts.status if dep_ts else 'pending'}", [{"task_id": task_id, "blocked_by": dep_id, "blocked_status": dep_ts.status if dep_ts else "pending", "hint": f"依赖 {dep_id} 未完成（当前 {dep_ts.status if dep_ts else 'pending'}），需等待其 completed 后重试"}])
             conflicts = detect_file_conflict(state, tasks, task_def)
             if conflicts:
@@ -544,6 +570,78 @@ def _resolve_review_worktree(project_root: Path | None, task_id: str) -> Path | 
     from orchd.gitops_ops import resolve_task_worktree
 
     return resolve_task_worktree(project_root, task_id)
+
+
+def _attach_verify_head_drift(
+    result: dict[str, Any],
+    task_def: dict[str, Any],
+    task_id: str,
+    project_root: Path | None,
+    done_event: dict[str, Any],
+    degraded: list[dict[str, Any]],
+) -> None:
+    """DONE 存证与所审内容的同源校验：**仅位移时**按 HEAD 复跑（不阻断）。
+
+    task-review-verify-at-head（裁决 A'）：DONE 时跑的那一次 verify 只覆盖 DONE
+    那一刻的代码，「DONE 之后补交提交」在机器视角里不受任何 verify 覆盖——审查
+    凭据与所审内容不同源，「补一笔改动再送审」即可绕过机器复跑。本函数补上该洞，
+    但按**条件触发**以守住两条边界：
+
+    - **无位移**（含「存证无锚」这一旧存证 / 降级态）：**零子进程、零新增字段**，
+      响应与改动前逐字一致（AC3）——无条件复跑会让每次认领多等最长 120s，且与
+      ``rules/review.md:32``「默认引用不重跑」冲突；
+    - **位移**：按 HEAD 复跑 verify_command，把新记录塞进 ``verify_at_head`` 与
+      DONE 存证 ``verify`` **并列**（AC2）；复跑失败只把 ``severity`` 提到
+      ``error`` 并进 ``degraded``，**不阻断认领**（AC4）——「边审边补交」是合法
+      动作（本轮 A/B2 两卡均在审查期补交提交），阻断它等于惩罚修错。
+
+    复跑目录解析到**任务 worktree**（:func:`_resolve_review_worktree`）：container
+    布局下审查由主工作树发起，直接拿 ``project_root`` 会让 verify 跑错目录。
+
+    Args:
+        result: 认领响应字典（原地并入字段）。
+        task_def: 任务定义（复跑取 ``verify_command``）。
+        task_id: 任务 id。
+        project_root: 审查发起目录（主工作树或任务 worktree）。
+        done_event: DONE 事件（取其 ``verify.head`` 作为基线锚）。
+        degraded: 降级留痕列表（复跑异常时追加）。
+
+    Returns:
+        None（副作用落在 ``result`` 与 ``degraded`` 上）。
+    """
+    verify = done_event.get("verify") or {}
+    baseline_head = verify.get("head")
+    if not baseline_head or project_root is None:
+        return  # 无锚 → 无从比对，fail-open（行为退化为改动前）
+    current_head = task_branch_head(project_root, task_id)
+    if not current_head or current_head == baseline_head:
+        return  # 无位移 → 零成本：不跑子进程、不产噪声字段
+    # **不**回退 project_root：解析不到任务 worktree 时复跑会落在主工作树，
+    # 而 current_head 取的是任务分支 tip —— 执行目录与所审 HEAD 不同源，跑出来的
+    # ok 是**误导性凭据**，比不复跑更糟（本卡要防的正是假凭据）。故解析不到就
+    # 走降级通道留痕、不复跑。
+    wt_root = _resolve_review_worktree(project_root, task_id)
+
+    def _rerun() -> dict[str, Any] | None:
+        if wt_root is None:
+            raise NotApplicableError("任务 worktree 未解析到：不在主工作树复跑")
+        from orchd.onboard.lifecycle.core import rerun_verify_at_head
+
+        return rerun_verify_at_head(task_def, task_id, wt_root)
+
+    at_head = run_guard(
+        _rerun, guard_name="verify_at_head_rerun", on_error=GUARD_WARN,
+        fallback=None, context={"task_id": task_id},
+        hint="verify 按 HEAD 复跑失败（不阻断认领）", degraded=degraded,
+    )
+    result["verify_head_drift"] = {
+        "code": "verify_head_drift",
+        "baseline_head": baseline_head,
+        "current_head": current_head,
+        "severity": "info" if (at_head or {}).get("ok") else "error",
+    }
+    if at_head is not None:
+        result["verify_at_head"] = at_head
 
 
 def _reconcile_mergeability(
@@ -678,7 +776,7 @@ def _claim_review_branch(
             result["rerun_command"] = rerun
     except Exception:
         pass  # best-effort：重跑模板生成失败不阻断认领
-    review_degraded = []
+    review_degraded: list[dict[str, Any]] = []
 
     def _diag() -> dict[str, Any]:
         if project_root is None:
@@ -693,7 +791,7 @@ def _claim_review_branch(
         # False → 诊断恒降级 not worktree（branch_files / missing_declared_files
         # 恒为 null）。先按布局把诊断作用域解析到任务 worktree 再判定。
         diag_root = _resolve_review_worktree(project_root, task_id)
-        if not is_task_worktree(diag_root):
+        if diag_root is None or not is_task_worktree(diag_root):
             raise NotApplicableError("not worktree")
         # 诊断作用域已解析到任务 worktree（恒 git linked）→ 经端口分发恒命中
         # GitBackend，与原 task_branch_files 同函数（task-repo-migration-callsites）。
@@ -713,6 +811,15 @@ def _claim_review_branch(
     mergeability = _reconcile_mergeability(project_root, task_id)
     if mergeability is not None:
         result["mergeability"] = mergeability
+    # task-review-verify-at-head：DONE 存证与所审内容同源校验——无位移零成本，
+    # 位移才按 HEAD 复跑并把新旧两份并列；复跑失败只告警、不阻断认领。
+    if done_event:
+        _attach_verify_head_drift(
+            result, task_def, task_id, project_root, done_event, review_degraded)
+        if review_degraded:
+            # 复跑的降级留痕发生在本行之前、上面那个合并点之后 —— 补一次合并，
+            # 否则「复跑失败」这条留痕不会出现在响应里（审查侧就看不见）。
+            result["degraded_guards"] = degraded_guards + review_degraded
     return result
 
 
@@ -735,7 +842,8 @@ def claim(
     degraded_warning = None
     if role == "implementer" and project_root:
         worktree_path, degraded_warning = _claim_setup_worktree(project_root, task_id, task_def, store, degraded_guards)
-    review_phase = (store.replay().get(task_id).review_phase if store.replay().get(task_id) else None)
+    _review_ts = store.replay().get(task_id)
+    review_phase = _review_ts.review_phase if _review_ts else None
     if role == "reviewer":
         rb = _claim_review_branch(store, task_id, task_def, project_root, role, derived, review_phase, is_self_review, event, degraded_guards, shared, enforce_self_review_block=enforce_self_review_block)
         if rb is not None:

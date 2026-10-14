@@ -24,6 +24,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -74,9 +75,12 @@ def _is_junk_entry(name: str) -> bool:
 # <容器>/.orchd-runtime/，迁移时须从 main/.orchd/ 搬入，否则历史对引擎不可见。
 # master 目录文件（_master.json/shared/rules/IDEAS/ROADMAP/SKILL/templates/
 # proposals/merge-acks.json/.layout.json）保留在 main/.orchd/，不在此列。
+# task-migrate-sqlite-carrier：sqlite 载体一并搬运（库 + WAL 旁瓣；同目录
+# 搬移、无 Store 占用，失败走既有完整回滚；-shm 为划痕可重建，随库同搬无害）。
 _LEDGER_RUNTIME_FILES = (
     "_ledger.jsonl", "_checkpoint.json", ".lock", ".session.lock",
     "session-worktrees.json",
+    "_ledger.sqlite3", "_ledger.sqlite3-wal", "_ledger.sqlite3-shm",
 )
 
 
@@ -157,7 +161,14 @@ def read_layout(orchd_dir: Path) -> dict[str, Any] | None:
 
 
 def write_layout(orchd_dir: Path, layout: str, main_worktree: Path) -> dict[str, Any]:
-    """原子写入布局标记（tmp + os.replace），避免标记错乱读半成品。
+    """原子写入布局标记（tmp + fsync + _atomic_replace + 目录项 fsync）。
+
+    原子 rename 只保证「要么旧的、要么新的」，防标记错乱读半成品；fsync 再补
+    「新内容已落设备」，消除断电零长窗口（task-os-replace-hardening-worktree-batch
+    批次 1a：与账本 ``ledger._write_text_atomic`` 同档，复用其
+    ``_atomic_replace`` 的 WinError 5/32 有界重试——耗尽抛结构化 E007 前缀
+    ``atomic_replace_failed``——与 ``_fsync_dir``）。tmp 点前缀命名、强制 LF
+    与 JSON 文本形态原样保留。
 
     Args:
         orchd_dir: 主工作树的 .orchd 目录。
@@ -167,6 +178,8 @@ def write_layout(orchd_dir: Path, layout: str, main_worktree: Path) -> dict[str,
     Returns:
         结构化结果：``{"written": True, "path": <str>, "layout": <str>}``。
     """
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     data = {
         "layout": layout,
         "version": _LAYOUT_VERSION,
@@ -178,9 +191,12 @@ def write_layout(orchd_dir: Path, layout: str, main_worktree: Path) -> dict[str,
     # A3（task-hostfix-pack-b）：强制 LF。Windows 文本模式默认把 \n 翻成 \r\n，
     # 而标记文件以 LF 入库（或首次写入即 LF）→ git status 出現内容为空的幻影脏位
     # （ROADMAP.md 同款已在 hook 写盘路径修复，此处同源）。
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                   encoding="utf-8", newline="\n")
-    os.replace(tmp, marker)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, marker)
+    _fsync_dir(marker.parent)
     return {"written": True, "path": str(marker), "layout": layout}
 
 
@@ -227,12 +243,36 @@ def _git_toplevel(project_root: Path) -> Path | None:
 
 
 def _git_common_dir(project_root: Path) -> Path | None:
-    """定位仓库共享 git 目录（``git rev-parse --git-common-dir``，绝对路径）。
+    """定位仓库共享 git 目录（**就地取证优先**，git 命令兜底）。
 
     review W-1 / R-16：残留目录判定需要「曾由 git 登记为本仓库 worktree」的证据，
     证据落点即 ``<common-dir>/worktrees/<name>``。linked worktree 与主工作树返回
     同一 common dir；非 git / git 不可用 / 解析失败 → None（调用方保守降级）。
+
+    task-worktree-common-dir-fallback（CI/Linux 稳健）：原实现只走
+    ``git rev-parse --git-common-dir``，该命令失败即**静默**放弃取证——CI 实测该
+    用例决策退成 ``no_git_registry_evidence``（本机绿、CI 红）。故改为就地取证优先：
+    ``<root>/.git`` 为目录即 common dir；为文件（linked worktree）时解析其
+    ``gitdir: <path>``（``<common>/worktrees/<name>`` 形态取 ``<common>``）。两条就地
+    路径都不成立才回退 git 命令；三条全失败时写 stderr 留痕（不静默降级）。
     """
+    root = Path(project_root)
+    dot_git = root / ".git"
+    try:
+        if dot_git.is_dir():
+            return dot_git
+        if dot_git.is_file():
+            text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if text.startswith("gitdir:"):
+                target = Path(text.split(":", 1)[1].strip())
+                if not target.is_absolute():
+                    target = (root / target).resolve()
+                # linked worktree：<common>/worktrees/<name> → 取 <common>
+                if target.parent.name == "worktrees":
+                    return target.parent.parent
+                return target
+    except OSError:
+        pass
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
@@ -242,9 +282,20 @@ def _git_common_dir(project_root: Path) -> Path | None:
             errors="replace",
             timeout=_GIT_TIMEOUT,
         )
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        print(
+            f"WARN: git common dir 取证失败（{type(exc).__name__}: {exc}），"
+            "残留判定将退化为「无登记证据」",
+            file=sys.stderr,
+        )
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
+        detail = (proc.stderr or "").strip().splitlines()
+        print(
+            f"WARN: git common dir 取证失败（rc={proc.returncode}）"
+            f"{detail[0][:120] if detail else ''}，残留判定将退化为「无登记证据」",
+            file=sys.stderr,
+        )
         return None
     git_dir = Path(proc.stdout.strip())
     if not git_dir.is_absolute():
@@ -685,6 +736,7 @@ def bootstrap_container(project_root: Path, master_path: Path) -> dict[str, Any]
     # 搬动），避免 Windows 因持锁目录被 rename 而报 WinError 5/33（E999）。
     # 进程内可重入（ledger 注册表），同进程同路径二次获取不重复阻塞。
     from orchd.ledger import (
+        _write_text_atomic,
         intake_lock_acquire,
         intake_lock_release,
         resolve_agent_id,
@@ -702,9 +754,9 @@ def bootstrap_container(project_root: Path, master_path: Path) -> dict[str, Any]
         # 默认 master 直接写入 main/.orchd/（无需暂存 + move）
         master_file = orchd_dst / "_master.json"
         if not master_file.exists():
-            master_file.write_text(
+            _write_text_atomic(
+                master_file,
                 json.dumps(_default_master(main_dir), ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
             )
             created.append(str(master_file.relative_to(project_root)))
 

@@ -132,9 +132,11 @@ def _write_rows_unlocked(path: Path, rows: list[dict[str, Any]]) -> bool:
         True 成功；False IO 失败。
     """
     try:
+        from orchd.ledger import _write_text_atomic
+
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
-        path.write_text(content, encoding="utf-8")
+        _write_text_atomic(path, content)
         return True
     except OSError:
         return False

@@ -16,28 +16,49 @@ from typing import Any, Callable
 
 
 def _cli_skeleton(
-    func: Callable[[Any, Any, Any, Any], Any],
-) -> Callable[[Any], Any]:
+    func: Callable[..., Any] | None = None, *, with_archived: bool = False
+) -> Any:
     """命令骨架装饰器：统一承担样板，业务函数仅保留核心逻辑。
 
     样板包括：_load_tasks / _resolve_agent_id / _identity_warning / 异常统一
     转 JSON（stdout 恒合法）/ _attach_guidance 已在 main 层统一处理。
     本骨架聚焦命令内样板：master/store/agent 加载与 guard 透传。
+
+    两种用法（task-master-archive-readback-merge）：
+      - ``@_cli_skeleton``：裸用，沿 ``_load_tasks()`` 默认值 = **活跃定义**。
+        派发面（request）与里程碑/巡检判据**必须**用这一形态——归档定义对它们
+        结构性不可见（不依赖「归档任务必为终态」这条隐式不变量）。
+      - ``@_cli_skeleton(with_archived=True)``：展示面（status/show）显式开启
+        归档回读合并，使 `status --all` 与 `status <已归档-id>` 仍可见历史任务。
+
+    两形态装饰后的业务函数签名一致：
+    ``func(args, tasks, orchd_dir, master, store, agent_id)``。
     """
+    def _decorate(inner: Callable[..., Any]) -> Callable[[Any], Any]:
+        @wraps(inner)
+        def wrapper(args: Any) -> Any:
+            # 业务函数签名：func(args, tasks, orchd_dir, master, store, agent_id)
+            from orchd.cli import _load_tasks
+            from orchd.cli.identity import _resolve_agent_id
+            # 未开启归档合并时保持**无参调用形态**（与改动前逐字一致）：4 处既有
+            # 裸装饰命令（workflow.py 的 request/claim/done 与 control.py 的 amend）
+            # 的取数调用连同其测试桩都不受影响（零回归），只有显式开启的展示面
+            # （query.py::_cmd_status，1 处带参）才走带参形态。
+            if with_archived:
+                tasks, orchd_dir, master = _load_tasks(with_archived=True)
+            else:
+                tasks, orchd_dir, master = _load_tasks()
+            from orchd.ledger import Store
 
-    @wraps(func)
-    def wrapper(args: Any) -> Any:
-        # 业务函数签名：func(args, tasks, orchd_dir, master, store, agent_id)
-        from orchd.cli import _load_tasks
-        from orchd.cli.identity import _resolve_agent_id
-        tasks, orchd_dir, master = _load_tasks()
-        from orchd.ledger import Store
+            store = Store(orchd_dir)
+            agent_id = _resolve_agent_id(orchd_dir)
+            return inner(args, tasks, orchd_dir, master, store, agent_id)
 
-        store = Store(orchd_dir)
-        agent_id = _resolve_agent_id(orchd_dir)
-        return func(args, tasks, orchd_dir, master, store, agent_id)
+        return wrapper
 
-    return wrapper
+    if func is None:
+        return _decorate
+    return _decorate(func)
 
 
 # 在 ensure_ascii=False 直写下会破坏「严格 json.loads 解析」或「UTF-8 编码」的字符：

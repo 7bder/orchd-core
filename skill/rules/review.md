@@ -9,7 +9,7 @@ guide:
   approved_completed: 1
   changes_requested: 1
 ---
-# 审查规则（ID 约定 / 禁止自审 / 证据分层 / merge 前置 / 单阶段判定）
+# 审查规则（ID 约定 / 自审默认仅提示 / 证据分层 / merge 前置 / 单阶段判定）
 
 > TL;DR: ① 自审默认**仅提示**（`self_review_notice`；线上版 `config.enforce_self_review_block=true` 才恢复 E016 硬阻断；任务级 `require_independent_review=true` 同效且与全局开关 OR，见下）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
 
@@ -30,6 +30,7 @@ guide:
 ## 清单化模板与证据分层（M2-2，2026-08-06；证据分层 2026-08-08）
 - 按 `templates/spec-reviewer.md` / `templates/code-reviewer.md` 的三态/分组清单逐项勾选，每条判定必须引用证据（验收标准编号 + 引擎 verify 状态 / 定向测试结果）；spec 判定三态（满足/不满足/需人工），code 判定分"机器可辅助项（必须核验）"与"人工复核项（弱模型存疑默认放行交人工复审）"两组；禁止以逻辑推演替代测试。
 - **证据分层：in_review = 引擎已保证 verify_command 通过（done 前提），reviewer claim 响应附带 `verify` 摘要（P2 注入：ok/exit_code/output_summary），默认引用不重跑；仅 verify 摘要缺失/不可信或 diff 触及测试链路时重跑定向测试（禁全量 pytest / build / venv 重活，120s 预算）。**
+- **存证同源例外（task-review-verify-at-head，2026-10-15）：「默认引用不重跑」以「存证覆盖的就是所审内容」为前提。** DONE 存证只覆盖 DONE 那一刻的代码，故引擎为该存证落 `head` 锚，并在 reviewer claim 时与当前任务分支 tip 比对：**无位移 → 零成本、零新增字段（响应与无此机制时逐字一致）；位移 → 引擎按 HEAD 复跑一次 verify_command**，新旧两份记录并列（`verify` 为 DONE 存证、`verify_at_head` 为复跑结果），附 `verify_head_drift`（`baseline_head` / `current_head` / `severity`）。**复跑失败只告警不阻断认领**（`severity=error` 并进 `degraded_guards`）——「边审边补交」是合法动作，不得惩罚修错；但 reviewer **必须**以 `verify_at_head` 为准复核补交部分，不得只看 DONE 存证下结论。存证无锚（旧存证 / git 不可用）时 fail-open，退化为「默认引用不重跑」。
 
 ## code APPROVED 的 merge 前置语义
 - 引擎先执行 git merge，成功才写完成事件（任务 completed）。merge 冲突 → 任务**停留 in_review**（完成事件不落地，`merged: false` + `conflict_files`），由实现者（或人工）在 task 分支执行 `orchd git merge main`（受管通道，任务分支放行）解决冲突并提交后，同一 reviewer 再次提交 code APPROVED 重试 → merge 成功 → completed。

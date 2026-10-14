@@ -5,10 +5,9 @@
   - _cmd_bootstrap: bootstrap 命令（输出分解套件 JSON）
   - _cmd_init: init 命令（初始化 .orchd/ 并生成 snapshot）
 
-3a 阶段说明：本模块是 init 域的目标落点。当前 cli.py（legacy）仍
-保留同名函数为运行时主实现（兼容层透传 / monkeypatch 打点依赖），
-本模块随 3a 收尾（删除 orchd/cli.py）后接管。函数体逐字一致
-（AST 校验 IDENTICAL，仅允许 import 行变化），零逻辑变化。
+3a 收尾已完成（task-split-cli-remove-legacy）：orchd/cli.py 已删除，本模块即
+init 域运行时主实现（函数体迁移时与旧实现逐字一致，AST 校验 IDENTICAL，
+仅允许 import 行变化，零逻辑变化）。
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.cli._util import (
     _command_name,
     _find_orchd_dir,
@@ -51,7 +51,7 @@ def _aggregate_validation_items(
     }
 
 
-def _cmd_validate(args) -> dict:
+def _cmd_validate(args) -> dict | tuple[dict, int]:
     """校验 _master.json 的结构与引用完整性。
 
     CLI 参数: args.path — master 文件路径（默认 .orchd/_master.json）。
@@ -90,22 +90,56 @@ def _cmd_validate(args) -> dict:
 
     master = load_master(str(master_path))
     structure_errors = validate_structure(master) + validate_references(master)
-    quality_warnings = validate_quality(master)  # E022/E023/E024 为质量告警，不判 invalid
+    quality_warnings: list[Any] = list(validate_quality(master))  # E022/E023/E024 为质量告警，不判 invalid
 
-    # 终态任务集合；无可用 ledger（新项目 / replay 失败）时跳过过滤，validate 保持可运行。
+    # 终态任务集合；账本不可重建（新项目 / replay 失败 / 空载体）时**不再静默按「不豁免」
+    # 处理**——那会把终态任务的历史缺陷整片误报（task-terminal-exemption-availability
+    # 实测 CI 新克隆 E037×16）。改为显式降级：终态类告警整体判「不适用」，由下方
+    # terminal_exemption 字段承载留痕（不误报、不静默）。
     # --include-terminal 逃生口：回放全部历史任务定义缺陷（含终态）。
+    # task-validate-readonly：只读构造——validate 是只读入口，不得建库/迁移/改名。
     terminal_ids: set[str] | None = None
-    try:
-        state = Store(master_path.parent).replay()
-        terminal_ids = {tid for tid, ts in state.items() if ts.status in ("completed", "cancelled")}
-    except Exception:
-        terminal_ids = None
+    terminal_unavailable_reason: str | None = None
+    # 可用性判定与脚本侧同源（orchd.ledger.ledger_status_available）：**空载体**
+    # （0 事件 jsonl / 构造即建库的空库 / 仅 checkpoint）同样走降级——只看 replay 异常
+    # 不够，因为无载体时 Store 往往返回空集而不抛错，那会静默变成「不豁免」。
+    from orchd.ledger import ledger_status_available, resolve_store_dir
+
+    _store_dir = resolve_store_dir(master_path.parent)
+    if not ledger_status_available(_store_dir):
+        terminal_unavailable_reason = f"账本不可重建（载体缺失或为空）：{_store_dir}"
+    else:
+        try:
+            state = Store(master_path.parent, readonly=True).replay()
+            terminal_ids = {
+                tid for tid, ts in state.items() if ts.status in TERMINAL_STATUSES
+            }
+        except Exception as exc:
+            terminal_ids = None
+            terminal_unavailable_reason = f"{type(exc).__name__}: {exc}"
     if getattr(args, "include_terminal", False):
         terminal_ids = set()
+        terminal_unavailable_reason = None
 
-    quality_warnings, exempted_terminal_warnings = filter_terminal_quality_warnings(
-        quality_warnings, master.tasks, terminal_ids
-    )
+    if terminal_ids is None:
+        # 账本不可重建 ⇒ 无法逐条判定哪些任务已终态。**不剔除**告警（剔除会静默
+        # 漏掉活跃任务的真实缺陷，实测踩到：无账本项目里 pending 任务的 E037 被吞），
+        # 而是把「本批告警未按终态豁免过滤」显式化——读者据此知道其中可能含终态
+        # 任务的历史缺陷，而非把 16 条当现役缺陷追（task-terminal-exemption-availability）。
+        exempted_terminal_warnings = 0
+        terminal_exemption: dict[str, Any] = {
+            "state": "unavailable",
+            "reason": terminal_unavailable_reason or "账本不可重建",
+            "unfiltered": len(quality_warnings),
+        }
+    else:
+        quality_warnings, exempted_terminal_warnings = filter_terminal_quality_warnings(
+            quality_warnings, master.tasks, terminal_ids
+        )
+        terminal_exemption = {
+            "state": "available",
+            "exempted": exempted_terminal_warnings,
+        }
 
     # intake-dual-path（2026-08-15）：ROADMAP 规划章节落地兜底（E031 告警，不判 invalid）。
     # 独立追加：E031 非任务级质量项，不参与终态豁免过滤；dict 结构，与 ValidationError 并存。
@@ -147,6 +181,7 @@ def _cmd_validate(args) -> dict:
             "errors_summary": errors_summary,
             "warnings_summary": warnings_summary,
             "exempted_terminal_warnings": exempted_terminal_warnings,
+            "terminal_exemption": terminal_exemption,
         }, 1)
     return {
         "valid": True,
@@ -155,6 +190,7 @@ def _cmd_validate(args) -> dict:
         "errors_summary": errors_summary,
         "warnings_summary": warnings_summary,
         "exempted_terminal_warnings": exempted_terminal_warnings,
+        "terminal_exemption": terminal_exemption,
     }
 
 def _cmd_bootstrap(args) -> dict:

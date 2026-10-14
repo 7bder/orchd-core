@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import FORCE_TARGET_STATUSES, TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import get_default_branch as _get_default_branch, hook_uninstall
 from orchd.worktree import load_bindings, unbind_task_wt
@@ -23,7 +24,9 @@ from orchd.ledger import Store, TaskState, resolve_store_dir, review_claim_age_s
 
 # force-status 合法目标：force_status() 只允许将任务强制设置到这四种状态，
 # 其余状态（如 in_review、done）由正常事件流驱动，不可被强制跳转。
-_FORCE_TARGETS = {"pending", "claimed", "completed", "cancelled"}
+# 枚举本身在 contracts.events.FORCE_TARGET_STATUSES（单一真源，与 replay 守卫、
+# sync 入站拒收共用）；此处保留旧名别名，不改调用点。
+_FORCE_TARGETS = FORCE_TARGET_STATUSES
 
 
 # _is_fingerprint_agent_id 单一事实源已上移 ledger.is_fingerprint_agent_id
@@ -193,6 +196,7 @@ def retract(
 
         # 找级联事件（同 task_id，在 target 之后的事件）
         task_id = target_event.get("task_id", "")
+        assert task_id is not None
         target_idx = next(i for i, ev in enumerate(all_events)
                          if ev.get("event_id") == target_event_id)
         cascade_ids = [target_event_id]
@@ -590,7 +594,7 @@ def force_status(
     # worktree（git worktree remove + 删分支 + 解绑，best-effort）。
     # force-recycle：显式丢弃未合并分支（缺省 False → remove_task_wt 拒绝删除
     # 未合并分支并返回 branch_delete_refused，红线保护）。
-    if target_status in ("completed", "cancelled") and project_root:
+    if target_status in TERMINAL_STATUSES and project_root:
         from orchd.worktree import remove_task_wt
 
         try:

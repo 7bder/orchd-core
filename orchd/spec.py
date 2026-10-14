@@ -25,11 +25,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import jsonschema
-
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
+
+if TYPE_CHECKING:  # pragma: no cover - 仅供类型检查，运行时惰性导入
+    import jsonschema
 
 # schema 相关文件的目录布局：
 #   <项目根>/schema/                    ← _SCHEMA_DIR（默认 schema 根目录）
@@ -216,8 +218,47 @@ def _load_schema(version: int) -> dict[str, Any]:
 
 @lru_cache(maxsize=8)
 def _build_validator(version: int) -> jsonschema.Draft202012Validator:
-    """按版本缓存 Draft202012Validator（P2b：避免重复构建校验器）。"""
+    """按版本缓存 Draft202012Validator（P2b：避免重复构建校验器）。
+
+    jsonschema 惰性导入（task-spec-lazy-import-degrade）：顶层不再硬依赖，
+    缺库时此处抛 ImportError，由 validate_structure 降级处理；模块本身
+    （及整条 CLI）可无依赖导入，不再整条崩溃。
+    """
+    import jsonschema
+
     return jsonschema.Draft202012Validator(_load_schema(version))
+
+
+def jsonschema_available() -> bool:
+    """jsonschema 是否可用（缺依赖降级探针，task-spec-lazy-import-degrade）。
+
+    Returns:
+        True 表示完整结构校验可用；False 表示 validate_structure /
+        validate_quality 将走降级路径（跳过 schema 校验但明确留痕）。
+    """
+    try:
+        import jsonschema  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def spec_degraded_guard() -> dict[str, Any]:
+    """构造 jsonschema 缺依赖降级条目（既有 degraded_guards 通道，不新造字段）。
+
+    形状与 ``orchd.gitops.guard.record_degraded_guard`` 一致
+    （guard / code=E030 / severity / status / reason / hint），便于 agent
+    与 doctor 按 E030 统一检索「哪些校验没在跑」。此处不导入 guard 模块，
+    以保持 spec.py 依赖方向（spec → errors，不新增 spec → gitops 边）。
+    """
+    return {
+        "guard": "jsonschema",
+        "code": ErrorCode.E030.name,
+        "severity": "warning",
+        "status": "not_applicable",
+        "reason": "jsonschema 缺依赖，结构校验未执行（已降级跳过）",
+        "hint": "pip install jsonschema 后重跑以启用完整结构校验",
+    }
 
 
 @dataclass
@@ -291,12 +332,104 @@ def load_master(path: Path | str) -> Master:
     return load_registry(path)
 
 
-def validate_structure(master: Master) -> list[ValidationError]:
+def _check_declared_path_control_chars(master: Master) -> list[ValidationError]:
+    """声明路径控制字符检查（加法式，validate_structure 子步骤）。
+
+    合法路径不可能包含控制字符（L3 pre-commit 钩子按行消费声明列表，
+    换行路径可突破生成物注释行注入任意 shell 语句），故归入 E003 结构
+    校验（阻断级，fail-closed）。纯 Python 实现，不依赖 jsonschema，
+    缺库降级路径下仍执行（见 validate_structure）。
+    """
+    errors: list[ValidationError] = []
+    for i, t in enumerate(master.tasks):
+        tid = t.get("id", "")
+        for decl_field in ("files_to_edit", "exempt_files"):
+            for j, p in enumerate(t.get(decl_field) or []):
+                if not isinstance(p, str):
+                    continue
+                for ch in ("\n", "\r", "\x00"):
+                    if ch in p:
+                        errors.append(
+                            ValidationError(
+                                code=ErrorCode.E003,
+                                path=f"$.tasks[{i}].{decl_field}[{j}]",
+                                message=(
+                                    f"task '{tid}': {decl_field}[{j}] contains control "
+                                    f"character {ch!r} — declared paths are consumed "
+                                    "line-wise by the pre-commit hook "
+                                    "(fail-closed, pass9 review F1)"
+                                ),
+                            ))
+    return errors
+
+
+#: 阶段值不允许出现的控制字符（与声明路径同族：门禁按行消费）。
+#: \n/\r 是显式换行；\x00 是 NUL；\v(\x0b)/\f(\x0c) 也是 str.splitlines()
+#: 的行边界，会让按行消费的门禁错位——同族风险一并兜底。
+_TASK_PHASE_CONTROL_CHARS = ("\n", "\r", "\x00", "\v", "\f")
+
+
+def _check_task_phase(master: Master) -> list[ValidationError]:
+    """任务阶段字段（``tasks[].phase``）值域检查（加法式，接入点见下方）。
+
+    字段非必填；一旦声明则不得为空串、纯空白或含控制字符（换行 / CR / NUL
+    会让按行消费的门禁错位，与声明路径控制字符检查同族风险）。非字符串值
+    交由 JSON Schema 判类型，本处只拦值域（与声明路径检查同口径）。
+
+    纯 Python 实现、不依赖 jsonschema：schema 层在缺依赖时整体降级跳过
+    （``validate_structure`` 的 ImportError 分支），故本函数是阶段值域的
+    fail-closed 兜底——降级路径与正常路径**两处均挂载**，任一条路径下非法
+    阶段值都会被拦（由 tests/test_spec.py 的降级用例锁定）。
+
+    命名说明：引擎内「阶段」一词已被评审侧语义独占（见 review.py 与
+    guide.py 的评审阶段变量），本函数及其局部变量一律以 ``task_`` 前缀与
+    之物理隔离，由 tests/contract/test_phase_schema_field.py 用
+    ``inspect.getsource`` 断言源码不含评审侧标识符（防后续漂移复用）。
+    """
+    errors: list[ValidationError] = []
+    for i, task in enumerate(master.tasks):
+        task_phase = task.get("phase")
+        if task_phase is None:
+            continue
+        if not isinstance(task_phase, str):
+            continue
+        if not task_phase.strip():
+            errors.append(
+                ValidationError(
+                    code=ErrorCode.E003,
+                    path=f"$.tasks[{i}].phase",
+                    message=(
+                        f"task '{task.get('id', '')}': phase must not be empty or "
+                        f"whitespace-only (got {task_phase!r}); omit the field "
+                        f"entirely to opt out of phase gating"
+                    ),
+                ))
+            continue
+        for ch in _TASK_PHASE_CONTROL_CHARS:
+            if ch in task_phase:
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E003,
+                        path=f"$.tasks[{i}].phase",
+                        message=(
+                            f"task '{task.get('id', '')}': phase contains control "
+                            f"character {ch!r} — phase values are consumed "
+                            f"line-wise by gates (fail-closed)"
+                        ),
+                    ))
+                break
+    return errors
+
+
+def validate_structure(
+    master: Master,
+    degraded_guards: list[dict[str, Any]] | None = None,
+) -> list[ValidationError]:
     """基于 JSON Schema（Draft 2020-12）做结构校验（字段类型、必选/可选、枚举值）。
 
     根据 _master.json 中的 ``schema_version`` 字段决定加载哪个版本的 schema：
     优先查找 ``schema/v{version}/_master.schema.json``，不存在时回退到默认 schema。
-    未知版本（当前支持 1..2，与 orchd/migrate.py 双边锁定）直接返回 E003，
+    未知版本（当前支持 1..3，与 orchd/migrate.py 双边锁定）直接返回 E003，
     不静默回退（fail-closed，W1-③版本闸门）。
     返回 E003 错误列表；合法时返回空列表。
 
@@ -305,21 +438,36 @@ def validate_structure(master: Master) -> list[ValidationError]:
     列表按行消费（静态列表与动态允许列表同为行式形态），声明含换行 / CR /
     NUL 会让行式消费错位，换行路径可突破生成物注释行注入任意 shell 语句。
     合法路径不可能包含控制字符，故归入 E003 结构校验（阻断级，fail-closed）。
+
+    加法式检查之二（task-phase-schema-field）：任务阶段字段值域（空串 /
+    纯空白 / 控制字符）——schema 层在缺依赖时整体降级，故该检查在降级与
+    正常**两条路径均挂载**（见函数体内两处调用），保证 fail-closed。
+
+    缺依赖降级（task-spec-lazy-import-degrade）：jsonschema 缺失时跳过
+    schema 校验（控制字符检查仍执行），返回其错误列表（通常为空）；
+    如传入 ``degraded_guards`` 列表则追加 :func:`spec_degraded_guard`
+    条目（既有 degraded_guards 通道，E030，不新造字段）。依赖齐备时
+    行为与此前逐字一致（E003 错误码零变化）。
     """
     version = master.raw.get("schema_version", 1)
-    if not isinstance(version, int) or version not in (1, 2):
+    if not isinstance(version, int) or version not in (1, 2, 3):
         return [
             ValidationError(
                 code=ErrorCode.E003,
                 path="$.schema_version",
                 message=(
                     f"unsupported schema_version: {version!r} "
-                    f"(supported 1..2; "
+                    f"(supported 1..3; "
                     f"run `orchd migrate` or upgrade engine)"
                 ),
             )
         ]
-    validator = _build_validator(version)
+    try:
+        validator = _build_validator(version)
+    except ImportError:
+        if degraded_guards is not None:
+            degraded_guards.append(spec_degraded_guard())
+        return _check_declared_path_control_chars(master) + _check_task_phase(master)
     errors: list[ValidationError] = []
     for err in sorted(validator.iter_errors(master.raw),
                       key=lambda e: list(e.absolute_path)):
@@ -342,25 +490,9 @@ def validate_structure(master: Master) -> list[ValidationError]:
             ))
     # 声明路径控制字符检查（加法式，见 docstring）：非字符串交由上方 JSON
     # Schema 判定类型，这里只拦「合法路径不可能出现的控制字符」。
-    for i, t in enumerate(master.tasks):
-        tid = t.get("id", "")
-        for decl_field in ("files_to_edit", "exempt_files"):
-            for j, p in enumerate(t.get(decl_field) or []):
-                if not isinstance(p, str):
-                    continue
-                for ch in ("\n", "\r", "\x00"):
-                    if ch in p:
-                        errors.append(
-                            ValidationError(
-                                code=ErrorCode.E003,
-                                path=f"$.tasks[{i}].{decl_field}[{j}]",
-                                message=(
-                                    f"task '{tid}': {field}[{j}] contains control "
-                                    f"character {ch!r} — declared paths are consumed "
-                                    "line-wise by the pre-commit hook "
-                                    "(fail-closed, pass9 review F1)"
-                                ),
-                            ))
+    errors.extend(_check_declared_path_control_chars(master))
+    # 任务阶段字段值域检查（加法式，见 docstring）：两路径同挂载。
+    errors.extend(_check_task_phase(master))
     return errors
 
 
@@ -376,7 +508,18 @@ def validate_references(master: Master) -> list[ValidationError]:
 
     错误采用累积策略，不会因单个错误而提前终止，以便一次性返回所有问题。
     返回 E004/E005/E006 错误列表；合法时返回空列表。
+
+    归档回读合并（task-master-archive-readback-merge）：``depends_on`` 的存在性
+    真源是 ``master.tasks ∪ 归档 ids`` 而非仅 ``master.tasks``——终态定义归档后，
+    活跃任务对历史任务的引用仍是**合法引用**（归档只改变定义的存放位置，不使引用
+    失效）。    归档 id 经 ``orchd.definition_archive.read_archive_ids`` 取得（函数内
+    惰性导入，与既有 ledger 惰性导入同模式）。清单声明归档在场但**不可读**（缺文件
+    / 不可解析 / ``count``/``sha256`` 不符 / 条目 id 重复）→ 追加**一条** E003
+    （path ``$.definition_archive``），且 ``depends_on`` 存在性检查**整体判「不适用」
+    并跳过**（真源不完整时逐条判定必然误报——与「账本不可用时终态类检查整体不适用」
+    同口径），**不静默当作「无归档」**。无清单或空骨架时本函数行为逐字不变。
     """
+
     errors: list[ValidationError] = []
     tasks = master.tasks
     modules = master.modules
@@ -412,6 +555,36 @@ def validate_references(master: Master) -> list[ValidationError]:
     task_id_set = set(task_ids)
     module_id_set = set(module_ids)
 
+    # --- E003: 归档清单可读性（引用解析真源的完整性）---
+    # （task-master-archive-readback-merge）清单在场则归档必须可读，否则
+    # depends_on 的真源不完整——fail-closed：报 E003 且**不**退化为「无归档」。
+    archive_ids: frozenset[str] = frozenset()
+    #: 引用目标全集是否可完整判定（归档不可读 ⇒ False ⇒ depends_on 检查整体不适用）
+    reference_universe_complete = True
+    # 惰性导入（与 validate_source 惰性导入 ledger 同模式）：spec.py 依赖方向为
+    # errors.py，本模块不因引用解析而把定义归档模块提到顶层。
+    from orchd.definition_archive import ARCHIVE_KEY as _archive_key
+    from orchd.definition_archive import read_archive_ids
+
+    if isinstance(master.raw, dict) and master.raw.get(_archive_key):
+        from orchd.definition_archive import DefinitionArchiveError
+
+        try:
+            archive_ids = read_archive_ids(master.raw, master.source_path)
+        except DefinitionArchiveError as exc:
+            reference_universe_complete = False
+            errors.append(
+                ValidationError(
+                    code=ErrorCode.E003,
+                    path=f"$.{_archive_key}",
+                    message=(
+                        f"definition_archive 在场但不可读，depends_on 引用解析"
+                        f"真源不完整（该项检查整体不适用，不逐条误报）: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                ))
+    resolvable_ids = task_id_set | set(archive_ids)
+
     # --- E005: 引用存在性 ---
     for i, t in enumerate(tasks):
         # module 引用
@@ -423,16 +596,19 @@ def validate_references(master: Master) -> list[ValidationError]:
                     path=f"$.tasks[{i}].module",
                     message=f"module '{mod}' not found in modules[]",
                 ))
-        # depends_on 引用
-        for j, dep in enumerate(t.get("depends_on", [])):
-            if dep not in task_id_set:
-                errors.append(
-                    ValidationError(
-                        code=ErrorCode.E005,
-                        path=f"$.tasks[{i}].depends_on[{j}]",
-                        message=
-                        f"depends_on references unknown task_id: '{dep}'",
-                    ))
+        # depends_on 引用（真源 = master.tasks ∪ 归档 ids，见本函数 docstring）。
+        # 引用全集不可完整判定时本项整体不适用并跳过（不逐条误报）——已在上面
+        # 以 E003 留痕。
+        if reference_universe_complete:
+            for j, dep in enumerate(t.get("depends_on", [])):
+                if dep not in resolvable_ids:
+                    errors.append(
+                        ValidationError(
+                            code=ErrorCode.E005,
+                            path=f"$.tasks[{i}].depends_on[{j}]",
+                            message=
+                            f"depends_on references unknown task_id: '{dep}'",
+                        ))
 
     # --- E005: default_line 须为 lines 的键（前移 line.py 运行时口径） ---
     # pass7 P2-7 残留收口：line.py 已是执行点（非法 E005 硬拒），validate 在此
@@ -735,6 +911,88 @@ def _verify_command_path_tokens(verify_cmd: str) -> list[str]:
     return out
 
 
+# ------------------------------------------------------------------
+# AC → verify 覆盖反向一致性（E040 ac_verify_gap，task-ac-verify-coverage，2026-10-07）
+# ------------------------------------------------------------------
+# 现象：AC 明写「旧路径残留 0（对全仓库与全部任务声明做 grep）」，而 verify_command
+# 只是 trivial 命令——声称与验证手段脱节，351 处旧名照样通过验收。本组常量把该类
+# 「可判定声称」的启发式形态集中于此，供 validate_quality 追加 E040 warning。
+# 方向：宁可漏判不可误报（中文启发式）；AC 仍人类文本、verify_command 仍机器真源。
+#
+# 声称形态①「零残留」：残留 0 / 为零 / 清零 / 归零 …
+# task-e040-zero-fp-fix：裸 `为零` 会把「行为零变化/因为零…/作为零…」（为+零相邻）
+# 误判为「为零」声称——该短语在本仓 AC 中极常见。故对 `为零` 加负向环视排除
+# 行为/因为/作为 前缀；合法语境（残留为零 / 数量为零）不受影响。
+_AC_ZERO_RESIDUAL_RE = re.compile(
+    r"(?:残留|剩下|剩余)\s*[0０]|(?<!行)(?<!因)(?<!作)为零|清零|归零|均已?清除|全部清除"
+)
+# 声称形态②「全仓范围」：全仓库 / 全库 / 整个仓库（"全部任务"须与检查动词同现，
+# 见 _ac_repo_claim，避免「覆盖全部任务字段」这类无关陈述误报）。
+_AC_REPO_WIDE_RE = re.compile(r"(?:全仓库|全库|整个仓库|全仓)")
+_AC_ALL_TASKS_RE = re.compile(r"(?:全部任务|所有任务|全量任务)")
+_AC_CHECK_VERB_RE = re.compile(r"(?:grep|检索|扫描|检查|清除|残留|不复存在|不存在)")
+# 人工裁决形态：AC 声明 manual / 需人工 → 跳过（人类文本不要求机器 verify 覆盖）。
+_AC_MANUAL_RE = re.compile(r"(?:manual|需人工|人工确认|人工核|人工审查|手动确认)")
+# verify 侧：grep 族程序（grep / rg / findstr / ack）。
+_VERIFY_GREP_FAMILY_RE = re.compile(
+    r"(?:^|[\s|;&(])(?:git\s+)?(?:grep|rg|findstr|ack)(?=$|[\s|;&)])"
+)
+# verify 侧：repo 级 grep 判据（递归旗标 / git grep / rg 默认递归 / findstr /s /
+# 目标为仓库根）。文件级 grep（无递归、指定单文件）不算全仓覆盖。
+_VERIFY_GREP_REPO_RE = re.compile(
+    r"(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*(?=\s|$)"
+    r"|--recursive"
+    r"|(?:^|\s)(?:\.|\./)(?=\s|$)"
+    r"|(?:^|[\s|;&(])git\s+grep"
+    r"|(?:^|[\s|;&(])rg(?=$|[\s|;&)])"
+    r"|findstr(?=[^|;&]*\s/[sS])"
+)
+# verify 侧：run 引用（引用 scripts/、tools/ 下的检查脚本或独立 run 令牌）——
+# 视为可能自带检查逻辑，不判缺口（避免对合法的脚本化检查误报）。
+_VERIFY_RUN_REF_RE = re.compile(
+    r"(?:scripts|tools)[/\\][\w./\\-]+\.(?:py|sh)"
+    r"|(?:^|[\s|;&(])run(?=$|[\s|;&)])"
+)
+
+
+def _ac_repo_claim(ac: str) -> tuple[bool, bool]:
+    """AC 是否声称「零残留 / 全仓」可判定性质（task-ac-verify-coverage）。
+
+    Returns:
+        ``(claimed, repo_wide)``：是否声称；若声称，是否为**全仓范围**（全仓
+        声称要求 verify 含 repo 级 grep，文件级 grep 不算覆盖）。含 manual /
+        需人工 的 AC 一律不声称（人类裁决，机器 verify 无义务覆盖）。
+    """
+    if not isinstance(ac, str) or not ac:
+        return False, False
+    if _AC_MANUAL_RE.search(ac):
+        return False, False
+    repo_wide = bool(_AC_REPO_WIDE_RE.search(ac)) or bool(
+        _AC_ALL_TASKS_RE.search(ac) and _AC_CHECK_VERB_RE.search(ac)
+    )
+    zero = bool(_AC_ZERO_RESIDUAL_RE.search(ac))
+    return (zero or repo_wide), repo_wide
+
+
+def _verify_has_grep(verify_cmd: str) -> bool:
+    """verify_command 是否含 grep 族程序。"""
+    return bool(verify_cmd and _VERIFY_GREP_FAMILY_RE.search(verify_cmd))
+
+
+def _verify_has_repo_grep(verify_cmd: str) -> bool:
+    """verify_command 是否为 repo 级 grep（递归 / git grep / rg / findstr /s / 目标为根）。"""
+    return bool(
+        verify_cmd
+        and _VERIFY_GREP_FAMILY_RE.search(verify_cmd)
+        and _VERIFY_GREP_REPO_RE.search(verify_cmd)
+    )
+
+
+def _verify_has_run_ref(verify_cmd: str) -> bool:
+    """verify_command 是否引用仓库内检查脚本（run 引用）。"""
+    return bool(verify_cmd and _VERIFY_RUN_REF_RE.search(verify_cmd))
+
+
 def validate_quality(
     master: Master,
     terminal_ids: frozenset[str] | None = None,
@@ -753,7 +1011,12 @@ def validate_quality(
        终态任务由调用方按 TERMINAL_EXEMPT_QUALITY_CODES 豁免）。
     4. E038 —— brief 的「files_to_edit 控 N」与实际声明数不一致 → warning
        （同任务；**非拆分建议**，专用码从 E029 拆出）。
-    5. E024 / E026 / E029 其余项 —— 见各代码块内注释（basetemp / 测试连带 / 粒度锚点）。
+    5. E040 —— AC 声称「零残留 / 全仓」可判定性质但 verify_command 无对应
+       grep 覆盖 → warning（全仓声称要求 repo 级 grep，文件级不算；manual 类跳过）。
+    6. E024 / E026 / E029 其余项 —— 见各代码块内注释（basetemp / 测试连带 / 粒度锚点）。
+    7. E030 —— jsonschema 缺依赖时结构校验降级提示（warning，不阻断；
+       task-spec-lazy-import-degrade：validate CLI 把本函数输出渲染为
+       warnings，valid 仍为 True，退出码为 0 且降级可检索）。
 
     Args:
         master: 任务池 master。
@@ -764,9 +1027,26 @@ def validate_quality(
             :func:`filter_terminal_quality_warnings` 处理，本函数不扩大口径。
 
     Returns:
-        ValidationError 列表（E022/E023/E024/E026/E027/E029/E037/E038…）；合法时返回空列表。
+        ValidationError 列表（E022/E023/E024/E026/E027/E029/E030/E037/E038/E040…）；
+        合法时返回空列表（jsonschema 缺依赖时含一条 E030 降级提示，见校验项 6）。
     """
     errors: list[ValidationError] = []
+    # 缺依赖降级提示（task-spec-lazy-import-degrade，加法式，warning 不阻断）：
+    # jsonschema 缺失时 validate_structure 跳过 schema 校验——此处记一条 E030
+    # 告警（errors.py 口径：模块导入失败至少升级为 E030 告警，绝不静默），使
+    # validate CLI（warnings 档，valid 仍 True）在响应体明确报告
+    # 「缺依赖，校验未执行」，退出码保持 0。依赖齐备时零输出，行为零变化。
+    if not jsonschema_available():
+        errors.append(
+            ValidationError(
+                code=ErrorCode.E030,
+                path="$.schema_version",
+                message=(
+                    "jsonschema 缺依赖，结构校验未执行（已降级跳过）："
+                    "validate_structure 仅执行声明路径控制字符检查；"
+                    "pip install jsonschema 后重跑以启用完整校验"
+                ),
+            ))
     tasks = master.tasks
     # 声明路径存在性的解析基准（校验①用）：与 E026 的 tests/ 推导同源，单一真源。
     project_root = _project_root_from_master(master)
@@ -913,6 +1193,39 @@ def validate_quality(
                         ))
                     break
 
+        # E040（task-ac-verify-coverage）：AC 若声称「零残留 / 全仓」可判定性质，
+        # 则 verify_command 必须真有对应检查手段（grep 族；全仓声称要求 repo 级
+        # grep，文件级 grep 不算覆盖）——否则声称与验证脱节。warning 不阻断；
+        # 终态由调用方经 TERMINAL_EXEMPT_QUALITY_CODES / filter_terminal_quality_warnings
+        # 豁免（与 E023/E029/E037/E038 同口径）。
+        if verify_cmd and not _verify_has_run_ref(verify_cmd):
+            for j, ac in enumerate(ac_list):
+                claimed, repo_wide = _ac_repo_claim(ac)
+                if not claimed:
+                    continue
+                covered = (
+                    _verify_has_repo_grep(verify_cmd)
+                    if repo_wide else _verify_has_grep(verify_cmd)
+                )
+                if covered:
+                    continue
+                need = (
+                    "请补 repo 级 grep（如 grep -r / rg / git grep）到 verify_command"
+                    if repo_wide
+                    else "请补 grep 族检查到 verify_command"
+                )
+                errors.append(
+                    ValidationError(
+                        code=ErrorCode.E040,
+                        path=f"$.tasks[{i}].acceptance_criteria[{j}]",
+                        message=(
+                            f"task '{tid}' acceptance_criteria[{j}] 声称"
+                            f"「{'全仓' if repo_wide else ''}零残留 / 全仓可判定」性质，"
+                            f"但 verify_command 缺乏对应覆盖：{need}；"
+                            "或把该 AC 降级为文件级 / manual 并明确标注"
+                        ),
+                    ))
+
         # E024: verify_command 含 pytest 但缺 --basetemp（沙箱坑，warning）
         # 2026-08-06 实踩 3 例：pytest 默认落 C:\Temp 触发 SAFE_DELETE_BULK_CONFIRM_REQUIRED → E014
         # 2026-08-08 精确化：仅匹配"真正执行 pytest 子进程"的命令段
@@ -1022,10 +1335,10 @@ def validate_quality(
 
 
 # 终态任务质量告警豁免口径（task-amend-quality-warning-terminal-filter，单一真源）：
-# 质量类告警 E023/E026/E027/E029 对终态（completed/cancelled）任务一律豁免——
-# 拆分/改写终态任务定义无意义（E007 终态保护无法改写）。validate 与 amend 共用；
-# E022（代码类缺 verify_command 注册阻断）与 E024 不在豁免之列。
-TERMINAL_EXEMPT_QUALITY_CODES = frozenset({"E023", "E026", "E027", "E029", "E037", "E038"})
+# 质量类告警 E023/E026/E027/E029/E037/E038/E040 对终态（completed/cancelled）任务
+# 一律豁免——拆分/改写终态任务定义无意义（E007 终态保护无法改写）。validate 与
+# amend 共用；E022（代码类缺 verify_command 注册阻断）与 E024 不在豁免之列。
+TERMINAL_EXEMPT_QUALITY_CODES = frozenset({"E023", "E026", "E027", "E029", "E037", "E038", "E040"})
 
 
 def _quality_warning_code_name(w: Any) -> str:
@@ -1219,7 +1532,7 @@ def validate_source(
         store = Store(workspace_root)
         _terminal: set[str] = set()
         for _tid, _ts in store.replay().items():
-            if _ts.status in ("completed", "cancelled"):
+            if _ts.status in TERMINAL_STATUSES:
                 _terminal.add(_tid)
         terminal_ids = frozenset(_terminal)
     except Exception:
@@ -1472,10 +1785,36 @@ def roadmap_landing_warnings(orchd_dir: Path) -> list[dict[str, Any]]:
     for sec in _parse_roadmap_sections(roadmap.read_text(encoding="utf-8")):
         if sec["historical"] or not sec["id"]:
             continue
-        if f"§{sec['version']}" in ideas_text or f"§{sec['version']}" in archive_text:
+        if _section_landed(ideas_text, sec) or _section_landed(archive_text, sec):
             continue
         warnings.append(_e031_warning(sec))
     return warnings
+
+
+def _section_landed(text: str, sec: dict[str, Any]) -> bool:
+    """该章节在这份文本里是否已落地：``- id:`` 精确命中 **或** ``§版本`` 字面命中。
+
+    task-caliber-residue-and-surface-gate AC6：判据以「章节 id 命中即算已落地」为真源，
+    与 ``orchd.intake.roadmap_land`` 的幂等判据同口径。此前只看 ``§版本`` 字面，于是
+    「id 命中但 detail 引旧版本号」的形态下 land 已跳过、E031 却恒告警且**清不掉**
+    （重跑 land 被 id 短路、不写文件）——两条通道对同一份台账各说各话。
+
+    为何不 import ``orchd.intake._entry_id_exists``：本模块只登记
+    ``spec.py → errors.py / ledger.py / worktree 包 / registry / contracts 包``
+    （见 .orchd/shared/conventions.md），新增 spec→intake 边须改登记表、不在本卡声明面；
+    故按同一语义本地实现（行级精确比对，``- id:`` / ``id:`` 两种写法），两处口径由
+    tests/test_cli_ideas.py::TestRoadmapLandE031Combination 的组用例钉在一起。
+    """
+    if f"§{sec['version']}" in text:
+        return True
+    sid = sec["id"]
+    for line in text.splitlines():
+        s = line.strip()
+        if (s.startswith("- id:") and s[len("- id:"):].strip() == sid) or (
+            s.startswith("id:") and s[len("id:"):].strip() == sid
+        ):
+            return True
+    return False
 
 
 def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
@@ -1488,6 +1827,10 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
                "IDEAS.md 与 IDEAS-archive.md 均缺引用该章节的 detail；处置二选一——"
                "① 运行 `orchd roadmap-land <版本>` 落地为 IDEAS study（待 confirm 升 pending）；"
                "② 若该版本已发布或已放弃，标记历史或移出 ROADMAP")
+    # hint 的唯一真源是 orchd/guide.py 的 E031 注册表条目（task-caliber-residue-and-
+    # surface-gate AC1）：这里只把**版本号**交出去，由 attach_error_guidance 在渲染处代入
+    # `<版本>` 占位。此前本函数自带一份 hint 覆盖注册表，同一件事两份措辞、改一处另一处
+    # 照旧（"落地为 IDEAS pending" 假口径即由此活下来）。
     try:
         from orchd.ledger import structured_error
 
@@ -1495,12 +1838,8 @@ def _e031_warning(sec: dict[str, Any]) -> dict[str, Any]:
             "E031",
             message,
             [{
-                "path":
-                f"roadmap §{sec['version']}",
-                "hint":
-                (f"处置二选一：① 运行 `orchd roadmap-land {sec['version']}` 为该规划章节"
-                 "生成 IDEAS study 落地条目（摄入协议：先落地、confirm 升 pending 后再注册任务）；"
-                 "② 若该版本已发布或已放弃，在 ROADMAP.md 将章节标题标记「历史」或移出"),
+                "path": f"roadmap §{sec['version']}",
+                "version": sec["version"],
             }],
             None,
         )

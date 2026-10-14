@@ -245,7 +245,7 @@ python .orchd/__main__.py review --task <id> ...        # 提交审查结论（A
 
 * **git**：克隆 orchd-core、agent 在项目内建任务分支（v1.5.0 起支持无 git 模式：有目录即可）
 
-* **Python >= 3.11**：运行安装器与引擎；`jsonschema` 依赖由安装器自动装入 `.orchd/`
+* **Python >= 3.11**：运行安装器与引擎；`jsonschema>=4.20` 须预装（`pip install "jsonschema>=4.20"`）——安装路径不经由 pip，安装器不自动装入第三方依赖（见 `install.py`）
 
 * **网络**：可访问 GitHub 或 Gitee
 

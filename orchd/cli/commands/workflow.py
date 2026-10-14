@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.guide import (
     NEXT_ACTION_EXIT,
     NEXT_ACTION_REVIEW_TAKEOVER,
@@ -55,7 +56,8 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     返回: 匹配的任务信息或空结果。--auto-claim 时附加 claim 结果（或错误）。
     """
     from orchd.ledger import stale_review_claims
-    from orchd.onboard import claim, request
+    from orchd.onboard import request
+    from orchd.onboard.claim import claim
     enforce_self_review_block = bool(
         master.config.get("enforce_self_review_block") if hasattr(master, "config") else False
     )
@@ -74,6 +76,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             (master.config.get("conflict_policy") if hasattr(master, "config") else None)
             or None
         ),
+        phase=getattr(args, "phase", None),
     )
 
     # task-review-comments-gate-and-stale-timeout（D）：request 候选只透出
@@ -88,7 +91,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # W-2 僵尸审查认领巡检：request 响应恒附 stale_reviews，无候选时把
     # next_action 抬为 review_takeover 并给接管命令，避免 agent 卡在死锁里
     # （判定复用 ledger 派生，与 status/doctor 一致）。
-    stale_reviews: dict[str, dict[str, object]] = {}
+    stale_reviews: dict[str, dict[str, Any]] = {}
     try:
         stale_reviews = stale_review_claims(store.replay())
     except Exception:
@@ -275,7 +278,7 @@ def claim_preview(
             {"check": "依赖全部满足",
              "expected_pass": all(
                  (state.get(d).status if state.get(d) else "pending")
-                 in ("completed", "cancelled") for d in task_def.get("depends_on", [])
+                 in TERMINAL_STATUSES for d in task_def.get("depends_on", [])
              )},
             {"check": "未被其他 agent 认领",
              "expected_pass": not (ts and ts.claimed_by and ts.claimed_by != agent_id)},
@@ -305,7 +308,7 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     返回: 认领事件信息；无 --confirm 时仅返回确认闸门预览
     （confirm_required:true + preview，不写事件、不建分支）。
     """
-    from orchd.onboard import claim
+    from orchd.onboard.claim import claim
     from orchd.worktree import resolve_canonical_project_root
 
     shared = master.shared if hasattr(master, "shared") else None
@@ -391,7 +394,7 @@ def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         _early_scope_guard(orchd_dir.parent, _task_def_early, args.task, [])
     result = done(
         store, tasks, agent_id=agent_id, task_id=args.task,
-        changes_description=changes, concerns=args.concerns,
+        changes_description=changes or "", concerns=args.concerns,
         project_root=orchd_dir.parent,
         skip_lesson_review=getattr(args, "skip_lesson_review", False),
     )
@@ -503,6 +506,8 @@ def register(sub) -> None:
                    help="--auto-claim 时附加全部共享上下文（默认按需）")
     p.add_argument("--max-active", type=int, default=None,
                    help="全局活跃（claimed）任务数达到该值时拒绝候选（容量控制）")
+    p.add_argument("--phase", default=None,
+                   help="指定阶段名（覆盖自动推进）；不在 tasks[] 的 phase 取值集合时返回结构化提示而非静默空候选")
     p.set_defaults(func=_cmd_request)
 
     # claim

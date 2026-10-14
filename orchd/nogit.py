@@ -55,19 +55,17 @@ _EXCLUDED_TOP_NAMES = frozenset({
 })
 
 # 引擎运行时文件（task-nogit-single-dir-pivot）：单目录快照直接扫描主目录树，
-# `.orchd/` 下由引擎持续改写的状态文件（账本/检查点/绑定/锁/课程库/备份区/
-# 草案区）必须排除——否则认领/评审等引擎动作自身即构成“改动”，门禁恒红。
-# 仅在 `.orchd/` 子树内生效（项目源码同名文件不受影响）；用户可见文档
-# （IDEAS.md / shared/）与 _master.json 不在此列（仍参与变更检测——
+# `.orchd/` 下由引擎持续改写的状态文件（账本/检查点/绑定/销账清单/布局标记/
+# 课程库/备份区/草案区）必须排除——否则认领/评审等引擎动作自身即构成“改动”，
+# 门禁恒红。仅在 `.orchd/` 子树内生效（项目源码同名文件不受影响）；用户可见
+# 文档（IDEAS.md / shared/）与 _master.json 不在此列（仍参与变更检测——
 # _master.json 的门禁影响已由 out-of-scope 固定资产豁免与 residual 声明覆盖
 # 过滤中和，test_snapshot_roundtrip_and_lock 锁定其在 manifest 内）。
-_HASH_EXCLUDED_FILES = frozenset({
-    "_ledger.jsonl",
-    "_checkpoint.json",
-    "session-worktrees.json",
-    "lessons.jsonl",
-    "lessons.staged.jsonl",
-})
+#
+# task-nogit-runtime-list-single-source：成员唯一定义见
+# orchd.doctor._RUNTIME_STATE_FILES，此处仅别名引用（同一对象），禁止另立字面量
+# 枚举（负控制见 tests/test_nogit_changedet.py::TestSingleSourceRuntimeList）。
+from orchd.doctor import _RUNTIME_STATE_FILES as _HASH_EXCLUDED_FILES
 # SQLite 存储后端（A3）的账本库与侧车文件（``-wal`` / ``-shm`` / ``-journal``）同属
 # **引擎运行时状态**，无 git 快照口径必须一并排除：否则「切换存储后端」本身就会被
 # 越界门禁判成项目改动（task-storage-test-matrix 实测：sqlite 后端在无 git 项目下
@@ -155,8 +153,10 @@ def _ensure_store_ignored(store: Path) -> None:
     if gi.exists():
         return
     try:
+        from orchd.ledger import _write_text_atomic
+
         store.mkdir(parents=True, exist_ok=True)
-        gi.write_text("*\n", encoding="utf-8")
+        _write_text_atomic(gi, "*\n")
     except OSError:
         pass
 
@@ -223,7 +223,18 @@ def hash_tree(project_root: Path, *, store_root: Path | None = None) -> dict[str
 
 
 def write_manifest(snap_dir: Path, manifest: dict[str, str]) -> Path:
-    """原子写入 manifest（临时文件 + os.replace）。"""
+    """原子写入 manifest（临时文件 + os.replace）。
+
+    耐久档（task-os-replace-hardening-io-batch 批次 1b）：tmp 写入 → flush +
+    fsync → ``ledger._atomic_replace``（WinError 5/32 有界重试，耗尽抛结构化
+    E007）→ ``_fsync_dir(父目录)``。manifest 是无 git 模式快照的文件清单账面，
+    断电零长会让增量比对失真。tmp 形态（``<MANIFEST_NAME>.tmp``）与文本形态
+    （``indent=2`` / ``ensure_ascii=False`` / **带尾换行**——与 master 的无尾
+    换行相反，历史契约，勿「顺手统一」）原样保留。惰性导入沿用本模块对
+    orchd.* 的叶子约定。
+    """
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     snap_dir.mkdir(parents=True, exist_ok=True)
     target = snap_dir / MANIFEST_NAME
     tmp = snap_dir / (MANIFEST_NAME + ".tmp")
@@ -233,8 +244,12 @@ def write_manifest(snap_dir: Path, manifest: dict[str, str]) -> Path:
         indent=2,
         sort_keys=False,
     )
-    tmp.write_text(payload + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, target)
+    _fsync_dir(snap_dir)
     return target
 
 

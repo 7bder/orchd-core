@@ -40,6 +40,7 @@ from orchd.ledger import (
     Store,
     TaskDerived,
     TaskState,
+    _write_text_atomic,
     # task-fp-identity-single-source：指纹判定单一事实源（本子域不导入 onboard，
     # 统一从 ledger 导入，消除私有副本的同步漂移风险）
     is_fingerprint_agent_id as _is_fingerprint_agent_id,
@@ -257,7 +258,9 @@ def _own_residual_action(
             )
         elif reason == "branch_not_cleaned":
             fix = (
-                f"在主工作树执行 git branch -d task/{task_id}（root={audit_root}），"
+                f"引擎自动删分支（task-merge-auto-delete-branch）失败的兜底属仓库"
+                f"管理员处置：在主工作树人工执行 git branch -d task/{task_id}"
+                f"（root={audit_root}），agent 不得自行执行该写操作（红线 #1）；"
                 "失败则运行 doctor --fix"
             )
         elif reason == "branch_not_merged_into_main":
@@ -326,7 +329,7 @@ def request_reviewer(
             )
             if is_self and enforce_self_review_block:
                 continue
-            entry = {
+            entry: dict[str, Any] = {
                 "task_id": tid,
                 "task": task_def,
                 "review_phase": ts.review_phase,
@@ -601,7 +604,7 @@ def _resolve_review_resolve_markers(workdir: Path, conflict_files: list[str]) ->
         # 确认无残留冲突标记
         if "<<<<<<<" in merged or ">>>>>>>" in merged:
             return False
-        target.write_text(merged, encoding="utf-8")
+        _write_text_atomic(target, merged)
         add = subprocess.run(
             ["git", "-C", str(workdir), "add", rel],
             capture_output=True,
@@ -677,7 +680,8 @@ def _review_submit_impl(
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: task '{task_id}' not in_review",
-                [{"task_id": task_id, "actual": ts.status if ts else "pending",
+                [{"reason": "review_not_in_review",
+                  "task_id": task_id, "actual": ts.status if ts else "pending",
                   "recent_transitions": _err_transitions(),
                   "hint": f"任务当前状态为 {ts.status if ts else 'pending'}（非 in_review），"
                           f"可能尚未 done 或已被审查打回 pending"}],
@@ -686,7 +690,8 @@ def _review_submit_impl(
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: review phase mismatch (expected '{ts.review_phase}', got '{review_type}')",
-                [{"task_id": task_id, "expected_phase": ts.review_phase,
+                [{"reason": "phase_mismatch",
+                  "task_id": task_id, "expected_phase": ts.review_phase,
                   "got_phase": review_type,
                   "recent_transitions": _err_transitions(),
                   "hint": f"审查阶段不匹配：任务处于 {ts.review_phase} 阶段，"
@@ -706,7 +711,8 @@ def _review_submit_impl(
                 ErrorCode.E007,
                 f"invalid_state: review not claimed by this session "
                 f"(claimed_by='{ts.review_claimed_by}', claimed_session='{ts.review_claimed_session}')",
-                [{"task_id": task_id, "claimed_by": ts.review_claimed_by,
+                [{"reason": "review_not_claimed",
+                  "task_id": task_id, "claimed_by": ts.review_claimed_by,
                   "claimed_session": ts.review_claimed_session, "agent": agent_id,
                   "current_session": current_session,
                   "recent_transitions": _err_transitions(),
@@ -730,7 +736,8 @@ def _review_submit_impl(
             raise OrchdError(
                 ErrorCode.E007,
                 "invalid_state: CHANGES_REQUESTED requires non-empty review comments",
-                [{"task_id": task_id, "verdict": verdict,
+                [{"reason": "changes_requested_empty",
+                  "task_id": task_id, "verdict": verdict,
                   "hint": "打回审查必须附上具体修改意见（comments 不能为空或仅空白），"
                           "否则实现者返工后无法获知需要修复什么"}],
             )
@@ -750,7 +757,8 @@ def _review_submit_impl(
                 raise OrchdError(
                     ErrorCode.E007,
                     "invalid_rework_scope: rework_scope 仅用于 code 阶段的 CHANGES_REQUESTED",
-                    [{"task_id": task_id, "verdict": verdict,
+                    [{"reason": "invalid_rework_scope",
+                      "task_id": task_id, "verdict": verdict,
                       "review_type": review_type,
                       "hint": "仅 code 审查打回实现问题时可附 --rework-scope code"
                               "（返工后直达 code）；其余情形不得携带"}],
@@ -759,7 +767,8 @@ def _review_submit_impl(
                 raise OrchdError(
                     ErrorCode.E007,
                     f"invalid_rework_scope: {rework_scope!r} 非法",
-                    [{"task_id": task_id,
+                    [{"reason": "invalid_rework_scope",
+                      "task_id": task_id,
                       "hint": "rework_scope 仅支持 spec（默认，全退重走）/ code"
                               "（仅实现问题，返工直达 code）"}],
                 )
@@ -791,6 +800,7 @@ def _review_submit_impl(
             result["integrity_warnings"] = integrity_warnings
 
         if baseline_drift:
+            assert baseline_sha is not None and current_sha is not None
             # AC1（task-review-diagnostics-hardening）：baseline_warning 结构化，
             # 以稳定契约对象承载漂移信息（code / baseline_sha / current_sha /
             # severity / message），字段级可断言，避免 container 布局下告警长期
@@ -853,7 +863,8 @@ def _review_submit_impl(
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_verdict: unsupported verdict={verdict!r} review_type={review_type!r}",
-                [{"task_id": task_id, "verdict": verdict, "review_type": review_type,
+                [{"reason": "invalid_verdict", "task_id": task_id, "verdict": verdict,
+                  "review_type": review_type,
                   "hint": "verdict 仅支持 APPROVED / CHANGES_REQUESTED"}],
             )
     finally:
@@ -894,8 +905,26 @@ def _review_submit_impl(
                     )
             except OrchdError:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                # task-degraded-trace-visibility：声明完整性校验未生效不再纯静默
+                # pass——经 record_degraded_guard（guard="review_declared_diff"，
+                # E030 / warning）写入 degraded 供响应携带（degraded_guards）。
+                # 降级语义不变：仍跳过该门禁继续 merge（不升级为阻断）。
+                from orchd.gitops.guard import GUARD_STATUS_FAILED, record_degraded_guard
+
+                _err = f"{type(exc).__name__}: {exc}".strip()[:300]
+                record_degraded_guard(
+                    degraded,
+                    guard_name="review_declared_diff",
+                    status=GUARD_STATUS_FAILED,
+                    reason=f"声明文件 diff 校验未生效，已降级跳过：{_err}",
+                    context={"task_id": str(task_id)},
+                    error=_err,
+                    hint=(
+                        "声明完整性校验异常，本次 merge 未做声明 diff 门禁；"
+                        "请人工确认声明文件已进任务分支后重试"
+                    ),
+                )
 
         # 并发 merge 串行（task-14-merge-main-tree AC4）：以主工作树锁互斥，
         # 多个 code APPROVED 同时进主工作树 merge 时排队，互不干扰。
@@ -906,8 +935,10 @@ def _review_submit_impl(
         # 延迟导入即 ModuleNotFoundError → merge_audit 恒 skipped(no_project_root)
         # （生产 11/11 code APPROVED 实证；与 _cmd_review 的 _preimport_archive_deps
         # 同模式）。此处提前绑定，后续只用不再导入。
+        _merge_audit_fn: Any = None
         try:
-            from orchd.report import merge_audit as _merge_audit_fn
+            from orchd.report import merge_audit as _merge_audit_impl
+            _merge_audit_fn = _merge_audit_impl
         except Exception:
             _merge_audit_fn = None
         merge_lock: Any | None = None
@@ -936,7 +967,18 @@ def _review_submit_impl(
             auto_resolved = False
             conflict_files: list[str] = []
             if merge_result is not None and merge_result.get("conflict"):
-                auto = try_auto_resolve_conflict(project_root, task_id) if project_root else None
+                # task-degraded-trace-visibility：union 取 verify_command 失败经
+                # degraded 透到响应；2 参测试替身向后兼容（TypeError 回退 2 参）。
+                if project_root:
+                    try:
+                        auto = try_auto_resolve_conflict(project_root, task_id, degraded)
+                    except TypeError as _te:
+                        if "positional" in str(_te) or "takes" in str(_te):
+                            auto = try_auto_resolve_conflict(project_root, task_id)
+                        else:
+                            raise
+                else:
+                    auto = None
                 if auto and auto.get("resolved"):
                     auto_resolved = True
                 else:
@@ -1141,6 +1183,8 @@ def _review_submit_impl(
                         # 无需 lock_held 透传，不会触发 E012 死锁。
                         from orchd.worktree import remove_task_wt
 
+                        assert project_root is not None
+                        assert store_root is not None
                         result["worktree_recycled"] = remove_task_wt(
                             project_root, task_id, store_root, lock_held=reuse_recycle
                         )

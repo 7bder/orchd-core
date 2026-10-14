@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.worktree.bindings import _TASK_WT_PREFIX, load_bindings
 from orchd.worktree.layout import (
     _git_common_dir, _is_git_tracked_path,
@@ -159,7 +160,7 @@ def prune_orphans(
             for task_id, entry in list(bindings.items()):
                 status, status_source = _fresh_status(task_id)
                 effective = status or "pending"
-                if effective in ("completed", "cancelled"):
+                if effective in TERMINAL_STATUSES:
                     # 终态：回收 worktree + 解绑（删除动作由 remove_task_wt 记 recycle_log）
                     decisions.append({
                         "action": "recycle",
@@ -195,7 +196,7 @@ def prune_orphans(
                 for cid in candidate_ids:
                     if cid in bindings:
                         status, status_source = _fresh_status(cid)
-                        if (status or "pending") not in ("completed", "cancelled"):
+                        if (status or "pending") not in TERMINAL_STATUSES:
                             has_active_binding = True
                         break
                 if has_active_binding:

@@ -16,9 +16,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import get_current_branch, get_default_branch, list_tracked_changes
-from orchd.ledger import Store, resolve_store_dir
+from orchd.ledger import Store, _write_text_atomic, resolve_store_dir
 from orchd.spec import (
     Master,
     detect_dir_or_glob_declarations,
@@ -123,7 +124,8 @@ def _ac_field_routing_hint(status: str, fields: set[str]) -> str:
             "amend --revise-terminal <task_id> --reason \"<理由>\""
         )
     return (
-        f"字段 {names} 属 AC 类文本：pending 态可直接改；终态走 "
+        f"字段 {names} 属 AC 类文本：pending 态可直接改——合法通道："
+        "amend --task <id> --acceptance-criteria \"<ac>\" ...（整体覆写）；终态走 "
         "amend --revise-terminal <task_id> --reason \"<理由>\""
     )
 
@@ -188,16 +190,17 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
             mod_dir = store_root / mod_id
             mod_dir.mkdir(parents=True, exist_ok=True)
             spec_path = mod_dir / "spec.json"
-            spec_path.write_text(
+            _write_text_atomic(
+                spec_path,
                 json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
             )
             created_files.append(spec_path.relative_to(store_root).as_posix())
 
-        # 创建空 ledger（若不存在）
+        # 创建空 ledger（若不存在）——走后端端口，避免在 sqlite 后端下产出幽灵 jsonl
         if not store.ledger_exists():
-            store.ledger_path.touch()
-            created_files.append("_ledger.jsonl")
+            created = store.backend.create_empty_ledger()
+            if created:
+                created_files.append(created)
 
         # 写初始 checkpoint
         store.update_checkpoint({})
@@ -357,7 +360,9 @@ def amend(
     """增量更新 snapshot：按状态约束矩阵过滤变更。
 
     约束矩阵：
-    - pending：可改全部字段
+    - pending：可改全部字段（含 acceptance_criteria；合法 CLI 通道为
+      ``amend --task <id> --acceptance-criteria ...``，整体覆写，仅 pending
+      放行——task-amend-ac-pending-channel）
     - claimed：仅允许修改 verify_command / reviewers 白名单字段，其余拒绝（E007）
     - done / in_review（review 组）：仅允许修改 reviewers
     - completed / cancelled：默认拒绝；``revise_terminal`` 指向该任务时，纯文本规格
@@ -419,6 +424,7 @@ def amend(
             f"invalid_branch: amend 仅在 default（{default_branch}）分支执行（主工作树），"
             f"当前分支 {current_branch} 拒绝注册（红线 7）",
             [{
+                "reason": "invalid_branch",
                 "branch": current_branch,
                 "default": default_branch,
                 "hint": (
@@ -464,6 +470,8 @@ def amend(
     terminal_decl_sync: list[dict[str, Any]] = []
     # task-terminal-spec-revision-channel：本次终态规格文本修订明细（写审计事件 + 回响应）
     terminal_text_revisions: list[dict[str, Any]] = []
+    # task-amend-orphan-prune：本次清除的孤儿 module 快照目录（module_id 列表，留痕）
+    pruned_modules: list[str] = []
 
     # task-intake-file-lock（AC1/AC3）：准入写锁 + 提交前 HEAD 推进检测。
     # 准入写（改 _master.json / IDEAS.md / ROADMAP.md）受独立 .intake.lock 串行，
@@ -494,9 +502,10 @@ def amend(
                 intake_lock = None
             raise OrchdError(
                 ErrorCode.E007,
-                f"stale_base: main 已被并行推进（base {drift.get('base_sha')[:7]}"
+                f"stale_base: main 已被并行推进（base {(drift.get('base_sha') or '')[:7]}"
                 " 与本地 HEAD 分叉），拒绝注册——请先更新工作区 main 后重试",
-                [{"base_sha": drift.get("base_sha"), "head_sha": drift.get("head_sha")}],
+                [{"reason": "stale_base",
+                  "base_sha": drift.get("base_sha"), "head_sha": drift.get("head_sha")}],
             )
     except OrchdError:
         raise
@@ -538,7 +547,8 @@ def amend(
                     ErrorCode.E007,
                     "stale_base: main 已被并行推进，本次 amend 未写入任何内容——"
                     "请直接重试 amend（将重读最新 base 重放变更）",
-                    [{"expected_head": expected_head, "head_now": _head_now}],
+                    [{"reason": "stale_base",
+                      "expected_head": expected_head, "head_now": _head_now}],
                 )
 
         # task-terminal-spec-revision-channel：修订开关前置校验——先于任何写入，
@@ -557,13 +567,14 @@ def amend(
                 )
             target_state = state.get(revise_terminal)
             target_status = target_state.status if target_state else "pending"
-            if target_status not in ("completed", "cancelled"):
+            if target_status not in TERMINAL_STATUSES:
                 raise OrchdError(
                     ErrorCode.E007,
                     "invalid_state: --revise-terminal 仅适用于终态任务"
                     f"（completed/cancelled），任务 {revise_terminal} 当前状态为 "
                     f"{target_status}",
                     [{
+                        "reason": "revise_terminal_not_terminal",
                         "task_id": revise_terminal,
                         "status": target_status,
                         "hint": (
@@ -613,7 +624,7 @@ def amend(
                 # 进而因归档 idea 恒 E025（执行者被迫回灌引擎自己的引用完整性）。账本
                 # 终态为准：completed/cancelled 跳过 source 硬要求（与 validate_source
                 # 的 P2-2 豁免同源）。
-                _terminal_drifted = status in ("completed", "cancelled")
+                _terminal_drifted = status in TERMINAL_STATUSES
                 source = task.get("source")
                 if not _terminal_drifted and (
                         not source or not isinstance(source, str)
@@ -636,6 +647,8 @@ def amend(
                     conflicts: list[dict[str, Any]] = []
                     for other in tasks:
                         oid = other.get("id")
+                        if not isinstance(oid, str):
+                            continue
                         if oid == tid:
                             continue
                         ots = state.get(oid)
@@ -717,7 +730,7 @@ def amend(
                         **({"hint": _ac_field_routing_hint(status, _rejected)}
                            if _rejected & _TERMINAL_TEXT_REVISABLE_FIELDS else {}),
                     })
-            elif status in ("completed", "cancelled"):
+            elif status in TERMINAL_STATUSES:
                 # task-amend-terminal-drift-repair：终态任务 master≠snapshot 时，
                 # 区分"合法附加字段增量"与"核心字段变更"。附加字段白名单 → 自动
                 # 以 master 为准同步 snapshot（不报 E007）；含核心字段 → 仍 E007。
@@ -783,21 +796,21 @@ def amend(
                     for field in ("files_to_edit", "exempt_files"):
                         if field not in remaining:
                             continue
-                        old_files = old_task.get(field, []) or []
-                        new_files = task.get(field, []) or []
-                        removed = [p for p in old_files if p not in new_files]
-                        added = [p for p in new_files if p not in old_files]
-                        if any((project_root / p).exists() for p in removed):
+                        old_decl = old_task.get(field, []) or []
+                        new_decl = task.get(field, []) or []
+                        removed_decl = [p for p in old_decl if p not in new_decl]
+                        added_decl = [p for p in new_decl if p not in old_decl]
+                        if any((project_root / p).exists() for p in removed_decl):
                             normalized_ok = False
                             break
-                        if any(not (project_root / p).exists() for p in added):
+                        if any(not (project_root / p).exists() for p in added_decl):
                             normalized_ok = False
                             break
                         sync_entries.append({
                             "task_id": tid,
                             "field": field,
-                            "removed": sorted(removed),
-                            "added": sorted(added),
+                            "removed": sorted(removed_decl),
+                            "added": sorted(added_decl),
                         })
                     if normalized_ok:
                         updated_tasks.append(tid)
@@ -895,7 +908,9 @@ def amend(
                            if _normalized_changed & _TERMINAL_TEXT_REVISABLE_FIELDS else {}),
                     })
             else:
-                # pending：可改全部
+                # pending：可改全部（含 acceptance_criteria；合法 CLI 通道为
+                # amend --task <id> --acceptance-criteria ...，独立旗标 +
+                # 显式 pending 校验，不走白名单——task-amend-ac-pending-channel）
                 updated_tasks.append(tid)
 
         # 被删除的任务（snapshot 中存在但 master 已移除）：不阻止，仅报告
@@ -942,7 +957,7 @@ def amend(
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: {len(errors)} task(s) cannot be amended",
-                errors,
+                [{**errors[0], "reason": "cannot_amend"}, *errors[1:]],
             )
 
         # L262：注册前质量校验（E022/E023/E024/E029，warning 不阻断注册，附加到响应）。
@@ -955,15 +970,30 @@ def amend(
             if e.code is ErrorCode.E022:
                 m = re.match(r"\$\.tasks\[(\d+)\]\.verify_command$", e.path)
                 is_code = False
+                blocking_tid = ""
                 if m and m.group(1).isdigit():
                     idx = int(m.group(1))
                     if 0 <= idx < len(tasks):
                         is_code = is_code_task(tasks[idx])
+                        blocking_tid = str(tasks[idx].get("id") or "")
                 if is_code:
+                    # 场景化 hint（task-guide-placeholder-literal-scan AC3）：阻断
+                    # 响应必须带真值 task_id 与可执行命令——命令走 guide.amend_patch_cmd
+                    # 单一生成源（rules/git.md:17，禁手写第二份命令模板），占位词表
+                    # 的静态 recovery 退为尖括号形态仅作兜底。
+                    from orchd.guide import amend_patch_cmd
+
                     raise OrchdError(
                         ErrorCode.E022,
                         "注册前质量校验失败：代码类任务缺 verify_command，注册被阻断",
-                        [entry | {"blocking": True}],
+                        [entry | {
+                            "blocking": True,
+                            "hint": (
+                                f"代码类任务 {blocking_tid} 缺少 verify_command：运行 "
+                                f"{amend_patch_cmd(blocking_tid, verify='<cmd --basetemp=...>')} "
+                                "补齐后重试"
+                            ),
+                        }],
                     )
             quality_warnings.append(entry)
 
@@ -974,7 +1004,7 @@ def amend(
         try:
             _terminal_ids = {
                 tid for tid, ts in state.items()
-                if ts.status in ("completed", "cancelled")
+                if ts.status in TERMINAL_STATUSES
             }
         except Exception:
             _terminal_ids = None
@@ -1124,10 +1154,35 @@ def amend(
             mod_dir = store_root / mod_id
             mod_dir.mkdir(parents=True, exist_ok=True)
             spec_path = mod_dir / "spec.json"
-            spec_path.write_text(
+            _write_text_atomic(
+                spec_path,
                 json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
             )
+
+        # task-amend-orphan-prune：清除已删 module 的孤儿 mod-*/spec.json 快照目录。
+        # 根因：快照重写只写当前 modules，历史已删 module 的目录从不清理；其 tasks
+        # 仍被下一次 amend 的 existing_tasks（mod-*/spec.json 全量 glob）读入，
+        # removed_tasks 每次重复误报（非幂等，如 init 默认的 task-sample 孤儿）。
+        # 范围：仅 store_root 直接子级、目录名匹配 mod-* 且不在当前 master modules。
+        # 方式：仅删派生 spec.json，目录仅在其为空时 rmdir（非空留痕保留，下次重试）；
+        # 无 spec.json 的 mod-* 目录不入列（不误删用户数据）。
+        master_module_ids = {str(m.get("id", "")) for m in modules}
+        for orphan_spec in sorted(store_root.glob("mod-*/spec.json")):
+            orphan_dir = orphan_spec.parent
+            orphan_id = orphan_dir.name
+            if orphan_dir.parent != store_root or orphan_id in master_module_ids:
+                continue
+            if not _SAFE_MODULE_ID_RE.fullmatch(orphan_id):
+                continue
+            try:
+                orphan_spec.unlink()
+            except OSError:
+                continue
+            try:
+                orphan_dir.rmdir()  # 仅空目录（R-16：失败禁止升级 rmtree）
+            except OSError:
+                pass
+            pruned_modules.append(orphan_id)
 
         # task-terminal-spec-revision-channel：终态规格文本修订的 AMEND 审计事件。
         # 复用既有事件类型（不新增类型、不改 ledger._apply_event 语义——AMEND 为纯审计
@@ -1184,6 +1239,7 @@ def amend(
         # （new/updated/removed）保持原样。
         "unchanged_tasks_count": len(unchanged_tasks),
         "removed_tasks": removed_tasks,
+        "pruned_modules": pruned_modules,
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
         "exempted_terminal_warnings": _exempted_terminal_warnings,
         "conflict_warnings": conflict_warnings,

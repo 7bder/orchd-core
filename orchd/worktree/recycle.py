@@ -121,22 +121,38 @@ def _tx_journal_read(path: Path | None) -> dict[str, Any] | None:
 
 
 def _tx_journal_write(path: Path | None, payload: dict[str, Any]) -> bool:
-    """原子写 journal（tmp + os.replace）；失败返回 False，不抛异常。"""
+    """原子写 journal（tmp + fsync + _atomic_replace）；失败返回 False，不抛异常。
+
+    耐久档（task-os-replace-hardening-worktree-batch 批次 1a）：与账本
+    ``ledger._write_text_atomic`` 同一硬化序——tmp 写入 → flush + fsync →
+    ``ledger._atomic_replace``（WinError 5/32 有界重试）→ ``_fsync_dir``。
+    ``_atomic_replace`` 争用耗尽抛的结构化 E007 在此捕获并映射回 False——
+    本函数契约是 best-effort 日志面（调用方按 False 走「journal 不可用」
+    降级），一次 Windows 句柄争用不得把回收路径从「降级继续」变成「崩溃」。
+    tmp 的 pid 后缀命名（防同会话并行碰撞）与 JSON 文本形态原样保留。
+    """
     if path is None:
         return False
+    from orchd.errors import OrchdError
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(str(tmp), str(path))
-    except OSError:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        _atomic_replace(tmp, path)
+    except (OSError, OrchdError):
         try:
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
         except OSError:
             pass
         return False
+    _fsync_dir(path.parent)
     return True
 
 

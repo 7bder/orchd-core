@@ -1,5 +1,5 @@
 # Orchid Agent
-> agent 工作流协议（BOOTSTRAP / WORKER 与纪律）；使用手册见 [docs/user-manual.md](../docs/user-manual.md)。
+> agent 工作流协议（引擎自判阶段与纪律）；使用手册见 [docs/user-manual.md](../docs/user-manual.md)。
 > 体积口径：字符（本文件 ≤7200 字符，逼近时外置细则至 rules/，仅留协议概览与索引链接）。
 
 ## 入口协议（MUST，每 session 首读）
@@ -9,14 +9,14 @@
 4. **输出契约**：stdout 纯 JSON（guidance 对象；无内容则省略键）；人看 stderr，agent 只读 stdout。
 5. **转述契约**：收到 guidance 即转述下一步（初始化 SVG 卡片，日常引用块 + 粗体 project_view / agent_view）。SVG 卡片 = 首次入场时以 SVG 图形呈现的整体架构概览。
 
-## Determine your mode
-- `.orchd/` 存在 → **WORKER**（摄入 / 纪律红线 / rules / guidance 全能力）。
-- `.orchd/` 不存在 → **BOOTSTRAP**（自启动安装，走 [skill-bootstrap.md](skill-bootstrap.md)）。
-- SELF-HOSTED 已并入统一协议（两模式：WORKER / BOOTSTRAP）；`.orchd/shared/self-hosted` 仅来源标记，不是能力开关。
+## 阶段由引擎判定（无模式自判）
+- agent 不自判模式：只做三连检查 + `python .orchd/__main__.py status`，一律听 `guidance.step/command`。
+- 阶段真源 = 引擎 `has_master + _classify`：无 `_master.json` → `first_time` 初始化阶段（走 [skill-bootstrap.md](skill-bootstrap.md)）；有 → 日常阶段（request/claim/done/review）。
+- `BOOTSTRAP/WORKER` 仅历史别名，不作能力分支；SELF-HOSTED 已并入统一协议，`.orchd/shared/self-hosted` 仅来源标记，不是能力开关。
 
-## WORKER mode（已有项目）
+## 日常阶段（已有项目）
 - **零根入口**：统一 `python .orchd/__main__.py <命令>`，宿主根零额外文件免安装。
-- **无感引导**：JSON 响应自动附加 `guidance`，逐层导航 request/claim/done/review。
+- **无感引导**：JSON 响应自动附加 `guidance`，逐层导航 request/claim/done/review。其中 `read`/`template` 是知识+方法路由，闭环为「读规则 → 加载模板 → 执行 `command`」；引擎只吐实际存在的路径，不存在的剔除并打 `degraded` 标记，缺字段/空数组一律不阻塞（无害降级，可跳过）。
 - **多 worktree 并行**：生命周期引擎自动管理；merge 在主工作树执行（见 rules/git.md）。
 
 ## 纪律红线（MUST / MUST NOT，违反 = 事故；优先级最高）
@@ -33,17 +33,17 @@
 7. **禁擅自 auto-claim**：`request --auto-claim` 默认拒绝（E032），仅 `config.allow_auto_claim: true` 时可调。
 8. **禁任务分支执行 intake/amend**：amend 仅在 canonical 主工作树 main 且工作区干净时执行；任务分支 E007 拒绝，回主工作树补声明。
 9. **禁手改运行时文件**：`_ledger.jsonl` / `_checkpoint.json` / `mod-*/spec.json` 由引擎维护，不手改；只读诊断（`status` / `doctor`）不受限，数据异常按 rules/recovery.md 处置或报告。
-10. **版本进发先落地再摄入**：新版本先 `roadmap-land`（= 将未来版本规划落地为 IDEAS pending）再摄入；临时想法直接写 IDEAS.md。
+10. **版本进发先落地再摄入**：新版本先 `roadmap-land`（= 将未来版本规划落地为 IDEAS study，待用户 `idea confirm` 升 pending）再摄入；临时想法直接写 IDEAS.md。
 11. **禁绕过 claim**：任务必须经 claim 建分支；禁手动 `git branch/checkout` 创建。claim 失败或分支异常时按 guidance 处置并报告，不自行建分支绕过。
 12. **禁任务悬空**：claim 后必须 done → 审查 → merge；中断/放弃先 retract。
-13. **禁声明文件漏提交**：files_to_edit 声明文件必须随分支提交进 diff；不在主工作树直接改任务文件；无需改动走 amend。
+13. **禁声明文件漏提交**：files_to_edit 声明文件必须随分支提交进 diff；不在主工作树直接改任务文件；无需改动走 amend。引擎 done 末尾自动提交（`_done_auto_commit` → `ensure_committed`）范围 = files_to_edit ∪ exempt_files（真源 `orchd/onboard/lifecycle/core.py`，详见 rules/git.md）。
 14. **禁无候选自行领任务**：request 返回 candidate=None / next_action=exit 时，禁止自行 claim、重试 request、`--auto-claim`；立即停止报告等指令。
 
 **MUST**（强制项）：条件 → 动作 → 出口/核实：
 1. 会话开始三连检查：`git status` + `git branch --show-current` + `python .orchd/__main__.py status`。
 2. 不读不写；写前先读。
 3. done / review / amend 后核对引擎响应（verify 结果、commit、状态流转）。
-4. 测试/verify 用 `--basetemp` 指向系统临时目录，禁止项目内残留临时文件。
+4. 测试/verify 用 `--basetemp` 指向系统临时目录（写法口径见 rules/verify.md）；本条禁的是**本会话自产**的测试临时物残留项目内。`review/` 审查证据、他人在途产物、已登记存档（带 sha256 留底）不属本条范围——删除任何非自产文件一律回到红线#3「禁改范围外文件」判定。
 5. 任何异常立即停止报告，不擅自处置；session 结束工作区干净或说明。
 6. completed 关闭前运行 `status --audit-task` 清零声明文件完整性告警。
 7. 准入/会话锁（E012/E019）不盲重试：先查持有者，正常并发释放后自动成功；僵死则等其退出或接管后再重试。
@@ -53,18 +53,22 @@
    - A3 响应即定义：claim 响应已含任务定义与 review_comments，不再读 master.json。
 
 ## 按 exit_type 行动（错误出口处置纪律）
-> `guidance.exit_type` 是处置唯一依据（出处：docs/implementation-design.md §3.2 五分法）。
+> `guidance.exit_type` 是处置唯一依据（出处：`design/error-code-exit-guidance-design-20260830.md` §3.2 exit_type 五分法）。
 > 处置动作遵循上面「选择 exit_type 的行动」，同时遵守「纪律红线」——尤其 git-diagnose 类**禁手动 git 写**。
 
-| exit_type | 动作 | 红线 |
-|---|---|---|
-| `exec-command` | 照 command 执行后重试 | 禁跳过 command |
-| `git-diagnose` | 只读取证 → 按 recovery 处置 | **禁手动 git 写** |
-| `manual-action` | 按 recovery 步骤改 | 确认对象后执行 |
-| `await-external` | 查持有者 → 等待，**禁重试** | E009/E011/E012/E019 |
-| `continue` | warning 不阻断，可继续 | 深层征兆 → lesson report |
+| exit_type | 动作 | 是否隐含不阻断 | 红线 |
+|---|---|---|---|
+| `exec-command` | 照 command 执行后重试 | 否 | 禁跳过 command |
+| `git-diagnose` | 只读取证 → 按 recovery 处置 | 否 | **禁手动 git 写** |
+| `manual-action` | 按 recovery 步骤改 | 否 | 确认对象后执行 |
+| `await-external` | 查持有者 → 等待，**禁重试** | 否 | E009/E011/E012/E019 |
+| `continue` | 按原计划继续，不停下来 | **是**（准入：该码无通道 A） | 深层征兆 → lesson report |
 
-四通道与码 → 通道登记见 [rules/recovery.md](rules/recovery.md)。
+> `exit_type` 只回答「agent 接下来怎么行动」，**不回答「是否阻断」**：阻断性由通道 A
+> （`OrchdError` 构造点）决定，一码可同时是 B/C 通道的告警与 A 通道的硬阻断（E028/
+> E029/E030），此时 `exit_type` 一律不取 `continue`——判据见
+> `tests/test_guide.py::TestExitTypeContract`，五分法真源见 `orchd/guide.py::EXIT_TYPE_ACTION_MEANING`。
+> 四通道与码 → 通道登记见 [rules/recovery.md](rules/recovery.md)。
 
 ## 身份约定（会话级指纹）
 - 身份 = `ORCHD_SESSION_ID` 派生 12 位 hex 指纹；同对话不变，不同对话不同。

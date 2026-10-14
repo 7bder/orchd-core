@@ -29,13 +29,14 @@ from orchd.cli._util import (
     _reject_container_root_cwd,
     _resolve_text_arg,
 )
+from orchd.ledger import read_text_or_error, single_line
 
 
 
 def register(sub):
     """注册 ideas-archive 一级命令 + idea 二级子命令组（原样搬自 _build_parser，3a 纯移动，机制未变）。"""
     # ideas-archive 一级命令（handler 住在本模块，注册也随模块走）
-    p = sub.add_parser("ideas-archive", help="自动归档已完结的 IDEAS 条目")
+    p = sub.add_parser("ideas-archive", help="自动归档已完结或已放弃的 IDEAS 条目")
     p.set_defaults(func=_cmd_ideas_archive)
 
     # idea（2026-08-15 idea-write-gate）：灵感写入 IDEAS 写入门禁（propose / confirm / drop）
@@ -54,6 +55,14 @@ def register(sub):
     _p = idea_sub.add_parser("drop", help="将 status: study 条目降为 dropped（仅用户执行）")
     _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
     _p.set_defaults(func=_cmd_idea_drop)
+
+    _p = idea_sub.add_parser(
+        "archive",
+        help="把已交付/不再需要留在台账的条目按用户裁决移入 IDEAS-archive.md（仅用户执行）",
+    )
+    _p.add_argument("--title", required=True, help="条目标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug）")
+    _p.add_argument("--reason", required=True, help="裁决理由（写入块内「- 归档裁决:」行，无痕迹不得离场）")
+    _p.set_defaults(func=_cmd_idea_archive)
 
     _p = idea_sub.add_parser("append", help="按 - id: 定位条目并追加时间戳 notes 行（替代手改 IDEAS.md）")
     _p.add_argument("--id", required=True, help="条目 - id: 字段精确值（可用 ideas list 查询）")
@@ -123,15 +132,55 @@ def _cmd_idea_drop(args) -> dict:
     return idea_drop(orchd_dir.parent, args.title)
 
 
-def _strip_idea_html_comments(text: str) -> str:
-    """剔除 IDEAS.md 头部 HTML 注释（含格式示例），只留真实条目。
+def _cmd_idea_archive(args) -> dict:
+    """把条目按用户裁决移入 IDEAS-archive.md（idea-archive-decision-channel，仅用户执行）。
 
-    intake 摄入协议前置过滤口径：HTML 注释块内的 ``## `` 行是格式示例，
-    不是条目——list 输出供 agent 解析，必须与摄入口径一致。
+    CLI 参数: args.title / args.reason。
+    返回: 归档结果字典（archived / title / from_status / decision / commit）；
+    拒绝时顶层附 error 键 ⇒ 非零退出（与 propose 同口径，失败不静默 exit 0）。
+    提交清单取后端回传的两个路径：IDEAS.md 与 IDEAS-archive.md 必须同批入库
+    （intake_commit 自 task-intake-archive-path 起同样含归档件，两通道提交面一致）。
     """
-    import re
+    from orchd.cli import _load_tasks
+    from orchd.gitops import ensure_committed
+    from orchd.ideas import find_live_source_refs, idea_archive_decision
+    from orchd.ledger import Store
 
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    orchd_dir = _find_orchd_dir()
+    project_root = orchd_dir.parent
+    # 在途 source 判定需要 master + 账本状态；在此算好传给后端，避免 ideas.py
+    # 为读 master 新造 spec 依赖边（conventions.md 的 ideas.py 行未声明 spec）
+    _, _, master = _load_tasks()
+    task_status = {tid: ts.status for tid, ts in Store(orchd_dir).replay().items()}
+    result = idea_archive_decision(
+        project_root,
+        args.title,
+        args.reason,
+        live_refs=find_live_source_refs(master, task_status),
+    )
+    if not result.get("archived"):
+        result["error"] = {
+            "code": "idea_rejected",
+            "reason": result.get("reason", "unknown"),
+            "hint": result.get("hint", ""),
+        }
+        return result
+
+    paths = [result.pop("ideas_path"), result.pop("archive_path")]
+    title = result.get("title", args.title)
+    commit = ensure_committed(
+        project_root, paths, f"chore(idea): orchd idea archive — {title}"
+    )
+    result["commit"] = commit
+    if commit.get("performed") is not True and commit.get("reason") != "no_changes":
+        result["commit_warning"] = {
+            "reason": commit.get("reason"),
+            "hint": (
+                "裁决已落盘但未入库：条目已从 IDEAS.md 移入归档文件，"
+                "请核对 git 环境后重跑 ideas-archive/intake 提交，勿手改文档找平"
+            ),
+        }
+    return result
 
 
 def ideas_list(project_root) -> dict[str, Any]:
@@ -143,8 +192,15 @@ def ideas_list(project_root) -> dict[str, Any]:
     Returns:
         ``{"ideas": [{"title", "id", "status"}], "count": n}``，永不抛异常；
         IDEAS.md 缺失 / 不可读 → 空列表（可解析的零结果，而非错误）。
+        被未闭合 ``<!--`` 罩住的条目额外带 ``"comment_hidden": true``，此时结果另附
+        ``"comment_unclosed_at": <行号>``（1 基）；两者都不出现时形态与既有一致。
     """
-    from orchd.ideas import parse_ideas
+    from orchd.ideas import (
+        comment_visibility,
+        mask_closed_comment_spans,
+        parse_ideas,
+        unclosed_comment_line,
+    )
     from orchd.ledger import resolve_workspace_root
 
     try:
@@ -155,12 +211,23 @@ def ideas_list(project_root) -> dict[str, Any]:
         text = ideas.read_text(encoding="utf-8")
     except (OSError, IOError, UnicodeDecodeError):
         return {"ideas": [], "count": 0}
-    entries = parse_ideas(_strip_idea_html_comments(text))
-    items = [
-        {"title": e["title"], "id": e["id"], "status": e["status"]}
-        for e in entries
-    ]
-    return {"ideas": items, "count": len(items)}
+    # 可见性判定与归档判据同源（task-idea-archive-diagnostics）：字段值在"成对注释被
+    # 等长空白替换"的文本上取（注释内不是条目正文，取值口径与既有实现一致，且行号仍与
+    # 原文对齐），于是 start_line 可直接与 comment_visibility 的判定比对——list 与归档
+    # 谈的是同一组行号，不再各持一份"注释罩住哪些行"的算法。
+    frozen_lines = comment_visibility(text)[1]
+    items: list[dict[str, Any]] = []
+    for e in parse_ideas(mask_closed_comment_spans(text)):
+        item = {"title": e["title"], "id": e["id"], "status": e["status"]}
+        if e["start_line"] in frozen_lines:
+            # 字段只增不改：既有三键与 count 语义不变，只给"看得见但永不归档"的条目
+            # 加一个可机读标记，免得用户靠肉眼对不上账。
+            item["comment_hidden"] = True
+        items.append(item)
+    out: dict[str, Any] = {"ideas": items, "count": len(items)}
+    if frozen_lines:
+        out["comment_unclosed_at"] = unclosed_comment_line(text)
+    return out
 
 
 def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
@@ -174,11 +241,12 @@ def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
     Args:
         project_root: 仓库根目录。
         entry_id: 条目 ``- id:`` 精确值。
-        notes: 追记内容（原文写入，调用方保证单行语义）。
+        notes: 追记内容（**函数内**经 single_line 折成单行后写入，调用方无需自行保证）。
 
     Returns:
         成功 ``{"appended": True, "id", "commit"}``；未命中
-        ``{"appended": False, "reason": "not_found", ...}``；前置守卫失败
+        ``{"appended": False, "reason": "not_found", ...}``；主文件不可读
+        ``{"appended": False, "reason": "read_error", ...}``；前置守卫失败
         同 propose 口径（not_on_main / dirty_workspace）。
     """
     from orchd.gitops import ensure_committed
@@ -213,7 +281,16 @@ def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
                 "id": entry_id,
                 "hint": "IDEAS.md 不存在或无该 id 条目，先 python .orchd/__main__.py ideas list 查看条目 id。",
             }
-        text = ideas.read_text(encoding="utf-8")
+        # 读盘兜底走唯一原语（task-idea-archive-hardening）：非 UTF-8 / 目录形
+        # IDEAS.md 此前会让异常穿到 CLI（本函数此前无 except）。
+        text, text_err = read_text_or_error(ideas)
+        if text_err is not None:
+            return {
+                "appended": False,
+                "reason": "read_error",
+                "id": entry_id,
+                "hint": "IDEAS.md 不可按 UTF-8 读出：先修好该文件再 append",
+            }
         lines = text.splitlines()
         end = None
         for i, line in enumerate(lines):
@@ -240,7 +317,11 @@ def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
                 "hint": "未找到 - id: 为该值的条目，先 python .orchd/__main__.py ideas list 查看条目 id。",
             }
         stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        new_lines = lines[:end] + [f"- notes追记 {stamp}: {notes}"] + lines[end:]
+        # 行式台账安全网（task-idea-archive-hardening）：notes 是「前缀 + 自由文本拼
+        # 一行」，多行输入能伪造出假 ## 小节头（旧 docstring 把保证推给调用方，
+        # 而 CLI 层原样透传 ⇒ 实际无人保证）。归一在写入点完成。
+        new_lines = lines[:end] + [
+            f"- notes追记 {stamp}: {single_line(notes)}"] + lines[end:]
         _atomic_write_text(ideas, "\n".join(new_lines) + "\n")
 
         commit = ensure_committed(

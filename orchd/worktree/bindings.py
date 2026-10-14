@@ -188,26 +188,40 @@ def load_bindings(store_root: Path) -> dict[str, Any]:
 
 
 def _save_bindings(store_root: Path, data: dict[str, Any]) -> None:
-    """原子写入绑定映射（tmp + os.replace）。
+    """原子写入绑定映射（tmp + fsync + _atomic_replace + 目录项 fsync）。
 
     W-2 / R-22：写失败（磁盘满 / IO 错误）不得静默 —— 原文件保持不变（原子
-    替换失败即不改动原文件），并清理残留 tmp，向上抛 ``OSError`` 由调用方告警。
-    绝不用坏结果整表覆写成功绑定表。
+    替换失败即不改动原文件），并清理残留 tmp，向上抛由调用方告警（写阶段
+    OSError；争用耗尽为结构化 E007，读路径兜底均为宽 except，见
+    resolve_task_root）。绝不用坏结果整表覆写成功绑定表。
+
+    耐久档（task-os-replace-hardening-worktree-batch 批次 1a）：与账本
+    ``ledger._write_text_atomic`` 同一硬化序——tmp 写入 → flush + fsync →
+    ``ledger._atomic_replace``（WinError 5/32 有界重试，耗尽抛结构化 E007，
+    前缀 ``atomic_replace_failed``）→ ``_fsync_dir(父目录)``。绑定映射承载
+    认领事务态，断电零长会让「任务分支归属」不可自愈，故与账本同档。
+    tmp 点前缀 ``.{name}.tmp`` 与 JSON 文本形态（``ensure_ascii=False`` /
+    ``indent=2`` / 尾换行 / 平台默认换行翻译）原样保留——防碰撞与读侧兼容
+    设计，改动即引入新故障面。
     """
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     path = bindings_path(store_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     try:
-        tmp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        os.replace(tmp, path)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _atomic_replace(tmp, path)
     except OSError:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+    _fsync_dir(path.parent)
 
 
 def _backup_corrupt_bindings(store_root: Path, path: Path, cause: Exception) -> Path:
@@ -247,8 +261,13 @@ def bind_task_wt(store_root: Path, task_id: str, worktree_path: Path) -> dict[st
     """
     from orchd.errors import ErrorCode, OrchdError
     from orchd.ledger import Store
+    from orchd.storage.filesystem import FilesystemBackend
 
-    store = Store(store_root)
+    # 锁直连（task-cutover-fallout-bind）：本函数只需 store 锁（绑定文件读写
+    # 互斥），不碰账本。显式 file 后端构造零副作用（不建库、不迁移）；而默认
+    # 构造在 sqlite 下会附带迁移改名，曾把调用方 file 账本搬走致 replay 读空。
+    # 两后端锁是同一 `.lock` 文件（ExclusiveFileLock），互斥成立与后端无关。
+    store = Store(store_root, backend=FilesystemBackend(store_root))
     store.acquire_lock()
     try:
         try:
@@ -289,8 +308,10 @@ def unbind_task_wt(
     """
     from orchd.errors import ErrorCode, OrchdError
     from orchd.ledger import Store
+    from orchd.storage.filesystem import FilesystemBackend
 
-    store = Store(store_root)
+    # 锁直连（同 bind_task_wt：只需 store 锁，不碰账本，显式 file 后端零副作用）。
+    store = Store(store_root, backend=FilesystemBackend(store_root))
     if not lock_held:
         store.acquire_lock()
     try:

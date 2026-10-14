@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.ledger import structured_error
+from orchd.ledger import _write_text_atomic, structured_error
 
 # 宿主会话身份环境变量（TRAE 会话码兜底）
 _TRAE_SESSION_ID_ENV = "ICUBE_CODEMAIN_SESSION"
@@ -201,8 +201,8 @@ def record_session_command(orchd_dir, command: str | None) -> None:
         if not isinstance(data, dict) or not data.get("active"):
             return
         data["last_command"] = str(command)
-        path.write_text(_json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
+        _write_text_atomic(path,
+                           _json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     except Exception:
         return
 
@@ -242,6 +242,7 @@ def _session_collision_warning(
     store,
     exclude_task_id: str | None = None,
     review_task_id: str | None = None,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """只读检测当前会话指纹的「并行会话碰撞」，返回 ``session_collision_warning`` 或 None。
 
@@ -284,7 +285,7 @@ def _session_collision_warning(
             return claimed_session == current_session_id and claimed_by == agent_id
         return bool(claimed_by and claimed_by == agent_id)
 
-    states = store.replay()
+    states = store.replay() if state is None else state
 
     # 条件 2：审查自己实现（reviewer session == 实现者 session）
     if review_task_id:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from orchd.cli._util import (
     _resolve_text_arg,
 )
 
-from orchd.ledger import structured_error
+from orchd.ledger import _atomic_replace, _fsync_dir, structured_error
 
 from orchd.cli.identity import _identity_warning, _require_agent_id
 from orchd.cli.skeleton import _cli_skeleton
@@ -250,6 +251,85 @@ def _validate_additional_sources_patch(
             )
 
 
+def _consume_registered_proposal(proposal_file: Path,
+                                project_root: Path) -> dict[str, Any]:
+    """注册成功后消费提案草稿（task-hygiene-gate-executor-and-proposal-lifecycle AC1）。
+
+    可逆性依据（不是口头假设，由 tests/test_hygiene_gate_wiring.py 断言）：
+    ① 草稿正文已逐字段进 ``_master.json``（同一 JSON 对象 append，非字段映射）；
+    ② ``_master.json`` 被 ``.gitignore`` 的 ``!.orchd/_master.json`` 显式反忽略并随注册
+       自动提交入库，而草稿本身被 ``.orchd/*`` 规则忽略、零跟踪 ⇒ 注册成功后草稿不含
+       独立信息量，删除不丢事实。（引用规则文本而非行号：行号正是本域一直在收口的
+       漂移形态。）
+
+    删除走 :func:`orchd.gitops.cleanup._safe_delete`（沙箱把裸 ``Path.unlink`` 劫持为
+    「移入回收站」，回收站不可用时 FAIL_CLOSED 抛 OSError → 静默不清理）。幂等：路径
+    已不存在视为已消费。
+
+    Args:
+        proposal_file: ``--register`` 传入的提案路径。
+        project_root: 删除降级的唯一命名基准。
+
+    Returns:
+        ``{"path", "consumed", ...}``：``consumed=False`` 时附 ``error`` 与 ``hint``。
+        不抛异常——注册已成功（master 已原子落盘），草稿滞留会被卫生门禁
+        ``[proposals]`` 检查与 ``doctor --fix`` 再点名一次，故只留痕不反噬注册结果。
+    """
+    from orchd.gitops.cleanup import _safe_delete
+
+    if not proposal_file.exists():
+        return {"path": str(proposal_file), "consumed": True,
+                "reason": "already_absent"}
+    try:
+        _safe_delete(proposal_file, project_root)
+    except OSError as exc:
+        return {
+            "path": str(proposal_file),
+            "consumed": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": ("注册已成功（任务已入 _master.json），仅草稿文件未清理；"
+                     "可运行 orchd doctor --fix 受管移入 .doctor-backup 后删除"),
+        }
+    return {
+        "path": str(proposal_file),
+        "consumed": not proposal_file.exists(),
+    }
+
+
+def _persist_master_durable(master_path: Path, payload: str) -> None:
+    """``_master.json`` 落盘的硬化序（task-master-write-hardening-and-replace-registry AC1）。
+
+    与账本同档（``orchd/storage/filesystem.py`` / ``orchd/ledger.py`` 既有范式）：
+    ``tmp.write_text → fsync(tmp) → _atomic_replace → _fsync_dir(父目录)``。
+
+    为什么原子的 rename 还不够：rename 只保证「要么旧的、要么新的」，不保证新内容已
+    落到设备。断电/崩溃窗口里目录项可持久而数据块未刷 ⇒ 670 任务的唯一账本重启后可能
+    零长。第二档收益来自 ``_atomic_replace`` 本身：并发只读命令持有 ``_master.json``
+    句柄时 ``os.replace`` 抛 WinError 5/32，旧实现无重试，一次争用即以 E999 逃逸，而
+    此刻写锁仍在原子区内、提案草稿尚未消费（消费点绑在落盘之后）。
+
+    ``fsync`` 独立成函数是有意的可测点：用例既能在其上断言「刷盘先于 rename」的顺序
+    （顺序错则断电窗口照旧），又能在包装里继续调用真实现而不退化成 mock——真刷盘仍发生。
+
+    文本形态（``indent=2`` / ``ensure_ascii=False`` / 无尾换行）由调用方给定，本函数
+    不碰格式；改名保留 ``.<pid>.tmp`` 形态（task-sqlite-robustness-batch：与
+    ledger 原子写同口径，多进程各写各的 tmp，replace 原子决胜；崩溃残留经
+    doctor 运行时谓词在变更检测中忽略，git 侧本就被 ``.orchd/*`` 忽略）。
+    """
+    tmp = master_path.with_name(f"{master_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    _fsync_file_durable(tmp)
+    _atomic_replace(tmp, master_path)
+    _fsync_dir(master_path.parent)
+
+
+def _fsync_file_durable(path: Path) -> None:
+    """把已写完的 tmp 内容刷到设备（``r+b`` 打开只为拿到可 fsync 的写句柄）。"""
+    with open(path, "r+b") as fh:
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _apply_register_proposals(master, register_path: str) -> None:
     """task-amend-register-channel：读提案 JSON（单任务对象或任务数组）追加到 master。
 
@@ -257,6 +337,9 @@ def _apply_register_proposals(master, register_path: str) -> None:
     非法提案 fail-fast（调用方在写盘前抛出 → canonical 零修改）：
       ① 文件不存在 / ② JSON 解析失败 / ③ 提案为整份 master（疑似基于过期 canonical，
       缺已有任务）/ ④ 缺必填字段 / ⑤ 重复 id。坏 source 由后续 amend() 的 E025 口径拒绝。
+
+    成功注册后由调用方消费本文件（见 :func:`_consume_registered_proposal`）——上述
+    任一路径抛出时调用方尚未落盘，草稿原样保留（批量数组同理：一项失败整批不写不删）。
     """
     import json as _json
 
@@ -369,6 +452,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             f"invalid_branch: amend 仅在 default（{default_branch}）分支执行（主工作树），"
             f"当前分支 {caller_branch} 拒绝注册（红线 7）",
             [{
+                "reason": "invalid_branch",
                 "branch":
                 caller_branch,
                 "default":
@@ -397,7 +481,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         canonical_root = resolve_canonical_project_root(Path.cwd())
         master_path = canonical_root / ".orchd" / "_master.json"
     else:
-        master_path = Path(default_master)
+        master_path = Path(str(default_master))
         # task-amend-master-path-derivation-fix：--master 外部路径 fail-fast。
         # 此前无条件 parent.parent 推导——仓库外路径（如 C:/Temp/master_batch1.json）
         # 会把 project_root 推成盘符根，dry-run 以错误 cwd 执行，引用仓库内文件的
@@ -409,6 +493,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 ErrorCode.E007,
                 "amend_master_missing: --master 文件不存在",
                 [{
+                    "reason": "amend_master_missing",
                     "master_path": str(master_path),
                     "hint": ("请传入仓库内 canonical master 的路径，或先把新任务并入 "
                              "<repo>/.orchd/_master.json 再省略 --master "
@@ -421,6 +506,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 ErrorCode.E007,
                 "amend_master_outside: --master 必须位于某仓库的 .orchd/ 目录下",
                 [{
+                    "reason": "amend_master_outside",
                     "master_path": str(master_path),
                     "orchd_dir": str(master_path.parent),
                     "project_root": str(master_path.parent.parent),
@@ -474,25 +560,40 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # schema_policy.amendable_fields 内，claimed/终态附加通道可补登）。
     patch_reviewers = getattr(args, "reviewers", None)
     patch_files_to_read = getattr(args, "files_to_read", None)
+    # task-amend-ac-pending-channel：acceptance_criteria 覆写补丁（整体替换；
+    # 显式 pending 校验见下，与白名单通道正交）。
+    patch_ac = getattr(args, "acceptance_criteria", None)
+    # task-amend-text-field-patch-channel：brief / name 文本旗标（单值覆写；
+    # 状态矩阵见下方 gating 块——pending 直接改，终态经 --revise-terminal）。
+    patch_brief = getattr(args, "brief", None)
+    patch_name = getattr(args, "name", None)
     if patch_task is not None:
         if not (patch_files or patch_exempt or patch_remove_files
                 or patch_remove_exempt or patch_verify is not None
                 or patch_sources or patch_timeout is not None
                 or patch_reviewers is not None
-                or patch_files_to_read is not None):
+                or patch_files_to_read is not None
+                or patch_ac is not None
+                or patch_brief is not None
+                or patch_name is not None):
             raise OrchdError(
                 ErrorCode.E007,
                 "amend --task 需至少携带一个补丁字段",
                 [{
+                    "reason": "amend_multi_field",
                     "task_id":
                     patch_task,
                     "hint":
                     "补登示例：--files-to-edit <file> / --exempt-files <file> / "
                     "--verify-command \"<cmd>\" / --verify-timeout-seconds <N> / "
                     "--additional-sources <ref> / --reviewers <id...> / "
-                    "--files-to-read <path...>；撤回示例："
+                    "--files-to-read <path...> / "
+                    "--acceptance-criteria \"<ac>\" ... / --brief \"<text>\" / "
+                    "--name \"<text>\"；撤回示例："
                     "--remove-files-to-edit <file> / --remove-exempt-files <file>"
-                    "（追加为并集、撤回为集合差，只增不删语义已由撤回通道补齐）",
+                    "（追加为并集、撤回为集合差，只增不删语义已由撤回通道补齐；"
+                    "acceptance_criteria 为整体覆写且仅 pending 态放行；"
+                    "brief/name 同为 pending 态直接放行，终态配 --revise-terminal）",
                 }],
             )
         target = next(
@@ -516,12 +617,123 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 ErrorCode.E007,
                 "amend_decl_conflict: 同一路径不能同时追加与撤回声明",
                 [{
+                    "reason": "amend_decl_conflict",
                     "task_id": patch_task,
                     "files_to_edit_clash": _clash,
                     "exempt_files_clash": _clash_ex,
                     "hint": "追加与撤回互斥：确认该路径应保留还是移除后，只带其中一个标志重试",
                 }],
             )
+        # task-amend-ac-pending-channel AC1/AC2：acceptance_criteria 覆写补丁。
+        # 语义为整体覆写（与 --reviewers / --files-to-read 一致）；空值拒绝而非
+        # 清空（AC 必填下限 1 条，见 rules/intake.md 粒度下限）；仅 pending 态
+        # 放行，claimed / done / in_review 一律 E007（hint 沿用
+        # split._ac_field_routing_hint，终态仍走 --revise-terminal）。状态判定走
+        # 独立旗标 + 显式 pending 校验，与白名单通道正交——不得把
+        # acceptance_criteria 写进 x-amendable / amendable_fields()，否则
+        # split.amend 的 claimed 白名单判定会连带放行 AC，打穿 E007 矩阵。
+        if patch_ac is not None:
+            from orchd.spec import _GRANULARITY_MAX_AC
+            from orchd.split import _ac_field_routing_hint
+
+            if (not patch_ac or not any(
+                    isinstance(a, str) and a.strip() for a in patch_ac)):
+                raise OrchdError(
+                    ErrorCode.E007,
+                    "amend_ac_empty: --acceptance-criteria 至少须给 1 条非空 AC"
+                    "（AC 必填下限 1 条，见 rules/intake.md 粒度下限；"
+                    "空值拒绝而非清空）",
+                    [{
+                        "reason": "ac_empty",
+                        "task_id":
+                        patch_task,
+                        "hint":
+                        ("acceptance_criteria 为整体覆写：请给出完整的新 AC 列表，"
+                         "至少 1 条、不超过 6 条（E029 粒度锚点）；"
+                         "确需清空请走用户裁决逃生口，而非空列表覆写"),
+                    }],
+                )
+            _ac_state = store.replay().get(patch_task)
+            _ac_status = (_ac_state.status
+                          if _ac_state is not None else "pending")
+            if _ac_status != "pending":
+                raise OrchdError(
+                    ErrorCode.E007,
+                    f"invalid_state: 任务 {patch_task} 当前为 {_ac_status} 态，"
+                    "--acceptance-criteria 仅 pending 态放行",
+                    [{
+                        "reason": "ac_status_invalid",
+                        "task_id": patch_task,
+                        "status": _ac_status,
+                        "hint": _ac_field_routing_hint(
+                            _ac_status, {"acceptance_criteria"}),
+                    }],
+                )
+            if len(patch_ac) > _GRANULARITY_MAX_AC:
+                raise OrchdError(
+                    ErrorCode.E029,
+                    f"granularity_overflow: task '{patch_task}' "
+                    f"acceptance_criteria 数量 {len(patch_ac)} 超过粒度锚点 "
+                    f"{_GRANULARITY_MAX_AC}（E029，拒绝注册）",
+                    [{
+                        "task_id": patch_task,
+                        "count": len(patch_ac),
+                        "limit": _GRANULARITY_MAX_AC,
+                        "hint": ("AC 超过 6 条说明任务内聚性不足：请先拆分任务，"
+                                 "或删减合并至 6 条以内后重试"),
+                    }],
+                )
+            target["acceptance_criteria"] = list(patch_ac)
+        # task-amend-text-field-patch-channel：brief / name 文本旗标（E038 的
+        # pending 出口）。状态矩阵与 --acceptance-criteria 通道同构（同一
+        # _ac_field_routing_hint 生成器，不另写文案）：pending 直接改；
+        # claimed/done/in_review E007 并给既有出路；终态按现规则——不带
+        # --revise-terminal 拒绝（hint 指向 revise-terminal），带
+        # --revise-terminal 且指向本任务时放行（brief/name 本就在
+        # _TERMINAL_TEXT_REVISABLE_FIELDS，--reason 必填校验沿用既有通道，
+        # AMEND 审计 reason=terminal_spec_revision）。不进
+        # schema x-amendable（否则 claimed 白名单连带放行，打穿 E007 矩阵）。
+        _text_patches = {
+            "brief": patch_brief,
+            "name": patch_name,
+        }
+        _active_text = {k: v for k, v in _text_patches.items() if v is not None}
+        if _active_text:
+            from orchd.split import _ac_field_routing_hint
+
+            _empty = sorted(k for k, v in _active_text.items()
+                            if not str(v).strip())
+            if _empty:
+                raise OrchdError(
+                    ErrorCode.E007,
+                    "amend_text_empty: --brief/--name 须为非空文本"
+                    "（schema minLength=1；空值拒绝而非清空）",
+                    [{
+                        "reason": "amend_text_empty",
+                        "task_id": patch_task,
+                        "fields": _empty,
+                        "hint": "文本字段不接受空串/纯空白；确需清空属删除语义，"
+                                "不在本通道（无用户裁决不删必填字段）",
+                    }],
+                )
+            _txt_state = store.replay().get(patch_task)
+            _txt_status = (_txt_state.status
+                           if _txt_state is not None else "pending")
+            if _txt_status != "pending" and revise_terminal != patch_task:
+                raise OrchdError(
+                    ErrorCode.E007,
+                    f"invalid_state: 任务 {patch_task} 当前为 {_txt_status} 态，"
+                    "--brief/--name 仅 pending 态直接放行（终态须配 "
+                    "--revise-terminal + --reason 走纯文本修订）",
+                    [{
+                        "reason": "text_status_invalid",
+                        "task_id": patch_task,
+                        "status": _txt_status,
+                        "hint": _ac_field_routing_hint(_txt_status,
+                                                       set(_active_text)),
+                    }],
+                )
+            target.update(_active_text)
         withdrawn: list[dict[str, str]] = []
         not_present: list[dict[str, str]] = []
         cur_files = set(target.get("files_to_edit", []))
@@ -537,6 +749,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 ErrorCode.E007,
                 "amend_decl_empty: files_to_edit 撤回后为空（schema 要求非空）",
                 [{
+                    "reason": "amend_decl_empty",
                     "task_id":
                     patch_task,
                     "removed":
@@ -648,6 +861,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
                 "（快照疑似被手动删除，违反红线 #9 不得手改运行时文件），"
                 "amend 已阻断，未写入任何内容",
                 [{
+                    "reason": "missing_snapshot",
                     "store_root": str(store_root),
                     "ledger_lines": _ledger_lines,
                     "hint": ("快照为派生数据但账本有状态，不可 init 覆盖；"
@@ -661,6 +875,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             "（快照不入库，clone 后须先 init 重建，否则全量任务会被误判为新任务 "
             "并逐个 dry-run），amend 已阻断，未写入任何内容",
             [{
+                "reason": "missing_snapshot",
                 "store_root": str(store_root),
                 "task_count": len(master.tasks),
                 "hint": ("请先执行 python .orchd/__main__.py init 重建快照后重试 "
@@ -825,6 +1040,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # CAS（expected_head=读时 HEAD）已在持锁后校验，未漂移才走到这里。
     # amend() 内抛异常 → 锁由其内部 except 释放，此处 held_lock 保持 None。
     held_lock: dict[str, Any] | None = None
+    proposal_consumed: dict[str, Any] | None = None
     try:
         result = amend(
             orchd_dir,
@@ -842,22 +1058,34 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         # 热修复 1b5cdef）。amend() 成功返回才写 master：此前任何失败（E007/E025/E028）
         # 均在写盘前抛出，canonical 零修改；与 1b5cdef 同格式（无尾换行）。
         # （锁仍持有中：写盘纳入原子区。）
+        # task-master-write-atomic → §11-13 续（task-master-write-hardening-...）：
+        # 原子写只解决了「撕裂」，本路此前仍比账本低一档——写完 tmp 不 fsync、rename 不
+        # 争用重试。现统一到 _persist_master_durable 的同一硬化序（含顺序与理由）。
+        # 文本形态与现状一致（无尾换行），不新增幻影脏。
         if patch_task is not None:
-            master_path.write_text(
-                _json.dumps(master.raw, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _persist_master_durable(
+                master_path,
+                _json.dumps(master.raw, ensure_ascii=False, indent=2))
 
         # task-amend-register-channel-hotfix（2026-09-21）：--register 路径内存追加后落盘。
         # split.amend() 只重写快照不写 master（写盘仅 --task 分支 577 行），缺此行则注册
         # 仅存于内存/快照、canonical master 丢失（新任务幽灵化；下次快照重生成连快照痕迹
         # 一并消失，响应却报 amended:true）。位置：blocking_errors/dry-run 阻断之后、
         # amend() 成功之后——失败路径不落盘；与 577 行同格式（无尾换行）。
+        # task-master-write-atomic：同上，--register 路径走同一硬化序（§11-13 续）。
         if register_path is not None:
-            master_path.write_text(
-                _json.dumps(master.raw, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _persist_master_durable(
+                master_path,
+                _json.dumps(master.raw, ensure_ascii=False, indent=2))
+            # 注册即消费提案（task-hygiene-gate-executor-and-proposal-lifecycle AC1，
+            # 根因修复）：位置必须在本行之后——此前 _apply_register_proposals 只把提案
+            # append 进内存 master，落盘由此处完成，而**整段从不删除草稿**，于是
+            # .orchd/proposals 长期堆积已注册任务的历史草稿（实测 main 上 161 行
+            # [proposals] FAIL），卫生门禁 check 3 恒红。放在落盘之后 → 任何失败路径
+            # （提案校验 E007/E002、amend 的 E007/E025/E028、os.replace 自身抛错）
+            # 都不消费，草稿原样保留可重试；锁仍持有（写+提交原子区内）。
+            proposal_consumed = _consume_registered_proposal(
+                Path(register_path), project_root)
 
         # 成功后 best-effort 自动提交（锁内、不阻塞状态机，语义对齐 merged:false）
         summary = ", ".join(changed) if changed else "snapshot refresh"
@@ -927,6 +1155,11 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     #    canonical → registered=false + 明确 hint（不再用 amended:true 暗示已注册）。
     if register_path is not None:
         result["registered"] = True
+        # 消费留痕：consumed=False 属「注册已成功、草稿清理失败」，草稿仍在会被
+        # 卫生门禁点名（可见而非静默），故不升级为注册失败；响应的 proposal_consumed
+        # 字段是该状态的唯一出口。
+        if proposal_consumed is not None:
+            result["proposal_consumed"] = proposal_consumed
     else:
         # task-master-path-residual-convergence：经单一真源取 canonical master
         # （对 canonical orchd_dir 自身解析恒等，无裸拼；AST 门禁零新增）。
@@ -960,9 +1193,10 @@ def _amend_roundtrip_applicable(
     - 非 container 布局的独立任务 worktree（flat / 降级）——container 下任务
       worktree 走既有「cd 主工作树」路径，零回归。
 
-    说明：附加字段补丁域由 CLI 暴露面天然限定（全部 ⊆
-    ``schema_policy.amendable_fields``），实际矩阵仍由 ``split.amend`` 强制执行；
-    本判据只决定「是否走往返」，不放宽 amend 允许集。
+    说明：CLI 补丁域的主体 ⊆ ``schema_policy.amendable_fields``，唯一的例外是
+    pending 限定的 ``--acceptance-criteria``（task-amend-ac-pending-channel：
+    独立旗标 + 显式 pending 校验，与白名单通道正交）；实际矩阵仍由
+    ``split.amend`` 强制执行；本判据只决定「是否走往返」，不放宽 amend 允许集。
     """
     if patch_task is None:
         return False
@@ -1326,6 +1560,24 @@ def register(sub) -> None:
                    dest="files_to_read",
                    help="覆写 files_to_read（整体替换；条目按 priority=reference 登记，"
                    "需 must_read 请走 --register 提案注册；空值即清空）")
+    p.add_argument("--acceptance-criteria",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="acceptance_criteria",
+                   help="覆写 acceptance_criteria（整体替换，与 --reviewers / "
+                   "--files-to-read 一致；空值拒绝；仅 pending 态放行，"
+                   "claimed/done/in_review 一律 E007，终态走 --revise-terminal）")
+    p.add_argument("--brief",
+                   default=None,
+                   help="覆写 brief 文本（单值整体替换，与 --acceptance-criteria 同一"
+                   "状态矩阵：仅 pending 态放行，claimed/done/in_review 一律 E007，"
+                   "终态配 --revise-terminal + --reason 走纯文本修订；空值拒绝；"
+                   "E038 brief 口径对齐的合法出口）")
+    p.add_argument("--name",
+                   default=None,
+                   help="覆写 name 文本（单值整体替换，状态矩阵与 --brief 一致；"
+                   "空值拒绝）")
     p.add_argument(
         "--verify-timeout-seconds",
         default=None,

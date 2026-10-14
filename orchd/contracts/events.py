@@ -161,6 +161,28 @@ REVIEW_SUBMITTED_TARGETS = {
     ("APPROVED", "spec"): "in_review",
 }
 
+# 任务状态词表（六态）——派生层的**单一真源**：``ledger._apply_event`` 的
+# FORCE_STATUS 分支只接受这六个值，白矩阵外的字符串不得静默写进运行态。
+TASK_STATUSES = frozenset(
+    {"pending", "claimed", "done", "in_review", "completed", "cancelled"})
+
+# 终态词表（completed / cancelled）——**单一真源**：原散落多处硬编码
+# （init / workflow / guidance / doctor / ideas / scripts.check_release_ready），
+# task-terminal-single-source 逐批收敛到此处。终态 = 不再入池、不再变更的状态
+# （amend 对终态拒绝；``--revise-terminal`` 仅放行纯文本字段）。
+TERMINAL_STATUSES = frozenset({"completed", "cancelled"})
+
+# 人工 force-status 的合法目标（``onboard.control._FORCE_TARGETS`` 白名单）——
+# TASK_STATUSES 的真子集：done / in_review 由正常事件流（DONE / REVIEW_READY）
+# 驱动，不开放给人工强制跳转。
+# **两份枚举不可合并**：引擎内部路径只受 TASK_STATUSES 约束，不受人工白名单约束
+# ——``review.py:1232`` 的终审残留回退就写 ``target_status="in_review"``（绕开 CLI
+# 的 _FORCE_TARGETS，直接经 make_event 落账）。派生层若按人工四态校验，会把这个
+# 引擎自写事件静默吞掉（task-sync-inbound-force-gate 实现期全量回归实测到）。
+# 共用点：onboard.control（人工写路径白名单）/ ledger replay（派生态守卫）/
+# ledger_sync 入站整类拒收（见 ``_INBOUND_LOCAL_ONLY_TYPES``）。
+FORCE_TARGET_STATUSES = frozenset({"pending", "claimed", "completed", "cancelled"})
+
 
 def validate_event(event: dict[str, Any]) -> list[str]:
     """fail-closed 契约校验：返回违规描述列表，空即通过。"""

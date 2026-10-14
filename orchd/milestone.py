@@ -130,6 +130,13 @@ def _git_head_short(project_root: Path) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def _sha_covers(head: str, recorded: str) -> bool:
+    """短 sha 双向前缀比较（集中一处的宽松口径，供本地记录点与 CI 记录点共用）。"""
+    if not head or not recorded:
+        return False
+    return recorded.startswith(head[:7]) or head.startswith(recorded[:7])
+
+
 def _status_counts(ctx: MilestoneContext) -> dict[str, int]:
     counts: dict[str, int] = {}
     for ts in (ctx.state or {}).values():
@@ -234,6 +241,15 @@ def _m1_a3_dep_closure(ctx: MilestoneContext) -> tuple[bool, str, str]:
 
 
 def _m1_b1_full_regression(ctx: MilestoneContext) -> tuple[bool, str, str]:
+    """F1 / M1-B1：全量回归证据覆盖 HEAD——本地记录 + 已推送 + 远端 CI 三重齐备。
+
+    卡 A（task-ci-evidence-authority）：此前只认本地 ``last_pass_commit``，于是
+    「本地绿 + 若干提交未推 + CI 停在旧 HEAD」也能盖章（2026-10-12 实测：本地领先 67
+    提交、CI 最近 6 条 run 全红，而本判据照绿）。证据须与实况同源，故三重都落在 HEAD 上：
+    ① 本地记录点（本机跑过的全量回归）；② 推送状态（``gitops.query.upstream_state`` 单一真源）；
+    ③ 远端 CI 结论（``orchd ci-record`` 落库，可离线复算）。任一项缺失即 not_ready——
+    显式失败而非静默放行（无 gh / 无网络 / 记录未落 = 缺字段 = 不通过）。
+    """
     path = ctx.master_dir / _FULL_REGRESSION_FILE
     data = _read_json(path)
     if data is None:
@@ -241,14 +257,39 @@ def _m1_b1_full_regression(ctx: MilestoneContext) -> tuple[bool, str, str]:
             "跑 python .orchd/__main__.py full-regression 并全绿（发版门禁的覆盖检查会硬拦）"
         )
     head = _git_head_short(ctx.project_root)
-    recorded = str(data.get("last_pass_commit") or "")
     if not head:
         return False, "无法解析当前 HEAD（git 探测失败）", "确认 git 可用后重试"
-    if not recorded.startswith(head[:7]) and not head.startswith(recorded[:7]):
+    recorded = str(data.get("last_pass_commit") or "")
+    if not _sha_covers(head, recorded):
         return False, f"全量回归记录点 {recorded or '<空>'} ≠ HEAD {head}", (
             "HEAD 已推进：重跑 orchd full-regression 刷新 last_pass_commit"
         )
-    return True, f"全量回归已覆盖 HEAD {head}（记录于 {recorded}）", ""
+    from orchd.gitops.query import upstream_state
+
+    up = upstream_state(ctx.project_root)
+    if up["state"] != "pushed":
+        return False, f"HEAD {head} 未证明已推送（{up['detail']}）", (
+            "证据须来自远端已验证的历史：commit → push → CI 绿 → "
+            "python .orchd/__main__.py ci-record"
+        )
+    ci_sha = str(data.get("ci_head_sha") or "")
+    if not ci_sha:
+        return False, f"缺远端 CI 记录（{path.name} 无 ci_head_sha）", (
+            "推送后跑 python .orchd/__main__.py ci-record 记录该 HEAD 的 CI 结论"
+        )
+    if not _sha_covers(head, ci_sha):
+        return False, f"远端 CI 记录点 {ci_sha} ≠ HEAD {head}", (
+            "CI 记录对应的是旧提交：推送后重跑 ci-record"
+        )
+    conclusion = str(data.get("ci_conclusion") or "")
+    if conclusion != "success":
+        return False, f"远端 CI 结论非 success：{conclusion or '<空>'}", (
+            "CI 红或仍在跑：修红重推，待该 HEAD 的 run 完成后再 ci-record"
+        )
+    return True, (
+        f"全量回归 + 远端 CI 均已覆盖 HEAD {head}"
+        f"（记录于 {recorded}，CI run {data.get('ci_run_id')}）"
+    ), ""
 
 
 def _m1_b2_baseline_fresh(ctx: MilestoneContext) -> tuple[bool, str, str]:
@@ -290,6 +331,10 @@ def _m1_b3_validate(ctx: MilestoneContext) -> tuple[bool, str, str]:
         return False, f"validate 复用失败：{type(exc).__name__}: {exc}", (
             "确认 .orchd/_master.json 可读；validate 是本组判据的既有真源"
         )
+    # _cmd_validate 在结构错误时返回 (dict, exit_code) 元组（task-cli-exit-honesty）；
+    # 此处只关心 payload，取出元组首元素后再读 valid / errors_summary。
+    if isinstance(result, tuple):
+        result = result[0]
     if not result.get("valid"):
         total = (result.get("errors_summary") or {}).get("total")
         return False, f"validate errors 非空（valid=False, total={total}）", (

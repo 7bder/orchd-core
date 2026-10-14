@@ -118,7 +118,10 @@ def classify_update(
     """单条引用更新的分类（纯函数；``is_ancestor`` 由调用方注入以隔离 git 依赖）。
 
     Returns:
-        ``{"ref", "action": "allow"|"refuse", "rule", "reason"?, "hint"?}``。
+        ``{"ref", "action": "allow"|"refuse", "rule", "reason"?, "hint"?, "degraded"?}``。
+        ``degraded`` 只在 fail-open 类放行上出现（未纳入受管命名空间的 allow、
+        快进探针不可用时的 allow），供 :func:`evaluate` 聚合成顶层留痕；
+        放行语义不变。
     """
     ref = update["ref"]
     base: dict[str, Any] = {"ref": ref}
@@ -143,10 +146,17 @@ def classify_update(
     if ref == f"{HEADS_PREFIX}{default_branch}":
         # 创建（old=0）放行：仓库初始化 / 首次提交；非快进更新拒绝（红线 #②）
         if _is_create(update) or is_ancestor is None:
-            return {
+            verdict = {
                 **base, "action": "allow", "rule": _ALLOW_FF_DEFAULT,
                 "reason": "默认分支创建" if _is_create(update) else "快进判定不可用（放行）",
             }
+            if not _is_create(update):
+                verdict["degraded"] = [{
+                    "guard": "ref_tx_ancestor_probe_unavailable",
+                    "status": "allowed_by_default",
+                    "reason": "快进探针不可用（未注入），默认分支更新放行未做快进校验",
+                }]
+            return verdict
         if is_ancestor(update["old"], update["new"]):
             return {**base, "action": "allow", "rule": _ALLOW_FF_DEFAULT,
                     "reason": "快进/后代更新"}
@@ -171,7 +181,12 @@ def classify_update(
             "hint": _REFUSAL_HINTS[_REFUSE_FOREIGN_BRANCH],
         }
     return {**base, "action": "allow", "rule": _ALLOW_UNCLASSIFIED,
-            "reason": "未纳入受管命名空间（放行以免打断 fetch / 引擎内部引用）"}
+            "reason": "未纳入受管命名空间（放行以免打断 fetch / 引擎内部引用）",
+            "degraded": [{
+                "guard": "ref_tx_unclassified_namespace",
+                "status": "allowed_by_default",
+                "reason": f"未纳入受管命名空间的引用更新按默认放行：{ref}",
+            }]}
 
 
 def evaluate(
@@ -195,17 +210,25 @@ def evaluate(
         }
     refusals: list[dict[str, Any]] = []
     allowed: list[dict[str, Any]] = []
+    degraded: list[dict[str, Any]] = []
     for update in updates:
         verdict = classify_update(
             update, default_branch=default_branch, task_prefix=task_prefix,
             is_ancestor=is_ancestor,
         )
         (refusals if verdict["action"] == "refuse" else allowed).append(verdict)
+        degraded.extend(verdict.get("degraded") or [])
+    # _git_ancestor_check 的 fail-open 侧信道（真 git 探针异常/超时/不可用码）：
+    # 纯函数签名只传 bool，留痕经闭包属性带出；普通 lambda/None 无该属性即跳过。
+    probe_trail = getattr(is_ancestor, "degraded", None)
+    if isinstance(probe_trail, list):
+        degraded.extend(probe_trail)
     return {
         "state": state,
         "blocked": bool(refusals),
         "refusals": refusals,
         "allowed": allowed,
+        "degraded": degraded,
         "reason": (
             "红线 #1/#2 强制层：引用事务被拒（详见 refusals）" if refusals else "全部放行"
         ),
@@ -228,6 +251,15 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
     """
     import subprocess
 
+    trail: list[dict[str, Any]] = []
+
+    def _record(cause: str) -> None:
+        trail.append({
+            "guard": "ref_tx_ancestor_probe_indeterminate",
+            "status": "allowed_by_default",
+            "reason": f"非快进判定不可用（{cause}），本次放行",
+        })
+
     def _check(old: str, new: str) -> bool:
         try:
             proc = subprocess.run(
@@ -240,6 +272,7 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
                 "本次放行（留痕）",
                 file=sys.stderr,
             )
+            _record(f"git 异常：{type(exc).__name__}")
             return True
         if proc.returncode == 0:
             return True
@@ -250,8 +283,11 @@ def _git_ancestor_check(project_root: Path) -> Callable[[str, str], bool]:
             "本次放行（留痕）",
             file=sys.stderr,
         )
+        _record(f"git 退出码 {proc.returncode}")
         return True
 
+    # 侧信道经 setattr 挂载（避免各 mypy 版本对函数属性赋值的分歧判定）。
+    setattr(_check, "degraded", trail)
     return _check
 
 
@@ -338,16 +374,28 @@ def _maybe_warn_unbaked_multiline(project_root: Path) -> None:
         return
 
 
-def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int:
+def main(argv: list[str] | None = None, *, stdin_text: str | None = None,
+         degraded: list[dict[str, Any]] | None = None) -> int:
     """hook 入口：返回 0 放行 / 1 拒绝（非零仅在 prepared 阶段有意义）。
 
     Args:
         argv: ``["reference-transaction", "<state>"]``（缺省取 ``sys.argv``）。
         stdin_text: 引用更新文本；缺省从 stdin 读取（便于测试注入）。
+        degraded: 留痕外参；非 ``None`` 时本次的降级条目（逃生口生效、
+            聚合判据的 fail-open 面）追加进该列表。进程外可观测性不依赖
+            本参数——降级条目恒打印 stderr。
     """
     args = list(sys.argv if argv is None else argv)
     state = args[1] if len(args) > 1 else ""
     if os.environ.get("ORCHD_ALLOW_REF_TX"):
+        entry = {
+            "guard": "ref_tx_escape_hatch",
+            "status": "enforcement_bypassed",
+            "reason": "逃生口 ORCHD_ALLOW_REF_TX 生效，本次放行未做任何判定",
+        }
+        if degraded is not None:
+            degraded.append(entry)
+        print("[orchd ref-tx degraded] 逃生口生效，本次放行未判定", file=sys.stderr)
         return 0
     try:
         text = stdin_text if stdin_text is not None else sys.stdin.read()
@@ -378,6 +426,14 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None) -> int
         task_prefix=line_prefix,
         is_ancestor=_git_ancestor_check(project_root),
     )
+    if degraded is not None:
+        degraded.extend(verdict.get("degraded") or [])
+    for entry in verdict.get("degraded") or []:
+        try:
+            print(f"[orchd ref-tx degraded] {entry.get('guard')}: "
+                  f"{entry.get('reason')}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 - 输出失败不影响放行语义
+            pass
     if not verdict["blocked"]:
         return 0
     try:

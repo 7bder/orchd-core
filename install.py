@@ -120,7 +120,8 @@ _ROADMAP_TEMPLATE = """\
 # ROADMAP
 
 > 未来版本规划（宿主资产，纳入 git；ROADMAP 唯一源 = 宿主项目根，引擎不读 .orchd/ 内副本）：
-> 新版本先 `orchd roadmap-land` 落地为 IDEAS pending 条目，再走摄入注册为任务。
+> 新版本先 `orchd roadmap-land <版本>` 落地为 IDEAS study 条目（待用户 confirm 升 pending），
+> 再走摄入注册为任务。
 """
 
 # 宿主三文件骨架（task-installer-host-docs-skeleton）：CHANGELOG（已完成记录）与
@@ -668,14 +669,23 @@ def _is_absolute_hooks_path(value: str) -> bool:
 def _ensure_repo_hooks(host: Path) -> dict:
     """确保宿主仓库自带的 ``.githooks/`` 被启用（幂等；不覆盖用户自定义 hooksPath）。
 
+    写入值必须是**绝对路径**（与 ``orchd/gitops/hook._ensure_hooks_path`` 同语义）：
+    git 把相对 ``core.hooksPath`` 按**当前工作树顶层**解析，``git worktree add`` 出的
+    链接工作树里没有 ``.githooks/`` 时 git 静默跳过 hook（fail-open），仓库级
+    ``pre-push`` 与 claim 期 L3 强制层在任务工作树内双双失效。实测（git 2.55）：
+    相对值 → 主工作树执行 / 链接工作树不执行；绝对值 → 两者都执行。
+
     决策表（与 ``orchd/gitops/hook._ensure_hooks_path`` 同语义，永不抛异常）：
 
     - 非 git 仓库 → ``reason="not_a_git_repo"``，不动；
     - 仓库内无 ``.githooks/`` → ``reason="hooks_dir_missing"``，不动；
-    - ``core.hooksPath`` 未设置 / 空 → 设为 ``.githooks``（相对仓库根），``reason="set"``；
-    - 已指向同一目录（相对或等价绝对路径）→ 幂等不写，``reason="already_set"``；
-    - 指向其他路径（用户显式自定义）→ **不改写**，``reason="custom_hooks_path"``
-      并附 ``hint`` 提示手动改法。
+    - ``core.hooksPath`` 未设置 / 空 → 设为**绝对**目标目录，``reason="set"``；
+    - 已指向同一目录且为绝对值 → 幂等不写，``reason="already_set"``；
+    - 已指向同一目录但为相对值 → 升级为绝对值，``reason="upgraded_to_absolute"``；
+    - 已为绝对值但目录不存在、末级名就是 ``.githooks``（仓库被移动/改名）→
+      改写为当前绝对目标，``reason="reinstalled_stale"``；
+    - 指向其他路径（用户显式自定义，如 ``.husky``）→ **不改写**，
+      ``reason="custom_hooks_path"`` 并附 ``hint`` 提示手动改法。
     """
     try:
         if not (host / ".git").exists():
@@ -685,15 +695,20 @@ def _ensure_repo_hooks(host: Path) -> dict:
             return {"configured": False, "reason": "hooks_dir_missing",
                     "hooks_dir": _REPO_HOOKS_DIR}
         current = _git_config_get(host, "core.hooksPath")
-        if current is None:
+        absolute_target = target.resolve().as_posix()
+
+        def _write(value: str) -> tuple[bool, str]:
             proc = subprocess.run(
-                ["git", "-C", str(host), "config", "core.hooksPath", _REPO_HOOKS_DIR],
+                ["git", "-C", str(host), "config", "core.hooksPath", value],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
             )
-            if proc.returncode != 0:
-                return {"configured": False, "reason": "config_failed",
-                        "error": (proc.stderr or "").strip()}
-            return {"configured": True, "reason": "set", "hooks_path": _REPO_HOOKS_DIR}
+            return proc.returncode == 0, (proc.stderr or "").strip()
+
+        if current is None:
+            ok, err = _write(absolute_target)
+            if not ok:
+                return {"configured": False, "reason": "config_failed", "error": err}
+            return {"configured": True, "reason": "set", "hooks_path": absolute_target}
         resolved = (Path(current) if _is_absolute_hooks_path(current)
                     else host / current)
         try:
@@ -701,16 +716,32 @@ def _ensure_repo_hooks(host: Path) -> dict:
         except OSError:
             same = False
         if same:
-            return {"configured": False, "reason": "already_set", "hooks_path": current}
+            if _is_absolute_hooks_path(current):
+                return {"configured": False, "reason": "already_set",
+                        "hooks_path": current}
+            # 相对等价值：目录对、可达性错 → 只改形态不改指向
+            ok, err = _write(absolute_target)
+            if not ok:
+                return {"configured": False, "reason": "config_failed", "error": err}
+            return {"configured": True, "reason": "upgraded_to_absolute",
+                    "hooks_path": absolute_target, "previous": current}
+        if (_is_absolute_hooks_path(current)
+                and not Path(current).is_dir()
+                and Path(current).name == _REPO_HOOKS_DIR):
+            ok, err = _write(absolute_target)
+            if not ok:
+                return {"configured": False, "reason": "config_failed", "error": err}
+            return {"configured": True, "reason": "reinstalled_stale",
+                    "hooks_path": absolute_target, "previous": current}
         return {
             "configured": False,
             "reason": "custom_hooks_path",
             "hooks_path": current,
-            "expected": _REPO_HOOKS_DIR,
+            "expected": absolute_target,
             "hint": (
                 f"core.hooksPath 已自定义为 {current}（非仓库自带 {_REPO_HOOKS_DIR}）："
                 f"保持不动、未改写；如需改为仓库自带 hooks，执行 "
-                f"git config core.hooksPath {_REPO_HOOKS_DIR}"
+                f"git config core.hooksPath {absolute_target}"
             ),
         }
     except (OSError, subprocess.SubprocessError) as exc:
@@ -719,7 +750,7 @@ def _ensure_repo_hooks(host: Path) -> dict:
 
 def _force_rmtree(path: Path) -> None:
     """跨平台删除目录；Windows 上先清只读属性（git 对象文件只读会阻止 rmtree）。"""
-    if os.name == "nt":
+    if sys.platform == "win32":
         for root, dirs, files in os.walk(path, topdown=False):
             for name in files + dirs:
                 try:

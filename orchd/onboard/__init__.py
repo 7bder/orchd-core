@@ -59,12 +59,14 @@ from orchd.onboard.request import (
 # claim 域：导入子模块并包装为可调用模块，使「orchd.onboard.claim」既是模块
 # （供 monkeypatch.setattr("orchd.onboard.claim.get_head_commit", ...) 打点），
 # 又可像函数一样直接调用（供 cli.py 的 from orchd.onboard import claim; claim(...)）。
+import types
+
 import orchd.onboard.claim as _claim_mod
 
 
-class _ClaimModule(_claim_mod.__class__):
+class _ClaimModule(types.ModuleType):
     def __call__(self, *args, **kwargs):
-        return self.claim(*args, **kwargs)
+        return getattr(self, "claim")(*args, **kwargs)
 
 
 _claim_mod.__class__ = _ClaimModule

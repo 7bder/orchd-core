@@ -187,9 +187,11 @@ def plan_backport(
         orchd_dir = resolve_master_path_from_dir(project_root / ".orchd").parent
         target_dir = orchd_dir.joinpath(*_PROPOSAL_DIR)
         target_dir.mkdir(parents=True, exist_ok=True)
+        from orchd.ledger import _write_text_atomic
+
         path = target_dir / f"{tid}.json"
-        path.write_text(
-            json.dumps(proposal, ensure_ascii=False, indent=2), encoding="utf-8"
+        _write_text_atomic(
+            path, json.dumps(proposal, ensure_ascii=False, indent=2)
         )
         proposal_path = str(path)
 

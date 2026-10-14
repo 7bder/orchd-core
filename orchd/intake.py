@@ -24,11 +24,25 @@ from typing import Any
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """P2-12：原子写（tmp + os.replace），避免读-改-写中途崩溃产生半截 IDEAS.md。"""
+    """P2-12：原子写（tmp + os.replace），避免读-改-写中途崩溃产生半截 IDEAS.md。
+
+    耐久档（task-os-replace-hardening-io-batch 批次 1b）：tmp 写入 → flush +
+    fsync → ``ledger._atomic_replace``（WinError 5/32 有界重试，耗尽抛结构化
+    E007，前缀 ``atomic_replace_failed``）→ ``_fsync_dir(父目录)``。IDEAS.md
+    是唯一摄入账面，断电零长即丢全部条目，故与账本同档。tmp 形态
+    （``<name>.tmp``，无点前缀）与文本形态（调用方给定，平台默认换行翻译）
+    原样保留。惰性导入沿用本模块「零 orchd 内部依赖」的叶子约定。
+    """
+    from orchd.ledger import _atomic_replace, _fsync_dir
+
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    _atomic_replace(tmp, path)
+    _fsync_dir(path.parent)
 
 # IDEAS.md 条目 status 合法值白名单（与 IDEAS.md 模板状态流转一致）
 # study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm/drop 裁决。
@@ -42,6 +56,7 @@ _INTAKE_PRODUCT_FILES = frozenset({
     ".orchd/_master.json",
     "IDEAS.md",
     ".orchd/IDEAS.md",
+    "IDEAS-archive.md",
     ".orchd/IDEAS-archive.md",
     "ROADMAP.md",
     ".orchd/ROADMAP.md",
@@ -151,8 +166,8 @@ def _intake_guard(project_root: Path) -> dict[str, Any] | None:
                 "reason": "dirty_workspace",
                 "dirty_files": non_intake,
                 "hint": (
-                    "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
-                    "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                    "请先提交或还原摄入产物（IDEAS.md / IDEAS-archive.md / ROADMAP.md / "
+                    "_master.json）之外的文件改动（untracked 工具/配置文件不阻塞）"
                     + _DIRTY_AFTER_INIT_HINT
                 ),
             }
@@ -230,8 +245,11 @@ def intake_commit(
     try:
         # task-engine-cli-friction-fix：提交范围加入 _master.json（摄入产物），
         # 消除新任务注册后 _master.json 残留未提交态、agent 需人工 git commit 的摩擦。
+        # task-intake-archive-path（F9 下半）：同理由加入 IDEAS-archive.md——白名单
+        # 早已放行归档脏改动，提交清单却漏该件，归档侧写了盘却永不入库。
         paths = [
             str(workspace_root / "IDEAS.md"),
+            str(workspace_root / "IDEAS-archive.md"),
             # task-roadmap-root-resolution：ROADMAP 走独立定位（宿主根优先）——
             # 归根后的根版 ROADMAP.md 同样纳入摄入产物提交范围；被 gitignore
             # 忽略时由 commit 层按既有 roadmap-untracked 逻辑剔除（不 fatal）。
@@ -313,6 +331,9 @@ def roadmap_land(
     Returns:
         结构化结果，永不抛异常：
         - 前置失败: ``{"landed": False, "reason": "not_on_main" | "dirty_workspace", ...}``
+        - 读盘失败: ``{"landed": False, "reason": "read_error", ...}``（ROADMAP.md /
+          IDEAS.md / IDEAS-archive.md 任一不可按 UTF-8 读出即拒——判重面缺一角就不落地，
+          task-idea-archive-diagnostics 起走 :func:`orchd.ledger.read_text_or_error`）
         - 定位失败: ``{"landed": False, "reason": "roadmap_missing" | "section_not_found"
           | "historical_section" | "no_section_id", ...}``
         - 幂等跳过: ``{"landed": False, "reason": "already_landed", ...}``
@@ -324,7 +345,11 @@ def roadmap_land(
         get_current_branch,
         list_tracked_changes,
     )
-    from orchd.ledger import resolve_roadmap_path, resolve_workspace_root
+    from orchd.ledger import (
+        read_text_or_error,
+        resolve_roadmap_path,
+        resolve_workspace_root,
+    )
     from orchd.ledger import (
         intake_lock_acquire,
         intake_lock_release,
@@ -355,8 +380,8 @@ def roadmap_land(
                 "reason": "dirty_workspace",
                 "dirty_files": non_intake,
                 "hint": (
-                    "请先提交或还原摄入产物（IDEAS.md / ROADMAP.md / _master.json）"
-                    "之外的文件改动（untracked 工具/配置文件不阻塞）"
+                    "请先提交或还原摄入产物（IDEAS.md / IDEAS-archive.md / ROADMAP.md / "
+                    "_master.json）之外的文件改动（untracked 工具/配置文件不阻塞）"
                     + _DIRTY_AFTER_INIT_HINT
                 ),
             }
@@ -370,7 +395,15 @@ def roadmap_land(
     roadmap = resolve_roadmap_path(project_root)
     if not roadmap.exists():
         return {"landed": False, "reason": "roadmap_missing", "hint": f"缺 {roadmap}"}
-    sections = _parse_roadmap_sections(roadmap.read_text(encoding="utf-8"))
+    roadmap_text, roadmap_err = read_text_or_error(roadmap)
+    if roadmap_err is not None:
+        return {
+            "landed": False,
+            "reason": "read_error",
+            "version": version,
+            "hint": f"ROADMAP 不可按 UTF-8 读出：{roadmap}（权限 / 目录形 / 编码）",
+        }
+    sections = _parse_roadmap_sections(roadmap_text)
     sec = next((s for s in sections if s["version"] == version), None)
     available = [s["version"] for s in sections if not s["historical"] and s["id"]]
     if sec is None:
@@ -389,16 +422,57 @@ def roadmap_land(
     # ① 章节 id 精确命中（- id: 主判据：重定基改版本号后 §字面失效时仍能认出）；
     # ② §版本 字面命中（兼容存量无 id 条目；且与 E031「§版本文本即已落地」
     # 判据对齐——E031 放行处 land 必跳过，两边不打架）。
-    # 仅查 IDEAS.md（与旧语义同文件；归档后重落与旧行为一致，不在此展开）。
+    # 判重面 = IDEAS.md ∪ IDEAS-archive.md（task-roadmap-land-dedup-across-archive）：
+    # 条目被裁决归档后正文与 `- id:` 原样留在归档面，只查 IDEAS.md 会让同章节
+    # 二次 land 双落同 id，E025 溯源当场分叉。面仅此两文件，不含任何其它 md。
+    # 判重面两个文件都走唯一读盘兜底原语（task-idea-archive-hardening）：此前是裸
+    # read_text，非 UTF-8 / 目录形输入会让本函数把异常穿到 CLI（实测落 E999 exit 1，
+    # 不建锁不动文件）。语义由"意外出界"改成"结构化拒绝"，与 idea_propose 的
+    # archive_unreadable 同族。
     ideas = ws / "IDEAS.md"
-    ideas_text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
-    if _entry_id_exists(ideas_text, sec["id"]) or f"§{version}" in ideas_text:
+    ideas_text, ideas_err = (
+        read_text_or_error(ideas) if ideas.exists() else ("", None)
+    )
+    archive = ws / "IDEAS-archive.md"
+    archive_text, archive_err = (
+        read_text_or_error(archive) if archive.exists() else ("", None)
+    )
+    if ideas_err is not None or archive_err is not None:
         return {
+            "landed": False,
+            "reason": "read_error",
+            "version": version,
+            "hint": (
+                "IDEAS.md / IDEAS-archive.md 不可按 UTF-8 读出（判重面缺一角即不落地）："
+                "先确认两文件能按 UTF-8 读出（权限 / 是否被换成目录 / 编码）后重试"
+            ),
+        }
+    id_hit = _entry_id_exists(ideas_text, sec["id"]) or _entry_id_exists(
+        archive_text, sec["id"])
+    literal_hit = f"§{version}" in ideas_text or f"§{version}" in archive_text
+    if id_hit or literal_hit:
+        landed_resp: dict[str, Any] = {
             "landed": False,
             "reason": "already_landed",
             "version": version,
-            "hint": f"IDEAS.md 已有引用 ROADMAP §{version} 的落地条目",
+            "hint": (
+                f"IDEAS.md / IDEAS-archive.md 已有引用 ROADMAP §{version} 的落地条目"
+            ),
         }
+        # detail 陈旧提示（task-caliber-residue-and-surface-gate AC6）：条目按 **id** 命中
+        # 即算已落地，但正文里的 § 版本号与当前章节版本不一致（章节被重定基 / 改名）。
+        # E031 侧已对齐同一真源、不再为这种形态恒告警，故这里给一条**只读提示**指明该
+        # 改哪一行即可——不新增错误码、不动失败路径（additive，键仅在陈旧时出现）。
+        if id_hit and not literal_hit:
+            landed_resp["detail_stale"] = {
+                "section_id": sec["id"],
+                "expected": f"§{version}",
+                "hint": (
+                    f"该章节落地条目未引用 §{version}：land 因 id 命中而跳过、E031 亦按 id "
+                    f"放行；若版本号确已变更，请把该条目 detail 的 § 版本号改为 §{version}"
+                ),
+            }
+        return landed_resp
 
     # 4) 生成 IDEAS study 条目（追加到 IDEAS.md 末尾）—— 受准入写锁串行
     # （task-admission-lock-engine：D 项，与 amend 共用同一把 .intake.lock）
@@ -408,7 +482,14 @@ def roadmap_land(
         roadmap_rel = roadmap.relative_to(project_root).as_posix()
         entry = _roadmap_land_entry(sec["header"], version, roadmap_rel, sec["id"])
         if ideas.exists():
-            existing = ideas.read_text(encoding="utf-8")
+            existing, existing_err = read_text_or_error(ideas)
+            if existing_err is not None:
+                return {
+                    "landed": False,
+                    "reason": "read_error",
+                    "version": version,
+                    "hint": "IDEAS.md 不可按 UTF-8 读出：先修好该文件再 roadmap-land",
+                }
             if not existing.endswith("\n"):
                 existing += "\n"
             _atomic_write_text(ideas, existing + "\n" + entry)
@@ -552,6 +633,13 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         结构化结果，永不抛异常：
         - 前置失败: ``{"proposed": False, "reason": "not_on_main" | "dirty_workspace", ...}``
         - 重复标题: ``{"proposed": False, "reason": "duplicate_title", ...}``
+          （命中面含 IDEAS-archive.md，hint 指名命中文件与该条目 ``- status``；
+          命中 dropped 时 hint 另给重议路径）
+        - 归档件不可读: ``{"proposed": False, "reason": "archive_unreadable", ...}``
+          （判重面缺一角即 fail-closed，不写主文件）
+        - 主文件不可读: ``{"proposed": False, "reason": "read_error", ...}``（同上：读不到
+          IDEAS.md 就无从查重，照常追加可能把已离场条目重提成第二份）
+        - 缺显式 id: ``{"proposed": False, "reason": "missing_idea_id", ...}``
         - 成功: ``{"proposed": True, "title", "commit": {...}, 可选 "commit_warning"}``
     """
     from orchd.gitops import ensure_committed
@@ -559,10 +647,17 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         resolve_workspace_root,
         intake_lock_acquire,
         intake_lock_release,
+        read_text_or_error,
         resolve_agent_id,
+        single_line,
     )
 
     project_root = Path(project_root)
+    # 行式台账安全网（task-idea-archive-hardening）：标题与论证都是「前缀 + 自由文本
+    # 拼一行」，多行输入能伪造出假 ## 小节头。归一必须发生在**查重之前**，否则查重
+    # 比的是未归一标题、写入的是归一标题，两边说的不是同一件事。
+    title = single_line(title)
+    feasibility = single_line(feasibility)
     guard_err = _intake_guard(project_root)
     if guard_err is not None:
         # guard 返回 committed 键，转换为该动作的键（proposed），保留 reason 与明细
@@ -579,13 +674,70 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
     try:
         ws = resolve_workspace_root(project_root)
         ideas = ws / "IDEAS.md"
-        text = ideas.read_text(encoding="utf-8") if ideas.exists() else ""
-        if _find_idea_entry(text, title) is not None:
+        text, text_err = (
+            read_text_or_error(ideas) if ideas.exists() else ("", None)
+        )
+        if text_err is not None:
+            # 判重面缺一角即 fail-closed（与下方归档件读同族）：读不到主文件就无从
+            # 查重，照常追加可能把已存在（含已裁决放弃）的条目重提成第二份。
+            return {
+                "proposed": False,
+                "reason": "read_error",
+                "title": title,
+                "hint": (
+                    "IDEAS.md 不可按 UTF-8 读出（权限 / 是否被换成目录 / 编码）："
+                    "先修好该文件再 propose"
+                ),
+            }
+        # 查重面 = IDEAS.md ∪ IDEAS-archive.md（ideas-dropped-exit）：条目离场后正文
+        # 原样留在归档面，只查 IDEAS.md 等于把"这条已被用户裁决放弃"的记忆随块一起
+        # 抹掉——同一标题可被无声重提，同 id 更会在归档面与主文件分叉成两份历史。
+        # 面仅此两文件，与 roadmap_land 的判重面同形（task-roadmap-land-dedup-across-archive）。
+        hit = _find_idea_entry(text, title)
+        hit_file, hit_status = "IDEAS.md", (hit or {}).get("status") or ""
+        if hit is None:
+            archive = ws / "IDEAS-archive.md"
+            # 归档件不存在时不必二次查表：语义等价（空文本必不命中），且让"取锁后
+            # 只查一次"的既有锁序探针（test_intake_atomic_consistent）在净库上继续成立。
+            if archive.exists():
+                try:
+                    a_text = archive.read_text(encoding="utf-8")
+                except (OSError, IOError, UnicodeDecodeError) as exc:
+                    # fail-closed：判重面缺一角就不写。读不到归档件却照常追加，等于把
+                    # 已离场（含已裁决放弃）的条目重提成第二份——那正是本次扩面要防的事。
+                    # 本函数契约是"永不抛异常"（docstring），故异常在此收口成结构化拒绝，
+                    # 不退化成 E999（同族缺陷见 pending 卡 idea-archive-hardening 第④项，
+                    # 那条管 roadmap_land 的既有裸读，不在本卡范围）。
+                    return {
+                        "proposed": False,
+                        "reason": "archive_unreadable",
+                        "title": title,
+                        "hint": (
+                            f"IDEAS-archive.md 不可读（{type(exc).__name__}）：判重面缺一角，"
+                            "此时写入可能把已离场的条目重提成第二份，故拒绝。处置：先确认该"
+                            "文件能按 UTF-8 读出（权限 / 是否被换成了目录 / 编码），修好前不要"
+                            "手改其正文，必要时走 doctor 或重新归档收敛，再重跑 propose。"
+                        ),
+                    }
+                hit = _find_idea_entry(a_text, title)
+                if hit is not None:
+                    hit_file = "IDEAS-archive.md"
+                    hit_status = hit.get("status") or ""
+        if hit is not None:
+            hint = f"{hit_file} 已存在标题为 '{title}' 的条目"
+            if hit_file != "IDEAS.md":
+                hint += f"（该条目已离场留档，status: {hit_status or '未声明'}）"
+            if hit_status == "dropped":
+                hint += (
+                    "处置：放弃是用户对**这一条**的裁决，不是对同主题永久封嘴——确要"
+                    "重议请另立新 id 重新 propose，并在新条目正文引用旧 id（如"
+                    "「重议 <旧 id>」）说明裁决改变了什么；沿用原标题会被本判据持续拒绝。"
+                )
             return {
                 "proposed": False,
                 "reason": "duplicate_title",
                 "title": title,
-                "hint": f"IDEAS.md 已存在标题为 '{title}' 的条目",
+                "hint": hint,
             }
 
         # 显式 id 强校验（fail-closed）：- id: 是 E025 溯源校验与自动归档的权威锚点。
@@ -660,6 +812,7 @@ def _idea_transition(
     Returns:
         结构化结果，永不抛异常（结果键用动作过去式：confirm→confirmed / drop→dropped）：
         - 前置失败: ``{"{key}": False, "reason": "not_on_main" | "dirty_workspace"}``
+        - 主文件不可读: ``{"{key}": False, "reason": "read_error"}``（fail-closed，不改写）
         - 不存在: ``{"{key}": False, "reason": "not_found"}``
         - 非 study: ``{"{key}": False, "reason": "not_study", "current_status": ...}``
         - 成功: ``{"{key}": True, "title", "new_status", "commit": {...}}``
@@ -692,7 +845,13 @@ def _idea_transition(
         ideas = ws / "IDEAS.md"
         if not ideas.exists():
             return {key: False, "reason": "not_found", "title": title}
-        text = ideas.read_text(encoding="utf-8")
+        from orchd.ledger import read_text_or_error
+
+        # 读盘兜底走唯一原语（task-idea-archive-hardening）：本函数 docstring 同样
+        # 声称"永不抛异常"，非 UTF-8 / 目录形 IDEAS.md 此前会让异常穿到 CLI。
+        text, text_err = read_text_or_error(ideas)
+        if text_err is not None:
+            return {key: False, "reason": "read_error", "title": title}
         entry = _find_idea_entry(text, title)
         if entry is None:
             import difflib

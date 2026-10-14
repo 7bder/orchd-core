@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -106,14 +107,79 @@ def get_head_commit(project_root: Path) -> str | None:
     """获取当前 HEAD 的 commit SHA（用于 review baseline 追踪）。
 
     非 git 仓库、git 不可用或任何异常返回 None（best-effort 降级）。
+
+    按次缓存：同键（同目录 + 同 HEAD 快照）重复调用零 spawn。
+    确定性失败（git 正常返回非零退出码）同样缓存；抛异常路径
+    （超时/IO，瞬时故障）永不缓存，保证恢复力。
     """
+    key = _probe_cache_key(project_root)
+    ckey = ("head_commit", key) if key is not None else None
+    if ckey is not None and ckey in _PROBE_CACHE:
+        return _PROBE_CACHE[ckey]
     try:
         result = _gitops_pkg._run_git(project_root, ["rev-parse", "HEAD"])
         if result.returncode == 0:
-            return result.stdout.strip() or None
+            value = result.stdout.strip() or None
+        else:
+            value = None
+        if ckey is not None:
+            _PROBE_CACHE[ckey] = value
+        return value
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return None
+
+
+def upstream_state(project_root: Path) -> dict[str, Any]:
+    """探测「HEAD 是否已推送到上游」的**单一真源**（里程碑 F1 与发版门禁共用）。
+
+    卡 A（task-ci-evidence-authority）：本地自证绿不足以支撑里程碑/发版——证据必须来自
+    远端已验证的历史。本函数是该判定的唯一探测入口：``orchd.milestone`` 的 F1 与
+    ``scripts/check_release_ready.py`` 的 check_upstream 都调它，避免两套 rev-list 口径漂移。
+
+    Returns:
+        结构化结果，永不抛异常（``state`` 取值及其含义）：
+            - ``pushed``：有上游且 ``@{u}..HEAD`` 为空；
+            - ``ahead``：``ahead`` 条提交未推送；
+            - ``no_upstream``：分支存在但未设置上游（无法证明已推送）；
+            - ``detached``：HEAD 为 detached（CI 按 tag 检出等，无分支上游可比对）；
+            - ``error``：git 不可用或探测失败（调用方须 fail-closed，不得当作通过）。
+    """
+    try:
+        if shutil.which("git") is None:
+            return {"state": "error", "upstream": None, "ahead": None,
+                    "branch": None, "detail": "git 不可用"}
+        branch = _gitops_pkg._run_git(
+            project_root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+        name = (branch.stdout or "").strip() if branch.returncode == 0 else ""
+        if branch.returncode != 0 or not name:
+            return {"state": "detached", "upstream": None, "ahead": None,
+                    "branch": None, "detail": "HEAD 为 detached，无分支上游可比对"}
+        up = _gitops_pkg._run_git(
+            project_root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        upstream_ref = (up.stdout or "").strip()
+        if up.returncode != 0 or not upstream_ref or upstream_ref == "@{u}":
+            return {"state": "no_upstream", "upstream": None, "ahead": None,
+                    "branch": name, "detail": f"分支 {name} 未设置上游"}
+        ahead = _gitops_pkg._run_git(project_root, ["rev-list", "--count", "@{u}..HEAD"])
+        if ahead.returncode != 0:
+            reason = (ahead.stderr or "").strip()[:60] or "git rev-list 失败"
+            return {"state": "error", "upstream": upstream_ref, "ahead": None,
+                    "branch": name, "detail": reason}
+        try:
+            n = int((ahead.stdout or "").strip())
+        except ValueError:
+            return {"state": "error", "upstream": upstream_ref, "ahead": None,
+                    "branch": name, "detail": "上游未推送计数无法解析"}
+        if n:
+            return {"state": "ahead", "upstream": upstream_ref, "ahead": n,
+                    "branch": name,
+                    "detail": f"{n} 条提交未推送到上游 {upstream_ref}"}
+        return {"state": "pushed", "upstream": upstream_ref, "ahead": 0,
+                "branch": name, "detail": f"已推送（上游 {upstream_ref}）"}
+    except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
+        return {"state": "error", "upstream": None, "ahead": None,
+                "branch": None, "detail": f"{type(exc).__name__}: {exc}"}
 
 
 def get_default_branch(project_root: Path) -> str | None:
@@ -127,6 +193,10 @@ def get_default_branch(project_root: Path) -> str | None:
 
     非 git 仓库、git 不可用或任何异常返回 None。
 
+    按次缓存：同键（同目录 + 同 HEAD 快照）重复调用零新增 spawn。
+    确定性失败（非工作树、配置缺失、名单为空）同样缓存——同键下答案
+    不变；抛异常路径（超时/IO，瞬时故障）永不缓存，保证恢复力。
+
     Note:
         必须先判定 ``project_root`` 是否为 git 工作树，再读 ``init.defaultBranch``。
         ``git config --get`` 会一路回溯到**系统 / 全局**配置（Git for Windows 的
@@ -134,30 +204,44 @@ def get_default_branch(project_root: Path) -> str | None:
         包括非 git 目录——都返回非 None。若据此认定"存在默认分支"，下游门禁
         会把"非 git 环境（不适用）"误判成"git 探测故障"而错误 fail-closed
         （2026-08-29 实踩：引擎经 Git Bash 执行 verify 时命中该组合）。
+
+    缓存边界：同键复用整次判定的终值；``init.defaultBranch`` 这类仓库外
+    配置在同键下变更不会触发 miss（实践中进程内静态，测试以 fake 隔离）。
     """
+    key = _probe_cache_key(project_root)
+    ckey = ("default_branch", key) if key is not None else None
+    if ckey is not None and ckey in _PROBE_CACHE:
+        return _PROBE_CACHE[ckey]
     try:
         # 0. 非 git 工作树 → 无"本仓库默认分支"概念，直接返回 None
         inside = _gitops_pkg._run_git(project_root, ["rev-parse", "--is-inside-work-tree"])
         if inside.returncode != 0 or inside.stdout.strip() != "true":
-            return None
-        # 1. 显式配置优先
-        cfg = _gitops_pkg._run_git(project_root, ["config", "--get", "init.defaultBranch"])
-        if cfg.returncode == 0:
-            name = cfg.stdout.strip()
-            if name:
-                return name
-        # 2. 本地常见默认分支名单次调用判定（task-gitops-probe-cache 压扁）：
-        #    `git branch --list main master` 一次返回存在性，替代逐个
-        #    `rev-parse --verify`（省 1 spawn；语义与文档"本地存在 main/master
-        #    分支"逐字一致——且比 --verify 更严格：后者连同名 tag 也命中）。
-        names = _gitops_pkg._run_git(
-            project_root, ["branch", "--list", "main", "master", "--format=%(refname:short)"])
-        if names.returncode == 0:
-            have = set((names.stdout or "").split())
-            if "main" in have:
-                return "main"
-            if "master" in have:
-                return "master"
+            value = None
+        else:
+            # 1. 显式配置优先
+            cfg = _gitops_pkg._run_git(project_root, ["config", "--get", "init.defaultBranch"])
+            if cfg.returncode == 0 and cfg.stdout.strip():
+                value = cfg.stdout.strip()
+            else:
+                # 2. 本地常见默认分支名单次调用判定（task-gitops-probe-cache 压扁）：
+                #    `git branch --list main master` 一次返回存在性，替代逐个
+                #    `rev-parse --verify`（省 1 spawn；语义与文档"本地存在 main/master
+                #    分支"逐字一致——且比 --verify 更严格：后者连同名 tag 也命中）。
+                names = _gitops_pkg._run_git(
+                    project_root, ["branch", "--list", "main", "master", "--format=%(refname:short)"])
+                if names.returncode == 0:
+                    have = set((names.stdout or "").split())
+                    if "main" in have:
+                        value = "main"
+                    elif "master" in have:
+                        value = "master"
+                    else:
+                        value = None
+                else:
+                    value = None
+        if ckey is not None:
+            _PROBE_CACHE[ckey] = value
+        return value
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
     return None
@@ -175,16 +259,97 @@ def branch_exists(project_root: Path, branch: str) -> bool | None:
     Note:
         与 :func:`check_workspace_state` 同构：把「不适用」与「故障」分开，
         避免用 ``returncode != 0`` 一次性吞掉两种语义。
+
+    按次缓存：键含分支名（同目录 + 同 HEAD 快照 + 同分支名）重复调用
+    零新增 spawn。只缓存确定性结论（存在 True / 不存在 False）；其他
+    退出码与抛异常路径（超时/IO）永不缓存，调用方 fail-closed 语义不变。
     """
+    key = _probe_cache_key(project_root)
+    ckey = ("branch_exists", branch, key) if key is not None else None
+    if ckey is not None and ckey in _PROBE_CACHE:
+        return _PROBE_CACHE[ckey]
     try:
         proc = _gitops_pkg._run_git(project_root, ["rev-parse", "--verify", "--quiet", branch])
         if proc.returncode == 0:
-            return True
-        if proc.returncode == 1:
-            return False
-        return None
+            value = True
+        elif proc.returncode == 1:
+            value = False
+        else:
+            return None
+        if ckey is not None:
+            _PROBE_CACHE[ckey] = value
+        return value
     except (subprocess.SubprocessError, OSError):
         return None
+
+
+# 落地任务集三正则（task-changelog-landed-single-source）：git 历史为权威源，
+# merge/impl/paren 三形态 single-source 收敛于此，发版门⑧与漂移测试双消费。
+# 错口径对照：``--merges`` 漏 ff 合并（ff 不产 merge 提交）；DONE 事件 ≠ 落地
+# （done 未必合）；CHANGELOG 触碰提交作锚一提交即空转。三者负控制见 tests。
+_LANDED_MERGE_RE = re.compile(r"Merge branch 'task/([a-z0-9-]+)'")
+_LANDED_IMPL_RE = re.compile(r"^task-([a-z0-9-]+):")
+_LANDED_PAREN_RE = re.compile(r"[（(](task-[a-z0-9-]+)[）)]")
+
+
+def landed_task_ids_since(project_root: Path, ref: str) -> list[str] | None:
+    """取 ``ref..HEAD`` first-parent 历史中的落地任务 id（保序去重）。
+
+    落地 = 分支已合入主干：merge 提交（``Merge branch 'task/<id>'``）、实现提交
+    （``task-<slug>:`` 前缀，ff 合并的唯一痕迹）、括号引用（回填行内任务号）。
+    未合分支（只存在、未合入）天然不在范围内。``ref`` 为空串时读全历史。
+
+    Returns:
+        任务 id 列表；git 不可用 / 非仓库 / ref 非法返回 None（调用方定
+        fail-closed 还是 skip——门禁侧判红，测试侧 skip）。
+    """
+    try:
+        result = _gitops_pkg._run_git(
+            project_root, ["log", "--first-parent", "--format=%s", f"{ref}..HEAD"])
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    landed: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        found: set[str] = set()
+        m = _LANDED_MERGE_RE.search(line)
+        if m:
+            found.add(m.group(1))
+        m = _LANDED_IMPL_RE.match(line)
+        if m:
+            found.add("task-" + m.group(1))
+        found.update(_LANDED_PAREN_RE.findall(line))
+        for tid in found:
+            if tid not in landed:
+                landed.append(tid)
+    return landed
+
+
+def previous_release_tag(project_root: Path,
+                         exclude: tuple[str, ...] = ()) -> str | None:
+    """按创建时间倒序取最新 tag（剔除 ``exclude``，典型为目标版本自身）。
+
+    发版门⑧与漂移测试共用同一锚：无 tag（首版或浅克隆无 tag）返回 None，
+    调用方显式不适用——不得回落 CHANGELOG 触碰提交（该锚一提交即空转）。
+
+    排序：creatordate 倒序，同秒并列时按版本 refname 倒序兜底（脚本化连续打
+    tag 同秒是常态；无次级排序则并列顺序不定，上一锚会漂）。
+    """
+    try:
+        result = _gitops_pkg._run_git(
+            project_root, ["tag", "--list", "--sort=-creatordate",
+                           "--sort=-v:refname"])
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    excluded = set(exclude)
+    for line in (result.stdout or "").splitlines():
+        name = line.strip()
+        if name and name not in excluded:
+            return name
+    return None
 
 
 def check_workspace_state(project_root: Path) -> dict[str, Any]:
