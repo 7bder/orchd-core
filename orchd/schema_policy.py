@@ -12,9 +12,15 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+import orchd
+
 
 def _schema_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "schema" / "_master.schema.json"
+    """``<repo>/schema/_master.schema.json``。
+
+    W7-A：锚点取 ``orchd.__file__``（包根）而非本文件层级——拆包 / 搬迁后不再静默错根。
+    """
+    return Path(orchd.__file__).resolve().parent.parent / "schema" / "_master.schema.json"
 
 
 @lru_cache(maxsize=1)

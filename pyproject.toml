@@ -99,32 +99,67 @@ ignore = [
 # （该测试断言「基线条目数 == 实测剩余超宽文件数」，注释写死计数只增漂移面）。
 # 阶段 2 清零后整块删除。
 [tool.ruff.lint.per-file-ignores]
-"orchd/cli/commands/control.py" = ["E501"]
 "orchd/cli/commands/ideas.py" = ["E501"]
 "orchd/cli/commands/init.py" = ["E501"]
-"orchd/cli/commands/misc.py" = ["E501"]
+# W6-C7：misc 子包化，存量超宽行随代码落点迁到 registration（register 的 help 串）
+# 与 storage（recutover 说明串）两域；单文件键删除（不是放宽，是债务随文件搬家）。
+"orchd/cli/commands/misc/registration.py" = ["E501"]
+"orchd/cli/commands/misc/storage.py" = ["E501"]
 "orchd/cli/commands/query.py" = ["E501"]
 
 "orchd/cli/commands/workflow.py" = ["E501"]
 "orchd/cli/identity.py" = ["E501"]
 "orchd/cli/parser.py" = ["E501"]
 "orchd/errors.py" = ["E501"]
-"orchd/gitops/hook.py" = ["E501"]
-"orchd/gitops/query.py" = ["E501"]
-"orchd/guide.py" = ["E501"]
-"orchd/intake.py" = ["E501"]
-"orchd/ledger.py" = ["E501"]
+# W6-C8：`orchd/gitops/hook.py` 拆为子包后，原有超宽行随「纯搬移」逐字继承：
+# content.py 2 处 f-string、precommit_template.py 的模板内嵌脚本文本。
+# 缩短需改模板渲染语义（属重构卡），故按基线豁免而非改短（纯搬移红线）。
+"orchd/gitops/hook/content.py" = ["E501"]
+"orchd/gitops/hook/precommit_template.py" = ["E501"]
+# W8-10（task-split2-w8-10-gitops-query-pkg）：gitops/query.py 拆为 query/ 六域包，两处 102 列存量行
+# 随代码落点迁到 refs（默认分支探测）与 workspace（工作区状态）两域；单文件键删除（债务随文件搬家）。
+"orchd/gitops/query/refs.py" = ["E501"]
+"orchd/gitops/query/workspace.py" = ["E501"]
+# guide 建包（file-split-program W5-G1，2026-10-18）：存量超宽行全部留在聚合入口
+# （错误码注册表 E001–E040 行 + GUIDANCE_STEPS 注释），paths/digest 两域零超宽 ⇒
+# 键随实际落点迁移，不是放宽基线。
+"orchd/guide/__init__.py" = ["E501"]
+# W5-G2/G3：stage 承接 _classify 的 step 判定表；errors 承接错误码注册表（E001–E040 行）。
+# 键逐文件显式跟随实际落点（flow/rules/paths/digest 已无超宽行，故无键）。
+"orchd/guide/errors.py" = ["E501"]
+"orchd/guide/stage.py" = ["E501"]
+# W6-C7：intake 子包化，存量超宽行随落点迁到 idea（种子写入门禁说明）与 roadmap
+# （落点表说明）两域；单文件键删除。
+"orchd/intake/idea.py" = ["E501"]
+"orchd/intake/roadmap.py" = ["E501"]
+# ledger 建包（file-split-program W1-L1，2026-10-15）：键必须指向实际落点
+# 文件且逐文件显式（禁通配 / 禁目录级）——口径同 tests/test_linewidth_gate.py AC2
+# L7（task-split2-ledger-l7-store）：Store 域的存量超宽行随代码落点迁到 store.py。
+# L8（task-split2-ledger-l8-store-segmentation）：Store 类四段 mixin 化后存量超宽行
+# 再随代码落点迁到 store_write.py（store.py 退化为骨架、自身已无超宽行），键随实际
+# 落点迁移（不是放宽，是债务随文件搬家）。
+"orchd/ledger/store_write.py" = ["E501"]
+# L3（task-split2-ledger-l3-identity）：身份与会话域的存量超宽行随代码落点迁移到
+# identity.py——键跟随实际落点，与 L1 的口径一致（不是放宽，是债务随文件搬家）。
+"orchd/ledger/identity.py" = ["E501"]
 "orchd/lockfile.py" = ["E501"]
 "orchd/onboard/bootstrap.py" = ["E501"]
-"orchd/onboard/claim.py" = ["E501"]
 "orchd/onboard/control.py" = ["E501"]
 "orchd/onboard/lifecycle/guards.py" = ["E501"]
-"orchd/onboard/request.py" = ["E501"]
-"orchd/report.py" = ["E501"]
-"orchd/review.py" = ["E501"]
-"orchd/spec.py" = ["E501"]
-"orchd/worktree/layout.py" = ["E501"]
-"orchd/worktree/lifecycle.py" = ["E501"]
+# W8-7（task-split2-w8-7-onboard-request-pkg）：onboard/request.py 拆为 request/ 六域包，存量超宽行
+# 随代码落点迁到 conflicts（6 处 dict 字面量）/ entry（11 处编排结果字面量）/ routing（15 处）三域；
+# 单文件键删除（不是放宽，是债务随文件搬家；test_linewidth_gate 集合相等仍锁）。
+"orchd/onboard/request/conflicts.py" = ["E501"]
+"orchd/onboard/request/entry.py" = ["E501"]
+"orchd/onboard/request/routing.py" = ["E501"]
+"orchd/report/status.py" = ["E501"]
+"orchd/spec/quality.py" = ["E501"]
+"orchd/spec/roadmap.py" = ["E501"]
+
+# W6-C7：worktree.lifecycle 子包化，存量超宽行随落点迁到 create（ensure 说明）与
+# probe（注册路径探测说明）两域；单文件键删除。
+"orchd/worktree/lifecycle/create.py" = ["E501"]
+"orchd/worktree/lifecycle/probe.py" = ["E501"]
 "scripts/verify_cross_platform.py" = ["E501"]
 "scripts/verify_install.py" = ["E501"]
 "scripts/verify_release_self_contained.py" = ["E501"]
@@ -159,6 +194,8 @@ ignore = [
 "tests/test_split.py" = ["E501"]
 "tests/test_split_guard_fallback.py" = ["E501"]
 "tests/test_worktree.py" = ["E501"]
+"orchd/worktree/layout/migration.py" = ["E501"]
+"orchd/worktree/layout/paths.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -213,5 +250,8 @@ disallow_untyped_defs = false
 warn_unused_ignores = false
 warn_redundant_casts = false
 # 仅对 orchd/ 做类型检查；scripts/ 与 tests/ 由 lint 门禁覆盖且 untyped 较多。
+# W7-Z2 尺寸棘轮（`scripts/file_census.py` + 仓根 `file-census-baseline.json`）同理不在此面内：
+# 前者由 ruff + 运行时守卫 `tests/test_file_census_ratchet.py` 覆盖，后者是数据文件不是代码；
+# 若将来决定把 scripts/ 纳入 mypy，只需在 CI 的 mypy 命令里补上该路径即可。
 # 2026-10-08（task-mypy-strict-onboard，mypy 收紧路线终点）：全部 ignore_errors
 # override 已移除，orchd/ 现为全量强类型检查——任何新类型错误将直接红。

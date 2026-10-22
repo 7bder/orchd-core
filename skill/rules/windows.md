@@ -29,7 +29,7 @@ orchd 协议文本（`AGENTS.md`、`SKILL.md`、`rules/*.md`、`templates/*.md`�
 
 ## 管道编码（中文 Windows）
 
-- 中文 Windows 上 git/子进程输出编码：引擎已统一 UTF-8 解码（`orchd/gitops_ops.py` 的稳健解码 helper（UTF-8 优先 / GBK 回退 / 有损兜底）+ `orchd/subproc.py`；原扁平模块 `gitops.py` / `onboard.py` 已拆分为 `orchd/gitops/` / `orchd/onboard/` 子模块）。
+- 中文 Windows 上 git/子进程输出编码：引擎已统一 UTF-8 解码（`orchd/gitops_ops/output.py` 的稳健解码 helper（UTF-8 优先 / GBK 回退 / 有损兜底）+ `orchd/subproc.py`；原扁平模块 `gitops.py` / `onboard.py` 已拆分为 `orchd/gitops/` / `orchd/onboard/` 子模块）。
 - **管道消费 orchd JSON 须按 UTF-8 解码**：`python .orchd/__main__.py pool --all | python -c "json.load(sys.stdin)"` 在中文 Windows 会 JSONDecodeError/乱码（消费方 stdin 按 GBK 解码 UTF-8 字节流）。
 - 规避方式：设 `PYTHONIOENCODING=utf-8` 或 `python -X utf8`、或显式 `encoding='utf-8'` 解码。
 - 此为 CLI 写 stdout 给管道消费方的编码契约，与 task-encoding-hardening 的引擎读子进程输出解码不同向，详见 README「Windows 管道编码」。

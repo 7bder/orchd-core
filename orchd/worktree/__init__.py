@@ -77,6 +77,7 @@ from orchd.worktree.diagnosis import (
     actual_changes_conflict,
 )
 
+# W6-C7：lifecycle 已子包化为 orchd/worktree/lifecycle/（入口纯重导出），本导入路径不变
 from orchd.worktree.lifecycle import (
     _engine_manifest,
     _propagate_vendored_engine,

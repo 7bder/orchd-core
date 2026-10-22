@@ -98,7 +98,7 @@ invalid_state），属复用既有码的既存口径，本表如实登记 C 通�
 
 **E015 (merge_conflict) 双通道**（历史：曾是「登记有码、通道空集」的死映射，
 task-done-reconcile-main 接入 A 后改为 `{"A"}`，pass13 §11-8b 实测再补 C）：
-A = `done` 前置对账在 `orchd/onboard/lifecycle/core.py`
+A = `done` 前置对账在 `orchd/onboard/lifecycle/core/reconcile.py`
 `raise OrchdError(E015)`（挂载点①）；C = `orchd/review.py:1009`
 经 `structured_error("E015", …)` 把指引挂到 `result["error"]`（该处源码注释自称「通道 D」，
 与通道定义不符，属文档假陈述，登记在 pass13 §11 第 11 项待修）。

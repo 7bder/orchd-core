@@ -76,6 +76,7 @@ from orchd.cli.commands.init import (
     _cmd_init,
     _cmd_validate,
 )
+# W6-C7：misc 已子包化为 orchd/cli/commands/misc/（入口纯重导出），本导入路径不变
 from orchd.cli.commands.misc import (
     _cmd_context_digest,
     _cmd_full_regression,

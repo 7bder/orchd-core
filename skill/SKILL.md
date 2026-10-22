@@ -36,7 +36,7 @@
 10. **版本进发先落地再摄入**：新版本先 `roadmap-land`（= 将未来版本规划落地为 IDEAS study，待用户 `idea confirm` 升 pending）再摄入；临时想法直接写 IDEAS.md。
 11. **禁绕过 claim**：任务必须经 claim 建分支；禁手动 `git branch/checkout` 创建。claim 失败或分支异常时按 guidance 处置并报告，不自行建分支绕过。
 12. **禁任务悬空**：claim 后必须 done → 审查 → merge；中断/放弃先 retract。
-13. **禁声明文件漏提交**：files_to_edit 声明文件必须随分支提交进 diff；不在主工作树直接改任务文件；无需改动走 amend。引擎 done 末尾自动提交（`_done_auto_commit` → `ensure_committed`）范围 = files_to_edit ∪ exempt_files（真源 `orchd/onboard/lifecycle/core.py`，详见 rules/git.md）。
+13. **禁声明文件漏提交**：files_to_edit 声明文件必须随分支提交进 diff；不在主工作树直接改任务文件；无需改动走 amend。引擎 done 末尾自动提交（`_done_auto_commit` → `ensure_committed`）范围 = files_to_edit ∪ exempt_files（真源 `orchd/onboard/lifecycle/core/stages.py`，详见 rules/git.md）。
 14. **禁无候选自行领任务**：request 返回 candidate=None / next_action=exit 时，禁止自行 claim、重试 request、`--auto-claim`；立即停止报告等指令。
 
 **MUST**（强制项）：条件 → 动作 → 出口/核实：

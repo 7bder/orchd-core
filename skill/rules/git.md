@@ -25,7 +25,7 @@ guide:
 - **审查者**：领取前确认处于对应 task 分支且工作区干净；审查对象是分支上的已提交 diff
 - **本地提交自主执行**：任务分支上的 `git commit` 是协议动作，agent 直接执行、无需管理员确认（纪律红线豁免之一的手动 git 命令；另一豁免为任务分支 `orchd git merge main` 受管出口，见 TL;DR）；只提交协议范围内（files_to_edit；done 的自动提交面另含 exempt_files，口径见下「exempt_files 豁免」）改动，不 push
 - **不 push**：远端推送不在 agent 职责内，由项目管理员负责
-- **L3 pre-commit hook 生命周期**（2026-08-08 语义升级）：claim 时安装到真实仓库 `.git/hooks/pre-commit`，**任务活跃时任何分支**都校验 staged ⊆ files_to_edit ∪ exempt_files（堵住 main/幽灵分支越界提交实现内容）；任务未活跃（无 CLAIMED/REVIEW_CLAIMED，或已 DONE/RETRACT/REVIEW_SUBMITTED）→ 放行；`--no-verify` 可绕过。**固定资产豁免（完整枚举）**：`.orchd/_master.json`、`IDEAS.md`、`.orchd/IDEAS.md`、`ROADMAP.md`（宿主根唯一源、纳入 git）。注：`.orchd/ROADMAP.md` 已非合法形态，**不在豁免表**——提交该路径会被 E020 拦（防残留副本被当固定资产放行；双向用例见 tests/test_gitops.py::test_hook_rejects_legacy_roadmap_in_orchd 与 ::test_hook_exempts_roadmap_at_host_root）。**exempt_files 豁免（2026-08-08 新增）**：任务定义可声明 `exempt_files`（必要连带文件，如新增错误码连带更新的 `tests/test_errors.py` 断言），claim 安装期即随 hook 生效（staged 文件 ∈ exempt_files 放行）；豁免文件**同样纳入 done 的自动提交范围**（真源 `orchd/onboard/lifecycle/core.py` 的 `commit_files = files_to_edit ∪ exempt_files`，task-done-exempt-files-commit）；**扩展仅限提交范围**——`declared_diff` / `zero_residual` / `out_of_scope` 三道门禁仍以 files_to_edit 为准，越界提交仍被 E020 拦；E017 不再因 exempt_files 未提交而阻断（该改动正是为消除误伤），实现者仍宜随手提交以保持分支 diff 可审。done 执行 verify_command 前临时卸载、verify 后重装（避免 verify 期间真实仓库 git 操作被误伤），done 末尾 / retract 真正卸载。**强制层生命周期（task-ref-tx-hook，2026-09-21）**：`reference-transaction` hook 与 pre-commit 同进退——claim 期安装，retract / force-status 卸载；任务正常完成（done→review→merge）后保持生效（无任务在跑时仓库仍处强制层，属承接既有语义，需知晓）；运行时产物（`.githooks/pre-commit`、`.githooks/reference-transaction`）在 `.gitignore` 忽略，git status 不显。
+- **L3 pre-commit hook 生命周期**（2026-08-08 语义升级）：claim 时安装到真实仓库 `.git/hooks/pre-commit`，**任务活跃时任何分支**都校验 staged ⊆ files_to_edit ∪ exempt_files（堵住 main/幽灵分支越界提交实现内容）；任务未活跃（无 CLAIMED/REVIEW_CLAIMED，或已 DONE/RETRACT/REVIEW_SUBMITTED）→ 放行；`--no-verify` 可绕过。**固定资产豁免（完整枚举，判定面真源 = `orchd/gitops/hook.py` 的两处 `case`）**：`.orchd/_master.json`、`IDEAS.md`、`.orchd/IDEAS.md`、`ROADMAP.md`（宿主根唯一源、纳入 git）、`.orchd/_full_regression.json`（`orchd full-regression` 通过后由命令自动提交的发版回归证据，同属引擎自动提交路径——缺此豁免时「另一任务活跃 + 在 main 刷证据」会被 E020 拒而命令仍回 `ok=true`，即条文说入库、实际没入库的假绿门；双向用例见 `tests/test_full_regression_commit.py`，task-full-regression-evidence-commit）。注：`.orchd/ROADMAP.md` 已非合法形态，**不在豁免表**——提交该路径会被 E020 拦（防残留副本被当固定资产放行；双向用例见 tests/test_gitops.py::test_hook_rejects_legacy_roadmap_in_orchd 与 ::test_hook_exempts_roadmap_at_host_root）。**exempt_files 豁免（2026-08-08 新增）**：任务定义可声明 `exempt_files`（必要连带文件，如新增错误码连带更新的 `tests/test_errors.py` 断言），claim 安装期即随 hook 生效（staged 文件 ∈ exempt_files 放行）；豁免文件**同样纳入 done 的自动提交范围**（真源 `orchd/onboard/lifecycle/core/stages.py` 的 `commit_files = files_to_edit ∪ exempt_files`，task-done-exempt-files-commit）；**扩展仅限提交范围**——`declared_diff` / `zero_residual` / `out_of_scope` 三道门禁仍以 files_to_edit 为准，越界提交仍被 E020 拦；E017 不再因 exempt_files 未提交而阻断（该改动正是为消除误伤），实现者仍宜随手提交以保持分支 diff 可审。done 执行 verify_command 前临时卸载、verify 后重装（避免 verify 期间真实仓库 git 操作被误伤），done 末尾 / retract 真正卸载。**强制层生命周期（task-ref-tx-hook，2026-09-21）**：`reference-transaction` hook 与 pre-commit 同进退——claim 期安装，retract / force-status 卸载；任务正常完成（done→review→merge）后保持生效（无任务在跑时仓库仍处强制层，属承接既有语义，需知晓）；运行时产物（`.githooks/pre-commit`、`.githooks/reference-transaction`）在 `.gitignore` 忽略，git status 不显。
 - **多 worktree 并行（1.4，multi-worktree-m-p1，2026-08-22）**：仓库开多个 worktree 并行时——**任务 worktree 全生命周期由引擎自动管理**（claim 自动创建 + 绑定 `session-worktrees.json`、终态自动回收、孤儿惰性清理），agent **零 worktree 管理操作**；任务 worktree **独立 checkout 各自 `task/{id}` 分支**实现（互不干扰）；**agent 不碰 main**——merge 由引擎在**主工作树**内执行（`main_worktree_root` 定位，专用 merge-wt 已废弃删除，见 gitops_ops.try_git_merge），任务 worktree **永不 checkout main**（规避 git 单分支单 worktree checkout 硬限制）；账本（container 默认 `<容器>/.orchd-runtime/`，可 `ORCHD_HOME` 重定向；flat 维持 `.orchd/` 零回归）**全局共享**，各 worktree 的 agent 状态一致，并发写由**统一排他文件锁原语（ExclusiveFileLock）**兜底——存储层 `.lock` 基于 flock（内核托管，进程退出自动释放），append/checkpoint 写原子化 + E011 任务级忙度锁（agent 一次一任务）；并发 merge 以主工作树锁串行；依赖链保持完成级串行（E008）；单 worktree（默认 flat）不建独立任务 worktree，行为与以往完全一致（零回归）
 
 ## 账本同步（orchd sync，task-ledger-git-sync）
@@ -158,16 +158,16 @@ python .orchd/__main__.py sync --remote <name>  # 指定远端名（默认 origi
 | 站点 | git 动作 | argv 片段（判据锚，须在源码中逐字存在） | 实测 spawn | 处置 |
 |---|---|---|---|---|
 | `orchd/gitops/commit.py` | add | `["add", "--", *paths]` | `clean` | 登记不处置 |
-| `orchd/gitops/guard.py` | checkout | `["git", "checkout", branch_name]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops/guard.py` | checkout | `["git", "checkout", "HEAD", "--", *ok]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops/guard.py` | checkout | `["git", "checkout", default]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops_ops.py` | checkout | `["git", "checkout", branch]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops_ops.py` | checkout | `["git", "checkout", "-b", branch, default]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops_ops.py` | checkout | `["git", "-C", str(workdir), "checkout", trunk]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops_ops.py` | checkout | `_git("checkout", trunk)` | `smudge`+`clean` | 登记不处置 |
-| `orchd/worktree/lifecycle.py` | worktree | `["git", "worktree", "add", "-b", branch, str(wt_path)]` | `smudge`（落在**新工作树根**，不在源仓库） | 登记不处置 |
-| `orchd/gitops_ops.py` | merge | `["git", "-C", str(workdir), "merge", branch]` | `smudge`+`clean` | 登记不处置 |
-| `orchd/gitops/proxy.py` | merge | `cls["kind"] == "merge"` | `smudge`+`clean` | 已锁代理==直连 |
+| `orchd/gitops/guard/checkout.py` | checkout | `["git", "checkout", branch_name]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops/guard/restore.py` | checkout | `["git", "checkout", "HEAD", "--", *ok]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops/guard/checkout.py` | checkout | `["git", "checkout", default]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops_ops/branch.py` | checkout | `["git", "checkout", branch]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops_ops/branch.py` | checkout | `["git", "checkout", "-b", branch, default]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops_ops/branch.py` | checkout | `["git", "-C", str(workdir), "checkout", trunk]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops_ops/branch.py` | checkout | `_git("checkout", trunk)` | `smudge`+`clean` | 登记不处置 |
+| `orchd/worktree/lifecycle/create.py` | worktree | `["git", "worktree", "add", "-b", branch, str(wt_path)]` | `smudge`（落在**新工作树根**，不在源仓库） | 登记不处置 |
+| `orchd/gitops_ops/branch.py` | merge | `["git", "-C", str(workdir), "merge", branch]` | `smudge`+`clean` | 登记不处置 |
+| `orchd/gitops/proxy/runner.py` | merge | `cls["kind"] == "merge"` | `smudge`+`clean` | 已锁代理==直连 |
 
 > 夹具纪律（写新用例前必读）：配 driver 的 scratch 仓库，smudge 必须写成
 > `touch MARKER && cat`。裸 `touch` 吃掉 stdin 会把重写出来的文件截成 0 字节，于是任何

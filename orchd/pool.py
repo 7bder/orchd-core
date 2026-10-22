@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from orchd.contracts.events import TERMINAL_STATUSES
@@ -21,54 +20,12 @@ from orchd.ledger import Store, TaskState
 # importance 权重映射
 _IMPORTANCE_WEIGHT = {"critical": 4, "high": 3, "normal": 2, "low": 1}
 
-# 共享核心文件集合（task-concurrency-hardening + 拆包前置）：
-# 多 agent 并行改动这些引擎/测试基础设施文件时冲突最密集。改为递归扫描
-# 避免拆包后真空：_SHARED_CORE_PACKAGES 三子包递归 rglob + _SHARED_CORE_MODULES 硬编码散文件，
-# 迁移期双留旧路径保证兼容。
-_SHARED_CORE_PACKAGES = ("gitops", "onboard", "cli")
-_SHARED_CORE_MODULES = frozenset({
-    "orchd/gitops_ops.py",
-    "orchd/errors.py",
-    "orchd/spec.py",
-    "orchd/pool.py",
-    "orchd/review.py",
-    "orchd/worktree.py",
-    "orchd/ledger.py",
-    "orchd/split.py",
-    "orchd/intake.py",
-    "orchd/report.py",
-    # 迁移期双留旧路径（拆包前 hard-coded 兼容）
-    "orchd/gitops.py",
-    "orchd/onboard.py",
-    "orchd/cli.py",
-})
-
-
-def _scan_core_files() -> frozenset[str]:
-    """扫描核心文件集合：子包递归 + 散文件，基于 __file__ 推导绝对路径，不依赖 CWD。"""
-    base = Path(__file__).resolve().parent
-    files: set[str] = set(_SHARED_CORE_MODULES)
-    for pkg in _SHARED_CORE_PACKAGES:
-        pkg_dir = base / pkg
-        if pkg_dir.is_dir():
-            for p in pkg_dir.rglob("*.py"):
-                if "__pycache__" in p.parts:
-                    continue
-                # 相对 orchd/ 父目录的路径，如 orchd/gitops/file.py
-                try:
-                    rel = p.relative_to(base.parent).as_posix()
-                    files.add(rel)
-                except ValueError:
-                    continue
-        else:
-            # 子包目录不存在（如拆包前），跳过，硬编码已覆盖
-            continue
-    if not files:
-        raise RuntimeError("SHARED_CORE_FILES 扫描结果为空（fail-closed）")
-    return frozenset(files)
-
-
-SHARED_CORE_FILES = _scan_core_files()
+# 共享核心面与子域级并行面已抽到 ``orchd/parallel_face.py``（W7-C）：pool.py 只保留消费方，
+# 避免本文件因承载两张登记表继续变长（尺寸棘轮禁止）。
+# W7-Z1 接线后 detect_file_conflict 另经 ``orchd.pool.parallel_face`` 模块引用晚期绑定
+# 调用 parallel_safe / subdomain_overlap（不走 from 导入，保 monkeypatch 可达）。
+from orchd import parallel_face
+from orchd.parallel_face import SHARED_CORE_FILES
 
 
 def derive_importance(blocked_downstream_count: int,
@@ -147,7 +104,7 @@ class Conflict:
 
 # 在途任务（task-inflight-conflict-visibility）在冲突检测输入中的 claimed_by 标记。
 # 语义：「分支上已有改动、尚未落 main」——含 done / in_review / force-status 悬空态，
-# 与状态字段无关（真源 = git 事实）。实际改动文件由调用方（onboard/request.py）
+# 与状态字段无关（真源 = git 事实）。实际改动文件由调用方（onboard/request/gitinfo.py）
 # 以 git 提供，本模块保持零 git 依赖；上层据此按 config.conflict_policy 分流。
 INFLIGHT_MARKER = "inflight"
 
@@ -364,15 +321,33 @@ def detect_file_conflict(
     for tid, (files, claimed_by) in sorted(claimed_files.items()):
         if tid == target_id:
             continue
+        # W7-Z1 接线（task-split2-w7-d-parallel-face-wiring）：冲突判定单一真源化为
+        # 子域并行面 parallel_safe（fail-closed：判据抛异常 ⇒ 按冲突处理，不假设无冲突）。
+        # 经模块属性晚期绑定调用（orchd.pool.parallel_face），monkeypatch 可达。
+        # 与旧判据（_prefix_overlap 路径精确）的关系：严格收紧——旧判据命中的形态
+        # （同文件 / 目录覆盖）在子域判据下全部判撞，增量仅两处（无尾斜杠目录覆盖其下
+        # 声明、非 orchd 目录前缀覆盖），其余场景逐条一致。
+        try:
+            collide = not parallel_face.parallel_safe(target_files, files)
+        except Exception:
+            collide = True
+        if not collide:
+            continue
         overlap = _prefix_overlap(target_files, files)
-        if overlap:
-            conflicts.append(
-                Conflict(
-                    task_id=tid,
-                    files=overlap,
-                    claimed_by=claimed_by,
-                    is_shared_core=_overlap_is_shared_core(overlap),
-                ))
+        if not overlap:
+            # 收紧增量的细节回退：路径判据给不出重叠时，报子域判据的相撞单元
+            # （如无尾斜杠目录声明 ⇒ 报该目录 stem；非 orchd 前缀覆盖 ⇒ 报被覆盖文件）。
+            try:
+                overlap = parallel_face.subdomain_overlap(target_files, files)
+            except Exception:
+                overlap = []
+        conflicts.append(
+            Conflict(
+                task_id=tid,
+                files=overlap,
+                claimed_by=claimed_by,
+                is_shared_core=_overlap_is_shared_core(overlap),
+            ))
     return conflicts
 
 

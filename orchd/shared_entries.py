@@ -72,6 +72,8 @@ from pathlib import Path
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
+from orchd.errors import ErrorCode, OrchdError
+
 # 共享入口（仓库相对 POSIX 路径）→ 必须出现在 verify_command 的既有测试文件。
 SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
     # 2026-09-19 task-cli-json-envelope：改 main() 的 argparse 错误出口后只跑了
@@ -111,15 +113,136 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
     # （case 模式 / scope-check 行）被 test_decl_dir_match_guards.py 的断言钉住，
     # 改生成层而不跑它 = 断言漂移只能靠全量回归兜底（实测漏 3 条红）。生成行为
     # 由三文件直接断言，改 hook.py 须全跑。
-    "orchd/gitops/hook.py": (
+    # W6-C8：`orchd/gitops/hook.py` 拆为子包 ⇒ 原单文件键不再命中任何改动（E039 对该域
+    # 静默失明），改为逐子域登记（精确匹配语义不变，保守地都要求三文件全跑）。
+    # 审查返修：拆包后**包入口**是最易碎的面（重导出面 / `__all__` 都在这），漏掉它等于
+    # 该入口改动不触发 E039；同样补上 `cli/_util/` 四域（拆前亦无键，一并收口）。
+    "orchd/gitops/hook/__init__.py": (
+        "tests/test_gitops.py",
+        "tests/test_hook_template_external.py",
+    ),
+    "orchd/gitops/hook/paths.py": (
         "tests/test_gitops.py",
         "tests/test_decl_dir_match_guards.py",
         "tests/test_hook_path_injection.py",
     ),
+    "orchd/gitops/hook/content.py": (
+        "tests/test_gitops.py",
+        "tests/test_decl_dir_match_guards.py",
+        "tests/test_hook_path_injection.py",
+        "tests/test_hook_template_external.py",
+    ),
+    "orchd/gitops/hook/install.py": (
+        "tests/test_gitops.py",
+        "tests/test_decl_dir_match_guards.py",
+        "tests/test_hook_path_injection.py",
+    ),
+    "orchd/gitops/hook/templates.py": (
+        "tests/test_hook_template_external.py",
+        "tests/test_gitops.py",
+    ),
+    "orchd/gitops/hook/precommit_template.py": (
+        "tests/test_hook_template_external.py",
+        "tests/test_gitops.py",
+    ),
+    "orchd/cli/_util/__init__.py": (
+        "tests/test_cli_workflow.py",
+        "tests/test_cli_ideas.py",
+    ),
+    "orchd/cli/_util/paths.py": (
+        "tests/test_cli_workflow.py",
+        "tests/test_cli_ideas.py",
+    ),
+    "orchd/cli/_util/archive.py": (
+        "tests/test_cli_workflow.py",
+        "tests/test_cli_ideas.py",
+    ),
+    "orchd/cli/_util/fallback.py": (
+        "tests/test_cli_workflow.py",
+    ),
     # 2026-09-27 task-pass9-shared-entry-registry（pass9 实测）：session 锁回收/
     # 探活链路被 test_concurrency.py 的 W-17 断言钉住；锁协议属高风险区（verify.md
     # 第三环），改 session_lock.py 须全跑四个同域测试文件。
-    "orchd/gitops/session_lock.py": (
+    # W8-5：`orchd/gitops/session_lock.py` 拆为子包 ⇒ 单文件键替换为逐子模块键（照 hook 先例）。
+    "orchd/gitops/session_lock/__init__.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/constants.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/degrade.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/state.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/gate.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/paths.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/payload.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/write.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/probe.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/reclaim.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/acquire.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/check.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/release.py": (
+        "tests/test_concurrency.py",
+        "tests/test_session_lock_observe.py",
+        "tests/test_session_lock_acquire_respect.py",
+        "tests/test_session_lock_unlink_race.py",
+    ),
+    "orchd/gitops/session_lock/ensure.py": (
         "tests/test_concurrency.py",
         "tests/test_session_lock_observe.py",
         "tests/test_session_lock_acquire_respect.py",
@@ -146,15 +269,93 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
 CLI_COMMAND_MODULE_EXEMPT: dict[str, str] = {
     "orchd/cli/commands/__init__.py": "仅注册顺序表（_REGISTER_ORDER），无独立行为面",
     "orchd/cli/commands/check.py": "只读体检命令，对外面由通用门（help AST + 名字集对拍）覆盖",
-    "orchd/cli/commands/control.py": "事件写入类命令，行为面由 tests/test_cli_workflow.py 覆盖",
+    "orchd/cli/commands/control/__init__.py": (
+        "事件写入类命令（W8-3 子包化，入口纯重导出），"
+        "行为面由 tests/test_cli_workflow.py 覆盖"
+    ),
     "orchd/cli/commands/lessons.py": "经验回灌命令组，行为面由 tests/test_lessons*.py 覆盖",
     "orchd/cli/commands/line.py": "分线只读命令，对外面由通用门覆盖",
-    "orchd/cli/commands/misc.py": "零散运维命令，对外面由通用门覆盖",
+    "orchd/cli/commands/misc/__init__.py": "零散运维命令（W6-C7 子包化，入口纯重导出），"
+                                           "对外面由通用门覆盖",
     "orchd/cli/commands/query.py": "只读查询命令，对外面由通用门覆盖",
     "orchd/cli/commands/session.py": "会话命令组，行为面由 tests/test_session*.py 覆盖",
     "orchd/cli/commands/sync.py": "账本同步命令，行为面由 tests/test_sync*.py 覆盖",
     "orchd/cli/commands/workflow.py": "任务流程命令组，行为面由 tests/test_cli_workflow.py 覆盖",
 }
+
+
+# ``commands_dir`` 入参契约（W7-A）：形状必须是 ``<repo>/orchd/cli/commands``。
+# 旧写法 ``commands_dir.resolve().parents[2]`` 按「本目录在第几层」反推仓库根——调用方
+# 一旦换了层深（工程搬迁 / 传错目录），仓库根静默偏两级，完备性判据扫错面并「可信地」
+# 返回空列表（与 C8 的 ``parent.parent.parent`` 同族：看起来在守，实际守空）。
+_COMMANDS_DIR_NAME = "commands"
+_CLI_DIR_NAME = "cli"
+
+# 契约判别键（W7-A 审查返修 F11/F12）：错误码取 E007（invalid_state，阻断级）——E030 是
+# ``runtime_file_integrity``（warning 级 + suggest_report + doctor 话术），把「调用方传错
+# 目录」渲染成「引擎文件异常、建议上报」会同时误导严重度与补救方向；E007 是仓库既有的
+# 「入参 / 状态校验失败」同族码（lessons 等模块已有先例）。details 两支共用同一键集并带
+# 稳定判别键 ``contract`` / ``reason``，便于机器检索（不依赖 message 文本）。
+_CONTRACT_ID = "commands_dir_shape"
+
+
+def _contract_details(resolved: Path, reason: str) -> dict[str, Any]:
+    """形状契约失败时的结构化 details（三分支键集相同，只有 ``reason`` 取值不同）。
+
+    ``hint`` 是给 guidance 层的**可执行指引**（F17）：``attach_error_guidance`` 的模板覆盖
+    只认 ``details[].hint``，缺它就会套用 E007 的状态机模板（「当前 <current> 不允许
+    <event_type>→<target>」，占位符无处代入、方向错误导向 ``orchd status``）。
+    """
+    return {
+        "contract": _CONTRACT_ID,
+        "reason": reason,
+        "commands_dir": str(resolved),
+        "name": resolved.name,
+        "parent_name": resolved.parent.name,
+        "expected_name": _COMMANDS_DIR_NAME,
+        "expected_parent_name": _CLI_DIR_NAME,
+        "is_dir": resolved.is_dir(),
+        "hint": (
+            f"把 commands_dir 传成 <repo>/orchd/cli/commands（目录名 {_COMMANDS_DIR_NAME!r}、"
+            f"父目录 {_CLI_DIR_NAME!r}）；不要按「本目录在第几层」反推仓库根"
+        ),
+    }
+
+
+def _resolve_repo_root(commands_dir: Path) -> Path:
+    """从 ``commands_dir`` 反推仓库根；形状不符即 E007 结构化报错（不静默退层级）。
+
+    契约（三条都满足才返回仓库根）：解析后是**目录**、目录名 == ``commands``、其父目录名
+    == ``cli``。拒绝「按层数硬退」：那会把形状错误变成静默的空扫描结果，而不是可检索的
+    故障。
+
+    覆盖边界（宣称与能力对齐，审查返修 F13）：本条只判「名字 + 是否目录」；**仓库根是否
+    真是仓库**（其下有 ``orchd/__init__.py``）不在此判——由调用方与守卫的落点判据另判
+    （``tests/test_w7_depth_paths.py`` 的等值判据）。
+    """
+    resolved = commands_dir.resolve()
+    if not resolved.is_dir():
+        raise OrchdError(
+            ErrorCode.E007,
+            "shared_entry_path_contract: commands_dir 必须是已存在的目录"
+            f"（实际 {resolved}，is_dir=False），拒绝按层级反推仓库根",
+            [_contract_details(resolved, "not_a_dir")],
+        )
+    if resolved.name != _COMMANDS_DIR_NAME:
+        raise OrchdError(
+            ErrorCode.E007,
+            "shared_entry_path_contract: commands_dir 目录名必须是 "
+            f"{_COMMANDS_DIR_NAME!r}（实际 {resolved.name!r}），拒绝按层级反推仓库根",
+            [_contract_details(resolved, "dir_name")],
+        )
+    if resolved.parent.name != _CLI_DIR_NAME:
+        raise OrchdError(
+            ErrorCode.E007,
+            "shared_entry_path_contract: commands_dir 的父目录必须是 "
+            f"{_CLI_DIR_NAME!r}（实际 {resolved.parent.name!r}），拒绝按层级反推仓库根",
+            [_contract_details(resolved, "parent_dir_name")],
+        )
+    return resolved.parent.parent.parent
 
 
 def cli_command_modules_unaccounted(commands_dir: Path) -> list[str]:
@@ -166,10 +367,24 @@ def cli_command_modules_unaccounted(commands_dir: Path) -> list[str]:
     返回值用仓库相对 POSIX 路径（与登记表键同口径）。
     """
     unaccounted: list[str] = []
-    repo_root = commands_dir.resolve().parents[2]  # <root>/orchd/cli/commands → <root>
-    for path in sorted(commands_dir.glob("*.py")):
+    repo_root = _resolve_repo_root(commands_dir)
+    decided = set(SHARED_ENTRY_TESTS) | set(CLI_COMMAND_MODULE_EXEMPT)
+    for path in sorted(commands_dir.iterdir()):
+        if path.is_dir():
+            # W6-C7：命令模块子包化后，`glob("*.py")` 永远扫不到目录 ⇒ 整棵子树
+            # （含承载实现的各域）掉出「必须登记或豁免」的完备性判据（覆盖 1→0 的
+            # fail-open）。包目录以**包入口**为决策单元：入口在表内即视为已决策。
+            if not (path / "__init__.py").is_file():
+                continue
+            rel = (path / "__init__.py").resolve().relative_to(repo_root).as_posix()
+            if rel in decided:
+                continue
+            unaccounted.append(rel)
+            continue
+        if path.suffix != ".py":
+            continue
         rel = path.resolve().relative_to(repo_root).as_posix()
-        if rel in SHARED_ENTRY_TESTS or rel in CLI_COMMAND_MODULE_EXEMPT:
+        if rel in decided:
             continue
         unaccounted.append(rel)
     return unaccounted
