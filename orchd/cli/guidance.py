@@ -75,7 +75,13 @@ def _attach_guidance(data: Any, command: str = "", guidance_mode: str = "slim") 
         from orchd.ledger import resolve_review_mode
         from orchd.gitops import get_current_branch
         agent_id = _resolve_agent_id(orchd_dir)
-        has_master = master_path.exists()
+        # A5（debug-pack A 组）：init 成功即证明 master 已建（container 新项目
+        # master 落 <容器>/main/.orchd；cwd 在容器根时 _find_orchd_dir 定位不到，
+        # master_path.exists() 为 False）。若仍按 False 推导，会把「初始化完成」
+        # 的响应回成 first_time/bootstrap 引导，与响应 initialized:true 自相矛盾。
+        has_master = master_path.exists() or bool(
+            isinstance(data, dict) and data.get("initialized") is True
+        )
         review_mode = resolve_review_mode(orchd_dir)
         # W-4 登记表权威分支：cwd 仅作最后一次兜底，不再优先。先算聚焦任务，再从
         # session-worktrees.json 登记表取该任务 worktree 的真实分支；无绑定才回退

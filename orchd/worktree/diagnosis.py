@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # 仅类型标注：叶子模块，运行时不依赖 ledger（防循环）
     from orchd.ledger import Store
 
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.worktree.layout import _GIT_TIMEOUT
 
 # task-pass9-rev-slug-guard：task_id 中央层白名单（与 split.py module.id 同口径）。
@@ -315,7 +320,7 @@ def actual_changes_conflict(
         target_task: 候选目标任务。
 
     Returns:
-        实际改动冲突列表：``[{"task_id", "files", "claimed_by", "source": "actual"}]``。
+        实际改动冲突列表：``[{"task_id", "files", "claimed_by", SOURCE_FIELD: "actual"}]``。
     """
     if project_root is None:
         return []
@@ -324,11 +329,11 @@ def actual_changes_conflict(
     except Exception:
         return []
     claimed_files = _build_claimed_files(state, tasks)
-    target_files = set(target_task.get("files_to_edit", []))
+    target_files = set(target_task.get(FILES_TO_EDIT_FIELD, []))
     if not target_files:
         return []
     conflicts: list[dict[str, Any]] = []
-    target_id = target_task.get("id", "")
+    target_id = target_task.get(ID_FIELD, "")
     for tid, (_, claimed_by) in claimed_files.items():
         if tid == target_id:
             continue
@@ -342,6 +347,6 @@ def actual_changes_conflict(
                 "task_id": tid,
                 "files": overlap,
                 "claimed_by": claimed_by,
-                "source": "actual",
+                SOURCE_FIELD: "actual",
             })
     return conflicts

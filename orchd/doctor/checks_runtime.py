@@ -17,6 +17,8 @@
 ``orchd.ledger`` / ``orchd.lessons`` / ``orchd.storage`` / ``orchd.storage.sqlite`` 保持
 **函数级惰性导入**（搬迁不改取用方式，保持 ``orchd.ledger.<名>`` 的 monkeypatch 补丁面）。
 本模块**不得**导入 ``orchd.doctor`` 聚合入口（否则成加载期环）。
+本模块不直接读环境变量：文内出现的 ``ORCHD_STORAGE_BACKEND`` 仅为说明语义，变量名真源见
+``orchd.constants.ORCHD_STORAGE_BACKEND_ENV``（Wave1-T3b）。
 """
 
 from __future__ import annotations
@@ -28,6 +30,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    CHECKPOINT_FILE,
+    LEDGER_FILE,
+    LESSONS_FILE,
+    LESSONS_STAGED_FILE,
+)
 from orchd.doctor.runtime import _make_check, _make_check_unavailable
 
 
@@ -210,8 +218,8 @@ def _check_lessons_transit(canonical: Path) -> list[dict[str, str]]:
     - 库有内容 **且** 暂存超龄未晋升 → warn（积压，附最老年龄）；
     - 其余（全新仓：库缺且暂存亦空 / 库有内容且无积压 / 未超龄）→ ok，零误报。
     """
-    lib_path = canonical / "lessons.jsonl"
-    staged_path = canonical / "lessons.staged.jsonl"
+    lib_path = canonical / LESSONS_FILE
+    staged_path = canonical / LESSONS_STAGED_FILE
     try:
         # 复用 lessons 域唯一的容错 JSONL 读（缺文件 → []、损坏行跳过）：另立
         # 一份读实现就会与 lookup 的可见集合漂移。
@@ -300,13 +308,13 @@ def _check_lessons_runtime(project_root: Path) -> list[dict[str, str]]:
             "lessons_runtime", "ok",
             "flat 布局：经验库与账本同根，无迁移观测项")]
     legacy = sorted(
-        name for name in ("lessons.jsonl", "lessons.staged.jsonl")
+        name for name in (LESSONS_FILE, LESSONS_STAGED_FILE)
         if (orchd_dir / name).is_file()
     )
     if not legacy:
         return _check_lessons_transit(canonical)
     try:
-        lib_missing = not (canonical / "lessons.jsonl").is_file()
+        lib_missing = not (canonical / LESSONS_FILE).is_file()
     except OSError:
         lib_missing = True
     if lib_missing:
@@ -419,7 +427,7 @@ def _check_migration_consistency(project_root: Path) -> list[dict[str, str]]:
         if not (store_dir / "_ledger.sqlite3").is_file():
             return [_make_check("migration_consistency", "ok", "无库文件：尚未迁移")]
         store = Store(orchd_dir, readonly=True)
-        live = [n for n in ("_ledger.jsonl", "_checkpoint.json")
+        live = [n for n in (LEDGER_FILE, CHECKPOINT_FILE)
                 if (store_dir / n).is_file()]
         from orchd.storage.sqlite import SqliteBackend
 
@@ -459,8 +467,8 @@ def _check_checkpoint_consistency_files(store_dir: Path) -> list[dict[str, str]]
 
     from orchd.ledger import _CHECKPOINT_SCHEMA_VERSION
 
-    ledger_path = store_dir / "_ledger.jsonl"
-    ckpt_path = store_dir / "_checkpoint.json"
+    ledger_path = store_dir / LEDGER_FILE
+    ckpt_path = store_dir / CHECKPOINT_FILE
     if not ledger_path.is_file() or not ckpt_path.is_file():
         return [
             _make_check(
@@ -735,7 +743,7 @@ def _check_event_schema_files(store_dir: Path) -> list[dict[str, str]]:
     """
     import json
 
-    ledger_path = store_dir / "_ledger.jsonl"
+    ledger_path = store_dir / LEDGER_FILE
     if not ledger_path.is_file():
         return [_make_check("event_schema", "ok", "无账本文件，跳过")]
     bad: list[str] = []

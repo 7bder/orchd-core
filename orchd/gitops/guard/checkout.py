@@ -14,6 +14,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_AMEND,
+)
 from orchd.errors import ErrorCode, OrchdError
 
 from orchd.gitops._const import (
@@ -195,7 +198,7 @@ def _reviewer_auto_checkout(
         store.acquire_lock()
         try:
             ev = make_event(
-                task_id, _audit_agent, "AMEND",
+                task_id, _audit_agent, EVENT_AMEND,
                 reason="auto_branch_prepare",
                 branch=branch_name,
                 from_branch=from_branch,

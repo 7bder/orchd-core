@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+# 本模块不直接读环境变量：文内出现的 ``ORCHD_LINE`` 仅为说明语义，变量名真源见
+# ``orchd.line.LINE_ENV_VAR``（= ``orchd.constants.ORCHD_LINE_ENV``，Wave1-T3b）。
 import json
 import sys
 from collections.abc import Mapping

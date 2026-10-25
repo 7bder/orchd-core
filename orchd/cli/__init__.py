@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from orchd import __version__
+from orchd.constants import ORCHD_TEST_STORE_ENV
 from orchd.errors import ErrorCode, OrchdError, to_json_response
 
 # 从同模块子包导入
@@ -86,7 +87,7 @@ from orchd.cli.commands.misc import (
 )
 from orchd.cli.commands.ideas import (
     _cmd_idea_confirm,
-    _cmd_idea_drop,
+    _cmd_idea_close,
     _cmd_idea_propose,
     _cmd_ideas_archive,
 )
@@ -190,7 +191,7 @@ def _is_within(path: Path, root: Path) -> bool:
 
 def _guard_test_store(command: str) -> None:
     """测试会话（ORCHD_TEST_STORE=1）下，写命令禁指向非临时目录的账本根。"""
-    if os.environ.get("ORCHD_TEST_STORE") != "1":
+    if os.environ.get(ORCHD_TEST_STORE_ENV) != "1":
         return
     if command in _READ_ONLY_COMMANDS:
         return

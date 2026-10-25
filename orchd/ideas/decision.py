@@ -11,9 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    IDEAS_ARCHIVE_FILE,
+    IDEAS_FILE,
+)
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import OrchdError
 from orchd.intake import (
+    IDEA_STATUS_VALUES,
     _atomic_write_text,
     _find_idea_entry,
     _intake_guard,
@@ -48,10 +53,13 @@ from .archive import (
 
 # 用户裁决可归档的状态（idea-archive-decision-channel）。归档通道只认「有无任务把
 # source 指向我」，总纲类条目天然不直接产生任务 ⇒ 走不到终态判据，只能由人裁决离场。
-# study 不在列：它是尚未拍板的灵感，出路是 idea drop，不是"已交付"。
-# dropped 不在列：drop 这个动作本身就是裁决，无需再点一次——它的离场由机器判，
-# 走 find_archivable_entries 的 dropped 分支（ideas-dropped-exit）。
-_DECISION_ARCHIVABLE_STATUSES = frozenset({"pending", "taskified", "questioning"})
+# covered 在列：撞车并入的条目无任务 source 指向它，走不到终态判据，须由人裁决离场。
+# study 在列（task-intake-exit-verb-close）：未拍板的灵感不再降级为 dropped 留在台账，
+#   而是由 idea close --reason 一次离场归档——「放弃」由此成为带理由的裁决而非状态值。
+# dropped 已整体下线：自动归档判据收敛为 resolved-only，本通道也不再接受该状态。
+# Wave1-T2：可归档面与合法词表当前同集合，故直接引用单一真源（同一 frozenset 对象），
+# 不再在本模块复制第二套枚举；若将来两者分化，在此显式收窄并留注释。
+_DECISION_ARCHIVABLE_STATUSES = IDEA_STATUS_VALUES
 
 
 
@@ -59,9 +67,9 @@ def idea_archive_decision(
     project_root, title: str, reason: str,
     live_refs: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """把一条 IDEAS 条目按用户裁决移入 IDEAS-archive.md（idea archive 后端）。
+    """把一条 IDEAS 条目按用户裁决移入 IDEAS-archive.md（idea close 后端）。
 
-    与 confirm/drop 同族：共用 ``intake._intake_guard`` 前置与同一把 ``.intake.lock``
+    与 confirm 同族（drop 通道已下线）：共用 ``intake._intake_guard`` 前置与同一把 ``.intake.lock``
     准入写锁；搬块复用 ``extract_entry_block`` / ``_remove_blocks``，与自动通道同一套
     原语。块形态自 task-idea-archive-hardening 起**两通道共用** :func:`_canonical_block`
     （剥裁决行 + 统一尾换行）：此前本通道原样搬、自动通道落档前补换行，"IDEAS.md 末块且
@@ -86,7 +94,7 @@ def idea_archive_decision(
           "deduped", "ideas_path", "archive_path"}``
         - 拒绝: ``{"archived": False, "reason": ..., "title": ...}``，reason 取值
           missing_reason / not_on_main 等 guard 原值 / not_found / already_archived
-          / use_drop_for_study / not_archivable_status / source_live_reference /
+          / not_archivable_status / source_live_reference /
           comment_unbalanced_block / lock_unavailable / read_error / write_error
     """
     from orchd.ledger import (
@@ -103,7 +111,7 @@ def idea_archive_decision(
             "reason": "missing_reason",
             "title": title,
             "hint": (
-                "idea archive 必须给出 --reason：裁决离场是无痕搬块与可审留痕的分界，"
+                "idea close 必须给出 --reason：裁决离场是无痕搬块与可审留痕的分界，"
                 "理由会写进条目块内供日后追溯"
             ),
         }
@@ -116,8 +124,8 @@ def idea_archive_decision(
         }
 
     ws = resolve_workspace_root(project_root)
-    ideas_path = ws / "IDEAS.md"
-    archive_path = ws / "IDEAS-archive.md"
+    ideas_path = ws / IDEAS_FILE
+    archive_path = ws / IDEAS_ARCHIVE_FILE
 
     lock_dir = _resolve_lock_orchd_dir(project_root)
     try:
@@ -170,14 +178,8 @@ def idea_archive_decision(
             }
 
         status = entry.get("status") or ""
-        if status == "study":
-            return {
-                "archived": False,
-                "reason": "use_drop_for_study",
-                "title": title,
-                "current_status": status,
-                "hint": "status: study 是未拍板灵感，出路是 orchd idea drop，不是归档",
-            }
+        # study 不再被拒（task-intake-exit-verb-close）：close 一律走归档，未拍板的
+        # 灵感同样以「带理由的裁决」离场，不再先降级为 dropped 等机器搬。
         if status not in _DECISION_ARCHIVABLE_STATUSES:
             return {
                 "archived": False,
@@ -185,8 +187,8 @@ def idea_archive_decision(
                 "title": title,
                 "current_status": status,
                 "hint": (
-                    f"仅 status ∈ {sorted(_DECISION_ARCHIVABLE_STATUSES)} 的条目可裁决归档"
-                    f"（当前 '{status}'）；study 走 idea drop"
+                    f"仅 status ∈ {sorted(_DECISION_ARCHIVABLE_STATUSES)} 的条目可 close 归档"
+                    f"（当前 '{status}'）；活跃台账已不存在 dropped 状态"
                 ),
             }
 

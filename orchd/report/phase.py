@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import STATUS_COMPLETED, STATUS_PENDING, TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.ledger import Store, TaskState, resolve_workspace_root
@@ -79,7 +79,7 @@ def _aggregate_top(
 def _task_phase_status(task: dict[str, Any], state: dict[str, Any]) -> str:
     """任务在 replay state 中的状态；未 claim（无 ledger 条目）视为 pending。"""
     ts = state.get(task.get("id", ""))
-    return ts.status if ts else "pending"
+    return ts.status if ts else STATUS_PENDING
 
 
 
@@ -123,14 +123,14 @@ def phase_aggregate(
         )
         pending = sum(
             1 for t in group_tasks
-            if _task_phase_status(t, state) == "pending"
+            if _task_phase_status(t, state) == STATUS_PENDING
         )
         active = total - completed - pending
         phases.append({
             "phase": ph,
             "total": total,
-            "completed": completed,
+            STATUS_COMPLETED: completed,
             "active": active,
-            "pending": pending,
+            STATUS_PENDING: pending,
         })
     return {"active_phase": active_phase, "phases": phases}

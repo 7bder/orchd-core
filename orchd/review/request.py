@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    REVIEWERS_FIELD,
+)
 from orchd.guide import NEXT_ACTION_EXIT
 from orchd.ledger import Store
 from orchd.ledger import TaskDerived
@@ -31,7 +40,7 @@ def request_reviewer(
     """
     review_candidates: list[dict[str, Any]] = []
     not_in_list: list[dict[str, Any]] = []
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     for tid, ts in state.items():
         if ts.status == "in_review" and ts.review_claimed_by is None:
             task_def = task_map.get(tid, {})
@@ -40,13 +49,13 @@ def request_reviewer(
             # 指纹豁免（task-fp-review-priority-exempt，对齐 claim 侧 E007）：
             # 指纹形态 agent_id（12 位 hex）不在名单内也正常进入候选（不落入
             # not_in_list）；具名 agent（名单外）仍记 not_in_list（向后兼容）。
-            designated = task_def.get("reviewers")
+            designated = task_def.get(REVIEWERS_FIELD)
             if designated and agent_id not in designated \
                     and not _is_fingerprint_agent_id(agent_id):
                 not_in_list.append({
                     "task_id": tid,
                     "review_phase": ts.review_phase or "spec",
-                    "reviewers": task_def.get("reviewers", []),
+                    REVIEWERS_FIELD: task_def.get(REVIEWERS_FIELD, []),
                 })
                 continue
             # self-review：DONE 实现指纹 == 当前 reviewer 指纹。
@@ -94,14 +103,14 @@ def request_reviewer(
         "task_id": task_id,
         # review-unify-r2：unified 单阶段（review_phase 为 None）展示为 unified。
         "review_type": best["review_phase"] or "unified",
-        "module": task_def.get("module", ""),
-        "brief": task_def.get("brief", ""),
-        "importance": task_def.get("importance", "normal"),
+        MODULE_FIELD: task_def.get(MODULE_FIELD, ""),
+        BRIEF_FIELD: task_def.get(BRIEF_FIELD, ""),
+        IMPORTANCE_FIELD: task_def.get(IMPORTANCE_FIELD, "normal"),
         "files_to_review": [
             {"path": p, "priority": "must_read"}
-            for p in task_def.get("files_to_edit", [])
+            for p in task_def.get(FILES_TO_EDIT_FIELD, [])
         ],
-        "acceptance_criteria": task_def.get("acceptance_criteria", []),
+        ACCEPTANCE_CRITERIA_FIELD: task_def.get(ACCEPTANCE_CRITERIA_FIELD, []),
         "changes_description": changes_description,
     }
     if author:

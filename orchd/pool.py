@@ -14,7 +14,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.constants import CLAIMED_BY_INFLIGHT, CLAIMED_BY_PENDING
+from orchd.contracts.events import STATUS_CLAIMED, STATUS_PENDING, TERMINAL_STATUSES
+from orchd.contracts.task_schema import (
+    DEPENDS_ON_FIELD,
+    ESTIMATED_HOURS_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    REQUIRES_FIELD,
+)
 from orchd.ledger import Store, TaskState
 
 # importance 权重映射
@@ -56,7 +65,7 @@ def effective_importance(
     thresholds: dict[str, Any] | None = None,
 ) -> str:
     """任务生效的 importance：显式声明优先，缺省时按下游阻塞数推导。"""
-    explicit = task.get("importance")
+    explicit = task.get(IMPORTANCE_FIELD)
     if explicit:
         return explicit
     return derive_importance(blocked_downstream_count, thresholds)
@@ -106,7 +115,7 @@ class Conflict:
 # 语义：「分支上已有改动、尚未落 main」——含 done / in_review / force-status 悬空态，
 # 与状态字段无关（真源 = git 事实）。实际改动文件由调用方（onboard/request/gitinfo.py）
 # 以 git 提供，本模块保持零 git 依赖；上层据此按 config.conflict_policy 分流。
-INFLIGHT_MARKER = "inflight"
+INFLIGHT_MARKER = CLAIMED_BY_INFLIGHT
 
 
 def build_pool(
@@ -118,7 +127,7 @@ def build_pool(
     """构建就绪池。
 
     过滤管线按以下顺序依次执行，任一环节不通过则跳过该任务：
-    1. 状态过滤：status == "pending"（缺失状态视为 pending）。
+    1. 状态过滤：status == STATUS_PENDING（缺失状态视为 pending）。
     2. 依赖放行：所有 depends_on 中任务的 status ∈ {completed, cancelled}。
     3. 能力过滤：若 agent 声明 capabilities，则 task.requires ⊆ capabilities。
     4. 排除列表：task_id 不在 exclude 列表中。
@@ -140,7 +149,7 @@ def build_pool(
 
     candidates: list[Candidate] = []
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
 
         # 排除
         if tid in exclude_set:
@@ -148,16 +157,16 @@ def build_pool(
 
         # 状态过滤：缺失 = pending
         ts = state.get(tid)
-        status = ts.status if ts else "pending"
-        if status != "pending":
+        status = ts.status if ts else STATUS_PENDING
+        if status != STATUS_PENDING:
             continue
 
         # 依赖放行：所有 depends_on 的任务必须 completed 或 cancelled
-        deps = task.get("depends_on") or []
+        deps = task.get(DEPENDS_ON_FIELD) or []
         deps_satisfied = True
         for dep_id in deps:
             dep_ts = state.get(dep_id)
-            dep_status = dep_ts.status if dep_ts else "pending"
+            dep_status = dep_ts.status if dep_ts else STATUS_PENDING
             if dep_status not in TERMINAL_STATUSES:
                 deps_satisfied = False
                 break
@@ -166,7 +175,7 @@ def build_pool(
 
         # 能力过滤（空 requires 直接放行，免去集合构造）
         if caps_set is not None:
-            requires = task.get("requires") or []
+            requires = task.get(REQUIRES_FIELD) or []
             if requires and not set(requires).issubset(caps_set):
                 continue
 
@@ -196,7 +205,7 @@ def sort_candidates(
     importance_thresholds: _master.json ``config.importance`` 自定义阈值
     （derive_importance 覆盖），None 用默认阈值。
     """
-    if sort_key == "importance":
+    if sort_key == IMPORTANCE_FIELD:
         return sorted(
             candidates,
             key=lambda c: _importance_key(c, importance_thresholds),
@@ -208,7 +217,7 @@ def sort_candidates(
                       reverse=True)
     elif sort_key == "hours":
         return sorted(candidates,
-                      key=lambda c: c.task.get("estimated_hours", 0))
+                      key=lambda c: c.task.get(ESTIMATED_HOURS_FIELD, 0))
     else:
         # 默认复合排序：rework（返工全局优先，与 guide.py rework_first 对齐）
         # → importance desc → blocked_downstream desc → estimated_hours asc。
@@ -220,7 +229,7 @@ def sort_candidates(
                 c.rework,
                 _importance_key(c, importance_thresholds),
                 c.blocked_downstream_count,
-                -c.task.get("estimated_hours", 0),
+                -c.task.get(ESTIMATED_HOURS_FIELD, 0),
             ),
             reverse=True,
         )
@@ -307,7 +316,7 @@ def detect_file_conflict(
     Returns:
         冲突列表。
     """
-    target_files = set(target_task.get("files_to_edit", []))
+    target_files = set(target_task.get(FILES_TO_EDIT_FIELD, []))
     if not target_files:
         return []
 
@@ -317,7 +326,7 @@ def detect_file_conflict(
                                              include_pending=include_pending)
 
     conflicts: list[Conflict] = []
-    target_id = target_task.get("id", "")
+    target_id = target_task.get(ID_FIELD, "")
     for tid, (files, claimed_by) in sorted(claimed_files.items()):
         if tid == target_id:
             continue
@@ -362,10 +371,10 @@ def build_dependency_index(tasks: list[dict[str, Any]]) -> dict[str, Any]:
 
     纯数据构建：无状态、不缓存、不依赖 git / 账本（符合性能冻结令「只做提/并/删」）。
     """
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     children: dict[str, list[str]] = {}
     for tid, task in task_map.items():
-        for dep in (task.get("depends_on") or []):
+        for dep in (task.get(DEPENDS_ON_FIELD) or []):
             children.setdefault(str(dep), []).append(tid)
     return {"map": task_map, "children": children}
 
@@ -401,13 +410,13 @@ def get_dependency_closure(
     result: set[str] = set()
     # 向上（祖先）遍历
     seen: set[str] = set()
-    stack = list(task_map.get(task_id, {}).get("depends_on") or [])
+    stack = list(task_map.get(task_id, {}).get(DEPENDS_ON_FIELD) or [])
     while stack:
         cur = stack.pop()
         if cur in seen or cur not in task_map:
             continue
         seen.add(cur)
-        stack.extend(task_map[cur].get("depends_on") or [])
+        stack.extend(task_map[cur].get(DEPENDS_ON_FIELD) or [])
     result |= seen
     # 向下（子孙）遍历：走反向邻接，O(出边) —— 不再每步全表扫描
     seen_desc: set[str] = set()
@@ -445,12 +454,12 @@ def compute_downstream_blocked(tasks: list[dict[str, Any]],
     """统计每个任务被多少 pending 任务的 depends_on 引用。"""
     counts: dict[str, int] = {}
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         ts = state.get(tid)
-        status = ts.status if ts else "pending"
-        if status != "pending":
+        status = ts.status if ts else STATUS_PENDING
+        if status != STATUS_PENDING:
             continue
-        for dep_id in task.get("depends_on", []):
+        for dep_id in task.get(DEPENDS_ON_FIELD, []):
             counts[dep_id] = counts.get(dep_id, 0) + 1
     return counts
 
@@ -463,9 +472,9 @@ def _build_claimed_files(
 ) -> dict[str, tuple[list[str], str]]:
     """从当前状态和任务定义推导活跃任务的文件映射。
 
-    默认包含状态为 "claimed" 且持有者（claimed_by）非空的任务；
+    默认包含状态为 STATUS_CLAIMED 且持有者（claimed_by）非空的任务；
     include_pending=True 时额外纳入 pending 任务（claimed_by 标记为
-    "pending"），供 request 预检 / 摄入冲突规划使用。
+    "pending" 哨兵），供 request 预检 / 摄入冲突规划使用。
 
     inflight_files（task-inflight-conflict-visibility）：{task_id: 实际改动文件}
     ——「在途」任务（分支上已有改动、尚未落 main：done / in_review /
@@ -484,13 +493,13 @@ def _build_claimed_files(
         {task_id: (files 列表, claimed_by 标识)} 的映射字典。
         claimed_by ∈ {agent 标识, "pending", "inflight"}。
     """
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     result: dict[str, tuple[list[str], str]] = {}
     # claimed 任务（有 ledger 状态且持有者非空）
     for tid, ts in state.items():
-        if ts.status == "claimed" and ts.claimed_by:
+        if ts.status == STATUS_CLAIMED and ts.claimed_by:
             task_def = task_map.get(tid, {})
-            files = task_def.get("files_to_edit", [])
+            files = task_def.get(FILES_TO_EDIT_FIELD, [])
             result[tid] = (files, ts.claimed_by)
     # 在途任务（真源 = git 事实，由调用方提供；本层不做 git 调用）。
     # 位置在 claimed 之后、pending 之前：claimed 的声明语义最强；在途任务用
@@ -505,11 +514,13 @@ def _build_claimed_files(
     # 必须遍历 tasks 定义补齐，否则空 ledger 下收集不到
     if include_pending:
         for task_def in tasks:
-            tid = task_def.get("id", "")
+            tid = task_def.get(ID_FIELD, "")
             if tid in result:
                 continue
             task_state: TaskState | None = state.get(tid)
-            s = task_state.status if task_state else "pending"
-            if s == "pending":
-                result[tid] = (task_def.get("files_to_edit", []), "pending")
+            s = task_state.status if task_state else STATUS_PENDING
+            if s == STATUS_PENDING:
+                # 第二个元素是 claimed_by 哨兵（归口 constants.CLAIMED_BY_*，见 Wave1-T12），
+                # 与任务状态词表同形但语义独立。
+                result[tid] = (task_def.get(FILES_TO_EDIT_FIELD, []), CLAIMED_BY_PENDING)
     return result

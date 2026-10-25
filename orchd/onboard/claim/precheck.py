@@ -16,6 +16,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_RETRACT,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import guard_claim as _guard_claim
 from orchd.gitops_ops import try_git_branch as _try_git_branch
@@ -150,9 +154,9 @@ def _check_retract_cooldown(store: Store, task_id: str) -> dict[str, Any] | None
         if ev.get("task_id") != task_id:
             continue
         etype = ev.get("type")
-        if etype == "RETRACT" and not ev.get("retracted"):
+        if etype == EVENT_RETRACT and not ev.get("retracted"):
             last_retract = ev
-        elif etype == "CLAIMED" and not ev.get("retracted"):
+        elif etype == EVENT_CLAIMED and not ev.get("retracted"):
             last_claimed_ts = ev.get("timestamp")
     if last_retract is None:
         return None

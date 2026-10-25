@@ -7,6 +7,11 @@
 
 from __future__ import annotations
 
+from orchd.names import (
+    FULL_REGRESSION_FILE,
+)
+
+
 import json
 import sys
 import tempfile
@@ -176,7 +181,7 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
 
     orchd_dir.mkdir(exist_ok=True)
     _write_text_atomic(
-        orchd_dir / "_full_regression.json",
+        orchd_dir / FULL_REGRESSION_FILE,
         json.dumps(payload, ensure_ascii=False, indent=2),
     )
     commit_result = _commit_regression_evidence(project_root)
@@ -187,7 +192,7 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         "elapsed_seconds": reg_elapsed,
         "output_summary": _verify_output_summary(
             reg_result.stdout, reg_result.stderr),
-        "note": f"已写入 {orchd_dir / '_full_regression.json'}",
+        "note": f"已写入 {orchd_dir / FULL_REGRESSION_FILE}",
         # task-milestone-check-gate：本次记录是 M1（单机内核冻结）B 组判据的输入，
         # 刷新后可直接查门禁（避免"刷了记录却不知道下一步判什么"）。
         "milestone_gate": "python .orchd/__main__.py milestone-check freeze",
@@ -282,7 +287,7 @@ def _cmd_ci_record(args) -> tuple[dict, int]:
             "status": run.get("status"),
             "hint": "CI 仍在跑：等该 HEAD 的 run 结束后重跑 ci-record（不落半截字段）",
         }, 1
-    path = orchd_dir / "_full_regression.json"
+    path = orchd_dir / FULL_REGRESSION_FILE
     data: dict[str, Any] = {}
     if path.exists():
         try:

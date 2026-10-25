@@ -76,6 +76,11 @@ from orchd.errors import ErrorCode, OrchdError
 
 # 共享入口（仓库相对 POSIX 路径）→ 必须出现在 verify_command 的既有测试文件。
 SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
+    # 2026-10-23 task-release-command-skeleton：新增 release 命令模块，其行为面由
+    # tests/test_cli_release.py 覆盖；改它须把该测试放进 verify_command。
+    "orchd/cli/commands/release.py": (
+        "tests/test_cli_release.py",
+    ),
     # 2026-09-19 task-cli-json-envelope：改 main() 的 argparse 错误出口后只跑了
     # tests/test_cli_contract.py，漏了断言同一 CLI 行为的 test_cli_workflow.py。
     "orchd/cli/__init__.py": (

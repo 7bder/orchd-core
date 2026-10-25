@@ -5,6 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_AMEND,
+)
 from orchd.errors import ErrorCode, OrchdError
 
 
@@ -109,7 +112,7 @@ def _emit_amend_roundtrip_event(
         store.acquire_lock()
         try:
             ev = make_event(
-                roundtrip["task_id"], _agent, "AMEND",
+                roundtrip["task_id"], _agent, EVENT_AMEND,
                 reason="implementer_amend_roundtrip",
                 branch=roundtrip["from_branch"],
                 from_branch=roundtrip["default_branch"],

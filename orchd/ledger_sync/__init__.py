@@ -47,6 +47,16 @@ from .ops import (
     compact,
     status_remote,
 )
+from orchd.contracts.responses import (
+    COMMAND_KEY,
+    ERROR_KEY,
+    EVENT_ID_KEY,
+    HINT_KEY,
+    MESSAGE_KEY,
+    STATUS_KEY,
+    TASKS_KEY,
+    TASK_ID_KEY,
+)
 from .refs import (
     ORCHD_LEDGER_REF,
     _REF_STATE,
@@ -123,4 +133,12 @@ __all__ = [
     "push",
     "compact",
     "status_remote",
+    "COMMAND_KEY",
+    "ERROR_KEY",
+    "EVENT_ID_KEY",
+    "HINT_KEY",
+    "MESSAGE_KEY",
+    "STATUS_KEY",
+    "TASKS_KEY",
+    "TASK_ID_KEY",
 ]

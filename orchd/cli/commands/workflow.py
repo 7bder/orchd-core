@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_REVIEW_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 from orchd.guide import (
     NEXT_ACTION_EXIT,
     NEXT_ACTION_REVIEW_TAKEOVER,
@@ -32,8 +39,23 @@ from orchd.cli._util import (
     _reject_container_root_cwd,
     _resolve_text_arg,
 )
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    DEPENDS_ON_FIELD,
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    REVIEWERS_FIELD,
+    SOURCE_FIELD,
+    VERIFY_COMMAND_FIELD,
+)
 
 from orchd.ledger import structured_error
+from orchd.line import TASK_BRANCH_ROOT
 
 from orchd.cli.identity import (
     _detect_claim_role,
@@ -42,6 +64,19 @@ from orchd.cli.identity import (
     _session_collision_warning,
 )
 from orchd.cli.skeleton import _cli_skeleton
+from orchd.contracts.responses import (
+    BRANCH_KEY,
+    CLAIMED_KEY,
+    COMMAND_KEY,
+    COMMENTS_KEY,
+    COUNT_KEY,
+    ERROR_KEY,
+    GUIDANCE_KEY,
+    HINT_KEY,
+    MESSAGE_KEY,
+    NEXT_ACTION_KEY,
+    TASK_ID_KEY,
+)
 
 
 @_cli_skeleton
@@ -59,7 +94,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     from orchd.onboard import request
     from orchd.onboard.claim import claim
     enforce_self_review_block = bool(
-        master.config.get("enforce_self_review_block") if hasattr(master, "config") else False
+        master.config.get("enforce_self_review_block", True) if hasattr(master, "config") else True
     )
     result = request(
         store, tasks, agent_id=agent_id,
@@ -68,7 +103,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         sort_key=args.sort,
         max_active=getattr(args, "max_active", None),
         importance_thresholds=(
-            (master.config.get("importance") if hasattr(master, "config") else None)
+            (master.config.get(IMPORTANCE_FIELD) if hasattr(master, "config") else None)
             or None
         ),
         enforce_self_review_block=enforce_self_review_block,
@@ -99,7 +134,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     if stale_reviews:
         ordered = sorted(stale_reviews.items(), key=lambda kv: kv[1]["age_s"], reverse=True)
         result["stale_reviews"] = [
-            {"task_id": tid, **v} for tid, v in ordered
+            {TASK_ID_KEY: tid, **v} for tid, v in ordered
         ]
         takeover_msg = (
             f"僵尸审查认领 {len(stale_reviews)} 个（认领超时未提交）："
@@ -108,11 +143,11 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             "REVIEW_CLAIMED（引擎对超时认领放行跨 agent 回收），再重新认领审查。"
         )
         if result.get("message"):
-            result["message"] = f"{result['message']} {takeover_msg}"
+            result[MESSAGE_KEY] = f"{result['message']} {takeover_msg}"
         else:
-            result["message"] = takeover_msg
+            result[MESSAGE_KEY] = takeover_msg
         if result.get("candidate") is None:
-            result["next_action"] = NEXT_ACTION_REVIEW_TAKEOVER
+            result[NEXT_ACTION_KEY] = NEXT_ACTION_REVIEW_TAKEOVER
 
     # 无候选（candidate=None / next_action=exit|wait）：以引擎分配为准，
     # 附加 stop_wait 引导，明确"停止等待用户指令"，防止 agent 自行 claim/重试。
@@ -122,7 +157,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     ):
         from orchd.guide import stop_wait_guidance
 
-        result["guidance"] = stop_wait_guidance()
+        result[GUIDANCE_KEY] = stop_wait_guidance()
 
     # --auto-claim：候选非空时自动 claim（绕过人工确认）。
     # 默认禁用：仅当 _master.json 顶层 config.allow_auto_claim 显式为 true 时，
@@ -136,16 +171,16 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             result["auto_claim_disabled"] = True
             _details32 = [
                 {
-                    "message": "agent 不得擅自使用 --auto-claim 连续领任务。仅在用户明确于 _master.json 顶层 config.allow_auto_claim 设为 true 后才允许。",
-                    "hint": "请使用 python .orchd/__main__.py claim --task <id> --confirm 手动认领，或在 _master.json 顶层 config.allow_auto_claim 设为 true 后重试",
-                    "command": "python .orchd/__main__.py claim --task <id> --confirm",
+                    MESSAGE_KEY: "agent 不得擅自使用 --auto-claim 连续领任务。仅在用户明确于 _master.json 顶层 config.allow_auto_claim 设为 true 后才允许。",
+                    HINT_KEY: "请使用 python .orchd/__main__.py claim --task <id> --confirm 手动认领，或在 _master.json 顶层 config.allow_auto_claim 设为 true 后重试",
+                    COMMAND_KEY: "python .orchd/__main__.py claim --task <id> --confirm",
                 }
             ]
             _resp32 = structured_error("E032", "自动认领（--auto-claim）默认禁用", _details32, orchd_dir)
-            result["error"] = _resp32.get("error")
+            result[ERROR_KEY] = _resp32.get("error")
             # Channel C: attach guidance at top-level as well (structured_error已含guidance)
             if "guidance" in _resp32:
-                result["guidance"] = _resp32["guidance"]
+                result[GUIDANCE_KEY] = _resp32[GUIDANCE_KEY]
             return result
     if getattr(args, "auto_claim", False) and result.get("candidate"):
         candidate_id = result["candidate"]["task_id"]
@@ -157,7 +192,7 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             enforce_self_review_block=enforce_self_review_block,
         )
         result["auto_claimed"] = True
-        result["claimed"] = claim_result
+        result[CLAIMED_KEY] = claim_result
     return result
 
 
@@ -192,16 +227,16 @@ def claim_preview(
     from orchd.onboard.claim import build_scope_warning
     from orchd.report import task_revive_markers
 
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     task_def = task_map.get(task_id)
     if task_def is None:
         raise OrchdError(ErrorCode.E005, f"task '{task_id}' not found in master",
-                         [{"task_id": task_id, "hint": f"任务 {task_id} 在 _master.json 中不存在，检查 id 拼写或注册"}])
+                         [{TASK_ID_KEY: task_id, HINT_KEY: f"任务 {task_id} 在 _master.json 中不存在，检查 id 拼写或注册"}])
 
     state = store.replay()
     derived = store.scan_task_derived()
     ts = state.get(task_id)
-    status = ts.status if ts else "pending"
+    status = ts.status if ts else STATUS_PENDING
     # review-unify-r2：unified 模式下审查阶段显示为 unified（单阶段），
     # 不再回落 spec；two_phase 模式保持 spec/code 展示。
     from orchd.ledger import resolve_review_mode
@@ -212,20 +247,25 @@ def claim_preview(
 
     preview: dict[str, Any] = {
         "claim_type": role,
-        "task_id": task_id,
-        "name": task_def.get("name", ""),
-        "brief": task_def.get("brief", ""),
-        "module": task_def.get("module", ""),
-        "depends_on": task_def.get("depends_on", []),
-        "reviewers": task_def.get("reviewers", []),
+        TASK_ID_KEY: task_id,
+        NAME_FIELD: task_def.get(NAME_FIELD, ""),
+        BRIEF_FIELD: task_def.get(BRIEF_FIELD, ""),
+        MODULE_FIELD: task_def.get(MODULE_FIELD, ""),
+        DEPENDS_ON_FIELD: task_def.get(DEPENDS_ON_FIELD, []),
+        REVIEWERS_FIELD: task_def.get(REVIEWERS_FIELD, []),
         "current_status": status,
         "review_phase": current_phase,
         # task-claim-preview-and-scope-triage：声明范围与校验命令前置展示
-        "files_to_edit": task_def.get("files_to_edit", []),
-        "exempt_files": task_def.get("exempt_files", []),
-        "verify_command": task_def.get("verify_command", ""),
+        FILES_TO_EDIT_FIELD: task_def.get(FILES_TO_EDIT_FIELD, []),
+        EXEMPT_FILES_FIELD: task_def.get(EXEMPT_FILES_FIELD, []),
+        ACCEPTANCE_CRITERIA_FIELD: task_def.get(ACCEPTANCE_CRITERIA_FIELD, []),
+        VERIFY_COMMAND_FIELD: task_def.get(VERIFY_COMMAND_FIELD, ""),
         # cwd 预期：实现 claim 须在 main，审查 claim 须在 task 分支（两者规则相反）
-        "cwd_expected": "main（主工作树）" if role == "implementer" else f"task/{task_id} 或 task/{{line}}/{task_id}（任务 worktree）",
+        "cwd_expected": (
+            "main（主工作树）" if role == "implementer"
+            else f"{TASK_BRANCH_ROOT}{task_id} 或 "
+                 f"{TASK_BRANCH_ROOT}{{line}}/{task_id}（任务 worktree）"
+        ),
     }
     # task-review-comments-gate-and-stale-timeout（D）：预览阶段只透出意见条数，
     # 不摆正文（token 克制）；完整意见仅在 claim --confirm 返回体的 review_comments
@@ -238,7 +278,7 @@ def claim_preview(
         ws = check_workspace_state(project_root)
         preview["git"] = {
             "available": ws.get("available", False),
-            "branch": ws.get("branch"),
+            BRANCH_KEY: ws.get("branch"),
             "clean": ws.get("clean"),
         }
     else:
@@ -246,8 +286,8 @@ def claim_preview(
 
     # 将执行动作（claim() 会做的事）
     preview["actions"] = [
-        f"写 {'REVIEW_CLAIMED' if role == 'reviewer' else 'CLAIMED'} 事件到 ledger",
-        f"创建/切换 task/{task_id} 分支",
+        f"写 {EVENT_REVIEW_CLAIMED if role == 'reviewer' else EVENT_CLAIMED} 事件到 ledger",
+        f"创建/切换 {TASK_BRANCH_ROOT}{task_id} 分支",
     ]
 
     # 校验预期（与 claim() 锁内校验一致，透明展示；失败仅提示不阻断预览）
@@ -257,28 +297,28 @@ def claim_preview(
         is_self = bool(done_author and done_author == agent_id)
         preview["expected_checks"] = [
             {"check": "任务处于 in_review（可认领审查）",
-             "expected_pass": status == "in_review"},
+             "expected_pass": status == STATUS_IN_REVIEW},
             {"check": "agent 在任务 reviewers 名单内",
-             "expected_pass": agent_id in task_def.get("reviewers", []),
+             "expected_pass": agent_id in task_def.get(REVIEWERS_FIELD, []),
              "note": "指纹身份（12位hex）默认豁免此名单校验（ledger.is_fingerprint_agent_id），expected_pass=false 不阻断认领；具名 agent 身份才需在 reviewers 名单内"},
             {"check": "审查阶段与当前 review_phase 匹配",
              "expected_pass": (not review_type) or review_type == current_phase},
         ]
-        # 自审（E016）降级为提示项：默认不阻断，仅标注；enable 时才作为检查生效
+        # 自审（E016）：默认硬阻断（config 缺省 true，engine-discipline-hardening）；显式 false 时降级为提示项仅标注
         if is_self:
             preview["expected_checks"].append({
                 "check": "自审提示（E016：实现者 = 审查者）",
                 "expected_pass": not enforce_self_review_block,
-                "note": "默认仅提示不阻断；线上版 config.enforce_self_review_block=true 时该检查才生效并阻断",
+                "note": "默认 E016 硬阻断（engine-discipline-hardening 2026-10-23 停服施工：config 缺省翻转为 true）；config 显式 false 可退回仅提示",
             })
     else:
         preview["expected_checks"] = [
             {"check": "任务处于 pending（可认领）",
-             "expected_pass": status == "pending"},
+             "expected_pass": status == STATUS_PENDING},
             {"check": "依赖全部满足",
              "expected_pass": all(
-                 (state.get(d).status if state.get(d) else "pending")
-                 in TERMINAL_STATUSES for d in task_def.get("depends_on", [])
+                 (state.get(d).status if state.get(d) else STATUS_PENDING)
+                 in TERMINAL_STATUSES for d in task_def.get(DEPENDS_ON_FIELD, [])
              )},
             {"check": "未被其他 agent 认领",
              "expected_pass": not (ts and ts.claimed_by and ts.claimed_by != agent_id)},
@@ -321,7 +361,7 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     agent_id = _require_agent_id(orchd_dir)
     role = _detect_claim_role(store, tasks, args.task)
     enforce_self_review_block = bool(
-        master.config.get("enforce_self_review_block") if hasattr(master, "config") else False
+        master.config.get("enforce_self_review_block", True) if hasattr(master, "config") else True
     )
 
     # 确认闸门：无 --confirm 仅输出预览（只读，不写事件、不建分支）
@@ -335,7 +375,7 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         result = {
             "confirm_required": True,
             "claim_type": preview["claim_type"],
-            "hint": "预览模式：确认无误后请加 --confirm 真正执行认领（写事件 + 建分支）",
+            HINT_KEY: "预览模式：确认无误后请加 --confirm 真正执行认领（写事件 + 建分支）",
             "preview": preview,
         }
         warning = _identity_warning(agent_id, orchd_dir)
@@ -357,6 +397,17 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         enforce_self_review_block=enforce_self_review_block,
         force=getattr(args, "force", False),
     )
+    # engine-discipline-hardening 轻 guidance（2026-10-23 停服施工）：同 source 串行包
+    # 实现前复核提示（tier=suggest / exit_type=continue，不阻断、不新增错误码）。
+    # 顶层 serial_hint 键——不预置 guidance dict，避免挡掉 skeleton 的标准 guidance。
+    _src_of_task = next(
+        (t.get(SOURCE_FIELD) for t in tasks if t.get(ID_FIELD) == args.task), None)
+    if role != "reviewer" and _src_of_task:
+        result["serial_hint"] = {
+            HINT_KEY: "同 source 串行包：实现前请 amend 复核定义以当前现场为准（files_to_edit/AC 可能随前序兄弟卡落地而漂移）",
+            "tier": "suggest",
+            "exit_type": "continue",
+        }
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
@@ -388,7 +439,7 @@ def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # 解析（flat 下从 main blob 读权威声明；否则陈旧声明会在引擎之前先误拦 E010）。
     from orchd.worktree import resolve_declaration_source as _resolve_decl_early
     _tasks_early = _resolve_decl_early(orchd_dir.parent, tasks, None)[0]
-    _task_def_early = {t.get("id", ""): t for t in _tasks_early}.get(args.task)
+    _task_def_early = {t.get(ID_FIELD, ""): t for t in _tasks_early}.get(args.task)
     if _task_def_early is not None:
         from orchd.onboard import _guard_out_of_scope as _early_scope_guard
         _early_scope_guard(orchd_dir.parent, _task_def_early, args.task, [])
@@ -422,16 +473,16 @@ def _cmd_review_show(args) -> dict:
             [{"arguments": ["--show", "--verdict"]}],
         )
     tasks, orchd_dir, _ = _load_tasks()
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     if task_map.get(args.task) is None:
         raise OrchdError(
             ErrorCode.E005,
             f"task '{args.task}' not found in master",
-            [{"task_id": args.task, "hint": f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
+            [{TASK_ID_KEY: args.task, HINT_KEY: f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
         )
     store = Store(orchd_dir)
     history = extract_review_history(store, args.task)
-    return {"task_id": args.task, "comments": history, "count": len(history)}
+    return {TASK_ID_KEY: args.task, COMMENTS_KEY: history, COUNT_KEY: len(history)}
 
 
 def _cmd_review(args) -> dict:
@@ -463,12 +514,12 @@ def _cmd_review(args) -> dict:
         required=False,
     )
     tasks, orchd_dir, _ = _load_tasks()
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     if task_map.get(args.task) is None:
         raise OrchdError(
             ErrorCode.E005,
             f"task '{args.task}' not found in master",
-            [{"task_id": args.task, "hint": f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
+            [{TASK_ID_KEY: args.task, HINT_KEY: f"任务 {args.task} 在 _master.json 中不存在，检查 id 拼写或注册"}],
         )
     store = Store(orchd_dir)
     agent_id = _require_agent_id(orchd_dir)
@@ -488,7 +539,7 @@ def _cmd_review(args) -> dict:
     if warning:
         result["warning"] = warning
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
-    if result.get("task_status") == "completed":
+    if result.get("task_status") == STATUS_COMPLETED:
         result["ideas_archive"] = _maybe_archive_ideas(orchd_dir)
     return result
 

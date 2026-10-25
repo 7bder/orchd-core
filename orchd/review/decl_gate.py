@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 from pathlib import Path
 
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+)
 from orchd.errors import ErrorCode
 from orchd.errors import OrchdError
 
@@ -31,13 +35,13 @@ def _review_submit_decl_gate(
             # （flat 下从 main blob 读权威声明，防任务分支本地副本陈旧）。
             from orchd.worktree import resolve_declaration_source
             _tasks = resolve_declaration_source(project_root, tasks, degraded)[0]
-            task_map = {t.get("id", ""): t for t in _tasks}
+            task_map = {t.get(ID_FIELD, ""): t for t in _tasks}
             task_def = task_map.get(task_id) or {}
             from orchd.worktree import diagnose_missing_branch_files
 
             missing = [
                 d["file"] for d in diagnose_missing_branch_files(
-                    project_root, task_id, task_def.get("files_to_edit", [])
+                    project_root, task_id, task_def.get(FILES_TO_EDIT_FIELD, [])
                 )
             ]
             if missing:

@@ -27,6 +27,22 @@ W8-6 把 ``fix.py`` 拆为 ``fix/`` 七域后，消费点再下沉一层，补�
 
 from __future__ import annotations
 
+from orchd.names import (
+    CHECKPOINT_FILE,
+    FULL_REGRESSION_FILE,
+    IDEAS_ARCHIVE_FILE,
+    IDEAS_FILE,
+    LAYOUT_FILE,
+    LEDGER_FILE,
+    LESSONS_FILE,
+    LESSONS_STAGED_FILE,
+    MASTER_FILE,
+    MERGE_ACKS_FILE,
+    ROADMAP_FILE,
+    SESSION_WORKTREES_FILE,
+)
+
+
 import re
 import subprocess
 from pathlib import Path
@@ -353,11 +369,11 @@ def _pre_delete_lock_recheck(path: Path) -> str | None:
 # 归 _SOURCE_ASSETS 而非 _RUNTIME_STATE_FILES，避免 container 布局下被
 # _detect_legacy_flat_residues 误判为 flat 遗留而搬走（task-doctor-full-regression-alignment）。
 _SOURCE_ASSETS = frozenset({
-    "_master.json",
-    "IDEAS.md",
-    "IDEAS-archive.md",
-    "ROADMAP.md",
-    "_full_regression.json",
+    MASTER_FILE,
+    IDEAS_FILE,
+    IDEAS_ARCHIVE_FILE,
+    ROADMAP_FILE,
+    FULL_REGRESSION_FILE,
 })
 
 
@@ -396,13 +412,13 @@ class _RuntimeStateFiles(frozenset):
 # .layout.json 是布局标记（布局解析权威，不可清理）：legacy 扫描须跳过
 # （见 _detect_legacy_flat_residues），仅快照排除与 canonical 保护消费它。
 _RUNTIME_STATE_FILES = _RuntimeStateFiles({
-    "_ledger.jsonl",
-    "_checkpoint.json",
-    "session-worktrees.json",
-    "merge-acks.json",
-    "lessons.jsonl",
-    "lessons.staged.jsonl",
-    ".layout.json",
+    LEDGER_FILE,
+    CHECKPOINT_FILE,
+    SESSION_WORKTREES_FILE,
+    MERGE_ACKS_FILE,
+    LESSONS_FILE,
+    LESSONS_STAGED_FILE,
+    LAYOUT_FILE,
     # sqlite 迁移备份（task-runtime-list-migration-backups）：改名残留的旧载体，
     # 同属引擎运行时状态——无 git 快照不得计入项目变更（此前漏成员，与旧事故同型）。
     "_ledger.jsonl.pre-sqlite-bak",

@@ -13,6 +13,7 @@ from typing import Any
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import OrchdError
 from orchd.intake import (
+    IDEA_STATUS_PENDING,
     _atomic_write_text,
     _find_idea_entry,
     _intake_guard,
@@ -25,7 +26,6 @@ from orchd.intake import (
 from orchd.ledger import read_text_or_error, single_line
 from .parse import (
     extract_entry_block,
-    find_live_source_refs,
     find_resolved_entries,
 )
 
@@ -53,23 +53,22 @@ def _classify_archivable(
     ``text`` 为关键字必传：注释过滤要用原文算行偏移，漏传等价于静默关掉那道网。给默认
     值就是给"少传一个参数"留一条无声退路（spec 审查 C2）。
 
-    两条判据互补，缺一即有状态永不出场：
+    判据（task-intake-exit-verb-close 起收敛为单一 resolved）：
 
     - **resolved**：条目 ``- id`` 被任务 ``source``/``additional_sources`` 引用，且
       这些任务全部终态（:func:`find_resolved_entries`，语义与用例零改动，只被复用）；
-    - **dropped**：条目 ``- status: dropped`` 且其 id 未被任何**非终态**任务引用。
-      用户 ``idea drop`` 已经是裁决结论，但放弃的灵感通常从未被任务化 ⇒ 走不到"全
-      终态"判据；``_DECISION_ARCHIVABLE_STATUSES`` 也刻意不收 dropped（放弃条目的
-      离场不需要人再点一次按钮）。于是 dropped 两头无出口，每轮 ``ideas list`` 复读。
+    - ~~dropped~~ **已下线**：旧分支（ideas-dropped-exit）认「用户已裁决放弃」并由机器
+      判离场。统一出口 ``idea close --reason`` 落地后，「放弃」不再是留在台账里的状态值、
+      也不再需要机器代为判——带理由一次搬走即完成，故活跃白名单移除 dropped。
 
-    在途守护与人工裁决通道同口径（见 :func:`find_live_source_refs`）：命中非终态引用
-    即不搬。被非终态任务引用的 dropped 条目本来就已 E025 判红（``_check_idea_reference``
-    要求条目 status 为 pending），所以这道网保的不是"一个合法态"，而是两件事：块被销毁
-    后诊断退化成「无匹配条目」、在途任务台账失去可追溯的来源文本。无 ``- id:`` 的 dropped
-    条目可搬：E025 只认 ``- id:`` 精确相等，无 id 条目不可能被合法引用，搬走不伤任何任务；
-    按"无 id 保守"处理反而重新造出一个滞留桶。
+    在途守护与人工裁决通道同口径（见 :func:`orchd.ideas.parse.find_live_source_refs`）：
+    命中非终态引用即不搬——E025 溯源只读 IDEAS.md，此时搬走即在途任务当场失去来源。
+    保的不是"一个合法态"，而是两件事：块被销毁后诊断退化成「无匹配条目」、在途任务台账
+    失去可追溯的来源文本。无 ``- id:`` 的条目**永不进本判据**（``_entry_is_resolved``
+    对无 id 保守拒搬，防日期词 / 标题词 ref 误伤）——旧 dropped 分支曾允许这类条目
+    离场，该分支已删；放弃类条目改由人工 ``idea close`` 承担。
 
-    两判据同时命中只保留一次；候选再按 :func:`_block_comment_balanced` 分岔——块边界
+    候选再按 :func:`_block_comment_balanced` 分岔——块边界
     跨注释标记的一律**不搬**（宁可滞留，不可腐蚀两份文件）。返回三列均按
     ``start_line`` 升序，与 :func:`_remove_blocks` 的行区间删除口径一致。
 
@@ -81,25 +80,16 @@ def _classify_archivable(
     偏移判定派生。
     """
     task_status = task_status or {}
-    # 注释过滤罩住两条分支（code 审查 S1）：第 0 步"只有注释之外的 ## 章节才算条目"是
-    # 全局口径，只罩新增的 dropped 半边就留下"同一份文本两把尺子"——注释里的 ``- id:``
-    # 命中终态任务时照样把模板块搬走（实测 main 亦如此，属既有面，本卡一并收敛）。
+    # 注释过滤是全局口径（第 0 步"只有注释之外的 ## 章节才算条目"）：dropped 分支下线后
+    # 仍罩住 resolved——否则同一份文本两把尺子，注释里的 ``- id:`` 命中终态任务时照样
+    # 把模板块搬走（实测 main 亦如此，属既有面）。
     hidden = _html_comment_lines(text)
     eligible: dict[int, dict[str, Any]] = {
         e["start_line"]: e
         for e in find_resolved_entries(master, entries, task_status)
     }
-    live = find_live_source_refs(master, task_status)
-    for e in entries:
-        start = e["start_line"]
-        if start in eligible:
-            continue
-        if (e.get("status") or "").strip() != "dropped":
-            continue
-        eid = (e.get("id") or "").strip()
-        if eid and live.get(eid):
-            continue
-        eligible[start] = e
+    # dropped 分支已整体删除（task-intake-exit-verb-close）：放弃类条目的出路收敛到
+    # 人工统一出口 idea close，活跃白名单里不再有 dropped，也就没有第二条机器判离场分支。
     moved: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     frozen: list[dict[str, Any]] = []
@@ -137,10 +127,11 @@ def find_archivable_entries(
     *,
     text: str,
 ) -> list[dict[str, Any]]:
-    """自动归档通道的唯一判据入口：已完结 ∪ 已放弃，且块可安全搬走（ideas-dropped-exit）。
+    """自动归档通道的唯一判据入口：已完结（resolved），且块可安全搬走。
 
-    判据全文见 :func:`_select_archivable`（resolved ∪ dropped、注释过滤、在途守护、
-    注释配对不变量）；本函数取其中"放行"的那一列。
+    判据全文见 :func:`_select_archivable`（resolved-only、注释过滤、注释配对不变量）；
+    本函数取其中"放行"的那一列。已放弃类条目自 task-intake-exit-verb-close 起不再由机器
+    判离场，改走人工统一出口 idea close。
     """
     return _select_archivable(master, entries, task_status, text=text)[0]
 
@@ -224,7 +215,7 @@ def find_orphan_entries(
     orphans: list[dict[str, Any]] = []
     import re as _re
     for e in entries:
-        if (e.get("status") or "").strip() != "pending":
+        if (e.get("status") or "").strip() != IDEA_STATUS_PENDING:
             continue
         eid = (e.get("id") or "").strip()
         if not eid or eid in referenced_refs:

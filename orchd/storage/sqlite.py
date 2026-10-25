@@ -32,6 +32,8 @@ from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock, _depth_registry
 from orchd.storage import StorageBackend
 
+# 本文件不直接读环境变量：后端选择由 ``orchd.ledger.backend`` 按
+# ``orchd.constants.ORCHD_STORAGE_BACKEND_ENV`` 决定（文首 docstring 里的变量名仅说明语义）。
 _CHECKPOINT_KEY = "checkpoint"
 _COUNT_KEY = "event_count"
 

@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, NotApplicableError
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    FILES_TO_EDIT_FIELD,
+)
 from orchd.gitops import (
     GUARD_WARN,
     branch_exists,
@@ -224,7 +228,7 @@ def _claim_review_branch(
         return None
     files_to_review = [
         {"path": p, "priority": "must_read"}
-        for p in task_def.get("files_to_edit", [])
+        for p in task_def.get(FILES_TO_EDIT_FIELD, [])
     ]
     if shared:
         if review_phase == "spec":
@@ -247,7 +251,7 @@ def _claim_review_branch(
     result = {
         "claimed": True, "task_id": task_id, "review_type": review_phase,
         "files_to_review": files_to_review,
-        "acceptance_criteria": task_def.get("acceptance_criteria", []),
+        ACCEPTANCE_CRITERIA_FIELD: task_def.get(ACCEPTANCE_CRITERIA_FIELD, []),
         "changes_description": changes_description,
         "review_comments": _extract_review_comments(store, task_id, derived),
         "event_id": event["event_id"],
@@ -292,7 +296,7 @@ def _claim_review_branch(
         return {
             "branch_files": _repo_for_project(diag_root).changed_paths(task_id),
             "missing_declared_files": diagnose_missing_branch_files(
-                diag_root, task_id, task_def.get("files_to_edit", [])),
+                diag_root, task_id, task_def.get(FILES_TO_EDIT_FIELD, [])),
         }
 
     diag = run_guard(

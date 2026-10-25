@@ -73,8 +73,12 @@ from orchd.line_ctx import resolve_trunk_for
 #   ``fatal: ambiguous argument 'show'``：是硬失败而非静默污染。裸跑不触发 driver，仍排除。
 # - ``rev-list``：注入被接受且输出逐字节相同，但裸跑不触发 driver——注入零收益，为最小化
 #   argv 改写面不收录。
-# - ``whatchanged``：本 build 里**恒 rc=128**（``'git whatchanged' is nominated for removal``），
-#   作为白名单成员暂无实际执行面；撤除它属白名单变更、须按上面三条重新实测，故本轮不动。
+# - ``whatchanged``：**默认拒绝执行**（rc=128），且拒绝文案随 git 版本漂移——2.55 为
+#   ``is nominated for removal``、2.56 为 ``will be removed soon.``（故测试只锁行为、不锁措辞）；
+#   加 ``--i-still-use-this`` 后执行面恢复（rc=0），注入两旗标 stdout 逐字节不变（实测
+#   git 2.56.0.windows.2）⇒ 注入**有效且无害**。代理默认形态不带该旗标，故
+#   ``orchd git whatchanged`` 恒 rc=128。保留为白名单成员：撤除属白名单变更、须按上面三条
+#   收录条件重新实测（预期结论为保留，但须由实测背书而非沿用旧论证）。
 #
 # 已排除的替代方案（同样有实测背书，不是没想过）：用 ``GIT_CONFIG_COUNT`` +
 # ``GIT_CONFIG_KEY_n``/``VALUE_n`` 把 ``diff.tc.textconv`` / ``filter.mk.smudge`` 置空来中和

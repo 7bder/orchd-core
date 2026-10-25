@@ -12,6 +12,16 @@ from __future__ import annotations
 
 import warnings
 
+from orchd.names import (
+    LEDGER_ARCHIVE_FILE,
+    LEDGER_FILE,
+)
+from orchd.contracts.events import (
+    EVENT_DONE,
+    EVENT_RETRACT,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_SUBMITTED,
+)
 from orchd.ledger.store_types import TaskDerived, TaskState
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -152,7 +162,7 @@ class _StoreReadMixin:
         # 与 _rebuild_after_retract 一致：先完整收集前缀内的 RETRACT 目标，
         # 再应用非撤回事件，避免被撤回事件「复活」。
         for ev in events:
-            if ev.get("type") == "RETRACT":
+            if ev.get("type") == EVENT_RETRACT:
                 te = ev.get("target_event_id", "")
                 if te:
                     retracted.add(te)
@@ -197,7 +207,7 @@ class _StoreReadMixin:
         all_events = self._read_ledger_lines(from_line=1)
         retracted: set[str] = set()
         for ev in all_events:
-            if ev.get("type") == "RETRACT":
+            if ev.get("type") == EVENT_RETRACT:
                 te = ev.get("target_event_id", "")
                 if te:
                     retracted.add(te)
@@ -208,10 +218,10 @@ class _StoreReadMixin:
             tid = event.get("task_id", "")
             if not tid:
                 continue
-            if etype == "DONE":
+            if etype == EVENT_DONE:
                 # 正序遍历，后者覆盖前者 → last_done 保持「最近一次」
                 info.last_done[tid] = event
-            elif etype == "REVIEW_SUBMITTED":
+            elif etype == EVENT_REVIEW_SUBMITTED:
                 comments = event.get("comments")
                 if comments:
                     info.review_comments.setdefault(tid, []).append(comments)
@@ -222,7 +232,7 @@ class _StoreReadMixin:
                         "[该次打回未附审查意见（历史数据），请联系审查者补充；"
                         "当前版本已强制要求 CHANGES_REQUESTED 必须附意见]"
                     )
-            elif etype == "REVIEW_CLAIMED":
+            elif etype == EVENT_REVIEW_CLAIMED:
                 aid = event.get("agent_id")
                 if aid:
                     # 正序遍历后者覆盖 → (tid, aid) 保持「最近一次」的 baseline
@@ -250,9 +260,9 @@ class _StoreReadMixin:
         except Exception:
             store_dir = Path(self.orchd_dir)
         return (
-            (store_dir / "_ledger.jsonl").is_file()
+            (store_dir / LEDGER_FILE).is_file()
             or (store_dir / "_ledger.sqlite3").is_file()
-            or (store_dir / "_ledger.archive.jsonl").is_file()
+            or (store_dir / LEDGER_ARCHIVE_FILE).is_file()
         )
 
     def ledger_line_count(self) -> int:

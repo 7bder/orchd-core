@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_REVIEW_CLAIMED,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.ledger import Store, TaskState, resolve_workspace_root
@@ -154,9 +158,9 @@ def watchdog(
             ev_time = datetime.fromisoformat(ts_str)
         except ValueError:
             continue
-        if ev.get("type") == "CLAIMED":
+        if ev.get("type") == EVENT_CLAIMED:
             claim_times[tid] = ev_time
-        elif ev.get("type") == "REVIEW_CLAIMED":
+        elif ev.get("type") == EVENT_REVIEW_CLAIMED:
             review_claims[tid] = {
                 "time": ev_time,
                 "event_id": ev.get("event_id", ""),

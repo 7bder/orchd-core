@@ -50,3 +50,8 @@ guide:
 - **新域/新职责必须新建独立测试文件**：新增测试所属域若尚无对应文件，新建 `tests/test_<domain>.py`；即便同域已有热点文件，新增**独立子域**（如 `pool` 下的 `decl_dir_match`）也应新建 `tests/test_<domain>_<subdomain>.py`，避免 hotspot 尾部堆叠。
 - **理由（实证）**：2026-09-13 `task-decl-dir-match-conflict` 与 `task-inflight-conflict-visibility` 并行时**同时**向 `tests/test_pool.py` / `tests/test_worktree.py` 尾部追加测试 → 必然 modify/modify 冲突。根因：同一热点文件被多个并发异步任务共享作为追加点，引擎无法干预 append 冲突。约定层根治：降低冲突面，不新增引擎校验。
 - **例外**：修复既有测试文件中的 bug / 调整既有测试用例（非新增类/方法）不受此限；新增测试类必须新建文件。
+
+## 注册用测试骨架 hygiene（与摄入协议附录 B 双向指针）
+
+- 为注册而建的测试**占位文件**一律直接写任务 worktree，或注册后立即删 main 副本——main 残留的同路径 untracked 文件会在 code APPROVED 合并时触发「untracked would be overwritten」致 merge_env_error；合入前必验 main 干净。
+- 细则与实踩记录的真源在 [intake.md](intake.md) 附录 B，本条只做索引，**不复制正文**（避免两份真源漂移）。

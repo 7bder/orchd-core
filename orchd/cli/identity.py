@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_SESSION_ID_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger import _write_text_atomic, structured_error
 
@@ -27,11 +28,11 @@ _TRAE_SESSION_ID_ENV = "ICUBE_CODEMAIN_SESSION"
 
 def _auto_inject_session_id() -> None:
     """宿主会话身份自动注入：若 ORCHD_SESSION_ID 未设置，则用 TRAE 会话码兜底。"""
-    if os.environ.get("ORCHD_SESSION_ID"):
+    if os.environ.get(ORCHD_SESSION_ID_ENV):
         return
     trae_sid = os.environ.get(_TRAE_SESSION_ID_ENV)
     if trae_sid:
-        os.environ["ORCHD_SESSION_ID"] = trae_sid
+        os.environ[ORCHD_SESSION_ID_ENV] = trae_sid
 
 
 def _resolve_agent_id(orchd_dir: Path | None = None) -> str:

@@ -27,13 +27,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_SESSION_ID_ENV, ORCHD_SESSION_TTL_MIN_ENV
 from orchd.errors import ErrorCode, OrchdError
 
 
 # 宿主注入的每对话唯一会话标识环境变量（session-id-fingerprint）。
 # 由宿主在每次对话启动时注入，据此确定性派生 12 位 hex 指纹：
 # 同一对话内所有命令返回同一指纹，切换对话（新值）即换指纹。
-_ORCHD_SESSION_ID_ENV = "ORCHD_SESSION_ID"
+_ORCHD_SESSION_ID_ENV = ORCHD_SESSION_ID_ENV  # 变量名真源：orchd.constants
 
 # 会话身份完全由宿主注入的 ORCHD_SESSION_ID 派生，引擎不自持身份、不借用
 # 任何历史身份。据此彻底废除 .orchd/.agent_id 文件（读取与写入均删除）：
@@ -156,7 +157,7 @@ def _session_runtime_path(orchd_dir: Path, session_id: str) -> Path:
 #     （见 report.py，供接管流程发现）。
 
 
-_SESSION_TTL_MIN_ENV = "ORCHD_SESSION_TTL_MIN"
+_SESSION_TTL_MIN_ENV = ORCHD_SESSION_TTL_MIN_ENV  # 变量名真源：orchd.constants
 _SESSION_TTL_DEFAULT_MIN = 24 * 60  # 默认 24h
 
 
@@ -324,7 +325,7 @@ def session_start(
             "description": "将 session_token 注入 ORCHD_SESSION_ID 环境变量，后续命令即识别为同一会话身份",
             "powershell": f'$env:ORCHD_SESSION_ID="{token}"',
             "bash": f'export ORCHD_SESSION_ID="{token}"',
-            "env_var": "ORCHD_SESSION_ID",
+            "env_var": ORCHD_SESSION_ID_ENV,
             "token": token,
         },
     }

@@ -46,4 +46,4 @@ retract / force-status / status / watchdog / ideas-archive / doctor / intake。
 ## 分层边界（单一真源，task-skill-size-budget-and-consistency-gate）
 - **SKILL.md = 入口协议 + 纪律红线速查 + 本索引链接**：只放协议概览与红线明细，细则不过度展开。
 - **细则与原理真源只在本目录（`rules/*.md`）存活**：若 SKILL.md 逼近体积上限，应把细节外置到对应 rules 文件、SKILL 留一行链接，而非为降体积删减语义要素。
-- 行为默认值（认领接管阈值 600s/300s、重试冷却 300s、conflict_policy 缺省 warn、自审阻断默认关闭等）在 SKILL/rules 文案与引擎源码默认常量间保持双向一致，改动任一侧须同步另一侧。
+- 行为默认值（认领接管阈值 600s/300s、重试冷却 300s、conflict_policy 缺省 warn、自审阻断 CLI/config 缺省开启（内部 API 形参缺省 false）等）在 SKILL/rules 文案与引擎源码默认常量间保持双向一致，改动任一侧须同步另一侧。

@@ -4,7 +4,28 @@ from __future__ import annotations
 
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_RETRACT,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
+from orchd.contracts.task_schema import (
+    BRIEF_FIELD,
+    DEPENDS_ON_FIELD,
+    DIFFICULTY_FIELD,
+    ESTIMATED_HOURS_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MAX_ATTEMPTS_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    REQUIRE_INDEPENDENT_REVIEW_FIELD,
+    REQUIRES_FIELD,
+    REVIEWERS_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.guide import NEXT_ACTION_EXIT
 from orchd.ledger import Store, TaskDerived, TaskState
 from orchd.ledger import is_fingerprint_agent_id as _is_fingerprint_agent_id
@@ -38,11 +59,11 @@ def _find_review_priority_tasks(
     H2（2026-08-13）：``derived`` 为 request 单次扫描的派生缓存，
     循环内查询实现者改为 O(1)（原实现对每个候选任务全扫一次 ledger）。
     """
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
     review_tasks: list[dict[str, Any]] = []
     excluded_self_review: list[dict[str, Any]] = []
     for tid, ts in state.items():
-        if ts.status != "in_review" or ts.review_claimed_by is not None:
+        if ts.status != STATUS_IN_REVIEW or ts.review_claimed_by is not None:
             continue
         task_def = task_map.get(tid, {})
         # 向后兼容：reviewers 字段存在且非空时仍按其门禁（旧契约/测试）。
@@ -50,7 +71,7 @@ def _find_review_priority_tasks(
         # 指纹豁免（task-fp-review-priority-exempt，对齐 claim 侧 E007）：指纹形态
         # agent_id（12 位 hex）无法预写静态 reviewers 名单，不在名单内也不排除；
         # 具名 agent（名单外）仍被排除（向后兼容）。
-        designated = task_def.get("reviewers")
+        designated = task_def.get(REVIEWERS_FIELD)
         if designated and agent_id not in designated \
                 and not _is_fingerprint_agent_id(agent_id):
             continue
@@ -63,18 +84,18 @@ def _find_review_priority_tasks(
             excluded_self_review.append({
                 "task_id": tid,
                 "review_phase": ts.review_phase or "spec",
-                "name": task_def.get("name", ""),
+                NAME_FIELD: task_def.get(NAME_FIELD, ""),
                 "done_author": done_author,
                 "is_self_review": True,
             })
         # task-review-independence-enforce：任务级独立审查与全局开关 OR。
         if is_self and (enforce_self_review_block
-                        or task_def.get("require_independent_review", False)):
+                        or task_def.get(REQUIRE_INDEPENDENT_REVIEW_FIELD, False)):
             continue
         entry = {
             "task_id": tid,
             "review_phase": ts.review_phase or "spec",
-            "name": task_def.get("name", ""),
+            NAME_FIELD: task_def.get(NAME_FIELD, ""),
         }
         if is_self:
             entry["is_self_review"] = True
@@ -137,13 +158,13 @@ def _route_by_role(
             message = "guard_unavailable: 冲突预检门禁跑不起来（git 探测失败），请检查 git 环境后重试"
             blocked_count = 0
             for task in tasks:
-                tid = task.get("id", "")
+                tid = task.get(ID_FIELD, "")
                 ts = state.get(tid)
-                s = ts.status if ts else "pending"
-                if s == "pending":
-                    for dep_id in task.get("depends_on", []):
+                s = ts.status if ts else STATUS_PENDING
+                if s == STATUS_PENDING:
+                    for dep_id in task.get(DEPENDS_ON_FIELD, []):
                         dep_ts = state.get(dep_id)
-                        dep_s = dep_ts.status if dep_ts else "pending"
+                        dep_s = dep_ts.status if dep_ts else STATUS_PENDING
                         if dep_s not in TERMINAL_STATUSES:
                             blocked_count += 1
                             break
@@ -156,32 +177,32 @@ def _route_by_role(
             message = "全部就绪候选因文件冲突被依赖感知强制过滤，请等待冲突任务完成后重试"
             blocked_count = 0
             for task in tasks:
-                tid = task.get("id", "")
+                tid = task.get(ID_FIELD, "")
                 ts = state.get(tid)
-                s = ts.status if ts else "pending"
-                if s == "pending":
-                    for dep_id in task.get("depends_on", []):
+                s = ts.status if ts else STATUS_PENDING
+                if s == STATUS_PENDING:
+                    for dep_id in task.get(DEPENDS_ON_FIELD, []):
                         dep_ts = state.get(dep_id)
-                        dep_s = dep_ts.status if dep_ts else "pending"
+                        dep_s = dep_ts.status if dep_ts else STATUS_PENDING
                         if dep_s not in TERMINAL_STATUSES:
                             blocked_count += 1
                             break
             result = {"candidate": None, "message": message, "next_action": NEXT_ACTION_EXIT, "pool_size": 0, "blocked_count": blocked_count, "reason": reason, "mismatched": mismatched, "excluded_conflicts": excluded_conflicts}
         elif capabilities:
             unfiltered = build_pool(tasks, state, capabilities=None, exclude=exclude)
-            mismatched = [{"task_id": c.task.get("id", ""), "requires": list(c.task.get("requires", []))} for c in unfiltered if not set(c.task.get("requires", [])).issubset(set(capabilities))]
+            mismatched = [{"task_id": c.task.get(ID_FIELD, ""), REQUIRES_FIELD: list(c.task.get(REQUIRES_FIELD, []))} for c in unfiltered if not set(c.task.get(REQUIRES_FIELD, [])).issubset(set(capabilities))]
             if mismatched:
                 reason = "capability_mismatch"
                 message = "能力不匹配：存在就绪候选但 requires 不满足，请检查 --capabilities"
                 blocked_count = 0
                 for task in tasks:
-                    tid = task.get("id", "")
+                    tid = task.get(ID_FIELD, "")
                     ts = state.get(tid)
-                    s = ts.status if ts else "pending"
-                    if s == "pending":
-                        for dep_id in task.get("depends_on", []):
+                    s = ts.status if ts else STATUS_PENDING
+                    if s == STATUS_PENDING:
+                        for dep_id in task.get(DEPENDS_ON_FIELD, []):
                             dep_ts = state.get(dep_id)
-                            dep_s = dep_ts.status if dep_ts else "pending"
+                            dep_s = dep_ts.status if dep_ts else STATUS_PENDING
                             if dep_s not in TERMINAL_STATUSES:
                                 blocked_count += 1
                                 break
@@ -191,13 +212,13 @@ def _route_by_role(
                 mismatched = []
                 blocked_count = 0
                 for task in tasks:
-                    tid = task.get("id", "")
+                    tid = task.get(ID_FIELD, "")
                     ts = state.get(tid)
-                    s = ts.status if ts else "pending"
-                    if s == "pending":
-                        for dep_id in task.get("depends_on", []):
+                    s = ts.status if ts else STATUS_PENDING
+                    if s == STATUS_PENDING:
+                        for dep_id in task.get(DEPENDS_ON_FIELD, []):
                             dep_ts = state.get(dep_id)
-                            dep_s = dep_ts.status if dep_ts else "pending"
+                            dep_s = dep_ts.status if dep_ts else STATUS_PENDING
                             if dep_s not in TERMINAL_STATUSES:
                                 blocked_count += 1
                                 break
@@ -207,13 +228,13 @@ def _route_by_role(
             mismatched = []
             blocked_count = 0
             for task in tasks:
-                tid = task.get("id", "")
+                tid = task.get(ID_FIELD, "")
                 ts = state.get(tid)
-                s = ts.status if ts else "pending"
-                if s == "pending":
-                    for dep_id in task.get("depends_on", []):
+                s = ts.status if ts else STATUS_PENDING
+                if s == STATUS_PENDING:
+                    for dep_id in task.get(DEPENDS_ON_FIELD, []):
                         dep_ts = state.get(dep_id)
-                        dep_s = dep_ts.status if dep_ts else "pending"
+                        dep_s = dep_ts.status if dep_ts else STATUS_PENDING
                         if dep_s not in TERMINAL_STATUSES:
                             blocked_count += 1
                             break
@@ -227,21 +248,21 @@ def _route_by_role(
             result["cooldown_excluded"] = cooldown_excluded
         return result
     best = candidates[0]
-    task_id = best.task.get("id", "")
+    task_id = best.task.get(ID_FIELD, "")
     downstream_blocked = []
     for task in tasks:
-        ts = state.get(task.get("id", ""))
-        s = ts.status if ts else "pending"
-        if s == "pending" and task_id in task.get("depends_on", []):
-            downstream_blocked.append(task.get("id", ""))
+        ts = state.get(task.get(ID_FIELD, ""))
+        s = ts.status if ts else STATUS_PENDING
+        if s == STATUS_PENDING and task_id in task.get(DEPENDS_ON_FIELD, []):
+            downstream_blocked.append(task.get(ID_FIELD, ""))
     review_comments = _extract_review_comments(store, task_id, derived)
     warnings = []
     ts = state.get(task_id)
     if ts and ts.attempt_count > 0:
         warnings.append(f"rework_task: 第 {ts.attempt_count} 轮返工")
-        if ts.attempt_count >= best.task.get("max_attempts", 3):
+        if ts.attempt_count >= best.task.get(MAX_ATTEMPTS_FIELD, 3):
             warnings.append("exceeded_max_attempts")
-    candidate = {"task_id": task_id, "name": best.task.get("name", ""), "brief": best.task.get("brief", ""), "module": best.task.get("module", ""), "importance": effective_importance(best.task, best.blocked_downstream_count), "depends_on": list(best.task.get("depends_on", [])), "downstream_blocked": downstream_blocked, "review_comments": review_comments, "source": best.task.get("source")}
+    candidate = {"task_id": task_id, NAME_FIELD: best.task.get(NAME_FIELD, ""), BRIEF_FIELD: best.task.get(BRIEF_FIELD, ""), MODULE_FIELD: best.task.get(MODULE_FIELD, ""), IMPORTANCE_FIELD: effective_importance(best.task, best.blocked_downstream_count), DEPENDS_ON_FIELD: list(best.task.get(DEPENDS_ON_FIELD, [])), "downstream_blocked": downstream_blocked, "review_comments": review_comments, SOURCE_FIELD: best.task.get(SOURCE_FIELD)}
     if task_id in candidate_conflicts:
         candidate["conflict_with"] = candidate_conflicts[task_id]
         warnings.append(f"file_conflict_pending: 与池内 {len(candidate_conflicts[task_id])} 个任务共享声明文件")
@@ -261,7 +282,7 @@ def _route_by_role(
     if ts and ts.attempt_count > 0:
         candidate["rework"] = True
         candidate["attempt_count"] = ts.attempt_count
-    for optional in ("difficulty", "estimated_hours"):
+    for optional in (DIFFICULTY_FIELD, ESTIMATED_HOURS_FIELD):
         if optional in best.task:
             candidate[optional] = best.task[optional]
     result = {"candidate": candidate, "pool_size": len(candidates), "prompt": f"确认将此任务分配给 {task_id}?", "warnings": warnings, "excluded_conflicts": excluded_conflicts}
@@ -293,16 +314,16 @@ def _filter_cooldown_tasks(
     for ev in all_events:
         tid = ev.get("task_id")
         etype = ev.get("type")
-        if etype == "RETRACT" and not ev.get("retracted"):
+        if etype == EVENT_RETRACT and not ev.get("retracted"):
             task_last_retract[tid] = ev
-        elif etype == "CLAIMED" and not ev.get("retracted"):
+        elif etype == EVENT_CLAIMED and not ev.get("retracted"):
             task_last_claimed[tid] = ev.get("timestamp")
 
     kept = []
     cooldown_excluded = []
     now = None
     for cand in candidates:
-        tid = cand.task.get("id", "")
+        tid = cand.task.get(ID_FIELD, "")
         retract_ev = task_last_retract.get(tid)
         if retract_ev is None:
             kept.append(cand)
@@ -348,6 +369,6 @@ def _held_review_claim(
     （task-guidance-review-priority-fix）。
     """
     for tid, ts in state.items():
-        if ts.status == "in_review" and ts.review_claimed_by == agent_id:
+        if ts.status == STATUS_IN_REVIEW and ts.review_claimed_by == agent_id:
             return tid, (ts.review_phase or "unified")
     return None

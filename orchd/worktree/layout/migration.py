@@ -5,6 +5,13 @@
 
 from __future__ import annotations
 
+from orchd.names import (
+    CHECKPOINT_FILE,
+    LEDGER_FILE,
+    SESSION_WORKTREES_FILE,
+)
+
+
 import json
 import os
 import shutil
@@ -66,8 +73,8 @@ def _is_junk_entry(name: str) -> bool:
 # task-migrate-sqlite-carrier：sqlite 载体一并搬运（库 + WAL 旁瓣；同目录
 # 搬移、无 Store 占用，失败走既有完整回滚；-shm 为划痕可重建，随库同搬无害）。
 _LEDGER_RUNTIME_FILES = (
-    "_ledger.jsonl", "_checkpoint.json", ".lock", ".session.lock",
-    "session-worktrees.json",
+    LEDGER_FILE, CHECKPOINT_FILE, ".lock", ".session.lock",
+    SESSION_WORKTREES_FILE,
     "_ledger.sqlite3", "_ledger.sqlite3-wal", "_ledger.sqlite3-shm",
 )
 

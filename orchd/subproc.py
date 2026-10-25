@@ -484,6 +484,19 @@ def run_shell(cmd: str, cwd: str, timeout: float) -> subprocess.CompletedProcess
         else:
             spawn["args"] = actual
             spawn["shell"] = True
+        if sys.platform == "win32":
+            # D1/D2（debug-pack D）：bash 通道统一子进程 env——
+            # ① TMPDIR 兜底：cmd 通道把 ${TMPDIR:-/tmp} 译为系统临时目录，bash 通道
+            #    却交给 bash 展开，MSYS 下 /tmp 映射 C:/tmp（非系统临时目录）；
+            # ② PYTHONIOENCODING：子进程（hook/verify python 段 / 父进程回传）在 GBK
+            #    控制台强制 UTF-8 输出，消除中文 mojibake。
+            _env = dict(os.environ)
+            if "TMPDIR" not in _env and "${TMPDIR:-/tmp}" in cmd:
+                _env["TMPDIR"] = tempfile.gettempdir()
+            if "PYTHONIOENCODING" not in _env:
+                _env["PYTHONIOENCODING"] = "utf-8"
+            if _env != os.environ:
+                spawn["env"] = _env
         if sys.platform != "win32":
             # POSIX 自建会话 / 进程组：超时可整组终止，与 Windows 杀树语义对齐。
             # 注意组内进程的自杀风险——只有 `start_new_session=True` 时本进程才不在该组，

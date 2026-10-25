@@ -32,6 +32,9 @@ from orchd.cli._util import (
     _reject_container_root_cwd,
     _resolve_text_arg,
 )
+from orchd.contracts.responses import (
+    HINT_KEY,
+)
 
 
 
@@ -101,7 +104,7 @@ def _cmd_session_end(args) -> dict:
             "dirty_workspace_at_session_end: 工作区存在未提交的已跟踪文件改动，拒绝结束会话",
             [{
                 "dirty_files": dirty_files,
-                "hint": (commit_hint_for_branch(_branch)
+                HINT_KEY: (commit_hint_for_branch(_branch)
                          + "；如确需携带未提交改动结束，请使用 --force 显式放行"
                            "（--force-reason 注明原因，审计可查）"),
             }],

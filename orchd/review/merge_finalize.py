@@ -5,6 +5,9 @@ from __future__ import annotations
 from typing import Any
 from pathlib import Path
 
+from orchd.contracts.events import (
+    EVENT_FORCE_STATUS,
+)
 from orchd.ledger import Store
 from orchd.gitops_ops import make_event
 from orchd.ledger import resolve_store_dir
@@ -130,6 +133,10 @@ def _review_submit_merge_finalize(
                 new_state = store.replay()
                 store.update_checkpoint(new_state)
                 result["task_status"] = "completed"
+                # A1（spec 审查 AC1 回归修复）：完成事件已落账——标记之，使下方
+                # 失败路径兜底不再把 submitted 置 False，否则 own_merge_residual
+                # 回退 in_review 时会再现「账已落、报未落」的反向背离。
+                result["review_event_recorded"] = True
         finally:
             if not reuse_write:
                 store.release_lock()
@@ -231,7 +238,7 @@ def _review_submit_merge_finalize(
                         # target=in_review 保留审查认领字段，同一 reviewer 可重试；
                         # revive 巡检只认 completed→pending，本通道零审计噪音）。
                         _reopen = make_event(
-                            task_id, agent_id, "FORCE_STATUS",
+                            task_id, agent_id, EVENT_FORCE_STATUS,
                             target_status="in_review",
                             reason="own_merge_residual",
                             residual=_bounce,
@@ -262,3 +269,41 @@ def _review_submit_merge_finalize(
                                 "清理（doctor_check=worktree_residual）"
                             ),
                         }
+
+    # A1/A4（debug-pack A 组）：merge 未落地的失败路径统一兜底——审查结论
+    # （verdict/comments）仍须落账，使 review --show 可回看，且响应 submitted
+    # 与账本 REVIEW_SUBMITTED 落账状态一致（不再出现「报成功、账已回滚」的背离）。
+    # 事件带 merge_pending 标记，状态机据此保持 in_review（不推进终态），审查
+    # 认领与阶段字段不变，同一 reviewer 可重试 code APPROVED。
+    if (
+        pending_code_event is not None
+        and result.get("task_status") == "in_review"
+        and not result.get("review_event_recorded")
+    ):
+        if result.get("reason") == "merge_conflict":
+            # A4（debug-pack A 组）：E015 冲突——verdict 落账（带 merge_pending
+            # 标记，状态机据此保持 in_review、不清审查认领），使 review --show
+            # 可回看结论且同一 reviewer 可重试；不写完成事件（原契约保持）。
+            _pending = dict(pending_code_event)
+            _pending["merge_pending"] = True
+            # review --show 仅收录带 comments 的 REVIEW_SUBMITTED；无附注时补
+            # 一条留痕说明，保证结论可回看。
+            if not _pending.get("comments"):
+                _pending["comments"] = (
+                    f"merge 冲突未落地：审查结论 {_pending.get('verdict')} 已留痕，"
+                    f"待同一 reviewer 解决冲突后重试"
+                )
+            store.acquire_lock()
+            try:
+                store.append_event(_pending)
+                _pending_state = store.replay()
+                store.update_checkpoint(_pending_state)
+            finally:
+                store.release_lock()
+            result["review_event_recorded"] = True
+            result["submitted"] = True
+        else:
+            # A1（debug-pack A 组）：非冲突的 merge 未落地（merge_env_error /
+            # merge_diagnostic）——不落完成事件（原契约保持），但响应 submitted
+            # 从账本终态反查（无 REVIEW_SUBMITTED → False），不再背离。
+            result["submitted"] = False

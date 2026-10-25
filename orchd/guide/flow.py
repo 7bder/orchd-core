@@ -1,13 +1,22 @@
 """orchd/guide/flow.py — 转换上下文/分支/合并与入口域（W5-G2 拆分，纯搬移）。
 来源：``__init__.py`` L526-813（transition 族 + 分支/上下文/slim）、L827-934（hint 合并与 mode）、
 L937-948（预算常量块，G3 起迁 rules）、L995-1062（入口两部），见 §4.6.2/§4.6.3。域内两簇互相
-调用故同文件；截断原语与预算常量取 rules（顶层导入）；line / line_ctx 为函数级依赖。
+调用故同文件；截断原语与预算常量取 rules（顶层导入）；line / line_ctx 为函数级依赖；
+任务状态名取 ``contracts.events`` 常量。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from orchd.contracts.events import (
+    STATUS_CANCELLED,
+    STATUS_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+)
 from .digest import _ENTRY_CMD
 from .paths import read_for, template_for
 from .stage import _classify, _derive
@@ -53,7 +62,7 @@ def _active_transition(
 
     不匹配返回 None。
     """
-    if s == "claimed":
+    if s == STATUS_CLAIMED:
         mine = bool(agent_id and ts.claimed_by == agent_id)
         holder = ts.claimed_by or "其他 agent"
         return {
@@ -67,8 +76,8 @@ def _active_transition(
             ),
             "read": read_for("claimed_impl"),
         }
-    if s in ("done", "in_review"):
-        reviewing = "、正在审查中" if (s == "in_review" and ts.review_claimed_by) else ""
+    if s in (STATUS_DONE, STATUS_IN_REVIEW):
+        reviewing = "、正在审查中" if s == STATUS_IN_REVIEW and ts.review_claimed_by else ""
         return {
             "type": "done_submitted",
             "task_id": task_id,
@@ -88,7 +97,7 @@ def _terminal_transition(
     task_id: str,
 ) -> dict[str, Any] | None:
     """终态转换块：completed（已合并）/ cancelled（已取消）。不匹配返回 None。"""
-    if s == "completed":
+    if s == STATUS_COMPLETED:
         return {
             "type": "approved_completed",
             "task_id": task_id,
@@ -100,7 +109,7 @@ def _terminal_transition(
             ),
             "read": read_for("approved_completed"),
         }
-    if s == "cancelled":
+    if s == STATUS_CANCELLED:
         return {
             "type": "cancelled",
             "task_id": task_id,
@@ -119,7 +128,7 @@ def _rework_transition(
     task_id: str,
 ) -> dict[str, Any] | None:
     """返工转换块：pending 且 attempt_count > 0（被审查打回）。不匹配返回 None。"""
-    if s == "pending" and ts.attempt_count > 0:
+    if s == STATUS_PENDING and ts.attempt_count > 0:
         return {
             "type": "changes_requested",
             "task_id": task_id,

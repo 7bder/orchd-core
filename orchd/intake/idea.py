@@ -1,6 +1,10 @@
 """intake.idea —— 自 ``orchd/intake.py`` 拆出。
 
-IDEAS 生命周期动作（idea_propose / _idea_transition / idea_confirm / idea_drop）。
+IDEAS 生命周期动作（idea_propose / _idea_transition / idea_confirm）。
+
+「放弃 / 离场」自 task-intake-exit-verb-close 起不再有 drop 动作：统一出口
+``idea close --reason`` 的后端住在 ``orchd/ideas/decision.py``（搬块归档），
+本包不再提供状态降级为 dropped 的通道。
 
 纯搬移（W6-C7）：函数体逐字保留，仅 import 头与落点变化。
 """
@@ -11,12 +15,19 @@ from pathlib import Path
 from typing import Any
 
 from .guard import _intake_guard, _resolve_lock_orchd_dir
-from .parse import _atomic_write_text, _find_idea_entry, _list_idea_headers, _parse_title_id
+from .parse import (
+    IDEA_STATUS_PENDING,
+    IDEA_STATUS_STUDY,
+    _atomic_write_text,
+    _find_idea_entry,
+    _list_idea_headers,
+    _parse_title_id,
+)
 
 def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, Any]:
     """灵感写入 IDEAS 写入门禁：追加 status: study 条目（idea-write-gate，propose）。
 
-    执行权：agent 可执行（记录论证中的灵感，待用户 confirm/drop 裁决）。
+    执行权：agent 可执行（记录论证中的灵感，待用户 confirm 升 pending 或 close 归档）。
     并发：IDEAS.md 的「读-改-写」（锁内读 → 查重 → 追加）整体在 ``.intake.lock``
     持有范围内完成，与其它准入写者（amend / intake / roadmap-land / idea confirm）
     互斥（task-intake-atomic-lock-consistent AC1）。
@@ -31,7 +42,7 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         - 前置失败: ``{"proposed": False, "reason": "not_on_main" | "dirty_workspace", ...}``
         - 重复标题: ``{"proposed": False, "reason": "duplicate_title", ...}``
           （命中面含 IDEAS-archive.md，hint 指名命中文件与该条目 ``- status``；
-          命中 dropped 时 hint 另给重议路径）
+          命中历史 dropped（仅可能出现在归档件里）时 hint 另给重议路径）
         - 归档件不可读: ``{"proposed": False, "reason": "archive_unreadable", ...}``
           （判重面缺一角即 fail-closed，不写主文件）
         - 主文件不可读: ``{"proposed": False, "reason": "read_error", ...}``（同上：读不到
@@ -125,6 +136,9 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
             if hit_file != "IDEAS.md":
                 hint += f"（该条目已离场留档，status: {hit_status or '未声明'}）"
             if hit_status == "dropped":
+                # dropped 已从活跃白名单下线（task-intake-exit-verb-close），但归档件里的
+                # 历史条目仍带该状态——它们不被校验读取，只作为判重记忆存在，故重议
+                # 路径的 hint 必须保留，否则「搬走」会连「这条已被裁决放弃」一起抹掉。
                 hint += (
                     "处置：放弃是用户对**这一条**的裁决，不是对同主题永久封嘴——确要"
                     "重议请另立新 id 重新 propose，并在新条目正文引用旧 id（如"
@@ -159,10 +173,10 @@ def idea_propose(project_root: Path, title: str, feasibility: str) -> dict[str, 
         date = datetime.date.today().isoformat()
         entry = (
             f"## {date} {title}\n"
-            f"- status: study\n"
+            f"- status: {IDEA_STATUS_STUDY}\n"
             f"- id: {idea_id}\n"
             f"- 论证: {feasibility}\n"
-            f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 drop 丢弃。\n"
+            f"- notes: 由 orchd idea propose 写入（idea-write-gate），待用户 confirm 升 pending 或 close 归档。\n"
         )
         if ideas.exists():
             existing = text
@@ -202,12 +216,12 @@ def _idea_transition(
     target_status: str,
     action: str,
 ) -> dict[str, Any]:
-    """idea confirm / drop 公共后端：把 status: study 条目改写为 target_status。
+    """idea confirm 后端：把 status: study 条目改写为 target_status。
 
-    执行权：仅用户执行（confirm/drop 是裁决动作，agent 不得代行）。
+    执行权：仅用户执行（confirm 是裁决动作，agent 不得代行）。
 
     Returns:
-        结构化结果，永不抛异常（结果键用动作过去式：confirm→confirmed / drop→dropped）：
+        结构化结果，永不抛异常（结果键用动作过去式：confirm→confirmed）：
         - 前置失败: ``{"{key}": False, "reason": "not_on_main" | "dirty_workspace"}``
         - 主文件不可读: ``{"{key}": False, "reason": "read_error"}``（fail-closed，不改写）
         - 不存在: ``{"{key}": False, "reason": "not_found"}``
@@ -222,8 +236,9 @@ def _idea_transition(
         resolve_agent_id,
     )
 
-    # 动作 → 结果键（过去式）：confirm→confirmed，drop→dropped
-    key = "dropped" if action == "drop" else "confirmed"
+    # 结果键固定 confirmed：drop 通道随 task-intake-exit-verb-close 下线，
+    # _idea_transition 只服务 confirm（放弃的出路改由 idea close 一次归档承担）。
+    key = "confirmed"
 
     project_root = Path(project_root)
     guard_err = _intake_guard(project_root)
@@ -266,7 +281,7 @@ def _idea_transition(
                 ),
                 "candidates": candidates,
             }
-        if entry["status"] != "study":
+        if entry["status"] != IDEA_STATUS_STUDY:
             return {
                 key: False,
                 "reason": "not_study",
@@ -320,9 +335,4 @@ def _idea_transition(
 
 def idea_confirm(project_root: Path, title: str) -> dict[str, Any]:
     """把 status: study 条目升为 pending（idea-write-gate，confirm，仅用户执行）。"""
-    return _idea_transition(project_root, title, "pending", "confirm")
-
-
-def idea_drop(project_root: Path, title: str) -> dict[str, Any]:
-    """把 status: study 条目降为 dropped（idea-write-gate，drop，仅用户执行）。"""
-    return _idea_transition(project_root, title, "dropped", "drop")
+    return _idea_transition(project_root, title, IDEA_STATUS_PENDING, "confirm")

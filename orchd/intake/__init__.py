@@ -28,6 +28,11 @@ from __future__ import annotations
 from .parse import (
     _atomic_write_text,
     _VALID_IDEA_STATUSES,
+    IDEA_STATUS_PENDING,
+    IDEA_STATUS_QUESTIONING,
+    IDEA_STATUS_COVERED,
+    IDEA_STATUS_STUDY,
+    IDEA_STATUS_VALUES,
     _TITLE_ID_RE,
     _parse_title_id,
     _parse_idea_statuses,
@@ -43,11 +48,16 @@ from .guard import (
 )
 from .commit import intake_commit
 from .roadmap import _roadmap_land_entry, _entry_id_exists, roadmap_land
-from .idea import idea_propose, _idea_transition, idea_confirm, idea_drop
+from .idea import idea_propose, _idea_transition, idea_confirm
 
 __all__ = [
     "_atomic_write_text",
     "_VALID_IDEA_STATUSES",
+    "IDEA_STATUS_PENDING",
+    "IDEA_STATUS_QUESTIONING",
+    "IDEA_STATUS_COVERED",
+    "IDEA_STATUS_STUDY",
+    "IDEA_STATUS_VALUES",
     "_TITLE_ID_RE",
     "_parse_title_id",
     "_parse_idea_statuses",
@@ -65,5 +75,4 @@ __all__ = [
     "idea_propose",
     "_idea_transition",
     "idea_confirm",
-    "idea_drop",
 ]

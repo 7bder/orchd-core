@@ -19,7 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import validate_event
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_FORCE_STATUS,
+    EVENT_RETRACT,
+    EVENT_REVIEW_CLAIMED,
+    STATUS_PENDING,
+    validate_event,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
 from orchd.ledger import (
@@ -40,6 +47,10 @@ from .merge import (
     _claim_stale_timeout_s,
     _trunc,
 )
+from orchd.contracts.responses import (
+    EVENT_ID_KEY,
+    TASK_ID_KEY,
+)
 
 
 
@@ -52,7 +63,7 @@ from .merge import (
 # ``_inbound_retract_verdict``）——入站只认本地可验证的时间事实（目标认领已
 # 超时），不认入站署名与 admin（口径单一真源见
 # ``docs/system-design-online.md`` §3.6）。
-_INBOUND_LOCAL_ONLY_TYPES = frozenset({"FORCE_STATUS"})
+_INBOUND_LOCAL_ONLY_TYPES = frozenset({EVENT_FORCE_STATUS})
 
 
 # 入站拒收的判定基准二分（task-sync-push-kept-events 返工轮）：
@@ -108,13 +119,13 @@ def _inbound_retract_verdict(
     target = by_id.get(target_eid) if isinstance(target_eid, str) else None
     if target is None:
         return False, f"target_not_found: {target_eid!r}"
-    if target.get("type") == "FORCE_STATUS":
+    if target.get("type") == EVENT_FORCE_STATUS:
         return False, "cannot_retract_force_status"
     ttype = target.get("type")
     age = review_claim_age_s(target.get("timestamp"))
-    if ttype == "REVIEW_CLAIMED" and age is not None and age >= review_stale_timeout_s():
+    if ttype == EVENT_REVIEW_CLAIMED and age is not None and age >= review_stale_timeout_s():
         return True, "stale_review_claim"
-    if ttype == "CLAIMED" and age is not None and age >= _claim_stale_timeout_s():
+    if ttype == EVENT_CLAIMED and age is not None and age >= _claim_stale_timeout_s():
         return True, "stale_claim"
     return False, (
         f"not_authorized: target '{target_eid}' owned by "
@@ -166,11 +177,11 @@ def _validate_inbound_events(
     applied: dict[str, list[dict[str, Any]]] = {}
 
     def _recompute(tid: str) -> None:
-        st = "pending"
+        st = STATUS_PENDING
         for e in applied.get(tid, []):
-            if e.get("type") == "FORCE_STATUS":
-                ts = e.get("target_status", "pending")
-                st = ts if isinstance(ts, str) else "pending"
+            if e.get("type") == EVENT_FORCE_STATUS:
+                ts = e.get("target_status", STATUS_PENDING)
+                st = ts if isinstance(ts, str) else STATUS_PENDING
             else:
                 tgt = _event_target_status(e)
                 if tgt is not None:
@@ -181,7 +192,7 @@ def _validate_inbound_events(
         tid = ev.get("task_id")
         if not tid or not isinstance(tid, str):
             return
-        if ev.get("type") == "RETRACT":
+        if ev.get("type") == EVENT_RETRACT:
             target_eid = ev.get("target_event_id")
             applied[tid] = [
                 e for e in applied.get(tid, [])
@@ -190,10 +201,10 @@ def _validate_inbound_events(
             _recompute(tid)
             return
         applied.setdefault(tid, []).append(ev)
-        if ev.get("type") == "FORCE_STATUS":
-            target_status = ev.get("target_status", "pending")
+        if ev.get("type") == EVENT_FORCE_STATUS:
+            target_status = ev.get("target_status", STATUS_PENDING)
             status[tid] = (target_status if isinstance(target_status, str)
-                           else "pending")
+                           else STATUS_PENDING)
             return
         target = _event_target_status(ev)
         if target is not None:
@@ -217,9 +228,9 @@ def _validate_inbound_events(
     for remote_ev in new_remote:
         if not isinstance(remote_ev, dict):
             rejected.append({
-                "event_id": None,
+                EVENT_ID_KEY: None,
                 "type": None,
-                "task_id": None,
+                TASK_ID_KEY: None,
                 "reason": "not_a_dict: 远端事件不是 JSON 对象",
                 "basis": _INBOUND_REJECT_ABSOLUTE,
             })
@@ -232,9 +243,9 @@ def _validate_inbound_events(
         violations = validate_event(ev)
         if violations:
             rejected.append({
-                "event_id": eid,
+                EVENT_ID_KEY: eid,
                 "type": etype,
-                "task_id": tid,
+                TASK_ID_KEY: tid,
                 "reason": "contract: " + "; ".join(violations),
                 "basis": _INBOUND_REJECT_ABSOLUTE,
             })
@@ -245,9 +256,9 @@ def _validate_inbound_events(
             # task-sync-inbound-retract：仅 FORCE_STATUS 仍整类拒收；RETRACT 走
             # 下方窄口径（_inbound_retract_verdict）。
             rejected.append({
-                "event_id": eid,
+                EVENT_ID_KEY: eid,
                 "type": etype,
-                "task_id": tid,
+                TASK_ID_KEY: tid,
                 "reason": (
                     "local_only: 本地人工动作不跨机复制，整类拒收"
                     f"（target_status={_trunc(ev.get('target_status'))!r}）"
@@ -256,13 +267,13 @@ def _validate_inbound_events(
                 "target_status": _trunc(ev.get("target_status")),
             })
             continue
-        if etype == "RETRACT":
+        if etype == EVENT_RETRACT:
             allowed, verdict_reason = _inbound_retract_verdict(ev, by_id)
             if not allowed:
                 rejected.append({
-                    "event_id": eid,
+                    EVENT_ID_KEY: eid,
                     "type": etype,
-                    "task_id": tid,
+                    TASK_ID_KEY: tid,
                     "reason": f"retract_narrow: {verdict_reason}",
                     "basis": _INBOUND_REJECT_RELATIVE,
                     "target_event_id": _trunc(ev.get("target_event_id")),
@@ -278,15 +289,15 @@ def _validate_inbound_events(
             try:
                 validate_transition(
                     ev.get("type", ""),
-                    status.get(tid, "pending") if isinstance(tid, str)
-                    else "pending",
+                    status.get(tid, STATUS_PENDING) if isinstance(tid, str)
+                    else STATUS_PENDING,
                     target,
                 )
             except OrchdError as exc:
                 rejected.append({
-                    "event_id": eid,
+                    EVENT_ID_KEY: eid,
                     "type": etype,
-                    "task_id": tid,
+                    TASK_ID_KEY: tid,
                     "reason": f"transition: {exc.message}",
                     "basis": _INBOUND_REJECT_RELATIVE,
                 })

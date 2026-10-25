@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from orchd.names import (
+    FULL_REGRESSION_FILE,
+    ROADMAP_FILE,
+    TEST_BASELINE_FILE,
+)
+
+
 
 # 里程碑 → 出口版本
 EXIT_VERSIONS: dict[str, str] = {
@@ -56,13 +63,13 @@ KERNEL_CONTRACT_DOC = "docs/kernel-contract.md"
 KERNEL_CONTRACT_ANCHORS = ("不变量", "端口")
 
 
-ROADMAP_FILE = "ROADMAP.md"
+ROADMAP_FILE = ROADMAP_FILE
 
 
 ROADMAP_MILESTONE_ANCHOR = "## 里程碑"
 
 
-_FULL_REGRESSION_FILE = "_full_regression.json"
+_FULL_REGRESSION_FILE = FULL_REGRESSION_FILE
 
 
-_BASELINE_FILE = "test_baseline.json"
+_BASELINE_FILE = TEST_BASELINE_FILE

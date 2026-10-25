@@ -36,9 +36,17 @@ from orchd.ledger import (
     validate_transition,
 )
 from orchd.storage import read_archive_events
+from orchd.contracts.responses import (
+    COMMAND_KEY,
+    HINT_KEY,
+)
 
 
 # 专用账本 ref（本地 + 远端同名）
+# **T3 特例（禁改）**：本常量是 git **ref 路径**，不是环境变量——它虽然沿用了
+# `ORCHD_` 前缀的现场起名，但语义属于 ref 命名空间，与 `orchd.constants` 里的
+# `ORCHD_LEDGER_REF_ENV`（环境变量**契约名** "ORCHD_LEDGER_REF"）不是一回事：
+# 后者是宿主注入的变量名，本常量是 git 引用路径。二者值不相等，禁止互相替换。
 ORCHD_LEDGER_REF = "refs/heads/orchd/ledger"
 
 
@@ -144,10 +152,10 @@ def _run_git(
             ErrorCode.E007,
             f"git_timeout: git {' '.join(args[:3])} 超过 {timeout}s 未返回",
             [{
-                "command": "git " + " ".join(args),
+                COMMAND_KEY: "git " + " ".join(args),
                 "project_root": str(project_root),
                 "timeout_s": timeout,
-                "hint": "远端不可达 / 网络慢 / 仓库过大：稍后重试，或调大 _run_git 的 timeout",
+                HINT_KEY: "远端不可达 / 网络慢 / 仓库过大：稍后重试，或调大 _run_git 的 timeout",
             }],
         ) from exc
     return subprocess.CompletedProcess(
@@ -167,7 +175,7 @@ def _git_fail(project_root: Path, args: list[str],
         ErrorCode.E007,
         f"git_sync_failed: git {' '.join(args[:3])} → exit {proc.returncode}",
         [{
-            "command": "git " + " ".join(args),
+            COMMAND_KEY: "git " + " ".join(args),
             "detail": detail,
             "project_root": str(project_root)
         }],
@@ -200,7 +208,7 @@ def _check_git_repo(project_root: Path) -> None:
             "git_sync_not_a_repo: orchd sync 需要 git 工作树",
             [{
                 "project_root": str(project_root),
-                "hint": "在项目根（含 .git）目录下执行 sync"
+                HINT_KEY: "在项目根（含 .git）目录下执行 sync"
             }],
         )
 
@@ -247,7 +255,7 @@ def _fetch_ref(project_root: Path, remote: str) -> bool:
             f"git_sync_no_remote: 仓库没有远端 '{remote}'",
             [{
                 "remote": remote,
-                "hint": "git remote add origin <url> 后重试"
+                HINT_KEY: "git remote add origin <url> 后重试"
             }],
         )
     exists = _remote_ref_exists(project_root, remote)
@@ -259,7 +267,7 @@ def _fetch_ref(project_root: Path, remote: str) -> bool:
             [{
                 "remote": remote,
                 "ref": ORCHD_LEDGER_REF,
-                "hint": "检查网络连通 / 认证 / 代理后重试；不要按“远端无 ref”处理",
+                HINT_KEY: "检查网络连通 / 认证 / 代理后重试；不要按“远端无 ref”处理",
             }],
         )
     if not exists:
@@ -275,7 +283,7 @@ def _fetch_ref(project_root: Path, remote: str) -> bool:
                 "remote": remote,
                 "ref": ORCHD_LEDGER_REF,
                 "detail": (r.stderr or r.stdout or "").strip()[:400],
-                "hint": "检查网络连通 / 认证 / 代理后重试",
+                HINT_KEY: "检查网络连通 / 认证 / 代理后重试",
             }],
         )
     return True

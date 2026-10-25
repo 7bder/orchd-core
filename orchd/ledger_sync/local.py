@@ -48,6 +48,10 @@ from .merge import (
 from .inbound import (
     _validate_inbound_events,
 )
+from orchd.contracts.responses import (
+    MESSAGE_KEY,
+    TASKS_KEY,
+)
 
 
 
@@ -76,7 +80,7 @@ def _write_sentinel_checkpoint(store: Store) -> None:
         payload: dict[str, Any] = {
             "ledger_line": 0,
             "schema_version": _CHECKPOINT_SCHEMA_VERSION,
-            "tasks": {},
+            TASKS_KEY: {},
             "sentinel": "ledger_rewrite_in_progress",
         }
         # 快照基随哨兵原样存续（task-sync-compact-bootstrap-from-state）：重建尾部的
@@ -213,42 +217,42 @@ def _bootstrap_local_from_state(
         ``{"applied": bool, "tasks": int, "reason": str | None}``。
     """
     if state_error is not None:
-        return {"applied": False, "tasks": 0, "reason": state_error}
+        return {"applied": False, TASKS_KEY: 0, "reason": state_error}
     if remote_delta:
-        return {"applied": False, "tasks": 0, "reason": "delta_present"}
+        return {"applied": False, TASKS_KEY: 0, "reason": "delta_present"}
     if local_events:
-        return {"applied": False, "tasks": 0, "reason": "local_events_present"}
+        return {"applied": False, TASKS_KEY: 0, "reason": "local_events_present"}
     if not remote_state:
-        return {"applied": False, "tasks": 0, "reason": "no_remote_state"}
+        return {"applied": False, TASKS_KEY: 0, "reason": "no_remote_state"}
     version = remote_state.get("schema_version")
     if version != _STATE_SCHEMA_VERSION:
-        return {"applied": False, "tasks": 0,
+        return {"applied": False, TASKS_KEY: 0,
                 "reason": "state_schema_unsupported",
                 "schema_version": version}
     raw_tasks = remote_state.get("tasks")
     if not isinstance(raw_tasks, dict):
-        return {"applied": False, "tasks": 0, "reason": "state_tasks_malformed"}
+        return {"applied": False, TASKS_KEY: 0, "reason": "state_tasks_malformed"}
     snapshot: dict[str, dict[str, Any]] = {}
     try:
         for tid, ts in raw_tasks.items():
             if isinstance(tid, str) and isinstance(ts, dict):
                 snapshot[tid] = TaskState.from_dict(ts).to_dict()
     except (TypeError, ValueError, KeyError):
-        return {"applied": False, "tasks": 0,
+        return {"applied": False, TASKS_KEY: 0,
                 "reason": "state_task_fields_malformed"}
     if not snapshot:
-        return {"applied": False, "tasks": 0, "reason": "state_tasks_empty"}
+        return {"applied": False, TASKS_KEY: 0, "reason": "state_tasks_empty"}
     store.backend.save_checkpoint({
         "ledger_line": 0,
         "schema_version": _CHECKPOINT_SCHEMA_VERSION,
-        "tasks": snapshot,
+        TASKS_KEY: snapshot,
         # 快照基（task-sync-compact-bootstrap-from-state）：携带 **pre-compact
         # 原始快照**，供重建路径以它为基叠加物理事件、完整性校验豁免前缀比对。
         # 它必须恒为「原始」——update_checkpoint / 哨兵只保留、绝不更新其值，
         # 否则 base 会掺进本地事件的派生态，与「重放全部物理事件」二次应用。
         "bootstrap_tasks": snapshot,
     })
-    return {"applied": True, "tasks": len(snapshot), "reason": None}
+    return {"applied": True, TASKS_KEY: len(snapshot), "reason": None}
 
 
 
@@ -291,7 +295,7 @@ def _reconcile_local(
             "code": "counter_recalibrated",
             "severity": "info",
             "source": source,
-            "message": (
+            MESSAGE_KEY: (
                 "sync 接触即纠：计数缓存漂移 "
                 f"{rec.get('from')} → 实体真值 {rec.get('to')} 已归位"
                 if rec.get("recalibrated") else
@@ -311,7 +315,7 @@ def _reconcile_local(
             ErrorCode.E030.name,
             "severity":
             "warning",
-            "message": (f"sync 入站校验拒收 {len(inbound_rejected)} 条非法远端事件"
+            MESSAGE_KEY: (f"sync 入站校验拒收 {len(inbound_rejected)} 条非法远端事件"
                         "（逐条丢弃，整库合并继续）"),
             "source":
             source,
@@ -332,7 +336,7 @@ def _reconcile_local(
                 ErrorCode.E030.name,
                 "severity":
                 "warning",
-                "message": ("sync 重建判据命中原「条数相抵」盲区：合并后事件数与本地相同"
+                MESSAGE_KEY: ("sync 重建判据命中原「条数相抵」盲区：合并后事件数与本地相同"
                             "但内容已变（去重丢弃与新增相抵），已按内容比较触发重建"),
                 "context": {
                     "source": source,
@@ -356,7 +360,7 @@ def _reconcile_local(
                 ErrorCode.E030.name,
                 "severity":
                 "warning",
-                "message": (
+                MESSAGE_KEY: (
                     f"sync 重建后计数背离：后端 event_count={_counted} 与 "
                     f"len(read_events())={_read_len} 不符"
                     "（活跃段疑似重复承载归档前缀，读侧靠 event_id 去重掩盖）"
@@ -382,7 +386,7 @@ def _reconcile_local(
             ErrorCode.E030.name,
             "severity":
             "warning",
-            "message": (f"replay 软校验发现 {len(violations)} 条序列级不变量违规"
+            MESSAGE_KEY: (f"replay 软校验发现 {len(violations)} 条序列级不变量违规"
                         "（如跨设备双认领）——事件已照常应用，此处仅告警"),
             "source":
             source,

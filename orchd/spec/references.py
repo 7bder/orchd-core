@@ -11,6 +11,11 @@ from __future__ import annotations
 
 from collections import deque
 
+from orchd.contracts.task_schema import (
+    DEPENDS_ON_FIELD,
+    ID_FIELD,
+    MODULE_FIELD,
+)
 from orchd.errors import ErrorCode
 from orchd.spec.structure import Master, ValidationError
 
@@ -47,7 +52,7 @@ def validate_references(master: Master) -> list[ValidationError]:
     module_ids: list[str] = []
 
     for i, t in enumerate(tasks):
-        tid = t.get("id", "")
+        tid = t.get(ID_FIELD, "")
         if tid in task_ids:
             errors.append(
                 ValidationError(
@@ -59,7 +64,7 @@ def validate_references(master: Master) -> list[ValidationError]:
             task_ids.append(tid)
 
     for i, m in enumerate(modules):
-        mid = m.get("id", "")
+        mid = m.get(ID_FIELD, "")
         if mid in module_ids:
             errors.append(
                 ValidationError(
@@ -106,7 +111,7 @@ def validate_references(master: Master) -> list[ValidationError]:
     # --- E005: 引用存在性 ---
     for i, t in enumerate(tasks):
         # module 引用
-        mod = t.get("module", "")
+        mod = t.get(MODULE_FIELD, "")
         if mod and mod not in module_id_set:
             errors.append(
                 ValidationError(
@@ -118,7 +123,7 @@ def validate_references(master: Master) -> list[ValidationError]:
         # 引用全集不可完整判定时本项整体不适用并跳过（不逐条误报）——已在上面
         # 以 E003 留痕。
         if reference_universe_complete:
-            for j, dep in enumerate(t.get("depends_on", [])):
+            for j, dep in enumerate(t.get(DEPENDS_ON_FIELD, [])):
                 if dep not in resolvable_ids:
                     errors.append(
                         ValidationError(
@@ -171,10 +176,10 @@ def validate_references(master: Master) -> list[ValidationError]:
     dependents: dict[str, list[str]] = {tid: [] for tid in task_id_set}
 
     for t in tasks:
-        tid = t.get("id", "")
+        tid = t.get(ID_FIELD, "")
         if tid not in task_id_set:
             continue
-        for dep in t.get("depends_on", []):
+        for dep in t.get(DEPENDS_ON_FIELD, []):
             if dep in task_id_set:
                 in_degree[tid] += 1
                 dependents[dep].append(tid)

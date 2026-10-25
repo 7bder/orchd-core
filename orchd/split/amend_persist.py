@@ -1,6 +1,17 @@
 from __future__ import annotations
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.task_schema import (
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    VERIFY_COMMAND_FIELD,
+)
+from orchd.contracts.events import (
+    EVENT_AMEND,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger import Store, TaskState, _write_text_atomic
 from orchd.spec import (
@@ -52,7 +63,7 @@ def _amend_persist(
                 idx = int(m.group(1))
                 if 0 <= idx < len(tasks):
                     is_code = is_code_task(tasks[idx])
-                    blocking_tid = str(tasks[idx].get("id") or "")
+                    blocking_tid = str(tasks[idx].get(ID_FIELD) or "")
             if is_code:
                 # 场景化 hint（task-guide-placeholder-literal-scan AC3）：阻断
                 # 响应必须带真值 task_id 与可执行命令——命令走 guide.amend_patch_cmd
@@ -96,7 +107,7 @@ def _amend_persist(
     _changed_ids = set(new_tasks) | set(updated_tasks)
     _dir_glob_errors: list[dict[str, Any]] = []
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         if tid not in _changed_ids:
             continue
         hits = detect_dir_or_glob_declarations(task)
@@ -132,10 +143,10 @@ def _amend_persist(
     # task-pass9-union-verify-gate 注册期路径笔误直到 E020 提交被拦才暴露）。
     # 不做硬阻断：合法新源文件声明与笔误结构上不可区分。
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         if tid not in _changed_ids:
             continue
-        for field in ("files_to_edit", "exempt_files"):
+        for field in (FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD):
             for fp in task.get(field, []):
                 full = project_root / fp
                 if full.exists():
@@ -165,11 +176,11 @@ def _amend_persist(
     # E026 正是要求把**既有**连带测试文件声明进 exempt_files，存在即告会把正确
     # 用法全量误报；且照告警去 remove 会立刻触发 E010 越界。只告警不阻断。
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         if tid not in _changed_ids:
             continue
-        _declared = set(task.get("files_to_edit", []) or [])
-        for fp in task.get("exempt_files", []) or []:
+        _declared = set(task.get(FILES_TO_EDIT_FIELD, []) or [])
+        for fp in task.get(EXEMPT_FILES_FIELD, []) or []:
             if (project_root / fp).exists() and fp in _declared:
                 conflict_warnings.append({
                     "task_id": tid,
@@ -189,15 +200,15 @@ def _amend_persist(
     # 反推且报因不可读——注册期静态核对是唯一提前点。已声明路径（待创建的
     # 新文件）不告警；不做硬阻断：合法新源文件与笔误结构上不可区分。
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         if tid not in _changed_ids:
             continue
-        _verify_cmd = task.get("verify_command") or ""
+        _verify_cmd = task.get(VERIFY_COMMAND_FIELD) or ""
         if not _verify_cmd:
             continue
         _declared_paths = (
-            set(task.get("files_to_edit", []) or [])
-            | set(task.get("exempt_files", []) or [])
+            set(task.get(FILES_TO_EDIT_FIELD, []) or [])
+            | set(task.get(EXEMPT_FILES_FIELD, []) or [])
         )
         for _tok in _verify_cmd.split():
             if not _tok.endswith(".py"):
@@ -220,11 +231,11 @@ def _amend_persist(
 
     # 重新生成所有 snapshot（目录名 = module_id）
     for module in modules:
-        mod_id = _validate_module_id(module.get("id", ""))
-        mod_tasks = [t for t in tasks if t.get("module") == mod_id]
+        mod_id = _validate_module_id(module.get(ID_FIELD, ""))
+        mod_tasks = [t for t in tasks if t.get(MODULE_FIELD) == mod_id]
         snapshot = {
             "module_id": mod_id,
-            "module_name": module.get("name", ""),
+            "module_name": module.get(NAME_FIELD, ""),
             "module_role": module.get("role", ""),
             "tasks": mod_tasks,
         }
@@ -243,7 +254,7 @@ def _amend_persist(
     # 范围：仅 store_root 直接子级、目录名匹配 mod-* 且不在当前 master modules。
     # 方式：仅删派生 spec.json，目录仅在其为空时 rmdir（非空留痕保留，下次重试）；
     # 无 spec.json 的 mod-* 目录不入列（不误删用户数据）。
-    master_module_ids = {str(m.get("id", "")) for m in modules}
+    master_module_ids = {str(m.get(ID_FIELD, "")) for m in modules}
     for orphan_spec in sorted(store_root.glob("mod-*/spec.json")):
         orphan_dir = orphan_spec.parent
         orphan_id = orphan_dir.name
@@ -273,7 +284,7 @@ def _amend_persist(
         agent_id = resolve_agent_id(orchd_dir)
         for revision in terminal_text_revisions:
             store.append_event(make_event(
-                revision["task_id"], agent_id, "AMEND",
+                revision["task_id"], agent_id, EVENT_AMEND,
                 reason=_TERMINAL_REVISION_EVENT_REASON,
                 fields=revision["fields"],
                 rationale=revision["rationale"],

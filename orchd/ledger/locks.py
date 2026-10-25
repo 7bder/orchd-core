@@ -4,8 +4,9 @@
 常量/注册表，语句级等价，零逻辑改动）：``.intake.lock`` 的路径解析、超时残留回收、持有探测、
 可重入获取、引用计数释放、孤儿回收与显式清理。
 
-依赖方向：顶层只依赖标准库、``orchd.lockfile``（``ExclusiveFileLock`` / ``read_locked_text``）
-与 ``orchd.errors``；对 ``_flock_op``（lockfile 的低层 flock 原语）与 ``resolve_store_dir``
+依赖方向：顶层只依赖标准库、``orchd.lockfile``（``ExclusiveFileLock`` / ``read_locked_text``）、
+``orchd.errors`` 与 ``orchd.constants``（环境变量名真源，零 orchd 内部依赖的叶子）；
+对 ``_flock_op``（lockfile 的低层 flock 原语）与 ``resolve_store_dir``
 （paths 域）的引用一律用**函数级惰性导入** ``from orchd.ledger import ...``：① 避免与聚合入口
 ``orchd/ledger/__init__.py`` 形成加载期循环；② 保持「调用点解析」语义——既有探针
 ``monkeypatch.setattr(orchd.ledger, "_flock_op", ...)``（tests/test_intake_lock_path.py:207/233）
@@ -23,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_INTAKE_LOCK_WAIT_SECS_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock, read_locked_text
 
@@ -69,7 +71,7 @@ def _intake_lock_wait_secs() -> float:
     默认 :data:`_INTAKE_LOCK_WAIT_SECS`（60s）；环境变量
     ``ORCHD_INTAKE_LOCK_WAIT_SECS`` 可覆盖（须为正数）。
     """
-    env = os.environ.get("ORCHD_INTAKE_LOCK_WAIT_SECS")
+    env = os.environ.get(ORCHD_INTAKE_LOCK_WAIT_SECS_ENV)
     if env:
         try:
             v = float(env)

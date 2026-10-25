@@ -21,11 +21,12 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from orchd.constants import ORCHD_LINE_ENV
 from orchd.errors import ErrorCode, OrchdError
 
 DEFAULT_LINE = "default"
 DEFAULT_TRUNK = "main"
-LINE_ENV_VAR = "ORCHD_LINE"
+LINE_ENV_VAR = ORCHD_LINE_ENV  # 变量名真源：orchd.constants（AC3 与本常量对拍）
 
 # 配置入参：project 为 ``_master.json`` 的 ``project`` 段；env 供测试注入。
 ProjectConfig = Mapping[str, Any] | None
@@ -154,11 +155,11 @@ def resolve_task_branch_name(
     if not config:
         if line is not None and line != "" and line != DEFAULT_LINE:
             raise _unknown_line(line, [DEFAULT_LINE])
-        return f"task/{task_id}"
+        return f"{TASK_BRANCH_ROOT}{task_id}"
     target = line or _default_line_name(project, config)
     if target not in config:
         raise _unknown_line(target, sorted(config))
-    return f"task/{target}/{task_id}"
+    return f"{TASK_BRANCH_ROOT}{target}/{task_id}"
 
 TASK_BRANCH_ROOT = "task/"
 

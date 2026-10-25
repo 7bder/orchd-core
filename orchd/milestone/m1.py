@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import argparse
 
+from orchd.contracts.events import (
+    STATUS_CLAIMED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 from .constants import (
     KERNEL_CONTRACT_ANCHORS, KERNEL_CONTRACT_DOC, ROADMAP_FILE, ROADMAP_MILESTONE_ANCHOR,
     _BASELINE_FILE, _FULL_REGRESSION_FILE,
@@ -14,7 +21,10 @@ from .probe import _git_head_short, _read_json, _sha_covers, _status_counts
 
 def _m1_a1_active_clear(ctx: MilestoneContext) -> tuple[bool, str, str]:
     counts = _status_counts(ctx)
-    active = {k: counts.get(k, 0) for k in ("in_review", "claimed", "done")}
+    active = {
+        k: counts.get(k, 0)
+        for k in (STATUS_IN_REVIEW, STATUS_CLAIMED, STATUS_DONE)
+    }
     bad = {k: v for k, v in active.items() if v}
     if bad:
         return False, f"仍有活跃任务：{bad}", (
@@ -27,7 +37,8 @@ def _m1_a1_active_clear(ctx: MilestoneContext) -> tuple[bool, str, str]:
 def _m1_a2_pool_priority_clear(ctx: MilestoneContext) -> tuple[bool, str, str]:
     pending = [
         t for t in ctx.tasks
-        if getattr(ctx.state.get(str(t.get("id"))), "status", "pending") == "pending"
+        if (getattr(ctx.state.get(str(t.get("id"))), "status", STATUS_PENDING)
+                == STATUS_PENDING)
         and str(t.get("importance") or "normal") in ("high", "critical")
     ]
     if pending:
@@ -40,15 +51,15 @@ def _m1_a2_pool_priority_clear(ctx: MilestoneContext) -> tuple[bool, str, str]:
 
 
 def _m1_a3_dep_closure(ctx: MilestoneContext) -> tuple[bool, str, str]:
-    terminal = {"completed", "cancelled"}
+    terminal = TERMINAL_STATUSES
     offenders: list[str] = []
     for task in ctx.tasks:
         tid = str(task.get("id"))
-        status = getattr(ctx.state.get(tid), "status", "pending")
+        status = getattr(ctx.state.get(tid), "status", STATUS_PENDING)
         if status in terminal:
             continue
         for dep in task.get("depends_on") or []:
-            dep_status = getattr(ctx.state.get(str(dep)), "status", "pending")
+            dep_status = getattr(ctx.state.get(str(dep)), "status", STATUS_PENDING)
             if dep_status not in terminal:
                 offenders.append(f"{tid} ← {dep}({dep_status})")
     if offenders:

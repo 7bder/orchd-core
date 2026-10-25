@@ -15,7 +15,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_REVIEW_CLAIMED,
+    STATUS_CLAIMED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
+from orchd.contracts.task_schema import (
+    DEPENDS_ON_FIELD,
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    REQUIRE_INDEPENDENT_REVIEW_FIELD,
+    REVIEWERS_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import get_head_commit, hook_install
 from orchd.gitops_ops import make_event as _make_event, try_git_branch as _try_git_branch
@@ -88,11 +105,11 @@ def _claim_setup_worktree(
                 degraded_guards.append(_branch_degraded_guard(task_id, branch_state))
         if wt_info.get("degraded"):
             degraded_warning = f"worktree degraded: {wt_info.get('reason')}"
-        files_to_edit = task_def.get("files_to_edit", [])
+        files_to_edit = task_def.get(FILES_TO_EDIT_FIELD, [])
         if files_to_edit:
             hook_install(
                 project_root, task_id, files_to_edit,
-                exempt_files=task_def.get("exempt_files"))
+                exempt_files=task_def.get(EXEMPT_FILES_FIELD))
         # pass13 §11-9 甲案：旧布局经验库迁移接进 claim 的「工作树就绪」段。此前
         # ``migrate_lessons_to_runtime`` **零生产调用者**（全仓只命中 doctor.py 的提示
         # 文本与 tests），container 重定向后旧布局 lessons*.jsonl 成孤儿 ⇒ lookup 恒 0、
@@ -159,7 +176,7 @@ def _claim_write_event(
         state = store.replay()
         derived = store.scan_task_derived()
         ts = state.get(task_id)
-        status = ts.status if ts else "pending"
+        status = ts.status if ts else STATUS_PENDING
         is_self_review = False
         if role == "reviewer":
             if ts and ts.review_claimed_by:
@@ -169,7 +186,7 @@ def _claim_write_event(
                       "review_claimed_by": ts.review_claimed_by,
                       "hint": f"任务已被 {ts.review_claimed_by} 认领为 reviewer，"
                               "等待其完成或由其 retract 后重试，禁止重复 claim"}])
-            if status != "in_review":
+            if status != STATUS_IN_REVIEW:
                 raise OrchdError(
                     ErrorCode.E008,
                     f"task_not_in_review: '{task_id}' status={status} "
@@ -189,14 +206,14 @@ def _claim_write_event(
                               f"你指定的是 {review_type}（unified 单阶段须省略 "
                               "--type；文档类单阶段直接进 code）。当前状态 "
                               f"{status}，需 in_review 再 claim"}])
-            designated = task_def.get("reviewers", [])
+            designated = task_def.get(REVIEWERS_FIELD, [])
             if agent_id not in designated and not _is_fingerprint_agent_id(agent_id):
                 raise OrchdError(
                     ErrorCode.E007,
                     f"not_designated_reviewer: '{agent_id}' 不在任务 "
                     f"'{task_id}' 的 reviewers 名单中",
                     [{"task_id": task_id, "agent": agent_id,
-                      "reviewers": designated,
+                      REVIEWERS_FIELD: designated,
                       "hint": "请使用名单内的 agent ID"}])
             if (ts and ts.claimed_by == agent_id and ts.review_claimed_by
                     and ts.review_claimed_by != agent_id):
@@ -209,7 +226,7 @@ def _claim_write_event(
             )
             # task-review-independence-enforce：任务级独立审查与全局开关 OR——
             # 任一为 true 即 E016 硬阻断；缺省两者皆 false 保持仅标注行为不变。
-            _require_independent = bool(task_def.get("require_independent_review", False))
+            _require_independent = bool(task_def.get(REQUIRE_INDEPENDENT_REVIEW_FIELD, False))
             if is_self and (enforce_self_review_block or _require_independent):
                 raise OrchdError(
                     ErrorCode.E016, "self_review",
@@ -229,7 +246,7 @@ def _claim_write_event(
                           "claimed_session": ts.claimed_session,
                           "hint": f"任务已被 {ts.claimed_by} 认领，等待其完成或由其 "
                                   "retract 后重试，禁止重复 claim"}])
-            if status != "pending":
+            if status != STATUS_PENDING:
                 raise OrchdError(
                     ErrorCode.E008, f"task_not_pending: '{task_id}' status={status}",
                     [{"task_id": task_id, "current_status": status,
@@ -250,18 +267,44 @@ def _claim_write_event(
                           "disposition": _cooldown["disposition"],
                           "hint": "任务刚被撤回，疑似主动放弃；等待冷却或使用 --force 显式绕过"}],
                     )
-            for dep_id in task_def.get("depends_on", []):
+            for dep_id in task_def.get(DEPENDS_ON_FIELD, []):
                 dep_ts = state.get(dep_id)
-                if (dep_ts.status if dep_ts else "pending") not in TERMINAL_STATUSES:
+                if (dep_ts.status if dep_ts else STATUS_PENDING) not in TERMINAL_STATUSES:
                     raise OrchdError(
                     ErrorCode.E008,
                     f"dependency_not_met: '{task_id}' blocked_by {dep_id} "
-                    f"status={dep_ts.status if dep_ts else 'pending'}",
+                    f"status={dep_ts.status if dep_ts else STATUS_PENDING}",
                     [{"task_id": task_id, "blocked_by": dep_id,
-                      "blocked_status": dep_ts.status if dep_ts else "pending",
+                      "blocked_status": dep_ts.status if dep_ts else STATUS_PENDING,
                       "hint": f"依赖 {dep_id} 未完成（当前 "
-                              f"{dep_ts.status if dep_ts else 'pending'}），"
+                              f"{dep_ts.status if dep_ts else STATUS_PENDING}），"
                               "需等待其 completed 后重试"}])
+            # engine-discipline-hardening（2026-10-23 停服施工）：同 source 串行门——
+            # 同 source 其他任务存在在手（claimed/done/in_review）→ 拒绝本卡 claim（E041）。
+            # 只拦实现侧（审查认领不破坏现场）；pending 兄弟不拦（批量注册骨架常态，
+            # 伞收口卡 pending 亦不拦）；跨组冲突仍由 E010 / request 依赖感知过滤兜底。
+            _src = task_def.get(SOURCE_FIELD)
+            if _src:
+                # 类型收窄（task-release-162-mypy-blocker，零行为变更）：原单表达式里
+                # ``state.get(t.get(ID_FIELD))`` 既触发 arg-type（key 为 Any|None）又因条件
+                # 在表达式内无法收窄 union-attr；改为 str() 规范化键 + walrus 显式 None 判定。
+                # 语义等价：无 state 记录者视为 pending，而 pending 不在忙态集合内。
+                _busy_siblings = [
+                    t.get(ID_FIELD) for t in tasks
+                    if t.get(ID_FIELD) != task_id and t.get(SOURCE_FIELD) == _src
+                    and (_st := state.get(str(t.get(ID_FIELD)))) is not None
+                    and _st.status in (STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW)
+                ]
+                if _busy_siblings:
+                    raise OrchdError(
+                        ErrorCode.E041,
+                        f"serial_source_conflict: '{task_id}' source={_src} "
+                        f"busy_siblings={','.join(sorted(x for x in _busy_siblings if x))}",
+                        [{"task_id": task_id, SOURCE_FIELD: _src,
+                          "busy_siblings": _busy_siblings,
+                          "hint": "同 source 串行包：兄弟任务在手（claimed/done/in_review），"
+                                  "等其 completed 或 retract 后再 claim；收口卡须待全部终态"}])
+
             conflicts = detect_file_conflict(state, tasks, task_def)
             if conflicts:
                 try:
@@ -295,7 +338,7 @@ def _claim_write_event(
                 return ((hs == session_id and h == agent_id)
                         if hs and session_id else bool(h and h == agent_id))
 
-            if (t_state.status in ("claimed", "done", "in_review")
+            if (t_state.status in (STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW)
                     and _owns(t_state.claimed_by, t_state.claimed_session)
                     and (tid != task_id or enforce_self_review_block)):
                 raise OrchdError(
@@ -304,12 +347,12 @@ def _claim_write_event(
                       "blocking_status": t_state.status,
                       "hint": "任务完成审查（completed/cancelled）或被打回"
                               "（pending）后才可领取新任务"}])
-            if (t_state.status == "in_review" and _owns(
+            if (t_state.status == STATUS_IN_REVIEW and _owns(
                     t_state.review_claimed_by, t_state.review_claimed_session)):
                 rid = ""
                 for ev in store._read_ledger_lines(from_line=1):
                     if (ev.get("task_id") == tid
-                            and ev.get("type") == "REVIEW_CLAIMED"
+                            and ev.get("type") == EVENT_REVIEW_CLAIMED
                             and ev.get("agent_id") == agent_id):
                         rid = ev.get("event_id", "")
                 raise OrchdError(
@@ -317,7 +360,7 @@ def _claim_write_event(
                     [{"agent_id": agent_id, "blocking_task": tid,
                       "review_claim_event_id": rid,
                       "hint": "retract" if rid else "no event"}])
-        files_claimed = task_def.get("files_to_edit", [])
+        files_claimed = task_def.get(FILES_TO_EDIT_FIELD, [])
         if role == "reviewer":
             rp = ts.review_phase if ts else None
             # AC1（task-review-baseline-and-worktree-recycle-fix）：审查基线取**任务
@@ -335,10 +378,10 @@ def _claim_write_event(
             }
             if rp:
                 extra["review_type"] = rp
-            event = _make_event(task_id, agent_id, "REVIEW_CLAIMED", **extra)
+            event = _make_event(task_id, agent_id, EVENT_REVIEW_CLAIMED, **extra)
         else:
             event = _make_event(
-                task_id, agent_id, "CLAIMED", role=role,
+                task_id, agent_id, EVENT_CLAIMED, role=role,
                 files_claimed=files_claimed)
         store.append_event(event)
         new_state = store.replay()

@@ -18,6 +18,12 @@ from orchd.gitops import (
     guard_done_branch as _guard_done_branch,
 )
 from orchd.ledger import Store
+from orchd.contracts.task_schema import (
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    NAME_FIELD,
+)
 
 from orchd.onboard.lifecycle.guards import (
     _guard_declared_diff,
@@ -48,7 +54,7 @@ def _done_precheck(
     tasks = resolve_declaration_source(project_root, tasks, degraded_guards)[0]
     task_def = None
     for t in tasks:
-        if t.get("id") == task_id:
+        if t.get(ID_FIELD) == task_id:
             task_def = t
             break
     if task_def is None:
@@ -57,7 +63,7 @@ def _done_precheck(
             f"invalid_state: task '{task_id}' not found in task list",
             [{"task_id": task_id}],
         )
-    files_to_edit: list[str] = list(task_def.get("files_to_edit", []))
+    files_to_edit: list[str] = list(task_def.get(FILES_TO_EDIT_FIELD, []))
 
     state = store.replay()
     ts = state.get(task_id)
@@ -101,13 +107,13 @@ def _commit_and_verify_integrity(
     commit_result（与重构前一致）。
     """
     commit_message = changes_description or task_def.get(
-        "name", f"orchd: done {task_id}"
+        NAME_FIELD, f"orchd: done {task_id}"
     )
     # task-done-exempt-files-commit：自动提交范围扩展为 files_to_edit ∪ exempt_files，
     # 使 exempt_files 改动（如配套测试）随 done 自动提交进入任务分支 diff，不再被
     # _guard_clean_workspace 以 E017 阻断。扩展仅限提交范围；declared_diff / zero_residual
     # / out_of_scope 门禁仍以 files_to_edit 为准，与既有语义零回归。
-    commit_files = list(dict.fromkeys([*files_to_edit, *task_def.get("exempt_files", [])]))
+    commit_files = list(dict.fromkeys([*files_to_edit, *task_def.get(EXEMPT_FILES_FIELD, [])]))
     commit_result = _done_auto_commit(project_root, commit_files, commit_message, task_id)
 
     # task-commit-timeout-failure-surface AC4：自动提交硬失败（commit_timeout /

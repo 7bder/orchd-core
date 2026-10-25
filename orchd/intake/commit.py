@@ -7,6 +7,13 @@
 
 from __future__ import annotations
 
+from orchd.names import (
+    IDEAS_ARCHIVE_FILE,
+    IDEAS_FILE,
+    MASTER_FILE,
+)
+
+
 from pathlib import Path
 from typing import Any
 
@@ -69,13 +76,13 @@ def intake_commit(
         # task-intake-archive-path（F9 下半）：同理由加入 IDEAS-archive.md——白名单
         # 早已放行归档脏改动，提交清单却漏该件，归档侧写了盘却永不入库。
         paths = [
-            str(workspace_root / "IDEAS.md"),
-            str(workspace_root / "IDEAS-archive.md"),
+            str(workspace_root / IDEAS_FILE),
+            str(workspace_root / IDEAS_ARCHIVE_FILE),
             # task-roadmap-root-resolution：ROADMAP 走独立定位（宿主根优先）——
             # 归根后的根版 ROADMAP.md 同样纳入摄入产物提交范围；被 gitignore
             # 忽略时由 commit 层按既有 roadmap-untracked 逻辑剔除（不 fatal）。
             str(resolve_roadmap_path(project_root)),
-            str(_resolve_lock_orchd_dir(project_root) / "_master.json"),
+            str(_resolve_lock_orchd_dir(project_root) / MASTER_FILE),
         ]
         commit_message = message or "chore(intake): orchd intake — commit intake products"
         commit = ensure_committed(project_root, paths, commit_message)

@@ -9,7 +9,12 @@
 
 from typing import TYPE_CHECKING, Any
 
-from orchd.contracts.events import REVIEW_SUBMITTED_TARGETS, TRANSITION_TABLE
+from orchd.contracts.events import (
+    EVENT_REVIEW_SUBMITTED,
+    REVIEW_SUBMITTED_TARGETS,
+    STATUS_IN_REVIEW,
+    TRANSITION_TABLE,
+)
 from orchd.errors import ErrorCode, OrchdError
 
 if TYPE_CHECKING:  # 仅类型检查期存在：Store 由聚合入口定义，运行期按鸭子类型传入
@@ -45,10 +50,14 @@ def _event_target_status(event: dict[str, Any]) -> str | None:
     entry = TRANSITION_TABLE.get(etype)
     if entry is None:
         return None
-    if etype == "REVIEW_SUBMITTED":
+    if etype == EVENT_REVIEW_SUBMITTED:
         verdict = event.get("verdict", "")
         if verdict == "CHANGES_REQUESTED":
             return "pending"
+        if event.get("merge_pending"):
+            # A4（debug-pack A 组）：merge 未落地的审查结论落账后不推进终态，
+            # 任务保持 in_review，同一 reviewer 可重试。
+            return STATUS_IN_REVIEW
         return REVIEW_SUBMITTED_TARGETS.get((verdict, event.get("review_type")))
     return entry["target"]
 
@@ -103,7 +112,7 @@ def latest_rework_scope(store: "Store", task_id: str) -> str | None:
     except Exception:
         return None
     for ev in events:
-        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+        if ev.get("task_id") != task_id or ev.get("type") != EVENT_REVIEW_SUBMITTED:
             continue
         if ev.get("verdict") == "CHANGES_REQUESTED":
             scope = ev.get("rework_scope") or "spec"

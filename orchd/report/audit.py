@@ -18,6 +18,7 @@ from typing import Any
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
+from orchd.line import TASK_BRANCH_ROOT
 from orchd.ledger import Store, TaskState, resolve_workspace_root
 from .acks import (
     load_merge_acks,
@@ -72,7 +73,7 @@ def merge_audit(
     from orchd.line_ctx import resolve_trunk_for
 
     trunk = resolve_trunk_for(root)
-    branch_prefix = "task/"
+    branch_prefix = TASK_BRANCH_ROOT
 
     def _git(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -126,7 +127,10 @@ def merge_audit(
         if _parsed is not None:
             tid = _parsed[1]
         else:
-            tid = branch[len("task/"):] if branch.startswith("task/") else branch
+            tid = (
+                branch[len(TASK_BRANCH_ROOT):]
+                if branch.startswith(TASK_BRANCH_ROOT) else branch
+            )
         if tid not in registered_ids:
             # 未注册幽灵分支：agent 绕过 claim 手动建的分支，立即告警
             warnings.append({
@@ -178,8 +182,8 @@ def merge_audit(
         _p = parse_task_branch(_b)
         if _p is not None:
             branch_ids.add(_p[1])
-        elif _b.startswith("task/"):
-            branch_ids.add(_b[len("task/"):])
+        elif _b.startswith(TASK_BRANCH_ROOT):
+            branch_ids.add(_b[len(TASK_BRANCH_ROOT):])
         else:
             branch_ids.add(_b)
     resolve_sha_by_task: dict[str, str] = {}

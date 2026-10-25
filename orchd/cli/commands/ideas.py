@@ -4,7 +4,7 @@
   - _cmd_ideas_archive: ideas-archive 一级命令（自动归档已完结 IDEAS 条目）
   - _cmd_idea_propose: idea propose（为灵感追加 status: study 条目）
   - _cmd_idea_confirm: idea confirm（study → pending）
-  - _cmd_idea_drop: idea drop（study → dropped）
+  - _cmd_idea_close: idea close（带理由一次离场归档；旧 drop 与 archive 已合并）
   - register: idea 二级子命令组注册（原样搬自 _build_parser）
 
 3a 阶段说明：本模块是 ideas 域的目标落点。当前 cli.py（legacy）仍
@@ -21,6 +21,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    IDEAS_FILE,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.cli._util import (
     _command_name,
@@ -36,11 +39,12 @@ from orchd.ledger import read_text_or_error, single_line
 def register(sub):
     """注册 ideas-archive 一级命令 + idea 二级子命令组（原样搬自 _build_parser，3a 纯移动，机制未变）。"""
     # ideas-archive 一级命令（handler 住在本模块，注册也随模块走）
-    p = sub.add_parser("ideas-archive", help="自动归档已完结或已放弃的 IDEAS 条目")
+    p = sub.add_parser("ideas-archive", help="自动归档已完结（resolved）的 IDEAS 条目")
     p.set_defaults(func=_cmd_ideas_archive)
 
-    # idea（2026-08-15 idea-write-gate）：灵感写入 IDEAS 写入门禁（propose / confirm / drop）
-    p = sub.add_parser("idea", help="灵感写入 IDEAS 写入门禁：propose 记入 study，confirm/drop 裁决")
+    # idea（2026-08-15 idea-write-gate）：灵感写入 IDEAS 写入门禁（propose / confirm / close）
+    # 出口动词自 task-intake-exit-verb-close 起二合一：旧 drop 与 archive 收敛为 close。
+    p = sub.add_parser("idea", help="灵感写入 IDEAS 写入门禁：propose 记入 study，confirm/close 裁决")
     idea_sub = p.add_subparsers(dest="idea_action", required=True)
 
     _p = idea_sub.add_parser("propose", help="为灵感追加 status: study 条目到 IDEAS.md（agent 执行）")
@@ -52,17 +56,13 @@ def register(sub):
     _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
     _p.set_defaults(func=_cmd_idea_confirm)
 
-    _p = idea_sub.add_parser("drop", help="将 status: study 条目降为 dropped（仅用户执行）")
-    _p.add_argument("--title", required=True, help="灵感标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug；not_found 时返回近似候选）")
-    _p.set_defaults(func=_cmd_idea_drop)
-
     _p = idea_sub.add_parser(
-        "archive",
-        help="把已交付/不再需要留在台账的条目按用户裁决移入 IDEAS-archive.md（仅用户执行）",
+        "close",
+        help="按用户裁决将条目一次离场并归档（仅用户执行；旧 drop 与 archive 已合并）",
     )
     _p.add_argument("--title", required=True, help="条目标题（完整标题含「（id: <slug>）」后缀，或去日期前缀标题，或裸 slug）")
     _p.add_argument("--reason", required=True, help="裁决理由（写入块内「- 归档裁决:」行，无痕迹不得离场）")
-    _p.set_defaults(func=_cmd_idea_archive)
+    _p.set_defaults(func=_cmd_idea_close)
 
     _p = idea_sub.add_parser("append", help="按 - id: 定位条目并追加时间戳 notes 行（替代手改 IDEAS.md）")
     _p.add_argument("--id", required=True, help="条目 - id: 字段精确值（可用 ideas list 查询）")
@@ -120,20 +120,12 @@ def _cmd_idea_confirm(args) -> dict:
     orchd_dir = _find_orchd_dir()
     return idea_confirm(orchd_dir.parent, args.title)
 
-def _cmd_idea_drop(args) -> dict:
-    """将 status: study 条目降为 dropped（idea-write-gate，仅用户执行）。
+def _cmd_idea_close(args) -> dict:
+    """按用户裁决将条目一次离场并归档（idea close，仅用户执行）。
 
-    CLI 参数: args.title。
-    返回: 丢弃结果字典（dropped / title / new_status / commit）。
-    """
-    from orchd.intake import idea_drop
-
-    orchd_dir = _find_orchd_dir()
-    return idea_drop(orchd_dir.parent, args.title)
-
-
-def _cmd_idea_archive(args) -> dict:
-    """把条目按用户裁决移入 IDEAS-archive.md（idea-archive-decision-channel，仅用户执行）。
+    自 task-intake-exit-verb-close 起，旧 ``idea drop``（study 降级为 dropped）与
+    ``idea archive``（陈存量人工裁决归档）合为单一出口：close 一律走归档——study
+    不再先降级等机器搬，而是带理由直接离台。
 
     CLI 参数: args.title / args.reason。
     返回: 归档结果字典（archived / title / from_status / decision / commit）；
@@ -169,7 +161,7 @@ def _cmd_idea_archive(args) -> dict:
     paths = [result.pop("ideas_path"), result.pop("archive_path")]
     title = result.get("title", args.title)
     commit = ensure_committed(
-        project_root, paths, f"chore(idea): orchd idea archive — {title}"
+        project_root, paths, f"chore(idea): orchd idea close — {title}"
     )
     result["commit"] = commit
     if commit.get("performed") is not True and commit.get("reason") != "no_changes":
@@ -205,7 +197,7 @@ def ideas_list(project_root) -> dict[str, Any]:
 
     try:
         ws = resolve_workspace_root(Path(project_root))
-        ideas = ws / "IDEAS.md"
+        ideas = ws / IDEAS_FILE
         if not ideas.exists():
             return {"ideas": [], "count": 0}
         text = ideas.read_text(encoding="utf-8")
@@ -273,7 +265,7 @@ def idea_append(project_root, entry_id: str, notes: str) -> dict[str, Any]:
     lk = intake_lock_acquire(orchd_dir, resolve_agent_id(orchd_dir))
     try:
         ws = resolve_workspace_root(project_root)
-        ideas = ws / "IDEAS.md"
+        ideas = ws / IDEAS_FILE
         if not ideas.exists():
             return {
                 "appended": False,

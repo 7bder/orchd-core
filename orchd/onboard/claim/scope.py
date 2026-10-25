@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from orchd.ledger import Store, TaskDerived
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    FILES_TO_EDIT_FIELD,
+    MODULE_FIELD,
+)
 from orchd.review import extract_last_done as _extract_last_done
 
 
@@ -32,10 +38,10 @@ def _is_high_risk(task_def: dict[str, Any]) -> bool:
     ``orchd/``（开发态根布局）或 ``.orchd/orchd/``（发布态自包含 .orchd 布局）
     均判高风险；``.orchd/_master.json`` 固定资产同样高风险。
     """
-    module = task_def.get("module", "")
+    module = task_def.get(MODULE_FIELD, "")
     if module == "mod-core":
         return True
-    for f in task_def.get("files_to_edit", []):
+    for f in task_def.get(FILES_TO_EDIT_FIELD, []):
         if (
             f.startswith("orchd/")
             or f.startswith(".orchd/orchd/")
@@ -89,9 +95,9 @@ def build_scope_warning(
         ``ghost_files`` / ``hint`` 的 scope_warning 字典；无遗漏或扫描失败时返回 ``None``。
     """
     try:
-        declared_files = set(task_def.get("files_to_edit", []))
-        text_to_scan = (task_def.get("brief", "") or "") + " " + " ".join(
-            task_def.get("acceptance_criteria", []) or []
+        declared_files = set(task_def.get(FILES_TO_EDIT_FIELD, []))
+        text_to_scan = (task_def.get(BRIEF_FIELD, "") or "") + " " + " ".join(
+            task_def.get(ACCEPTANCE_CRITERIA_FIELD, []) or []
         )
         mentioned = set(_SCOPE_FILE_RE.findall(text_to_scan))
         # 目录式声明感知差集（task-decl-dir-match-guards）：mentioned 文件若被

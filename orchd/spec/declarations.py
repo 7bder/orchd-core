@@ -13,6 +13,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.task_schema import (
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+)
+
 
 # ------------------------------------------------------------------
 # 连带文件自动登记（task-decl-concession-autoregister）：白名单单一来源
@@ -144,7 +149,7 @@ def detect_dir_or_glob_declarations(
         无命中返回空列表。
     """
     hits: list[dict[str, str]] = []
-    for decl_field in ("files_to_edit", "exempt_files"):
+    for decl_field in (FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD):
         for fp in task.get(decl_field, []) or []:
             if not isinstance(fp, str):
                 continue

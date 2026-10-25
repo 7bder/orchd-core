@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from orchd.contracts.events import (
+    EVENT_AMEND,
+    EVENT_CLAIMED,
+    EVENT_DONE,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_READY,
+    EVENT_REVIEW_SUBMITTED,
+)
+
+
 
 from .commands import _cmd_amend, _cmd_force_status, _cmd_merge_ack, _cmd_restore, _cmd_retract
 
@@ -40,6 +50,13 @@ def register(sub) -> None:
                    default=None,
                    dest="remove_exempt_files",
                    help="撤回 exempt_files 声明（集合差；同上）")
+    p.add_argument("--depends-on",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="depends_on",
+                   help="补登 depends_on（并集追加，只增不删；重复 id 去重；"
+                   "仅 pending 态放行；未知引用/依赖环由 spec 校验拒绝且不落盘）")
     p.add_argument("--verify-command", default=None, help="覆写 verify_command")
     p.add_argument("--reviewers",
                    nargs="*",
@@ -112,8 +129,8 @@ def register(sub) -> None:
                    default=None,
                    dest="event_type",
                    choices=[
-                       "CLAIMED", "DONE", "REVIEW_CLAIMED", "REVIEW_SUBMITTED",
-                       "REVIEW_READY", "AMEND",
+                       EVENT_CLAIMED, EVENT_DONE, EVENT_REVIEW_CLAIMED, EVENT_REVIEW_SUBMITTED,
+                       EVENT_REVIEW_READY, EVENT_AMEND,
                    ],
                    help="事件类型（配合 --task 自动定位最近匹配事件）")
     p.add_argument("--reason", required=True)

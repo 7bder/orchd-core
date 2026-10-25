@@ -6,6 +6,20 @@ from typing import Any
 
 from orchd.guide import read_for
 
+# 容器布局下任务 worktree 的 .orchd/ 通常没有 rules/：此时 guide 路由缓存
+# 未初始化，read_for 会按 fail-closed 抛 RuntimeError。完成态 guidance 是
+# **best-effort**，不得让一次成功的 review merge 因规则摘要缺失而落 E999；
+# 回退到 rules/review.md（该场景 front-matter 的已知路由）。
+_AUDIT_MERGE_READ_FALLBACK = ("rules/review.md",)
+
+
+def _audit_merge_read_paths() -> list[str]:
+    """audit_merge 场景的 read 路由；路由不可用时安全回退。"""
+    try:
+        return read_for("audit_merge")
+    except Exception:
+        return list(_AUDIT_MERGE_READ_FALLBACK)
+
 
 def _build_completion_guidance(
     task_id: str, worktree_recycled: dict[str, Any] | None,
@@ -44,7 +58,7 @@ def _build_completion_guidance(
         "step": "audit_merge",
         "command": f"{_ENTRY_CMD} status --audit-merge",
         "hint": hint,
-        "read": read_for("audit_merge"),
+        "read": _audit_merge_read_paths(),
         **({"main_worktree": main_worktree} if main_worktree else {}),
     }
 

@@ -160,7 +160,7 @@ def inflight_proposals(orchd_dir: Path) -> list[Path]:
     """未注册的在途草稿（判据见 :func:`classify_proposals` 的在途列）。
 
     这一列**没有清理通道也不得有**：草案正文是用户尚未确认/尚未注册的意图载体，
-    intake 规则「只有用户可置 dropped」是硬边界。本列只供留痕（卫生门的
+    intake 规则「只有用户可 close」是硬边界。本列只供留痕（卫生门的
     ``[proposals-inflight]`` WAIVED 行），:func:`doctor_fix` 对其零操作。
     """
     _stale, inflight = classify_proposals(orchd_dir)

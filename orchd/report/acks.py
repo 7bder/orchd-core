@@ -15,6 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    MERGE_ACKS_FILE,
+)
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
@@ -25,7 +28,7 @@ from orchd.ledger import Store, TaskState, resolve_workspace_root
 # .orchd/merge-acks.json：merge_warning 残留的人工销账清单（task-merge-warning-ack）。
 # gitignored（运行时文件，.gitignore 白名单天然忽略），格式：
 #   {"<task_id>": {"acked_at": <ISO 时间>, "reason": <str>}}
-_MERGE_ACKS_FILENAME = "merge-acks.json"
+_MERGE_ACKS_FILENAME = MERGE_ACKS_FILE
 
 
 

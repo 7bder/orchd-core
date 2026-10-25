@@ -10,6 +10,15 @@ spec.quality_terms / spec.verify_cmd。
 
 from typing import Any
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    ESTIMATED_HOURS_FIELD,
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    VERIFY_COMMAND_FIELD,
+)
 from orchd.errors import ErrorCode
 from orchd.spec.declarations import derive_related_test_files
 from orchd.spec.quality_terms import (
@@ -102,7 +111,7 @@ def validate_quality(
     # 不建语料、不走文件系统，行为与旧版逐字一致。
     _term_candidates: dict[tuple[int, int], list[str]] = {}
     for _i, _t in enumerate(tasks):
-        for _j, _ac in enumerate(_t.get("acceptance_criteria", []) or []):
+        for _j, _ac in enumerate(_t.get(ACCEPTANCE_CRITERIA_FIELD, []) or []):
             if not isinstance(_ac, str):
                 continue
             _seen: set[str] = set()
@@ -122,7 +131,7 @@ def validate_quality(
         return _term_corpus
 
     for i, t in enumerate(tasks):
-        tid = t.get("id", "")
+        tid = t.get(ID_FIELD, "")
         # F6（task-validate-terminal-quiet，P2-2 同式）：终态任务跳过 E026/E027。
         terminal = tid in (terminal_ids or frozenset())
 
@@ -130,7 +139,7 @@ def validate_quality(
         # R5（task-constraint-quality-checks）：缺 verify_command 是否阻断，取决于任务类型。
         #   代码类（files_to_edit 含非文档文件）→ amend 注册点阻断；
         #   文档/基础设施类（全部文档后缀）→ 维持 warning。
-        verify_cmd = t.get("verify_command")
+        verify_cmd = t.get(VERIFY_COMMAND_FIELD)
         if not verify_cmd or (isinstance(verify_cmd, str)
                               and not verify_cmd.strip()):
             is_code = not _is_doc_task(t)
@@ -147,7 +156,7 @@ def validate_quality(
         # R4（task-constraint-quality-checks）：任务拆解粒度启发式越界（warning 级）。
         # 越界即提示拆分，不做注册阻断（触碰 §9.2 内容域，硬阻断留待人工决策）。
         files_edit = [
-            f for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+            f for f in (t.get(FILES_TO_EDIT_FIELD) or []) if isinstance(f, str)
         ]
         if len(files_edit) > _GRANULARITY_MAX_FILES:
             errors.append(
@@ -161,7 +170,7 @@ def validate_quality(
         # E038（task-decl-consistency-error-code）：brief 的数量口径
         # 「files_to_edit 控 N」与实际声明数不一致 → warning（不阻断，**非拆分建议**）。
         # 专用码从 E029 拆出，避免与「粒度越界/建议拆分」语义串味。
-        brief_text = t.get("brief")
+        brief_text = t.get(BRIEF_FIELD)
         if isinstance(brief_text, str) and brief_text:
             count_m = _DECL_COUNT_RE.search(brief_text)
             if count_m and int(count_m.group(1)) != len(files_edit):
@@ -175,7 +184,7 @@ def validate_quality(
                             "（warning 不阻断；此处非拆分建议：请对齐 brief 文案与声明集合）"),
                     ))
 
-        est_hours = t.get("estimated_hours")
+        est_hours = t.get(ESTIMATED_HOURS_FIELD)
         if isinstance(est_hours,
                       (int, float)) and est_hours > _GRANULARITY_MAX_HOURS:
             errors.append(
@@ -187,7 +196,7 @@ def validate_quality(
                         f"{_GRANULARITY_MAX_HOURS}（建议拆分，warning 不阻断）"),
                 ))
         ac_list2 = [
-            a for a in (t.get("acceptance_criteria") or [])
+            a for a in (t.get(ACCEPTANCE_CRITERIA_FIELD) or [])
             if isinstance(a, str)
         ]
         if len(ac_list2) > _GRANULARITY_MAX_AC:
@@ -201,7 +210,7 @@ def validate_quality(
                 ))
 
         # E023: acceptance_criteria 模糊词检测
-        ac_list = t.get("acceptance_criteria", [])
+        ac_list = t.get(ACCEPTANCE_CRITERIA_FIELD, [])
         for j, ac in enumerate(ac_list):
             if not isinstance(ac, str):
                 continue
@@ -319,10 +328,10 @@ def validate_quality(
             # TERMINAL_EXEMPT_QUALITY_CODES 豁免。
             declared_paths = {
                 f
-                for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+                for f in (t.get(FILES_TO_EDIT_FIELD) or []) if isinstance(f, str)
             } | {
                 f
-                for f in (t.get("exempt_files") or []) if isinstance(f, str)
+                for f in (t.get(EXEMPT_FILES_FIELD) or []) if isinstance(f, str)
             }
             missing_refs = sorted({
                 tok
@@ -350,10 +359,10 @@ def validate_quality(
         # 派生测试文件（如 orchd/gitops_ops.py → tests/test_gitops_ops.py 不存在）不产生
         # 无法满足的预警（E026 跳过）；tests/ 目录缺失时同样跳过（无从验证即不预警）。
         files_edit = [
-            f for f in (t.get("files_to_edit") or []) if isinstance(f, str)
+            f for f in (t.get(FILES_TO_EDIT_FIELD) or []) if isinstance(f, str)
         ]
         exempts = [
-            f for f in (t.get("exempt_files") or []) if isinstance(f, str)
+            f for f in (t.get(EXEMPT_FILES_FIELD) or []) if isinstance(f, str)
         ]
         tests_root = _tests_root_from_master(master)
         # F6（task-validate-terminal-quiet）：终态任务跳过 E026。
@@ -385,7 +394,7 @@ def validate_quality(
 # 质量类告警 E023/E026/E027/E029/E037/E038/E040 对终态（completed/cancelled）任务
 # 一律豁免——拆分/改写终态任务定义无意义（E007 终态保护无法改写）。validate 与
 # amend 共用；E022（代码类缺 verify_command 注册阻断）与 E024 不在豁免之列。
-TERMINAL_EXEMPT_QUALITY_CODES = frozenset({"E023", "E026", "E027", "E029", "E037", "E038", "E040"})
+TERMINAL_EXEMPT_QUALITY_CODES = frozenset({ErrorCode.E023.name, ErrorCode.E026.name, ErrorCode.E027.name, ErrorCode.E029.name, ErrorCode.E037.name, ErrorCode.E038.name, ErrorCode.E040.name})
 
 
 def _quality_warning_code_name(w: Any) -> str:
@@ -412,7 +421,7 @@ def filter_terminal_quality_warnings(
 
     Args:
         warnings: ValidationError 列表或同形 dict 列表（{"code", "path"}，
-            code 接受 "E026" 或 "ErrorCode.E026" 两种形态）。
+            code 接受 ErrorCode.E026.name 或 "ErrorCode.E026" 两种形态）。
         tasks: path 下标对应的任务定义列表（顺序须与判据产出一致，
             即 master.tasks 顺序）。
         terminal_ids: 终态任务 id 集合；为 None 时（ledger 不可用/replay 失败）
@@ -434,7 +443,7 @@ def filter_terminal_quality_warnings(
             w, "path") else (w.get("path") if isinstance(w, dict) else None)
         idx = _quality_warning_task_index(path)
         tid = tasks[idx].get(
-            "id") if idx is not None and 0 <= idx < len(tasks) else None
+            ID_FIELD) if idx is not None and 0 <= idx < len(tasks) else None
         if tid is not None and tid in terminal_ids:
             exempted += 1
             continue

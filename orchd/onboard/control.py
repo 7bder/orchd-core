@@ -15,12 +15,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import FORCE_TARGET_STATUSES, TERMINAL_STATUSES
+from orchd.constants import ORCHD_CLAIM_STALE_SECS_ENV, ORCHD_REVIEW_STALE_SECS_ENV
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_FORCE_STATUS,
+    EVENT_RETRACT,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_SUBMITTED,
+    FORCE_TARGET_STATUSES,
+    STATUS_CANCELLED,
+    STATUS_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import get_default_branch as _get_default_branch, hook_uninstall
 from orchd.worktree import load_bindings, unbind_task_wt
 from orchd.gitops_ops import make_event as _make_event
 from orchd.ledger import Store, TaskState, resolve_store_dir, review_claim_age_s, review_stale_timeout_s
+from orchd.contracts.responses import (
+    BRANCH_KEY,
+    ERROR_KEY,
+    EVENT_ID_KEY,
+    GUIDANCE_KEY,
+    HINT_KEY,
+    TASK_ID_KEY,
+    WARNINGS_KEY,
+)
 
 # force-status 合法目标：force_status() 只允许将任务强制设置到这四种状态，
 # 其余状态（如 in_review、done）由正常事件流驱动，不可被强制跳转。
@@ -40,8 +64,8 @@ _FORCE_TARGETS = FORCE_TARGET_STATUSES
 # 其余默认非法跳转（如跳过审查的 pending→completed、终态互转 completed→cancelled）
 # 不在此白名单内，--force 对它们无效，防止逃生口被用来绕过正常审查/终态保护。
 _FORCE_ESCAPE_HATCHES = frozenset({
-    ("completed", "claimed"),
-    ("pending", "cancelled"),
+    (STATUS_COMPLETED, STATUS_CLAIMED),
+    (STATUS_PENDING, STATUS_CANCELLED),
 })
 
 # verify_command 超时（秒）：120s 是在"给测试套件足够执行时间"与
@@ -69,7 +93,7 @@ def claim_stale_timeout_s() -> float:
     与 ``orchd.ledger.review_stale_timeout_s`` 同风格：非法 / 非正值回退默认，
     解析失败静默回退（不因环境变量误设而放宽守卫）。
     """
-    env = os.environ.get("ORCHD_CLAIM_STALE_SECS")
+    env = os.environ.get(ORCHD_CLAIM_STALE_SECS_ENV)
     if env is not None:
         try:
             v = float(env)
@@ -127,14 +151,14 @@ def retract(
                 raise OrchdError(
                     ErrorCode.E007,
                     f"invalid_state: no active {event_type} event found for task '{task_id}'",
-                    [{"task_id": task_id, "event_type": event_type,
-                      "hint": "确认任务 ID 和事件类型是否正确；可用 python .orchd/__main__.py status 查看事件历史"}],
+                    [{TASK_ID_KEY: task_id, "event_type": event_type,
+                      HINT_KEY: "确认任务 ID 和事件类型是否正确；可用 python .orchd/__main__.py status 查看事件历史"}],
                 )
         elif target_event_id is None:
             raise OrchdError(
                 ErrorCode.E007,
                 "invalid_state: retract requires --event <id> or --task <id> --type <type>",
-                [{"hint": "请提供事件 ID 或任务 ID + 事件类型"}],
+                [{HINT_KEY: "请提供事件 ID 或任务 ID + 事件类型"}],
             )
 
         target_event = None
@@ -147,13 +171,13 @@ def retract(
             raise OrchdError(
                 ErrorCode.E007,
                 f"invalid_state: event '{target_event_id}' not found",
-                [{"event_id": target_event_id}],
+                [{EVENT_ID_KEY: target_event_id}],
             )
-        if target_event.get("type") == "FORCE_STATUS":
+        if target_event.get("type") == EVENT_FORCE_STATUS:
             raise OrchdError(
                 ErrorCode.E007,
                 "invalid_state: cannot retract FORCE_STATUS event",
-                [{"event_id": target_event_id, "type": "FORCE_STATUS"}],
+                [{EVENT_ID_KEY: target_event_id, "type": EVENT_FORCE_STATUS}],
             )
 
         # E034: 撤认归属守卫（task-retract-ownership-guard）。
@@ -169,11 +193,11 @@ def retract(
             # 放行——这正是「接管僵死任务 / 僵死审查」的必要路径；未超时仍受
             # E034 保护，防借撤认抢活或绕过独立审查。
             stale_release = False
-            if target_event.get("type") == "REVIEW_CLAIMED":
+            if target_event.get("type") == EVENT_REVIEW_CLAIMED:
                 _age = review_claim_age_s(target_event.get("timestamp"))
                 if _age is not None and _age >= review_stale_timeout_s():
                     stale_release = True
-            elif target_event.get("type") == "CLAIMED":
+            elif target_event.get("type") == EVENT_CLAIMED:
                 # CLAIMED 超时接管（与 REVIEW_CLAIMED 对称，task-takeover-residue-alignment）：
                 # 使 rules/session.md 接管 SOP 第4步（接管方会话 retract 原 CLAIMED）
                 # 可达——此前 CLAIMED 无对称超时通道，接管只能绕道 force-status。
@@ -185,12 +209,12 @@ def retract(
                     ErrorCode.E034,
                     f"retract_not_authorized: event '{target_event_id}' owned by "
                     f"'{target_author}', caller '{agent_id}' cannot retract",
-                    [{"event_id": target_event_id, "owner": target_author,
+                    [{EVENT_ID_KEY: target_event_id, "owner": target_author,
                       "caller": agent_id,
-                      "hint": "跨 agent 撤认需事件作者本人或 admin 操作，或目标为超时（僵尸）"
+                      HINT_KEY: "跨 agent 撤认需事件作者本人或 admin 操作，或目标为超时（僵尸）"
                               f"认领——CLAIMED 超时阈值 {claim_stale_timeout_s():.0f}s"
-                              f"（ORCHD_CLAIM_STALE_SECS 可覆盖）、REVIEW_CLAIMED 超时阈值 "
-                              f"{review_stale_timeout_s():.0f}s（ORCHD_REVIEW_STALE_SECS 可覆盖），"
+                              f"（{ORCHD_CLAIM_STALE_SECS_ENV} 可覆盖）、REVIEW_CLAIMED 超时阈值 "
+                              f"{review_stale_timeout_s():.0f}s（{ORCHD_REVIEW_STALE_SECS_ENV} 可覆盖），"
                               f"未超时仍受本守卫保护；如确须纠正，请事件作者撤回或管理员 force-status"}],
                 )
 
@@ -201,14 +225,14 @@ def retract(
                          if ev.get("event_id") == target_event_id)
         cascade_ids = [target_event_id]
         for ev in all_events[target_idx + 1:]:
-            if ev.get("task_id") == task_id and ev.get("type") not in ("RETRACT", "FORCE_STATUS"):
+            if ev.get("task_id") == task_id and ev.get("type") not in (EVENT_RETRACT, EVENT_FORCE_STATUS):
                 cascade_ids.append(ev.get("event_id"))
 
         # 逐条写 RETRACT
         retracted_events = []
         for eid in cascade_ids:
             retract_ev = _make_event(
-                task_id, agent_id, "RETRACT",
+                task_id, agent_id, EVENT_RETRACT,
                 target_event_id=eid,
                 reason=reason,
                 disposition=disposition,
@@ -225,7 +249,7 @@ def retract(
         # 归属守卫由 retract 入口的 E034 保证（仅事件作者本人或 admin 可撤回），
         # 此处不再重复检查绑定归属。
         unbind_result = None
-        if target_event.get("type") in ("CLAIMED", "REVIEW_CLAIMED"):
+        if target_event.get("type") in (EVENT_CLAIMED, EVENT_REVIEW_CLAIMED):
             try:
                 bindings = load_bindings(resolve_store_dir(store.orchd_dir))
                 if task_id in bindings:
@@ -237,9 +261,9 @@ def retract(
                         f"disposition={disposition} by {agent_id}"
                     )
                 else:
-                    unbind_result = {"unbound": True, "task_id": task_id, "reason": "no_binding"}
+                    unbind_result = {"unbound": True, TASK_ID_KEY: task_id, "reason": "no_binding"}
             except Exception as e:
-                unbind_result = {"unbound": False, "task_id": task_id, "error": str(e)}
+                unbind_result = {"unbound": False, TASK_ID_KEY: task_id, ERROR_KEY: str(e)}
     finally:
         store.release_lock()
 
@@ -263,7 +287,7 @@ def retract(
     result = {
         "retracted": True,
         "retracted_events": retracted_events,
-        "task_id": task_id,
+        TASK_ID_KEY: task_id,
         "new_status": new_state.get(task_id, TaskState()).status,
         "disposition": disposition,
     }
@@ -298,19 +322,19 @@ def _task_completed_epoch(store: Store, task_id: str) -> float | None:
     retracted = store._collect_retracted_event_ids()
     completed_iso: str | None = None
     for ev in events:
-        if ev.get("type") == "RETRACT" or ev.get("event_id", "") in retracted:
+        if ev.get("type") == EVENT_RETRACT or ev.get("event_id", "") in retracted:
             continue
         if ev.get("task_id") != task_id:
             continue
         etype = ev.get("type")
-        if etype == "REVIEW_SUBMITTED":
+        if etype == EVENT_REVIEW_SUBMITTED:
             # review-unify-r2：unified 单阶段（无 review_type）与 code APPROVED
             # 均视为进入 completed 的终审。
             if ev.get("verdict") == "APPROVED" and (
                 ev.get("review_type") == "code" or ev.get("review_type") is None
             ):
                 completed_iso = ev.get("timestamp")
-        elif etype == "FORCE_STATUS" and ev.get("target_status") == "completed":
+        elif etype == EVENT_FORCE_STATUS and ev.get("target_status") == STATUS_COMPLETED:
             completed_iso = ev.get("timestamp")
     if not completed_iso:
         return None
@@ -340,7 +364,7 @@ def _validate_revive_evidence(
         raise OrchdError(
             ErrorCode.E007,
             f"revive_blocked: 复活 '{task_id}' 需 git 仓库做证据校验（project_root 缺失）",
-            [{"task_id": task_id, "missing": "project_root"}],
+            [{TASK_ID_KEY: task_id, "missing": "project_root"}],
         )
 
     def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -360,7 +384,7 @@ def _validate_revive_evidence(
             raise OrchdError(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 证据 sha '{evidence_sha}' 不是有效 commit",
-                [{"task_id": task_id, "evidence_sha": evidence_sha, "reason": "not_a_commit"}],
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha, "reason": "not_a_commit"}],
             )
 
         # 2. 必须是默认分支祖先
@@ -369,14 +393,14 @@ def _validate_revive_evidence(
             raise OrchdError(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 无法判定默认分支，证据 sha '{evidence_sha}' 校验中止",
-                [{"task_id": task_id, "evidence_sha": evidence_sha, "reason": "no_default_branch"}],
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha, "reason": "no_default_branch"}],
             )
         anc = _git(["merge-base", "--is-ancestor", evidence_sha, branch])
         if anc.returncode != 0:
             raise OrchdError(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 证据 sha '{evidence_sha}' 不是 {branch} 的祖先",
-                [{"task_id": task_id, "evidence_sha": evidence_sha, "branch": branch,
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha, BRANCH_KEY: branch,
                   "reason": "not_ancestor"}],
             )
 
@@ -385,14 +409,14 @@ def _validate_revive_evidence(
             raise OrchdError(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 无法确定任务完成时间，证据 sha '{evidence_sha}' 校验中止",
-                [{"task_id": task_id, "evidence_sha": evidence_sha, "reason": "no_completion_time"}],
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha, "reason": "no_completion_time"}],
             )
         show = _git(["show", "-s", "--format=%ct", evidence_sha])
         if show.returncode != 0 or not show.stdout.strip():
             raise OrchdError(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 无法读取证据 sha '{evidence_sha}' 提交时间",
-                [{"task_id": task_id, "evidence_sha": evidence_sha, "reason": "no_commit_time"}],
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha, "reason": "no_commit_time"}],
             )
         commit_epoch = float(show.stdout.strip())
         if commit_epoch <= completed_epoch:
@@ -400,7 +424,7 @@ def _validate_revive_evidence(
                 ErrorCode.E007,
                 f"revive_blocked: 复活 '{task_id}' 证据 sha '{evidence_sha}' 早于任务完成时间"
                 "（须晚于最近一次 completed 时刻）",
-                [{"task_id": task_id, "evidence_sha": evidence_sha,
+                [{TASK_ID_KEY: task_id, "evidence_sha": evidence_sha,
                   "commit_epoch": commit_epoch, "completed_epoch": completed_epoch,
                   "reason": "before_completion"}],
             )
@@ -410,7 +434,7 @@ def _validate_revive_evidence(
         raise OrchdError(
             ErrorCode.E007,
             f"revive_blocked: 复活 '{task_id}' git 证据校验不可用（git 命令失败）",
-            [{"task_id": task_id, "reason": "git_unavailable"}],
+            [{TASK_ID_KEY: task_id, "reason": "git_unavailable"}],
         ) from None
 
 
@@ -464,11 +488,11 @@ def force_status(
             f"invalid_state: cannot force to '{target_status}' (legal: {sorted(_FORCE_TARGETS)})",
             [{"target": target_status, "legal_targets": sorted(_FORCE_TARGETS)}],
         )
-    if target_status == "claimed" and not assignee:
+    if target_status == STATUS_CLAIMED and not assignee:
         raise OrchdError(
             ErrorCode.E007,
             "invalid_state: force to 'claimed' requires --assignee",
-            [{"target": "claimed", "missing": "assignee"}],
+            [{"target": STATUS_CLAIMED, "missing": "assignee"}],
         )
 
     store.acquire_lock()
@@ -476,34 +500,36 @@ def force_status(
         integrity_warnings = store.check_integrity()
         state = store.replay()
         ts = state.get(task_id)
-        current = ts.status if ts else "pending"
+        current = ts.status if ts else STATUS_PENDING
 
         # "允许从" 校验矩阵（completed→pending 已移出，见复活门禁）
         _ALLOWED_FROM = {
-            "pending": {"claimed", "done", "in_review"},
-            "claimed": {"pending"},
-            "completed": {"in_review"},
-            "cancelled": {"pending", "claimed", "done", "in_review"},
+            STATUS_PENDING: {STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW},
+            STATUS_CLAIMED: {STATUS_PENDING},
+            STATUS_COMPLETED: {STATUS_IN_REVIEW},
+            STATUS_CANCELLED: {
+                STATUS_PENDING, STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW,
+            },
         }
         allowed = _ALLOWED_FROM.get(target_status, set())
         if current not in allowed:
             in_hatch = (target_status, current) in _FORCE_ESCAPE_HATCHES
             # 复活门禁：completed→pending 严格路径（--force + --evidence-sha git 证据）
-            is_revive = current == "completed" and target_status == "pending"
+            is_revive = current == STATUS_COMPLETED and target_status == STATUS_PENDING
             if is_revive:
                 if not force:
                     raise OrchdError(
                         ErrorCode.E007,
                         f"revive_blocked: completed→pending 复活 '{task_id}' 需 --force 显式确认"
                         "（防止无授权复活已完成任务）",
-                        [{"task_id": task_id, "missing": "--force"}],
+                        [{TASK_ID_KEY: task_id, "missing": "--force"}],
                     )
                 if not evidence_sha:
                     raise OrchdError(
                         ErrorCode.E007,
                         f"revive_blocked: completed→pending 复活 '{task_id}' 需 "
                         "--evidence-sha <commit>（git 证据，须为 main 祖先且晚于任务完成）",
-                        [{"task_id": task_id, "missing": "--evidence-sha"}],
+                        [{TASK_ID_KEY: task_id, "missing": "--evidence-sha"}],
                     )
                 _validate_revive_evidence(
                     project_root, evidence_sha, _task_completed_epoch(store, task_id), task_id
@@ -520,7 +546,7 @@ def force_status(
                     ErrorCode.E007,
                     f"invalid_state: cannot force '{task_id}' from '{current}' to '{target_status}'"
                     f" (allowed from: {sorted(allowed)}){hint}",
-                    [{"task_id": task_id, "current": current, "target": target_status,
+                    [{TASK_ID_KEY: task_id, "current": current, "target": target_status,
                       "allowed_from": sorted(allowed)}],
                 )
 
@@ -528,7 +554,7 @@ def force_status(
         # 保证。任务分支领先 main 时自动 --ff-only 快进落码后再置终态；与 main 分叉则拒绝
         # 自动合并（仅接受快进，防止静默并入错误代码）并返回冲突指引交人工。
         merge_state: dict[str, Any] | None = None
-        if target_status == "completed" and project_root:
+        if target_status == STATUS_COMPLETED and project_root:
             from orchd.gitops_ops import try_ff_merge_to_main
 
             merge_state = try_ff_merge_to_main(project_root, task_id)
@@ -539,12 +565,12 @@ def force_status(
                     "已分叉，无法自动快进合并（逃生舱仅接受 --ff-only）。请先手工解决分叉"
                     "（合并/rebase）使任务分支可快进到 main，再重新 force-status completed，"
                     "防止静默并入错误代码。",
-                    [{"task_id": task_id, "branch": merge_state.get("branch"),
-                      "guidance": "resolve_divergence_then_retry"}],
+                    [{TASK_ID_KEY: task_id, BRANCH_KEY: merge_state.get("branch"),
+                      GUIDANCE_KEY: "resolve_divergence_then_retry"}],
                 )
 
         event = _make_event(
-            task_id, agent_id, "FORCE_STATUS",
+            task_id, agent_id, EVENT_FORCE_STATUS,
             target_status=target_status,
             reason=reason,
         )
@@ -578,7 +604,7 @@ def force_status(
 
     result = {
         "forced": True,
-        "task_id": task_id,
+        TASK_ID_KEY: task_id,
         "previous_status": current,
         "new_status": target_status,
         "reason": reason,
@@ -588,7 +614,7 @@ def force_status(
         if release_info.get("stranded"):
             result["stranded"] = release_info["stranded"]
     # W-5：completed 逃生隐含的落码结果透出（merged / already_in_main / None）。
-    if target_status == "completed" and merge_state is not None:
+    if target_status == STATUS_COMPLETED and merge_state is not None:
         result["merge"] = merge_state
     # task-14-worktree-lifecycle（AC3）：终态（completed/cancelled）自动回收任务
     # worktree（git worktree remove + 删分支 + 解绑，best-effort）。
@@ -609,11 +635,11 @@ def force_status(
             result["worktree_recycled"] = {
                 "removed": False,
                 "unbound": False,
-                "error": f"{code}: {exc}"[:300],
-                "warnings": [{
+                ERROR_KEY: f"{code}: {exc}"[:300],
+                WARNINGS_KEY: [{
                     "code": "worktree_recycle_failed",
-                    "task_id": task_id,
-                    "error": f"{code}: {exc}"[:300],
+                    TASK_ID_KEY: task_id,
+                    ERROR_KEY: f"{code}: {exc}"[:300],
                 }],
             }
         # L3 pre-commit hook 卸载（best-effort）：force_status 直达终态时兜底，

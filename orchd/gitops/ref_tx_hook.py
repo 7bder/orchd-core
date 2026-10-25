@@ -44,6 +44,14 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+# **本模块禁止 import orchd.***：hook 以 ``spec_from_file_location`` 按文件路径独立加载
+# （生成脚本里 ``python -c`` 只把源码根放在 argv，不进 sys.path），任何包内 import 都会
+# 让强制层在宿主侧加载失败、静默失去拦截力。故环境变量名在此就地声明，由
+# tests/test_gitops.py::TestEnvVarVocabulary 与 ``orchd.constants`` 双向对拍防漂移。
+_LINE_TRUNK_ENV = "ORCHD_LINE_TRUNK"
+_LINE_TASK_PREFIX_ENV = "ORCHD_LINE_TASK_PREFIX"
+_ALLOW_REF_TX_ENV = "ORCHD_ALLOW_REF_TX"
+
 # 引用命名空间
 TASK_PREFIX = "refs/heads/task/"
 ENGINE_REF_PREFIX = "refs/heads/orchd/"
@@ -341,7 +349,7 @@ def _maybe_warn_unbaked_multiline(project_root: Path) -> None:
     但“后启用多线未重装 → 回退单线口径”是静默的。在此 best-effort 探测并提示
     重装，任何异常静默跳过，永不影响放行/拒绝 verdict。
     """
-    if os.environ.get("ORCHD_LINE_TRUNK") or os.environ.get("ORCHD_LINE_TASK_PREFIX"):
+    if os.environ.get(_LINE_TRUNK_ENV) or os.environ.get(_LINE_TASK_PREFIX_ENV):
         return
     try:
         import json
@@ -387,7 +395,7 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None,
     """
     args = list(sys.argv if argv is None else argv)
     state = args[1] if len(args) > 1 else ""
-    if os.environ.get("ORCHD_ALLOW_REF_TX"):
+    if os.environ.get(_ALLOW_REF_TX_ENV):
         entry = {
             "guard": "ref_tx_escape_hatch",
             "status": "enforcement_bypassed",
@@ -408,8 +416,8 @@ def main(argv: list[str] | None = None, *, stdin_text: str | None = None,
     _maybe_warn_unbaked_multiline(project_root)
     # task-line-ref-tx-per-line：多线下命名空间前缀与 trunk 由**安装期烘焙 env** 提供
     # （未启用多线时不烘焙 → 与历史口径逐字一致，零额外 git 子进程）。
-    line_prefix = os.environ.get("ORCHD_LINE_TASK_PREFIX") or TASK_PREFIX
-    line_trunk = os.environ.get("ORCHD_LINE_TRUNK") or ""
+    line_prefix = os.environ.get(_LINE_TASK_PREFIX_ENV) or TASK_PREFIX
+    line_trunk = os.environ.get(_LINE_TRUNK_ENV) or ""
     need_default = any(
         u["ref"].startswith(HEADS_PREFIX)
         and not u["ref"].startswith((line_prefix, ENGINE_REF_PREFIX))

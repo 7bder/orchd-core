@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import STATUS_PENDING
 from orchd.errors import ErrorCode, OrchdError
 from orchd.cli.skeleton import _cli_skeleton
 from orchd.cli.identity import (
@@ -32,6 +33,21 @@ from orchd.cli._util import (
     _flatten_nargs,
     _reject_container_root_cwd,
     _resolve_text_arg,
+)
+from orchd.contracts.responses import (
+    MERGE_AUDIT_KEY,
+    POOL_SIZE_KEY,
+    STATUS_KEY,
+    TASK_ID_KEY,
+)
+from orchd.contracts.task_schema import (
+    BRIEF_FIELD,
+    DIFFICULTY_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    SOURCE_FIELD,
 )
 
 
@@ -54,20 +70,20 @@ def _cmd_pool(args) -> dict:
     tasks, orchd_dir, master = _load_tasks()
     store = Store(orchd_dir)
     state = store.replay()
-    imp_thresholds = master.config.get("importance") if hasattr(master, "config") else None
+    imp_thresholds = master.config.get(IMPORTANCE_FIELD) if hasattr(master, "config") else None
 
     def _entry(task: dict, blocked_count: int) -> dict:
         entry = {
-            "task_id": task.get("id", ""),
-            "name": task.get("name", ""),
-            "brief": task.get("brief", ""),
-            "module": task.get("module", ""),
-            "importance": effective_importance(task, blocked_count, imp_thresholds),
+            TASK_ID_KEY: task.get(ID_FIELD, ""),
+            NAME_FIELD: task.get(NAME_FIELD, ""),
+            BRIEF_FIELD: task.get(BRIEF_FIELD, ""),
+            MODULE_FIELD: task.get(MODULE_FIELD, ""),
+            IMPORTANCE_FIELD: effective_importance(task, blocked_count, imp_thresholds),
             "blocked_downstream_count": blocked_count,
-            "source": task.get("source"),
+            SOURCE_FIELD: task.get(SOURCE_FIELD),
         }
-        if "difficulty" in task:
-            entry["difficulty"] = task["difficulty"]
+        if DIFFICULTY_FIELD in task:
+            entry[DIFFICULTY_FIELD] = task[DIFFICULTY_FIELD]
         return entry
 
     blocked_counts = compute_downstream_blocked(tasks, state)
@@ -76,12 +92,12 @@ def _cmd_pool(args) -> dict:
         # --all：包含非就绪任务并附加 status 字段
         all_entries = []
         for task in tasks:
-            tid = task.get("id", "")
+            tid = task.get(ID_FIELD, "")
             ts = state.get(tid)
             entry = _entry(task, blocked_counts.get(tid, 0))
-            entry["status"] = ts.status if ts else "pending"
+            entry[STATUS_KEY] = ts.status if ts else STATUS_PENDING
             all_entries.append(entry)
-        return {"pool": all_entries, "pool_size": len(all_entries), "all": True}
+        return {"pool": all_entries, POOL_SIZE_KEY: len(all_entries), "all": True}
 
     candidates = build_pool(
         tasks, state, capabilities=_flatten_nargs(args.capabilities)
@@ -89,7 +105,7 @@ def _cmd_pool(args) -> dict:
     candidates = sort_candidates(candidates, importance_thresholds=imp_thresholds)
     return {
         "pool": [_entry(c.task, c.blocked_downstream_count) for c in candidates],
-        "pool_size": len(candidates),
+        POOL_SIZE_KEY: len(candidates),
     }
 
 def _cmd_doctor(args):
@@ -215,7 +231,7 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict | None:
             _stale = {}
         if _stale:
             result["stale_reviews"] = [
-                {"task_id": tid, **v}
+                {TASK_ID_KEY: tid, **v}
                 for tid, v in sorted(_stale.items(), key=lambda kv: kv[1]["age_s"], reverse=True)
             ]
     # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
@@ -247,7 +263,7 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict | None:
                     file=_sys.stderr,
                 )
     if args.audit_merge and args.task is None:
-        result["merge_audit"] = merge_audit(store, tasks, orchd_dir.parent)
+        result[MERGE_AUDIT_KEY] = merge_audit(store, tasks, orchd_dir.parent)
     if getattr(args, "audit_intake", False) and args.task is None:
         result["intake_audit"] = intake_audit(orchd_dir.parent)
     if getattr(args, "audit_revive", False) and args.task is None:

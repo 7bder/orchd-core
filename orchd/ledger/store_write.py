@@ -14,7 +14,12 @@ from __future__ import annotations
 import json
 
 from datetime import datetime, timezone
-from orchd.contracts.events import TERMINAL_STATUSES, normalize_event, validate_event
+from orchd.contracts.events import (
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+    normalize_event,
+    validate_event,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger.events import _event_target_status
 from orchd.ledger.identity import _touch_session_last_seen
@@ -130,7 +135,7 @@ class _StoreWriteMixin:
                 current = self.replay().get(task_id)
                 validate_transition(
                     event.get("type", ""),
-                    current.status if current else "pending",
+                    current.status if current else STATUS_PENDING,
                     target,
                 )
             self.backend.append_event(event)

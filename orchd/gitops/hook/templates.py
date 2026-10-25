@@ -5,6 +5,15 @@
 
 from __future__ import annotations
 
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_DONE,
+    EVENT_RETRACT,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_SUBMITTED,
+)
+
+
 
 # hook 归属标记（owner-aware 判定）：生成物首部注释行。宿主自有（husky / lint-staged
 # / 手写）的 pre-commit 不含该标记，引擎据此只覆盖 / 删除自己生成的 hook，
@@ -159,8 +168,8 @@ except SystemExit:
 except Exception as _exc:
     print("[orchd E020] ledger-state 查询失败：%s" % _exc, file=sys.stderr)
     sys.exit(5)
-_task_types = ("CLAIMED", "REVIEW_CLAIMED", "DONE", "RETRACT", "REVIEW_SUBMITTED")
-_review_types = ("REVIEW_CLAIMED", "REVIEW_SUBMITTED", "RETRACT")
+_task_types = (__ORCHD_TASK_EVENT_TYPES__)
+_review_types = (__ORCHD_REVIEW_EVENT_TYPES__)
 _last_task = "EMPTY"
 _last_review = "EMPTY"
 for _ev in _events:
@@ -176,3 +185,23 @@ for _ev in _events:
 print(_last_task)
 print(_last_review)
 """
+_HOOK_PY_LEDGER_STATE = _HOOK_PY_LEDGER_STATE.replace(
+    "__ORCHD_TASK_EVENT_TYPES__",
+    ", ".join(
+        f'"{_name}"'
+        for _name in (
+            EVENT_CLAIMED,
+            EVENT_REVIEW_CLAIMED,
+            EVENT_DONE,
+            EVENT_RETRACT,
+            EVENT_REVIEW_SUBMITTED,
+        )
+    ),
+).replace(
+    "__ORCHD_REVIEW_EVENT_TYPES__",
+    ", ".join(
+        f'"{_name}"'
+        for _name in (EVENT_REVIEW_CLAIMED, EVENT_REVIEW_SUBMITTED, EVENT_RETRACT)
+    ),
+)
+

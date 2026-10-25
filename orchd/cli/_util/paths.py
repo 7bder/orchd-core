@@ -12,10 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from orchd.constants import ORCHD_ALLOW_CONTAINER_ROOT_ENV
 from orchd.errors import ErrorCode, OrchdError
 
 
-_ORCHD_ALLOW_CONTAINER_ROOT = "ORCHD_ALLOW_CONTAINER_ROOT"
+_ORCHD_ALLOW_CONTAINER_ROOT = ORCHD_ALLOW_CONTAINER_ROOT_ENV  # 变量名真源：orchd.constants
 
 
 

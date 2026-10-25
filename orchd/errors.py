@@ -1,7 +1,7 @@
 """Orchd 统一错误处理模块。
 
 本模块提供四个核心组件：
-- ErrorCode 枚举：定义 E001–E040 码段的错误码（含 E031/E032/E035 三个
+- ErrorCode 枚举：定义 E001–E041 码段的错误码（含 E031/E032/E035 三个
   告警/拒绝码，统一纳入枚举以保证错误响应契约完整性）。**成员数量以枚举成员
   为准，本处不记账**——历史教训：此处写死的计数与成员数漂移（写 36 实为 38），
   根治见 task-contract-drift-and-metatest-sync，契约由
@@ -21,7 +21,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """全码段错误码枚举（E001–E040，无空洞）。
+    """全码段错误码枚举（E001–E041，无空洞）。
 
     成员数量以本枚举成员为准：注释与文档不重复记账，避免与枚举漂移
     （写死计数曾出现「注释 36 / 实际 38」）。码段范围同样由本类 docstring
@@ -71,24 +71,25 @@ class ErrorCode(Enum):
     E038 = "brief_decl_count_mismatch"  # 声明口径校验：brief「files_to_edit 控 N」与实际声明数不一致（warning 级，task-decl-consistency-error-code）
     E039 = "shared_entry_verify_gap"  # 共享入口改动的 verify 覆盖缺口（done 前置阻断，channel A，task-shared-entry-verify-gate）
     E040 = "ac_verify_gap"  # AC 声称「零残留 / 全仓」可判定性质但 verify_command 未覆盖（warning 级，task-ac-verify-coverage）
+    E041 = "serial_source_claim_conflict"  # 同 source 串行门：同 source 存在在手（claimed/done/in_review）任务时拒绝 claim 该 source 其他卡（channel A，engine-discipline-hardening 停服施工 2026-10-23）
 
 
 # warning 级错误码（设计 §5）：不阻断操作，默认不触发 lesson 注入，仅 agent 主动打点。
 WARNING_CODES = frozenset({
-    "E023",  # vague_acceptance_criteria
-    "E026",  # unexempted_test_coupling
-    "E028",  # dry_run_assertion_mismatch
-    "E029",  # granularity_overflow
-    "E030",  # runtime_file_integrity
-    "E031",  # roadmap_landing_warning
-    "E035",  # session_collision_warning
-    "E038",  # brief_decl_count_mismatch
-    "E040",  # ac_verify_gap
+    ErrorCode.E023.name,  # vague_acceptance_criteria
+    ErrorCode.E026.name,  # unexempted_test_coupling
+    ErrorCode.E028.name,  # dry_run_assertion_mismatch
+    ErrorCode.E029.name,  # granularity_overflow
+    ErrorCode.E030.name,  # runtime_file_integrity
+    ErrorCode.E031.name,  # roadmap_landing_warning
+    ErrorCode.E035.name,  # session_collision_warning
+    ErrorCode.E038.name,  # brief_decl_count_mismatch
+    ErrorCode.E040.name,  # ac_verify_gap
 })
 
 # 引擎预判「值得上报」的 warning 码（设计 §5.1 信号 A：suggest_report=true）。
 SUGGEST_REPORT_CODES = frozenset({
-    "E030",  # runtime_file_integrity：深层问题征兆，允许主动 lesson 沉淀
+    ErrorCode.E030.name,  # runtime_file_integrity：深层问题征兆，允许主动 lesson 沉淀
 })
 
 # 双语境码登记（task-channel-a-severity-param-raise ①）：既属 ``WARNING_CODES``
@@ -99,9 +100,9 @@ SUGGEST_REPORT_CODES = frozenset({
 # 集合口径由 tests/test_channel_a_severity.py 钉住：
 #   == WARNING_CODES ∩ {码 | "A" ∈ ERROR_CODE_CHANNELS[码]}
 SEVERITY_WARNING_BUT_BLOCKING = frozenset({
-    "E028",  # dry_run_assertion_mismatch（A 通道下阻断注册）
-    "E029",  # granularity_overflow（A 通道下拒绝注册）
-    "E030",  # runtime_file_integrity（A 通道下阻断回收）
+    ErrorCode.E028.name,  # dry_run_assertion_mismatch（A 通道下阻断注册）
+    ErrorCode.E029.name,  # granularity_overflow（A 通道下拒绝注册）
+    ErrorCode.E030.name,  # runtime_file_integrity（A 通道下阻断回收）
 })
 
 
@@ -178,7 +179,7 @@ def to_json_response(error: OrchdError) -> dict[str, Any]:
     打点 lesson（§5.1 信号 A）。
 
     返回:
-        {"error": {"code": "E003", "message": "...", "details": [...],
+        {"error": {"code": ErrorCode.E003.name, "message": "...", "details": [...],
                    "severity": "error", "suggest_report": false}}
     """
     code_name = error.code.name

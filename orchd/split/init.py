@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger import Store, _write_text_atomic, resolve_store_dir
 from orchd.spec import Master, validate_references, validate_structure
@@ -56,6 +58,18 @@ def init(orchd_dir: Path, master: Master) -> dict[str, Any]:
         # 为每个 module 生成 spec.json（目录名 = module_id，如 mod-foundation/）
         modules = master.modules
         tasks = master.tasks
+        # 对账清理（debug-pack C3）：删除已移出 master 的旧模块快照目录——此前只
+        # 前向写、不清理孤儿，re-init 后 doctor 会持续报孤儿残留。只删「目录 +
+        # 含 spec.json + 名不在 master.modules」者，best-effort（ignore_errors）。
+        _known_modules = {_validate_module_id(m.get("id", "")) for m in modules}
+        if store_root.is_dir():
+            for _orphan in sorted(store_root.iterdir()):
+                if not _orphan.is_dir() or not (_orphan / "spec.json").is_file():
+                    continue
+                if _orphan.name in _known_modules:
+                    continue
+                shutil.rmtree(_orphan, ignore_errors=True)
+                created_files.append(f"removed_orphan:{_orphan.name}")
         for module in modules:
             mod_id = _validate_module_id(module.get("id", ""))
             mod_tasks = [t for t in tasks if t.get("module") == mod_id]

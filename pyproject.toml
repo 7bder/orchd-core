@@ -152,7 +152,8 @@ ignore = [
 "orchd/onboard/request/conflicts.py" = ["E501"]
 "orchd/onboard/request/entry.py" = ["E501"]
 "orchd/onboard/request/routing.py" = ["E501"]
-"orchd/report/status.py" = ["E501"]
+# T1b（task-convergence-task-status-surface）：report/status.py 把状态字面量换成
+# STATUS_* 常量后行宽回落到 100 以内，按本门判据「清零文件须同步删条目」删键。
 "orchd/spec/quality.py" = ["E501"]
 "orchd/spec/roadmap.py" = ["E501"]
 

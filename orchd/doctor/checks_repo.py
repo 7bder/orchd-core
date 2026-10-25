@@ -20,6 +20,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from orchd.names import (
+    MASTER_FILE,
+)
 from orchd.doctor.checks_runtime import (
     _check_checkpoint_consistency, _check_event_schema, _check_hung_git_processes,
     _check_lessons_runtime, _check_migration_consistency,
@@ -465,7 +468,7 @@ def _check_master_single_copy(project_root: Path) -> list[dict[str, str]]:
             # 唯一权威 = 主工作树，其自身的 .orchd/_master.json 必在，不算残留
             if child.resolve() == canonical:
                 continue
-            wt_master = child / ".orchd" / "_master.json"
+            wt_master = child / ".orchd" / MASTER_FILE
             if wt_master.exists():
                 residual.append(str(child))
     except OSError as exc:  # INV-4a：扫描异常 = 盲区，不得报 ok（此前"扫描异常，跳过"）

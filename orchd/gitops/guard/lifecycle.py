@@ -14,10 +14,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_AMEND,
+)
 from orchd.errors import ErrorCode, OrchdError
 
 from orchd.gitops.query import check_workspace_state, get_default_branch, is_task_worktree
 
+from orchd.line import TASK_BRANCH_ROOT
 from orchd.line_ctx import resolve_trunk_for
 
 from .checkout import managed_checkout_branch
@@ -165,7 +169,7 @@ def _audit_lifecycle_release(
         store.acquire_lock()
         try:
             ev = make_event(
-                task_id, _audit_agent, "AMEND",
+                task_id, _audit_agent, EVENT_AMEND,
                 reason="lifecycle_release",
                 branch=trunk,
                 from_branch=from_branch,
@@ -203,9 +207,9 @@ def _implementer_ensure_trunk(
         if not state.get("available") or not state.get("clean"):
             return None
         branch = state.get("branch")
-        if not isinstance(branch, str) or not branch.startswith("task/"):
+        if not isinstance(branch, str) or not branch.startswith(TASK_BRANCH_ROOT):
             return None
-        stranded_task_id = branch[len("task/"):].rsplit("/", 1)[-1]
+        stranded_task_id = branch[len(TASK_BRANCH_ROOT):].rsplit("/", 1)[-1]
         if not stranded_task_id:
             return None
         st = store.replay().get(stranded_task_id)
@@ -242,7 +246,7 @@ def _audit_trunk_restore(
         store.acquire_lock()
         try:
             ev = make_event(
-                task_id, _audit_agent, "AMEND",
+                task_id, _audit_agent, EVENT_AMEND,
                 reason="auto_trunk_restore",
                 branch=trunk,
                 from_branch=from_branch,

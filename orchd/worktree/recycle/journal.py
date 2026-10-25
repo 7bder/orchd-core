@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_QUIET_ENV, ORCHD_SESSION_ID_ENV
 from orchd.worktree.bindings import (
     _TASK_WT_PREFIX, _task_wt_name, load_bindings, unbind_task_wt,
 )
@@ -30,7 +31,7 @@ def _recycle_actor() -> str:
             return agent
     except Exception:
         pass
-    return os.environ.get("ORCHD_SESSION_ID") or "<unknown>"
+    return os.environ.get(ORCHD_SESSION_ID_ENV) or "<unknown>"
 
 
 
@@ -51,7 +52,7 @@ def _recycle_quiet() -> bool:
     Returns:
         True = 抑制留痕（不写 stderr）；False = 照常留痕。
     """
-    return os.environ.get("ORCHD_QUIET", "").strip().lower() in _QUIET_TRUTHY
+    return os.environ.get(ORCHD_QUIET_ENV, "").strip().lower() in _QUIET_TRUTHY
 
 
 

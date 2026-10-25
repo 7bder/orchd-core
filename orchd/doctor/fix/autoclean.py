@@ -8,6 +8,7 @@ import os
 import shutil
 import time
 
+from orchd.constants import ORCHD_AUTO_CLEAN_ENV
 from orchd.doctor.residue import _AUTO_CLEAN_TYPES, _LEGACY_MOVE_TYPES, detect_residues
 from orchd.doctor.runtime import _pre_delete_lock_recheck, _run_git
 from .delete import _delete_file
@@ -157,7 +158,7 @@ def _auto_clean_impl(project_root: Path,
         }
     """
     project_root = Path(project_root).resolve()
-    mode = os.environ.get("ORCHD_AUTO_CLEAN", "").strip().lower()
+    mode = os.environ.get(ORCHD_AUTO_CLEAN_ENV, "").strip().lower()
     disabled = mode in ("off", "report")
 
     from orchd.worktree import _log_recycle, _recycle_actor

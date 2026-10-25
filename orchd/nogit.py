@@ -33,6 +33,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_SNAPSHOT_ROOT_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
 
@@ -84,7 +85,7 @@ _HASH_EXCLUDED_DIRS = frozenset({
 
 def snapshot_store_root(project_root: Path) -> Path:
     """快照存储根：``<project_root>/.orchd/snapshots``（或 ORCHD_SNAPSHOT_ROOT）。"""
-    override = os.environ.get("ORCHD_SNAPSHOT_ROOT")
+    override = os.environ.get(ORCHD_SNAPSHOT_ROOT_ENV)
     if override:
         return Path(override)
     return Path(project_root) / ".orchd" / SNAPSHOT_DIRNAME

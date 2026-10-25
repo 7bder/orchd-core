@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
+)
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.schema_policy import amendable_fields, terminal_attachable_fields
 from typing import Any
@@ -41,9 +46,9 @@ def _amend_route_state_matrix(
         if changed_fields <= amendable_fields():
             # task-amend-scope-add：claimed 任务 files_to_edit 只增不删
             # 添加遗漏连带文件允许，删除已声明文件拒绝（E007）
-            if "files_to_edit" in changed_fields:
-                old_files = set(old_task.get("files_to_edit", []))
-                new_files = set(task.get("files_to_edit", []))
+            if FILES_TO_EDIT_FIELD in changed_fields:
+                old_files = set(old_task.get(FILES_TO_EDIT_FIELD, []))
+                new_files = set(task.get(FILES_TO_EDIT_FIELD, []))
                 removed = old_files - new_files
                 if removed:
                     errors.append({
@@ -110,9 +115,9 @@ def _amend_route_state_matrix(
             # 改变 acceptance_criteria 条数（阈值 0，确定性）：条数增减会改变
             # E029 粒度语义与验收面，属范围变更而非文本对齐。命中即 E007，
             # 指引用户裁决后走逃生口（force-status 回 pending）。
-            if revise_terminal == tid and "acceptance_criteria" in text_revised:
-                _old_ac = old_task.get("acceptance_criteria") or []
-                _new_ac = task.get("acceptance_criteria") or []
+            if revise_terminal == tid and ACCEPTANCE_CRITERIA_FIELD in text_revised:
+                _old_ac = old_task.get(ACCEPTANCE_CRITERIA_FIELD) or []
+                _new_ac = task.get(ACCEPTANCE_CRITERIA_FIELD) or []
                 if len(_old_ac) != len(_new_ac):
                     errors.append({
                         "task_id": tid,
@@ -138,13 +143,13 @@ def _amend_route_state_matrix(
                 "status": status,
                 "fields": sorted(remaining),
             })
-        elif remaining <= {"files_to_edit", "exempt_files"}:
+        elif remaining <= {FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD}:
             # task-terminal-decl-drift-channel：终态声明路径规范化通道。
             # 仅当删的全不存在、增的全存在（相对 project_root）时放行并
             # 同步 snapshot；否则仍 E007。防"借规范化之名篡改声明"。
             sync_entries: list[dict[str, Any]] = []
             normalized_ok = True
-            for field in ("files_to_edit", "exempt_files"):
+            for field in (FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD):
                 if field not in remaining:
                     continue
                 old_decl = old_task.get(field, []) or []

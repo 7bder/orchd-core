@@ -23,9 +23,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+from orchd.names import (
+    LAYOUT_FILE,
+)
+from orchd.constants import (
+    ORCHD_BAKED_PY_ENV,
+    ORCHD_BAKED_SRC_ENV,
+    ORCHD_LINE_TASK_PREFIX_ENV,
+)
 from typing import TYPE_CHECKING, Any, Callable
 
-from orchd.contracts.events import TERMINAL_STATUSES as _GHOST_TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_FORCE_STATUS,
+    EVENT_RETRACT,
+    TERMINAL_STATUSES as _GHOST_TERMINAL_STATUSES,
+)
 from orchd.doctor.locks import (
     _detect_git_tracked_locks, _detect_orphan_session_locks, _detect_residual_intake_locks,
     _detect_zombie_sessions,
@@ -248,7 +261,7 @@ def _detect_legacy_flat_residues(project_root: Path) -> list[dict[str, Any]]:
     try:
         from orchd.worktree.layout import _LAYOUT_MARKER as _layout_marker
     except Exception:
-        _layout_marker = ".layout.json"
+        _layout_marker = LAYOUT_FILE
     for name in sorted(_RUNTIME_STATE_FILES):
         if name == _layout_marker:
             continue
@@ -344,9 +357,9 @@ def _detect_hook_enforcement_gaps(project_root: Path) -> list[dict[str, Any]]:
 
         baked: dict[str, str] = {}
         for line in head:
-            if line.startswith("ORCHD_BAKED_PY="):
+            if line.startswith(f"{ORCHD_BAKED_PY_ENV}="):
                 baked["py"] = _unquote(line.split("=", 1)[1])
-            elif line.startswith("ORCHD_BAKED_SRC="):
+            elif line.startswith(f"{ORCHD_BAKED_SRC_ENV}="):
                 baked["src"] = _unquote(line.split("=", 1)[1])
         causes: list[str] = []
         exp_py, exp_src = hook_mod._baked_hook_endpoints(root)
@@ -359,7 +372,7 @@ def _detect_hook_enforcement_gaps(project_root: Path) -> list[dict[str, Any]]:
             if src and not (Path(src) / "orchd" / "gitops" / "ref_tx_hook.py").is_file():
                 causes.append(f"烘焙引擎源码根已失效：{src}")
         exp_line, _exp_trunk = hook_mod._line_ref_tx_env(root)
-        if exp_line and "ORCHD_LINE_TASK_PREFIX" not in "\n".join(head):
+        if exp_line and ORCHD_LINE_TASK_PREFIX_ENV not in "\n".join(head):
             causes.append("项目已启用多线但 hook 未烘焙线命名空间前缀（回退单线口径）")
         if not causes:
             return []
@@ -652,6 +665,30 @@ def _detect_ghost_tasks(project_root: Path) -> list[dict[str, Any]]:
             target_event_id,
         })
 
+    # 孤儿模块快照（debug-pack C2）：<store_root>/<mod_id>/spec.json 的模块已不在
+    # master.modules——快照目录无账本可依，原检测以 master 为视野，看不见这类残留。
+    try:
+        from orchd.ledger import resolve_store_dir
+
+        _master_modules = {m.get("id", "") for m in getattr(master, "modules", [])}
+        _store_root = resolve_store_dir(Path(project_root) / ".orchd")
+        if _store_root.is_dir():
+            for _d in sorted(_store_root.iterdir()):
+                if not _d.is_dir() or not (_d / "spec.json").is_file():
+                    continue
+                if _d.name in _master_modules:
+                    continue
+                residues.append({
+                    "path": str(_d / "spec.json"),
+                    "type": "orphan_module_snapshot",
+                    "reason": (f"模块快照 {_d.name}/spec.json 不在 master.modules"
+                               f"（已移出 master 的旧模块快照残留）"),
+                    "action": "orphan_module_manual",
+                })
+    except Exception as exc:  # INV-4a：检测不可用须留痕，不得静默当"无残留"
+        residues.append(_unavailable_residue("orphan_module_snapshots", exc,
+                                              Path(project_root)))
+
     return residues
 
 
@@ -672,10 +709,10 @@ def _ghost_retract_target(events: list[dict[str, Any]]) -> str | None:
     """
     already_retracted = {
         ev.get("target_event_id")
-        for ev in events if ev.get("type") == "RETRACT"
+        for ev in events if ev.get("type") == EVENT_RETRACT
     }
     for ev in events:
-        if ev.get("type") in ("RETRACT", "FORCE_STATUS"):
+        if ev.get("type") in (EVENT_RETRACT, EVENT_FORCE_STATUS):
             continue
         if ev.get("event_id") in already_retracted:
             continue
@@ -725,6 +762,9 @@ _MANUAL_ACTIONS = frozenset({
     # 强制层 hook 自检项（task-enforcement-degrade-audit-trail）：只告警，
     # --fix 与 auto_clean 恒跳过（删 hook 等于自毁强制层）。
     "hook_manual",
+    # 孤儿模块快照（debug-pack C2）：已移出 master 的 mod-*/spec.json；清理走
+    # re-init 对账（C3）与人工确认，--fix 不自动删（防误删在用快照）。
+    "orphan_module_manual",
 })
 
 

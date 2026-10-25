@@ -5,13 +5,21 @@
 （review / impl / terminal）。拆分记录见 design/file-split-program-20261015.md §4.6.2。
 
 依赖方向：``stage`` → ``digest.py``（``_ENTRY_CMD``）+ ``paths.py``（``read_for`` /
-``template_for``）；不导入聚合入口（否则成加载期环）。
+``template_for``）+ ``contracts.events``（任务状态名真源）；不导入聚合入口（否则成加载期环）。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from orchd.contracts.events import (
+    STATUS_CLAIMED,
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+)
 from .digest import _ENTRY_CMD
 from .paths import read_for, template_for
 
@@ -35,8 +43,10 @@ def _summarize(
     Returns:
         六状态计数 + 关键派生态（含 rework 返工任务数）。
     """
-    counts: dict[str, Any] = {"pending": 0, "claimed": 0, "done": 0, "in_review": 0,
-                              "completed": 0, "cancelled": 0}
+    counts: dict[str, Any] = {
+        STATUS_PENDING: 0, STATUS_CLAIMED: 0, STATUS_DONE: 0,
+        STATUS_IN_REVIEW: 0, STATUS_COMPLETED: 0, STATUS_CANCELLED: 0,
+    }
     my_claimed: list[str] = []
     rework = 0
     first_rework_tid: str | None = None
@@ -53,15 +63,15 @@ def _summarize(
     for task in tasks:
         tid = task.get("id", "")
         ts = state.get(tid)
-        s = ts.status if ts else "pending"
+        s = ts.status if ts else STATUS_PENDING
         counts[s] = counts.get(s, 0) + 1
-        if s == "pending" and ts and ts.attempt_count > 0:
+        if s == STATUS_PENDING and ts and ts.attempt_count > 0:
             rework += 1
             if first_rework_tid is None:
                 first_rework_tid = tid
-        if s == "claimed" and agent_id and ts and ts.claimed_by == agent_id:
+        if s == STATUS_CLAIMED and agent_id and ts and ts.claimed_by == agent_id:
             my_claimed.append(tid)
-        if s == "in_review":
+        if s == STATUS_IN_REVIEW:
             if agent_id and ts and ts.review_claimed_by == agent_id:
                 counts["my_in_review"] = counts.get("my_in_review", 0) + 1
                 if my_review_tid is None:
@@ -104,7 +114,7 @@ def _classify(
             "step": "empty_project" if has_master else "first_time",
             "focus_tid": None,
         }
-    if c.get("in_review", 0) > 0:
+    if c.get(STATUS_IN_REVIEW, 0) > 0:
         # 优先级（task-guidance-review-priority-fix）：**先收尾本 agent 已领未提交的审查，
         # 再谈领新审查**。原先 first_unclaimed_review 判定在前，导致只要池中存在任何未认领
         # 审查，submit_review 出口就永不可达——会话被引去领他任务的审查，而该 claim 会被
@@ -119,17 +129,17 @@ def _classify(
         return {"step": "wait_review", "focus_tid": None}
     if c.get("rework", 0) > 0 and not c.get("my_claimed"):
         return {"step": "rework_first", "focus_tid": c.get("first_rework_tid")}
-    if c["pending"] > 0 and not c.get("my_claimed"):
+    if c[STATUS_PENDING] > 0 and not c.get("my_claimed"):
         # 忙度只看**本 agent** 的 claimed（原实现用全局 claimed，导致其他会话一旦有
         # 任务在实现，本 agent 永远拿不到 request_impl，与 request 的候选结论打架）
         return {"step": "request_impl", "focus_tid": None}
     if c.get("my_claimed"):
         return {"step": "done", "focus_tid": c["my_claimed"][0]}
-    if c["claimed"] > 0 or c["done"] > 0:
+    if c[STATUS_CLAIMED] > 0 or c[STATUS_DONE] > 0:
         return {"step": "wait_review", "focus_tid": None}
-    if c["cancelled"] > 0:
+    if c[STATUS_CANCELLED] > 0:
         return {"step": "optional_cancel", "focus_tid": None}
-    if c["completed"] > 0 and c["completed"] == c["total"]:
+    if c[STATUS_COMPLETED] > 0 and c[STATUS_COMPLETED] == c["total"]:
         return {"step": "done_all", "focus_tid": None}
     return {"step": "check_status", "focus_tid": None}
 
@@ -285,7 +295,7 @@ def _review_step_guidance(
             "template": review_templates,
             "command": cmd,
             "hint": (
-                f"有 {c['in_review']} 个任务待审查：领取审查任务（{phase_label} 阶段）——"
+                f"有 {c[STATUS_IN_REVIEW]} 个任务待审查：领取审查任务（{phase_label} 阶段）——"
                 f"认领须在任务 worktree 内执行且带 --confirm；审查结论也须在任务 worktree 内提交"
                 f"（E018 守卫：目标目录必须等于任务 worktree，防错目录审查）；提交成功后引擎回收"
                 f"该 worktree，回收前请先切出任务目录（Windows 句柄占用会导致回收失败）；"
@@ -355,7 +365,7 @@ def _impl_step_guidance(
             # hint 保持紧凑（task-guidance-block-budget-root-fix：预算由 _BLOCK_MAX
             # 求和不等式统一管理，不再有 200 字符硬编码上限）；
             # 测试纪律经 read 路由送达，不挤占 hint 额度。
-            "hint": f"有 {c['pending']} 个待认领任务：现在没有活跃实现，可领取一个新任务。",
+            "hint": f"有 {c[STATUS_PENDING]} 个待认领任务：现在没有活跃实现，可领取一个新任务。",
         }
     if step == "done":
         tid = cls["focus_tid"]

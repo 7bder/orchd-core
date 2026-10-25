@@ -11,6 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from orchd.names import (
+    IDEAS_ARCHIVE_FILE,
+    IDEAS_FILE,
+)
 from orchd.errors import ErrorCode, OrchdError
 
 from .fallback import (
@@ -124,7 +128,7 @@ def _archivable_ideas_count(
         # 以免先改写并提交了 IDEAS 文档。
         return 0, degraded
     try:
-        ideas_path = resolve_workspace_root(master_path.parent.parent) / "IDEAS.md"
+        ideas_path = resolve_workspace_root(master_path.parent.parent) / IDEAS_FILE
     except Exception as exc:
         return 0, _unusable("resolve_workspace_root", exc)
     if not ideas_path.exists():
@@ -367,7 +371,7 @@ def _commit_archived_ideas(project_root: Path) -> dict:
     try:
         return ensure_committed(
             canon_root,
-            [_rel("IDEAS.md"), _rel("IDEAS-archive.md")],
+            [_rel(IDEAS_FILE), _rel(IDEAS_ARCHIVE_FILE)],
             "chore(ideas): 自动归档已完结/已放弃条目",
         )
     except Exception as exc:

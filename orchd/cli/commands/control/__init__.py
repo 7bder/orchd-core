@@ -14,10 +14,20 @@ roundtrip <- commands。
 from .constants import _VERIFY_TIMEOUT_MIN, _VERIFY_TIMEOUT_MAX
 from .declarations import _log_decl_withdraw, _decl_withdraw_branch_overlap
 from .patch_validation import _validate_verify_timeout_patch, _validate_additional_sources_patch
-from .proposals import _consume_registered_proposal, _apply_register_proposals
+from .proposals import (
+    _apply_register_proposals,
+    _closeout_ids,
+    _consume_registered_proposal,
+    _expand_serial_order,
+    _validate_closeout_coverage,
+)
 from .persist import _persist_master_durable, _fsync_file_durable
 from .amend_admission import _amend_admission
-from .amend_patch_fields import _amend_patch_fields
+from .amend_patch_fields import (
+    _amend_patch_fields,
+    _apply_depends_on_patch,
+    _apply_text_field_patch,
+)
 from .amend_register_gate import _amend_register_gate
 from .amend_persist_commit import _amend_persist_commit
 from .amend_impl import _amend_impl

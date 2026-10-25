@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    SOURCE_FIELD,
+)
+from orchd.contracts.events import (
+    STATUS_CLAIMED,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger import TaskState
 from orchd.spec import Master, validate_source
@@ -38,10 +47,10 @@ def _amend_route_tasks(
     new_task_ids = set()
     conflict_warnings: list[dict[str, Any]] = []
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         new_task_ids.add(tid)
         ts = state.get(tid)
-        status = ts.status if ts else "pending"
+        status = ts.status if ts else STATUS_PENDING
 
         if tid not in existing_tasks:
             # 新增任务强制 source 声明（2026-08-11 硬约束 + 存量豁免）。
@@ -52,7 +61,7 @@ def _amend_route_tasks(
             # 终态为准：completed/cancelled 跳过 source 硬要求（与 validate_source
             # 的 P2-2 豁免同源）。
             _terminal_drifted = status in TERMINAL_STATUSES
-            source = task.get("source")
+            source = task.get(SOURCE_FIELD)
             if not _terminal_drifted and (
                     not source or not isinstance(source, str)
                     or not source.strip()):
@@ -69,20 +78,20 @@ def _amend_route_tasks(
             # files_to_edit 冲突降级为 warning（不阻断注册）。冲突硬边界
             # 在 claim E010（活跃集合判定）+ request 依赖感知强制过滤
             # （与 claimed 冲突、与 pending 非依赖任务冲突均被过滤）。
-            new_files = set(task.get("files_to_edit", []))
+            new_files = set(task.get(FILES_TO_EDIT_FIELD, []))
             if new_files:
                 conflicts: list[dict[str, Any]] = []
                 for other in tasks:
-                    oid = other.get("id")
+                    oid = other.get(ID_FIELD)
                     if not isinstance(oid, str):
                         continue
                     if oid == tid:
                         continue
                     ots = state.get(oid)
-                    ostat = ots.status if ots else "pending"
-                    if ostat not in ("pending", "claimed"):
+                    ostat = ots.status if ots else STATUS_PENDING
+                    if ostat not in (STATUS_PENDING, STATUS_CLAIMED):
                         continue
-                    overlap = new_files & set(other.get("files_to_edit", []))
+                    overlap = new_files & set(other.get(FILES_TO_EDIT_FIELD, []))
                     if overlap:
                         conflicts.append({
                             "task_id": oid,
@@ -145,7 +154,7 @@ def _amend_route_tasks(
             idx = int(m.group(1))
             if not (0 <= idx < len(master.tasks)):
                 continue
-            tid = master.tasks[idx].get("id", "")
+            tid = master.tasks[idx].get(ID_FIELD, "")
             if tid in new_task_set:
                 sources_invalid.append(tid)
                 source_errors.append({

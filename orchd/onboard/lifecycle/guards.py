@@ -15,6 +15,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_AMEND,
+)
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
 from orchd.gitops import (
     GUARD_FAIL_CLOSED,
@@ -25,6 +28,15 @@ from orchd.gitops import (
     list_tracked_changes,
     main_worktree_root,
     run_guard,
+)
+from orchd.contracts.responses import (
+    COMMAND_KEY,
+    HINT_KEY,
+    TASK_ID_KEY,
+)
+from orchd.contracts.task_schema import (
+    EXEMPT_FILES_FIELD,
+    FILES_TO_EDIT_FIELD,
 )
 
 
@@ -58,7 +70,7 @@ def _guard_cross_worktree_dirty(
         guard_name="main_worktree_dirty_overlap",
         on_error=GUARD_FAIL_CLOSED,
         fallback=[],
-        context={"task_id": task_id, "command": "done"},
+        context={TASK_ID_KEY: task_id, COMMAND_KEY: "done"},
         hint="检测未生效，已 fail-closed 阻断 done；确认 git 环境后重试 done",
         degraded=degraded_guards,
     ) or []
@@ -67,10 +79,10 @@ def _guard_cross_worktree_dirty(
             ErrorCode.E017,
             "dirty_workspace: 主工作树存在与当前任务 files_to_edit 重叠的未提交改动",
             [{
-                "task_id": task_id,
+                TASK_ID_KEY: task_id,
                 "overlap_files": overlap,
-                "files_to_edit": files_to_edit,
-                "hint": (
+                FILES_TO_EDIT_FIELD: files_to_edit,
+                HINT_KEY: (
                     "这些文件应在任务 worktree 内修改并由 done 提交；"
                     "请先提交/还原主工作树改动后重试"
                 ),
@@ -128,7 +140,7 @@ def _guard_declared_diff(
         guard_name="diagnose_missing_branch_files",
         on_error=GUARD_FAIL_CLOSED,
         fallback=[],
-        context={"task_id": task_id, "command": "done"},
+        context={TASK_ID_KEY: task_id, COMMAND_KEY: "done"},
         hint="声明文件 diff 校验未生效，已 fail-closed 阻断 done；确认 git 环境后重试",
         degraded=degraded_guards,
     ) or []
@@ -184,11 +196,11 @@ def _guard_declared_diff(
         ErrorCode.E010,
         "file_conflict: 声明文件未进入任务分支 diff",
         [{
-            "task_id": task_id,
+            TASK_ID_KEY: task_id,
             "missing_declared_files": missing_names,
             "reasons": reason_summary,
-            "files_to_edit": files_to_edit,
-            "hint": " | ".join(hints),
+            FILES_TO_EDIT_FIELD: files_to_edit,
+            HINT_KEY: " | ".join(hints),
         }],
     )
 
@@ -238,7 +250,7 @@ def _guard_zero_residual(
         guard_name="commit_zero_residual",
         on_error=GUARD_FAIL_CLOSED,
         fallback=[],
-        context={"task_id": task_id, "command": "done"},
+        context={TASK_ID_KEY: task_id, COMMAND_KEY: "done"},
         hint="零残留校验未生效，已 fail-closed 阻断 done；确认 git 环境后重试",
         degraded=degraded_guards,
     ) or []
@@ -248,9 +260,9 @@ def _guard_zero_residual(
         ErrorCode.E017,
         "dirty_workspace: files_to_edit 范围内仍有未提交跟踪改动",
         [{
-            "task_id": task_id,
+            TASK_ID_KEY: task_id,
             "residual_files": residual,
-            "hint": "引擎自动提交未覆盖这些文件，请先提交后重试 done",
+            HINT_KEY: "引擎自动提交未覆盖这些文件，请先提交后重试 done",
         }],
     )
 
@@ -275,8 +287,8 @@ def _guard_out_of_scope(
     """
     if not project_root:
         return
-    allowed: set[str] = set(task_def.get("files_to_edit", []))
-    allowed |= set(task_def.get("exempt_files", []))
+    allowed: set[str] = set(task_def.get(FILES_TO_EDIT_FIELD, []))
+    allowed |= set(task_def.get(EXEMPT_FILES_FIELD, []))
     # 固定资产豁免（对齐 L3 hook 的 amend 自动提交豁免）
     allowed |= {".orchd/_master.json", ".orchd/IDEAS.md"}
 
@@ -345,7 +357,7 @@ def _guard_out_of_scope(
         guard_name="out_of_scope_changes",
         on_error=GUARD_FAIL_CLOSED,
         fallback=[],
-        context={"task_id": task_id, "command": "done"},
+        context={TASK_ID_KEY: task_id, COMMAND_KEY: "done"},
         hint="越界改动检测未生效，已 fail-closed 阻断 done；确认 git 环境后重试",
         degraded=degraded_guards,
     ) or []
@@ -356,7 +368,7 @@ def _guard_out_of_scope(
     # 高风险类仍 E010 拒绝（护栏强度不下降）。
     from orchd.spec import is_concession_file
 
-    files_to_edit = [f for f in (task_def.get("files_to_edit") or []) if isinstance(f, str)]
+    files_to_edit = [f for f in (task_def.get(FILES_TO_EDIT_FIELD) or []) if isinstance(f, str)]
     concession: list[str] = []
     high_risk: list[str] = []
     for f in out_of_scope:
@@ -383,12 +395,12 @@ def _guard_out_of_scope(
         ErrorCode.E010,
         "file_conflict: 实现改动超出任务 files_to_edit∪exempt_files 声明范围",
         [{
-            "task_id": task_id,
+            TASK_ID_KEY: task_id,
             "out_of_scope_files": sorted(high_risk),
             "auto_registered_files": sorted(concession),
             "declared_files": sorted(allowed),
             "main_worktree": main_wt,
-            "hint": (
+            HINT_KEY: (
                 "实现只允许改动 files_to_edit/exempt_files 声明内的文件。"
                 "若确有必要连带修改，请回到主工作树补 files_to_edit 声明并执行 amend"
                 "（任务 worktree 不保留 _master.json，唯一权威 = 主工作树；"
@@ -437,7 +449,7 @@ def _auto_register_concession(
             for ev in store._read_ledger_lines(from_line=1):
                 if (
                     ev.get("task_id") == task_id
-                    and ev.get("type") == "AMEND"
+                    and ev.get("type") == EVENT_AMEND
                     and ev.get("reason") == "auto_concession_registration"
                 ):
                     already_registered.update(ev.get("files") or [])
@@ -451,7 +463,7 @@ def _auto_register_concession(
         try:
             for f in pending:
                 ev = make_event(
-                    task_id, agent_id, "AMEND",
+                    task_id, agent_id, EVENT_AMEND,
                     reason="auto_concession_registration",
                     files=[f],
                     hint=(

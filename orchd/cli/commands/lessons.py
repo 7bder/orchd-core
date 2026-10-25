@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_SESSION_ID_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.cli.identity import (
     _require_agent_id,
@@ -124,7 +125,7 @@ def _cmd_lesson_stage(args) -> dict:
     agent_id = _require_agent_id(orchd_dir)
     source = {
         "agent": agent_id,
-        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "session": os.environ.get(ORCHD_SESSION_ID_ENV, ""),
         "engine_version": __version__,
     }
     result = stage(
@@ -160,7 +161,7 @@ def _cmd_lesson_add(args) -> dict:
     agent_id = _resolve_agent_id(orchd_dir) or "human"
     source = {
         "agent": agent_id,
-        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "session": os.environ.get(ORCHD_SESSION_ID_ENV, ""),
         "engine_version": __version__,
     }
     return add(
@@ -189,7 +190,7 @@ def _cmd_lesson_report(args) -> dict:
     agent_id = _resolve_agent_id(orchd_dir) or "human"
     source = {
         "agent": agent_id,
-        "session": os.environ.get("ORCHD_SESSION_ID", ""),
+        "session": os.environ.get(ORCHD_SESSION_ID_ENV, ""),
         "engine_version": __version__,
     }
     return report(

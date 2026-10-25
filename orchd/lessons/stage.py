@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 import time
 
+from orchd.contracts.task_schema import (
+    ID_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.errors import ErrorCode, OrchdError
 from .storage import _append_jsonl, _lib_path, _lock_path, _read_jsonl, _staged_path
 from .text import _conflict_with, _next_lesson_id, _validate_lengths
@@ -43,7 +47,7 @@ def stage(
         "resolved": bool(resolved),
         "severity": severity,
         "urgent": bool(urgent),
-        "source": source,
+        SOURCE_FIELD: source,
     }
     if resolved and solution:
         conflict = _conflict_with(_read_jsonl(_lib_path(orchd_dir)), solution)
@@ -82,12 +86,12 @@ def add(
     _validate_lengths(symptom, solution)
     lesson_id = _next_lesson_id(orchd_dir)
     entry: dict[str, Any] = {
-        "id": lesson_id,
+        ID_FIELD: lesson_id,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "trigger": {"type": trigger_type, "key": trigger_key, "scene": scene},
         "symptom": symptom,
         "solution": solution,
-        "source": source,
+        SOURCE_FIELD: source,
         "severity": severity,
         "status": "proposed",
         "hits": 0,
@@ -105,7 +109,7 @@ def add(
     if not ok:
         return {"added": False, "skipped": True,
                 "reason": "lesson 入库因并发冲突跳过，不影响主流程"}
-    return {"added": True, "id": lesson_id, "similar_note": note}
+    return {"added": True, ID_FIELD: lesson_id, "similar_note": note}
 
 
 def report(
@@ -129,12 +133,12 @@ def report(
     _validate_lengths(symptom, "")
     lesson_id = _next_lesson_id(orchd_dir)
     entry: dict[str, Any] = {
-        "id": lesson_id,
+        ID_FIELD: lesson_id,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "trigger": {"type": trigger_type, "key": trigger_key, "scene": scene},
         "symptom": symptom,
         "solution": "",
-        "source": source,
+        SOURCE_FIELD: source,
         "severity": severity,
         "status": "proposed",
         "hits": 0,
@@ -145,4 +149,4 @@ def report(
     if not ok:
         return {"reported": False, "skipped": True,
                 "reason": "lesson 入库因并发冲突跳过，不影响主流程"}
-    return {"reported": True, "id": lesson_id}
+    return {"reported": True, ID_FIELD: lesson_id}

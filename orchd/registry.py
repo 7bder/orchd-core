@@ -19,11 +19,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from orchd.constants import ORCHD_REGISTRY_BACKEND_ENV
+
 if TYPE_CHECKING:  # pragma: no cover - 仅供类型标注
     from orchd.spec import Master
 
 # 适配器选择：显式参数 > 环境变量 > 缺省 file（切换适配器不改调用点语义）。
-_BACKEND_ENV = "ORCHD_REGISTRY_BACKEND"
+_BACKEND_ENV = ORCHD_REGISTRY_BACKEND_ENV  # 变量名真源：orchd.constants
 _DEFAULT_BACKEND = "file"
 
 # 内置适配器登记：name -> (module, class)，惰性导入（端口层不含实现细节）。

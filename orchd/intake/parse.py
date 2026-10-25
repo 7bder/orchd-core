@@ -34,9 +34,29 @@ def _atomic_write_text(path: Path, text: str) -> None:
     _fsync_dir(path.parent)
 
 
-# IDEAS.md 条目 status 合法值白名单（与 IDEAS.md 模板状态流转一致）
-# study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm/drop 裁决。
-_VALID_IDEA_STATUSES = frozenset({"pending", "taskified", "questioning", "dropped", "study"})
+# 灵感池状态词表**唯一真源**（single-source-truth-convergence Wave1-T2）：
+# 值即 IDEAS.md 条目 ``- status:`` 的合法取值；消费方（ideas/classify、
+# ideas/decision、intake/idea）一律引用下面的常量，不得再写第二套枚举或裸字面量。
+# 注意：本词表与任务状态词表（contracts/events.py 的 STATUS_*）**刻意不合并**——
+# 灵感四态与任务六态语义不同、流转不同，只是字形有重叠。
+# study（论证中，2026-08-15 idea-write-gate）：idea propose 写入的初始态，待用户 confirm
+#   升 pending 或 close 归档（task-intake-exit-verb-close 起 dropped 状态已下线：
+#   「放弃」不再是一个留在台账里的状态值，而是由 idea close --reason 一次离场并留痕）。
+# covered（撞车并入，task-intake-status-vocab-simplify）：本条诉求已被既有任务覆盖，
+#   不再单独注册、待归档，notes 记 task id；旧名（已淘汰）名实不符，并不表示"已注册"。
+IDEA_STATUS_PENDING = "pending"
+IDEA_STATUS_QUESTIONING = "questioning"
+IDEA_STATUS_COVERED = "covered"
+IDEA_STATUS_STUDY = "study"
+#: 合法状态集合（唯一真源；成员即上面四个常量，``check_idea_statuses`` 的 allowed 面）。
+IDEA_STATUS_VALUES = frozenset({
+    IDEA_STATUS_PENDING,
+    IDEA_STATUS_QUESTIONING,
+    IDEA_STATUS_COVERED,
+    IDEA_STATUS_STUDY,
+})
+#: 历史私有名，兼容别名（与 ``IDEA_STATUS_VALUES`` 同一对象；包内与聚合入口沿用）。
+_VALID_IDEA_STATUSES = IDEA_STATUS_VALUES
 
 
 # 条目标题中的显式 id 约定写法：`<标题>（id: <slug>）`

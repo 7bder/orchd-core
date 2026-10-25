@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    DELIVERABLES_FIELD,
+    NAME_FIELD,
+)
 from orchd.errors import ErrorCode, OrchdError
 from typing import Any
 
 _TERMINAL_REVISION_EVENT_REASON = "terminal_spec_revision"
 
 _TERMINAL_TEXT_REVISABLE_FIELDS = frozenset({
-    "acceptance_criteria", "brief", "name", "deliverables",
+    ACCEPTANCE_CRITERIA_FIELD, BRIEF_FIELD, NAME_FIELD, DELIVERABLES_FIELD,
 })
 
 def validate_terminal_revision(reason: str | None) -> str:

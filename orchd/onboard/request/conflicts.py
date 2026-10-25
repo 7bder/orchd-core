@@ -6,6 +6,13 @@ from typing import Any
 from pathlib import Path
 from functools import partial
 
+from orchd.constants import CLAIMED_BY_PENDING
+from orchd.contracts.events import STATUS_PENDING
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
 from orchd.gitops import GUARD_FAIL_CLOSED, check_workspace_state, run_guard
 from orchd.ledger import TaskState
@@ -100,7 +107,7 @@ def _filter_conflicts(
         if project_root is not None:
             if actual_probe_failed:
                 guard_unavailable_count += 1
-                excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get("files_to_edit", [])), "claimed_by": "guard_unavailable", "source": "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
+                excluded_conflicts.append({"task_id": cand.task.get(ID_FIELD, ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get(FILES_TO_EDIT_FIELD, [])), "claimed_by": "guard_unavailable", SOURCE_FIELD: "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
                 continue
             if actual_probe is None:
                 # 环境不适用（非 git / 无 git）：与原先一致——不取实际改动，不阻断该候选
@@ -114,7 +121,7 @@ def _filter_conflicts(
                                 project_root, state, tasks, cand.task),
                         guard_name="actual_changes_conflict",
                         on_error=GUARD_FAIL_CLOSED, fallback=[],
-                        context={"task_id": cand.task.get("id", ""),
+                        context={"task_id": cand.task.get(ID_FIELD, ""),
                                  "command": "request"},
                         hint="conflict precheck",
                         degraded=degraded_guards) or []
@@ -124,17 +131,17 @@ def _filter_conflicts(
                     if e.code is not ErrorCode.E030:
                         raise
                     guard_unavailable_count += 1
-                    excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get("files_to_edit", [])), "claimed_by": "guard_unavailable", "source": "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
+                    excluded_conflicts.append({"task_id": cand.task.get(ID_FIELD, ""), "conflicts": [{"task_id": "*", "files": sorted(cand.task.get(FILES_TO_EDIT_FIELD, [])), "claimed_by": "guard_unavailable", SOURCE_FIELD: "actual"}], "reason": "guard_unavailable", "guard": "actual_changes_conflict"})
                     continue
         dep_closure = get_dependency_closure(
-            cand.task.get("id", ""), tasks, index=dep_index
+            cand.task.get(ID_FIELD, ""), tasks, index=dep_index
         )
         # 显式注解：本列表由多来源 dict 字面量拼装（declared / inflight / actual），
         # 无注解时 mypy 会按首个 append 收窄元素类型。
         excluded: list[dict[str, Any]] = []
         pending_soft = []
         for c in conflicts:
-            if c.claimed_by == "pending":
+            if c.claimed_by == CLAIMED_BY_PENDING:
                 pending_soft.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by})
             elif c.claimed_by == INFLIGHT_MARKER:
                 # 在途重叠按 conflict_policy 分流：warn（缺省）= 仅提示 + 降权排序，
@@ -144,9 +151,9 @@ def _filter_conflicts(
                     "task_id": c.task_id,
                     "files": c.files,
                     "claimed_by": c.claimed_by,
-                    "source": "inflight",
+                    SOURCE_FIELD: "inflight",
                     "blocked_by": c.task_id,
-                    "other_status": (other.status if other else "pending"),
+                    "other_status": (other.status if other else STATUS_PENDING),
                     "policy": policy,
                 }
                 if policy in ("serialize", "block"):
@@ -154,25 +161,25 @@ def _filter_conflicts(
                 else:
                     pending_soft.append(entry)
             else:
-                excluded.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by, "source": "declared"})
+                excluded.append({"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by, SOURCE_FIELD: "declared"})
         for ac in actual_conflicts:
             if ac.get("task_id") in dep_closure:
                 continue
-            excluded.append({"task_id": ac["task_id"], "files": ac.get("files", []), "claimed_by": ac.get("claimed_by", "actual"), "source": "actual"})
+            excluded.append({"task_id": ac["task_id"], "files": ac.get("files", []), "claimed_by": ac.get("claimed_by", "actual"), SOURCE_FIELD: "actual"})
         # 去重（task-request-response-fidelity AC2）：同一（对方任务, 文件集合）组合只保留
         # 一条，actual 优先于 declared（实际在途比声明更精确）。循环变量取 ac 以与上方
         # Conflict dataclass 循环（c）区分，避免同作用域内两种类型混用。
         _seen: dict[tuple[str, frozenset[str]], dict[str, Any]] = {}
         for _e in excluded:
             _key = (_e["task_id"], frozenset(_e.get("files", [])))
-            if _key not in _seen or _e.get("source") == "actual":
+            if _key not in _seen or _e.get(SOURCE_FIELD) == "actual":
                 _seen[_key] = _e
         excluded = list(_seen.values())
         if excluded:
-            excluded_conflicts.append({"task_id": cand.task.get("id", ""), "conflicts": excluded})
+            excluded_conflicts.append({"task_id": cand.task.get(ID_FIELD, ""), "conflicts": excluded})
             continue
         kept.append(cand)
         if pending_soft:
-            candidate_conflicts[cand.task.get("id", "")] = pending_soft
-    kept.sort(key=lambda c: c.task.get("id", "") in candidate_conflicts)
+            candidate_conflicts[cand.task.get(ID_FIELD, "")] = pending_soft
+    kept.sort(key=lambda c: c.task.get(ID_FIELD, "") in candidate_conflicts)
     return kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count

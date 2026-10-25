@@ -111,11 +111,17 @@ def detect_container_root_cwd(cwd: Path, orchd_dir: Path) -> tuple[str | None, P
     try:
         cwd = Path(cwd).resolve()
         marker = read_layout(Path(orchd_dir))
-        if marker is None or marker.get("layout") != "container":
-            return None, None
-        main_wt = Path(marker["main_worktree"]).resolve()
-        if cwd == main_wt.parent:
-            return "container_root", main_wt
+        if marker is not None and marker.get("layout") == "container":
+            main_wt = Path(marker["main_worktree"]).resolve()
+            if cwd == main_wt.parent:
+                return "container_root", main_wt
+        # 反向不变量（debug-pack C1）：容器根即使 .layout.json 缺失（坏态）也须命中。
+        # 原判定只在「主工作树标记在场」时成立——检测依据只在正常态存在，坏态必然
+        # 缺证，静默放过后给出误导性 E001。按容器约定路径特征兜底：cwd 下同时存在
+        # main/.orchd（主工作树载体）与 .orchd-runtime（容器 runtime 根）。
+        _main = cwd / _CONTAINER_MAIN_DIR
+        if (_main / ".orchd").is_dir() and (cwd / _RUNTIME_DIR).is_dir():
+            return "container_root", _main
     except Exception:
         return None, None
     return None, None

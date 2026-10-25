@@ -15,7 +15,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+)
+from orchd.contracts.events import (
+    STATUS_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+    EVENT_CLAIMED,
+    EVENT_DONE,
+    EVENT_FORCE_STATUS,
+    EVENT_RETRACT,
+    EVENT_REVIEW_SUBMITTED,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.ledger import Store, TaskState, resolve_workspace_root
@@ -84,16 +100,16 @@ def task_integrity_audit(
 
     issues: list[dict[str, Any]] = []
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         ts = state.get(tid)
-        s = ts.status if ts else "pending"
+        s = ts.status if ts else STATUS_PENDING
         if scope == "active":
-            if s not in ("claimed", "done", "in_review"):
+            if s not in (STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW):
                 continue
         elif scope == "merged":
-            if s != "completed":
+            if s != STATUS_COMPLETED:
                 continue
-        declared = list(task.get("files_to_edit", []) or [])
+        declared = list(task.get(FILES_TO_EDIT_FIELD, []) or [])
         if not declared:
             continue
         entry: dict[str, Any] = {"task_id": tid, "status": s}
@@ -158,30 +174,31 @@ def _scan_revive_markers(store: Store) -> dict[str, dict[str, Any]]:
     status_by_task: dict[str, str] = {}
     markers: dict[str, dict[str, Any]] = {}
     for ev in events:
-        if ev.get("type") == "RETRACT" or ev.get("event_id", "") in retracted:
+        if ev.get("type") == EVENT_RETRACT or ev.get("event_id", "") in retracted:
             continue
         tid = ev.get("task_id", "")
         etype = ev.get("type")
-        if etype == "CLAIMED":
-            status_by_task[tid] = "claimed"
-        elif etype == "DONE":
-            status_by_task[tid] = "done"
-        elif etype == "REVIEW_SUBMITTED":
+        if etype == EVENT_CLAIMED:
+            status_by_task[tid] = STATUS_CLAIMED
+        elif etype == EVENT_DONE:
+            status_by_task[tid] = STATUS_DONE
+        elif etype == EVENT_REVIEW_SUBMITTED:
             # review-unify-r2：unified 单阶段（无 review_type）或 code APPROVED
             # 均视为终审完成；老事件含 review_type: spec 保持两阶段语义。
             if ev.get("verdict") == "APPROVED" and (
                 ev.get("review_type") == "code" or ev.get("review_type") is None
             ):
-                status_by_task[tid] = "completed"
-        elif etype == "FORCE_STATUS":
-            target = ev.get("target_status", "pending")
+                status_by_task[tid] = STATUS_COMPLETED
+        elif etype == EVENT_FORCE_STATUS:
+            target = ev.get("target_status", STATUS_PENDING)
             # 测试数据（test_data=True）标记（task-p2-ledger-audit-noise）：测试注入的
             # FORCE_STATUS 事件（如 completed→pending 复活 fixture）须与真实生产事件区分，
             # 避免 revive_audit 审计噪音。仅跳过告警生成，仍推进状态机状态
             # （status_by_task 照常更新）以防误伤后续真实事件判定。
             if not ev.get("test_data"):
                 # 复活：当前状态为 completed 且被强制回到 pending
-                if target == "pending" and status_by_task.get(tid) == "completed":
+                if (target == STATUS_PENDING
+                        and status_by_task.get(tid) == STATUS_COMPLETED):
                     markers[tid] = {
                         "revived_at": ev.get("timestamp"),
                         "revived_by": ev.get("agent_id"),

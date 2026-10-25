@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import ORCHD_SYNC_LOCK_WAIT_SECS_ENV
 from orchd.contracts.events import validate_event
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
@@ -72,6 +73,12 @@ from .local import (
     _bootstrap_local_from_state,
     _reconcile_local,
 )
+from orchd.contracts.responses import (
+    ERROR_KEY,
+    MESSAGE_KEY,
+    TASKS_KEY,
+    WARNINGS_KEY,
+)
 
 
 
@@ -97,7 +104,7 @@ def _sync_lock_wait_secs() -> float:
     默认 :data:`_SYNC_LOCK_WAIT_SECS`（300s）；环境变量
     ``ORCHD_SYNC_LOCK_WAIT_SECS`` 可覆盖（须为正数）。
     """
-    env = os.environ.get("ORCHD_SYNC_LOCK_WAIT_SECS")
+    env = os.environ.get(ORCHD_SYNC_LOCK_WAIT_SECS_ENV)
     if env:
         try:
             v = float(env)
@@ -178,7 +185,7 @@ def pull(
                 None,
                 "bootstrap": {
                     "applied": False,
-                    "tasks": 0,
+                    TASKS_KEY: 0,
                     "reason": "no_remote_ref",
                 },
                 "note":
@@ -237,7 +244,7 @@ def pull(
             "bootstrap": bootstrap,
         }
         if reconcile_warnings:
-            result["warnings"] = reconcile_warnings
+            result[WARNINGS_KEY] = reconcile_warnings
         # L-3：序列级软校验违规以独立结构化字段返回（warnings 内亦含 violations）
         replay_violations = store.replay_violations
         if replay_violations:
@@ -344,7 +351,7 @@ def push(
             "state_tasks": len(state.get("tasks", {})),
         }
         if reconcile_warnings:
-            result["warnings"] = reconcile_warnings
+            result[WARNINGS_KEY] = reconcile_warnings
         # L-3：序列级软校验违规以独立结构化字段返回（warnings 内亦含 violations）
         # NEW-L2：使用 build_state 之前的快照，防止 store.replay() 重置覆盖
         replay_violations = violations_snapshot
@@ -421,7 +428,7 @@ def compact(
             "state_tasks": len(state.get("tasks", {})),
         }
         if reconcile_warnings:
-            result["warnings"] = reconcile_warnings
+            result[WARNINGS_KEY] = reconcile_warnings
         # L-3：序列级软校验违规以独立结构化字段返回（warnings 内亦含 violations）
         # NEW-L2：使用 build_state 之前的快照，防止 store.replay() 重置覆盖
         replay_violations = violations_snapshot
@@ -471,8 +478,8 @@ def status_remote(
     except OrchdError as exc:
         return {
             "performed": False,
-            "error": {
+            ERROR_KEY: {
                 "code": exc.code.name,
-                "message": exc.message
+                MESSAGE_KEY: exc.message
             }
         }

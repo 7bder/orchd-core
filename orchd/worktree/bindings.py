@@ -14,6 +14,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    SESSION_WORKTREES_FILE,
+)
 from orchd.worktree.layout import _GIT_TIMEOUT
 
 
@@ -29,7 +32,7 @@ from orchd.worktree.layout import _GIT_TIMEOUT
 # 或已存在 linked worktrees（多会话并发）才建独立任务 worktree
 # （``<task_wt_root>/task-<id>/``）。
 
-_BINDINGS_FILENAME = "session-worktrees.json"
+_BINDINGS_FILENAME = SESSION_WORKTREES_FILE
 # 任务 worktree 目录名前缀
 _TASK_WT_PREFIX = "task-"
 

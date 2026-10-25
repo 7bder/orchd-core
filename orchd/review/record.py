@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 from pathlib import Path
 
+from orchd.contracts.events import (
+    EVENT_REVIEW_READY,
+    EVENT_REVIEW_SUBMITTED,
+)
 from orchd.errors import ErrorCode
 from orchd.errors import OrchdError
 from orchd.ledger import Store
@@ -35,7 +39,7 @@ def _review_submit_record(
     CHANGES_REQUESTED 终态收敛后回 pending；其余显式 E007 invalid_verdict。
     """
     event = make_event(
-        task_id, agent_id, "REVIEW_SUBMITTED",
+        task_id, agent_id, EVENT_REVIEW_SUBMITTED,
         verdict=verdict,
         is_self_review=is_self_review,
     )
@@ -83,7 +87,7 @@ def _review_submit_record(
 
     if verdict == "APPROVED" and review_type == "spec":
         store.append_event(event)
-        code_ready = make_event(task_id, agent_id, "REVIEW_READY", review_type="code")
+        code_ready = make_event(task_id, agent_id, EVENT_REVIEW_READY, review_type="code")
         store.append_event(code_ready)
         result["task_status"] = "in_review"
         result["next_review"] = "code"

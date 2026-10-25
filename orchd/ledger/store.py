@@ -31,6 +31,9 @@ from orchd.ledger.store_types import (
     stale_review_claims,
 )
 
+# 本文件不含代码级环境变量读取：下文 docstring 里的 ``ORCHD_STORAGE_BACKEND`` /
+# ``ORCHD_HOME`` 只是给读者的说明；变量名真源见 ``orchd.constants`` 的 ``*_ENV``。
+
 class Store(_StoreReadMixin, _StoreChecksMixin, _StoreWriteMixin, _StoreApplyMixin):
     """事件存储引擎，封装 ledger / checkpoint / lock 的全部 I/O。
 

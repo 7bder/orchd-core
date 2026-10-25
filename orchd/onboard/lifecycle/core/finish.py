@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_DONE,
+    EVENT_REVIEW_READY,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops_ops import make_event as _make_event
 from orchd.guide import NEXT_ACTION_AWAIT_REVIEW
 from orchd.ledger import Store, resolve_review_mode
+from orchd.contracts.task_schema import (
+    FILES_TO_EDIT_FIELD,
+)
 
 
 def _write_done_event(
@@ -47,7 +54,7 @@ def _write_done_event(
         author_mismatch = claimed_by != agent_id
         attempt_count = ts.attempt_count + 1
         done_event = _make_event(
-            task_id, claimed_by, "DONE",
+            task_id, claimed_by, EVENT_DONE,
             changes_description=changes_description,
             attempt_count=attempt_count,
         )
@@ -60,13 +67,13 @@ def _write_done_event(
         # 自动 REVIEW_READY（review-unify-r2）
         if resolve_review_mode(store.orchd_dir) == "unified":
             review_type: str | None = None
-            review_event = _make_event(task_id, claimed_by, "REVIEW_READY")
+            review_event = _make_event(task_id, claimed_by, EVENT_REVIEW_READY)
         else:
             # 延迟导入避免循环依赖
             from orchd.onboard import _load_config_blocked, _is_doc_single_stage
             blocked_config = _load_config_blocked(store)
             review_type = "code" if _is_doc_single_stage(
-                task_def.get("files_to_edit", []), blocked=blocked_config
+                task_def.get(FILES_TO_EDIT_FIELD, []), blocked=blocked_config
             ) else "spec"
             # task-review-rework-scope：code 范围打回的返工直达 code 审查，
             # 跳过 spec（缺省/历史事件无标记即 spec，与旧行为一致；标记随
@@ -76,7 +83,9 @@ def _write_done_event(
 
                 if latest_rework_scope(store, task_id) == "code":
                     review_type = "code"
-            review_event = _make_event(task_id, claimed_by, "REVIEW_READY", review_type=review_type)
+            review_event = _make_event(
+                task_id, claimed_by, EVENT_REVIEW_READY, review_type=review_type
+            )
         store.append_event(review_event)
 
         new_state = store.replay()

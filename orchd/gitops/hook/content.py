@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import (
+    ORCHD_BAKED_PY_ENV,
+    ORCHD_BAKED_SRC_ENV,
+    ORCHD_HOME_ENV,
+    ORCHD_LINE_TASK_PREFIX_ENV,
+    ORCHD_LINE_TRUNK_ENV,
+)
 from orchd.gitops._run import _shell_quote
 
 from .paths import _resolve_ledger_path
@@ -175,8 +182,8 @@ def ref_tx_hook_content(
     if py_exe and src_dir:
         baked = (
             "# 安装期固化快道：零探测直达；失效回退下探针。\n"
-            f"ORCHD_BAKED_PY={_shell_quote(py_exe)}\n"
-            f"ORCHD_BAKED_SRC={_shell_quote(src_dir)}\n"
+            f"{ORCHD_BAKED_PY_ENV}={_shell_quote(py_exe)}\n"
+            f"{ORCHD_BAKED_SRC_ENV}={_shell_quote(src_dir)}\n"
             f'if [ -x "$ORCHD_BAKED_PY" ] && [ -f "$ORCHD_BAKED_SRC/{module_rel}" ]; then\n'
             f"    exec \"$ORCHD_BAKED_PY\" -c '{py_code}' \"$ORCHD_BAKED_SRC\" \"$@\"\n"
             "fi\n"
@@ -189,8 +196,8 @@ def ref_tx_hook_content(
         line_env = (
             "# 多线（契约 v2）：安装期烘焙当前线命名空间前缀与 trunk"
             "（task-line-ref-tx-per-line）。\n"
-            f"export ORCHD_LINE_TASK_PREFIX={_shell_quote(line_task_prefix)}\n"
-            f"export ORCHD_LINE_TRUNK={_shell_quote(line_trunk)}\n"
+            f"export {ORCHD_LINE_TASK_PREFIX_ENV}={_shell_quote(line_task_prefix)}\n"
+            f"export {ORCHD_LINE_TRUNK_ENV}={_shell_quote(line_trunk)}\n"
         )
     return (
         f"{_HOOK_SHEBANG}\n"
@@ -278,6 +285,7 @@ def _precommit_hook_content(
         PY_RESOLVER=_HOOK_PY_RESOLVER,
         PY_LEDGER_STATE=_HOOK_PY_LEDGER_STATE,
         E020_ESCAPE_BLOCK=_e020_hook_escape_block(),
+        ORCHD_HOME_ENV=ORCHD_HOME_ENV,
     )
 
 

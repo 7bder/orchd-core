@@ -37,7 +37,9 @@ _DIRTY_AFTER_INIT_HINT = (
 def _intake_guard(project_root: Path) -> dict[str, Any] | None:
     """摄入前置守卫：main 分支 + 非摄入产物干净（对齐 amend 的 E017 语义）。
 
-    供 intake_commit / idea_propose / idea_confirm / idea_drop 复用（idea-write-gate）。
+    供 intake_commit / idea_propose / idea_confirm 复用（idea-write-gate）。
+    出口动词统一后不再有 idea_drop：close 的后端住在 ideas.decision（它自行取同一把
+    ``.intake.lock`` 并复用本守卫）。
 
     Returns:
         - 通过: ``None``。

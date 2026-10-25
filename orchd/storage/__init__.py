@@ -15,6 +15,11 @@ Store 侧（compact 操作与中断恢复）见 ``orchd.ledger``。
 
 from __future__ import annotations
 
+from orchd.names import (
+    LEDGER_ARCHIVE_FILE,
+)
+
+
 import json
 import os
 from abc import ABC, abstractmethod
@@ -22,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 #: 归档文件名（账本根下，与 ``_ledger.jsonl`` 同级）。
-ARCHIVE_FILENAME = "_ledger.archive.jsonl"
+ARCHIVE_FILENAME = LEDGER_ARCHIVE_FILE
 
 #: 中断恢复标记（compact 三写中途崩溃的唯一可观测痕迹，见 Store.compact_archive）。
 COMPACT_JOURNAL_FILENAME = ".compact-journal.json"

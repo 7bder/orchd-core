@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 import time
 
+from orchd.contracts.task_schema import (
+    ID_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.errors import OrchdError
 from orchd.lockfile import ExclusiveFileLock
 from .config import load_lessons_config
@@ -134,12 +138,12 @@ def _review_task_transaction(
             lesson_id = _next_lesson_id(orchd_dir)
             status = "verified" if s.get("resolved") else "proposed"
             entry = {
-                "id": lesson_id,
+                ID_FIELD: lesson_id,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "trigger": s.get("trigger"),
                 "symptom": s.get("symptom"),
                 "solution": s.get("solution", ""),
-                "source": s.get("source"),
+                SOURCE_FIELD: s.get(SOURCE_FIELD),
                 "severity": s.get("severity", "blocking"),
                 "status": status,
                 "hits": 0,
@@ -159,11 +163,11 @@ def _review_task_transaction(
                 })
                 continue
             promoted.append({
-                "id": lesson_id,
+                ID_FIELD: lesson_id,
                 "status": status,
                 "trigger_key": (s.get("trigger") or {}).get("key"),
                 "symptom": s.get("symptom"),
-                "source": s.get("source"),
+                SOURCE_FIELD: s.get(SOURCE_FIELD),
             })
 
         # 无锁原语回写 staged（调用方已持 lessons 锁，同上无嵌套锁风险）：

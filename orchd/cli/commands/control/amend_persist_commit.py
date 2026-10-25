@@ -33,10 +33,19 @@ def _amend_persist_commit(
     from orchd.gitops import ensure_committed, get_current_branch, get_default_branch
     from orchd.ledger import resolve_workspace_root
 
+    def _payload_preserving_trailing_newline() -> str:
+        # D3（debug-pack D）：保留**原始**尾换行形态——仅当既有文件以换行结尾才补，
+        # 否则维持「无尾换行」既有契约（tests/test_control_amend_atomic 硬断言）。
+        text = _json.dumps(master.raw, ensure_ascii=False, indent=2)
+        try:
+            if master_path.read_bytes().endswith(bytes([10])):
+                text += chr(10)
+        except OSError:
+            pass
+        return text
+
     if patch_task is not None:
-        _persist_master_durable(
-            master_path,
-            _json.dumps(master.raw, ensure_ascii=False, indent=2))
+        _persist_master_durable(master_path, _payload_preserving_trailing_newline())
 
     # task-amend-register-channel-hotfix（2026-09-21）：--register 路径内存追加后落盘。
     # split.amend() 只重写快照不写 master（写盘仅 --task 分支 577 行），缺此行则注册
@@ -45,9 +54,7 @@ def _amend_persist_commit(
     # amend() 成功之后——失败路径不落盘；与 577 行同格式（无尾换行）。
     # task-master-write-atomic：同上，--register 路径走同一硬化序（§11-13 续）。
     if register_path is not None:
-        _persist_master_durable(
-            master_path,
-            _json.dumps(master.raw, ensure_ascii=False, indent=2))
+        _persist_master_durable(master_path, _payload_preserving_trailing_newline())
         # 注册即消费提案（task-hygiene-gate-executor-and-proposal-lifecycle AC1，
         # 根因修复）：位置必须在本行之后——此前 _apply_register_proposals 只把提案
         # append 进内存 master，落盘由此处完成，而**整段从不删除草稿**，于是

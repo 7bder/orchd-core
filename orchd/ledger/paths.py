@@ -16,6 +16,31 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
+
+
+def __getattr__(name: str) -> Any:
+    """延迟提供由 ``orchd.names`` 承载的模块级常量。
+
+    task-convergence-asset-names-ledger：本模块顶层只依赖标准库（结构面约定，见
+    tests/test_ledger_paths.py）；对 ``orchd.names`` 常量的引用改为函数级惰性导入。
+    ``_ROADMAP_DOC`` / ``_WORKSPACE_DOCS`` 仍由聚合入口 ``orchd.ledger`` 重导出，
+    故经 PEP 562 模块级 ``__getattr__`` 惰性提供，取值与收敛前逐字相同。
+    """
+    if name == "_ROADMAP_DOC":
+        from orchd.names import ROADMAP_FILE
+
+        globals()[name] = ROADMAP_FILE
+        return ROADMAP_FILE
+    if name == "_WORKSPACE_DOCS":
+        from orchd.names import IDEAS_FILE, ROADMAP_FILE
+
+        value = (IDEAS_FILE, ROADMAP_FILE, "SKILL.md")
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 
 
 def _find_orchd_dir() -> Path:
@@ -47,7 +72,11 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     注意：``orchd_dir`` 语义是「master 目录」（含 ``_master.json`` + ``shared/``，
     走 git，不入 backend）；返回的账本根仅用于 FilesystemBackend 派生账本文件路径。
     """
-    home = os.environ.get("ORCHD_HOME")
+    # Wave1-T3a：变量名真源常量沿用本模块的函数级惰性导入惯例（顶层保持零 orchd 导入，
+    # 见模块 docstring 的依赖方向约定与 tests/test_ledger_paths.py 的结构面守卫）。
+    from orchd.constants import ORCHD_HOME_ENV
+
+    home = os.environ.get(ORCHD_HOME_ENV)
     if home:
         return Path(home)
     # task-14-worktree-lifecycle：仅 container 布局 → 布局级 runtime 根（共享账本默认）
@@ -61,7 +90,9 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     marker = read_layout(orchd_dir)
     if isinstance(marker, dict) and marker.get("layout") == "container":
         main_wt = Path(marker["main_worktree"])
-        return main_wt.parent / ".orchd-runtime"
+        from orchd.names import RUNTIME_DIR
+
+        return main_wt.parent / RUNTIME_DIR
     return orchd_dir
 
 
@@ -98,9 +129,6 @@ def resolve_review_mode(orchd_dir: Path) -> str:
         return "two_phase"
 
 
-_WORKSPACE_DOCS = ("IDEAS.md", "ROADMAP.md", "SKILL.md")
-
-
 def resolve_workspace_root(project_root: Path) -> Path:
     """解析工作区文档根目录（IDEAS.md / ROADMAP.md / SKILL.md 所在目录）。
 
@@ -126,6 +154,9 @@ def resolve_workspace_root(project_root: Path) -> Path:
     调用方：``validate_source``（spec.py）、``archive_resolved_ideas``（ideas.py）、
     ``amend``/``ideas_archive``（cli.py）——统一经本 helper 解析 IDEAS/ROADMAP/SKILL 路径。
     """
+    from orchd.names import IDEAS_FILE, ROADMAP_FILE
+
+    workspace_docs = (IDEAS_FILE, ROADMAP_FILE, "SKILL.md")
     project_root = Path(project_root)
     # task-canonical-workspace-docs（2026-08-25）：统一共享读入口，container 布局
     # 解析到 canonical 主工作树根（flat 返回本地），worktree 本地副本不参与文档定位。
@@ -134,14 +165,13 @@ def resolve_workspace_root(project_root: Path) -> Path:
     project_root = resolve_canonical_project_root(project_root)
     project_root = Path(project_root)
     orchd_dir = project_root / ".orchd"
-    if any((orchd_dir / name).exists() for name in _WORKSPACE_DOCS):
+    if any((orchd_dir / name).exists() for name in workspace_docs):
         return orchd_dir
-    if any((project_root / name).exists() for name in _WORKSPACE_DOCS):
+    if any((project_root / name).exists() for name in workspace_docs):
         return project_root
     return orchd_dir
 
 
-_ROADMAP_DOC = "ROADMAP.md"
 
 
 def resolve_roadmap_path(project_root: Path) -> Path:
@@ -168,11 +198,12 @@ def resolve_roadmap_path(project_root: Path) -> Path:
     Returns:
         宿主项目根的 ROADMAP.md 路径；**不保证存在**——消费点按需判 ``exists()``。
     """
+    from orchd.names import ROADMAP_FILE
     from orchd.worktree import resolve_canonical_project_root
 
     root = Path(resolve_canonical_project_root(Path(project_root)))
-    root_doc = root / _ROADMAP_DOC
-    legacy = root / ".orchd" / _ROADMAP_DOC
+    root_doc = root / ROADMAP_FILE
+    legacy = root / ".orchd" / ROADMAP_FILE
     # 旧布局残留（.orchd/ROADMAP.md）可观测：不读、不搬，仅留痕提示宿主处置。
     # 不自动搬家的原因：ROADMAP 是宿主资产，移动与提交归属由宿主决定
     # （一次性迁移点由安装器代搬，见 release/install.py::_roadmap_disposition）。
@@ -212,7 +243,9 @@ def _log_legacy_roadmap(root: Path, legacy: Path, *, root_doc: Path | None = Non
     主流程。宿主据此把文件移到项目根（安装器在一次性迁移点代做），或删除已确认的旧副本。
     """
     try:
-        target = root_doc if root_doc is not None else (root / _ROADMAP_DOC)
+        from orchd.names import ROADMAP_FILE
+
+        target = root_doc if root_doc is not None else (root / ROADMAP_FILE)
         reason = "root_missing" if not target.exists() else "content_diverges"
         record = {
             "action": "legacy_orchd_roadmap_ignored",

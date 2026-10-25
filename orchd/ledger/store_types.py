@@ -7,7 +7,7 @@
 若它们留在 ``store.py`` 而 ``store.py`` 又要导入四个 mixin 作基类，就会形成循环导入；集中到本
 模块后依赖单向：``store.py`` 与四个 mixin 都 → 本模块，无环。
 
-依赖方向：仅标准库 + ``orchd.errors``。
+依赖方向：标准库 + ``orchd.contracts.events``（任务状态名真源）+ ``orchd.errors``。
 """
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+from orchd.constants import ORCHD_REVIEW_STALE_SECS_ENV
+from orchd.contracts.events import STATUS_IN_REVIEW, STATUS_PENDING
 
 # checkpoint 字段 schema 版本（P2-10 / ROADMAP 1.4.1 引擎性能）：
 # update_checkpoint 稳态下用增量 state 写快照（O(tail)）；仅当 checkpoint 的
@@ -64,7 +67,7 @@ class TaskState:
                             标记完成但 merge 未落地，audit-merge 需告警。仅 completed 有值。
     """
 
-    status: str = "pending"
+    status: str = STATUS_PENDING
     claimed_by: str | None = None
     claimed_session: str | None = None
     attempt_count: int = 0
@@ -110,7 +113,7 @@ class TaskState:
         （``status`` 默认 ``"pending"``，其余可选字段默认 ``None``）。
         """
         return cls(
-            status=d.get("status", "pending"),
+            status=d.get("status", STATUS_PENDING),
             claimed_by=d.get("claimed_by"),
             claimed_session=d.get("claimed_session"),
             attempt_count=d.get("attempt_count", 0),
@@ -128,7 +131,7 @@ _REVIEW_STALE_DEFAULT_S = 300
 
 def review_stale_timeout_s() -> float:
     """返回审查认领超时秒数；环境变量 ``ORCHD_REVIEW_STALE_SECS`` 可覆盖（测试用）。"""
-    env = os.environ.get("ORCHD_REVIEW_STALE_SECS")
+    env = os.environ.get(ORCHD_REVIEW_STALE_SECS_ENV)
     if env is not None:
         try:
             v = float(env)
@@ -165,7 +168,8 @@ def stale_review_claims(
     tmo = review_stale_timeout_s() if timeout_s is None else timeout_s
     stale: dict[str, dict[str, Any]] = {}
     for tid, ts in state.items():
-        if not (ts.status == "in_review" and ts.review_claimed_by and ts.review_claimed_at):
+        if not (ts.status == STATUS_IN_REVIEW and ts.review_claimed_by
+                and ts.review_claimed_at):
             continue
         age = review_claim_age_s(ts.review_claimed_at, now)
         if age is not None and age >= tmo:

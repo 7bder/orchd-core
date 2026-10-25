@@ -110,7 +110,7 @@ def validate_source(
 
     task 可选 ``source`` 字段（``^(idea|roadmap|debug):[a-z0-9-]+$``）声明任务来源：
     - ``idea:<id>``：引用 IDEAS.md 中 ``- id: <id>`` **精确匹配**的条目，且该条目
-      ``status: pending``（已 taskified/完成/dropped 的条目不可作为新任务来源；
+      ``status: pending``（已 covered/完成的条目不可作为新任务来源；
       日期词/标题词 ref 因无对应条目 id 必然被拒）；
     - ``roadmap:<id>``：引用 ROADMAP.md 中 ``## 版本`` 章节头包含的规划 id。
 

@@ -36,6 +36,13 @@ from orchd.ledger import (
     validate_transition,
 )
 from orchd.storage import read_archive_events
+from orchd.contracts.responses import (
+    EVENT_ID_KEY,
+    MESSAGE_KEY,
+    STATUS_KEY,
+    TASKS_KEY,
+    TASK_ID_KEY,
+)
 
 
 # ref tree 内 state.json 的快照格式版本（build_state 写入；新设备 bootstrap 校验，
@@ -71,7 +78,7 @@ def build_state(store: Store) -> dict[str, Any]:
     tasks: dict[str, dict[str, Any]] = {}
     for tid, ts in sorted(state.items()):
         entry: dict[str, Any] = {
-            "status": ts.status,
+            STATUS_KEY: ts.status,
             "attempt_count": ts.attempt_count,
             "updated_event_id": last_event.get(tid),
         }
@@ -87,7 +94,7 @@ def build_state(store: Store) -> dict[str, Any]:
         "schema_version": _STATE_SCHEMA_VERSION,
         "generated_at":
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "tasks": tasks,
+        TASKS_KEY: tasks,
     }
 
 
@@ -146,7 +153,7 @@ def _inject_deterministic_ids(events: list[dict[str, Any]]) -> int:
     count = 0
     for ev in events:
         if not ev.get("event_id"):
-            ev["event_id"] = f"evt-sync-{_event_fingerprint(ev)[:12]}"
+            ev[EVENT_ID_KEY] = f"evt-sync-{_event_fingerprint(ev)[:12]}"
             count += 1
     return count
 
@@ -219,16 +226,16 @@ def _merge_events_detailed(
                         ErrorCode.E030.name,
                         "severity":
                         "warning",
-                        "message": (f"event_id 碰撞：{eid} 同时对应不同 task/type，"
+                        MESSAGE_KEY: (f"event_id 碰撞：{eid} 同时对应不同 task/type，"
                                     f"疑似 32 bit id 生日碰撞；{tiebreak_msg}，请人工核对"),
-                        "event_id":
+                        EVENT_ID_KEY:
                         eid,
                         "kept": {
-                            "task_id": kept.get("task_id"),
+                            TASK_ID_KEY: kept.get("task_id"),
                             "type": kept.get("type"),
                         },
                         "dropped": {
-                            "task_id": dropped.get("task_id"),
+                            TASK_ID_KEY: dropped.get("task_id"),
                             "type": dropped.get("type"),
                         },
                     })

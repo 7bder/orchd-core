@@ -20,6 +20,21 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BACKPORT_FIELD,
+    BRIEF_FIELD,
+    DEPENDS_ON_FIELD,
+    DIFFICULTY_FIELD,
+    ESTIMATED_HOURS_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    REQUIRES_FIELD,
+    SOURCE_FIELD,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.line import line_registry
 
@@ -76,8 +91,8 @@ def _default_module(project_root: Path) -> str:
     path = resolve_master_path_from_dir(Path(project_root) / ".orchd")
     if path.is_file():
         modules = load_master(path).modules
-        if modules and modules[0].get("id"):
-            return str(modules[0]["id"])
+        if modules and modules[0].get(ID_FIELD):
+            return str(modules[0][ID_FIELD])
     raise OrchdError(
         ErrorCode.E007,
         "line-sync 无法确定 module：目标项目无 modules[] 登记，请显式传 --module",
@@ -158,26 +173,26 @@ def plan_backport(
     tid = task_id or f"task-backport-{source_sha[:8]}"
     short = source_sha[:7]
     proposal: dict[str, Any] = {
-        "id": tid,
-        "name": title or f"回移 {short}",
-        "brief": (
+        ID_FIELD: tid,
+        NAME_FIELD: title or f"回移 {short}",
+        BRIEF_FIELD: (
             f"把源线 '{source_line}' 的提交 {short} 回移到目标线 '{target_line}'，"
             f"走目标线自己的审查与回归（line-sync 回移通道）。"
         ),
-        "module": module or _default_module(project_root),
-        "depends_on": [],
-        "estimated_hours": 2,
-        "importance": "high",
-        "difficulty": "medium",
-        "requires": ["python", "git"],
-        "source": source if source is not None else "debug:line-sync-backport",
-        "files_to_edit": files,
-        "acceptance_criteria": [
+        MODULE_FIELD: module or _default_module(project_root),
+        DEPENDS_ON_FIELD: [],
+        ESTIMATED_HOURS_FIELD: 2,
+        IMPORTANCE_FIELD: "high",
+        DIFFICULTY_FIELD: "medium",
+        REQUIRES_FIELD: ["python", "git"],
+        SOURCE_FIELD: source if source is not None else "debug:line-sync-backport",
+        FILES_TO_EDIT_FIELD: files,
+        ACCEPTANCE_CRITERIA_FIELD: [
             f"回移源提交 {short}（{source_line}）到目标线 {target_line}，改动内容与源一致",
             "走目标线自己的 verify_command 与审查（spec + code）后合并入目标线 trunk",
             f"回移留痕：backport={{source_sha: {source_sha}, source_line: {source_line}}}",
         ],
-        "backport": {"source_sha": source_sha, "source_line": source_line},
+        BACKPORT_FIELD: {"source_sha": source_sha, "source_line": source_line},
     }
 
     proposal_path: str | None = None
@@ -210,9 +225,9 @@ def plan_backport(
         "target_line": target_line,
         "source_trunk": source_trunk,
         "target_trunk": target_trunk,
-        "files_to_edit": files,
+        FILES_TO_EDIT_FIELD: files,
         "proposal_path": proposal_path,
-        "backport": backport,
+        BACKPORT_FIELD: backport,
         "hint": (
             f"回移任务提案已生成（{proposal_path}）：确认后执行 "
             f"python .orchd/__main__.py amend --register {proposal_path} 注册，"

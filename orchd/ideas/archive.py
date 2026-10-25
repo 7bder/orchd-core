@@ -11,6 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    IDEAS_ARCHIVE_FILE,
+    IDEAS_FILE,
+)
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.errors import OrchdError
 from orchd.intake import (
@@ -116,7 +120,7 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
     # main/，flat 返回本地），IDEAS.md / IDEAS-archive.md 以主工作树副本为权威，
     # 避免任务 worktree 本地 .orchd/ 拷贝过期导致归档/引导不一致。
     workspace_root = resolve_workspace_root(project_root)
-    ideas_path = workspace_root / "IDEAS.md"
+    ideas_path = workspace_root / IDEAS_FILE
     if not ideas_path.exists():
         return {"archived": [], "kept": 0, "skipped": "no_ideas_file"}
 
@@ -229,7 +233,7 @@ def archive_resolved_ideas(project_root, master) -> dict[str, Any]:
             blocks.append(_canonical_block(extract_entry_block(text, e)))
         new_ideas = _remove_blocks(text, entries, resolved)
 
-        archive_path = workspace_root / "IDEAS-archive.md"
+        archive_path = workspace_root / IDEAS_ARCHIVE_FILE
         try:
             if archive_path.exists():
                 # 同上：归档件读也走唯一原语（此前这处 except 只捕 OSError/IOError，

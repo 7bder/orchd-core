@@ -16,6 +16,9 @@ from __future__ import annotations
 # 让该通道静默失明，且引入包数据/安装面改动（越出 §2.1 纯搬移口径）。
 _PRE_COMMIT_HOOK_TEMPLATE = """#!/bin/sh
 {HOOK_MARKER} (auto-generated, do not edit)
+# D2（debug-pack D）：GBK 控制台中文输出编码补全（python 段已 reconfigure(utf-8)，
+# shell 段此前未覆盖）——best-effort，有 chcp.com 则置 65001，无则静默。
+if command -v chcp.com >/dev/null 2>&1; then chcp.com 65001 >/dev/null 2>&1 || true; fi
 # 解释器与 staged 精确消费（task-hook-staged-nul-rootfix）：含换行的文件名需要
 #   NUL 分隔 + `read -d ''` 才能不被拆——`read -d` 是 **bash 内建**，POSIX sh
 #   （dash / ash）不支持。此处**保留 `#!/bin/sh` + 运行时分流**，而非把 shebang
@@ -41,7 +44,7 @@ _PRE_COMMIT_HOOK_TEMPLATE = """#!/bin/sh
 # R1-b 审查冻结整体静默 fail-open（报告 P1-2/D-1）。
 LEDGER={LEDGER_Q}
 if [ ! -f "$LEDGER" ]; then
-    if [ -n "${{ORCHD_HOME:-}}" ] && [ -f "$ORCHD_HOME/_ledger.jsonl" ]; then
+    if [ -n "${{{ORCHD_HOME_ENV}:-}}" ] && [ -f "$ORCHD_HOME/_ledger.jsonl" ]; then
         LEDGER="$ORCHD_HOME/_ledger.jsonl"
     elif [ -f ".orchd/_ledger.jsonl" ]; then
         LEDGER=".orchd/_ledger.jsonl"
@@ -113,6 +116,9 @@ else
 )
         if [ $? -ne 0 ]; then
             echo "[orchd E020] ledger-state 回退查询失败 → 保守按任务活跃处理（继续范围校验）" >&2
+            echo "[orchd E020] 若因引擎目录搬移/改名导致安装期烘入路径失效：请重建 hook" >&2
+            echo "[orchd E020]   修复：python .orchd/__main__.py doctor --fix" >&2
+            echo "[orchd E020]   逃生（须自行留痕可审计）：git commit --no-verify；绕过后在任务 notes 记录理由" >&2
         else
             _PY_TASK=$(printf '%s\\n' "$_LS_RAW" | sed -n '1p' | tr -d '\\r')
             _PY_REVIEW=$(printf '%s\\n' "$_LS_RAW" | sed -n '2p' | tr -d '\\r')
@@ -140,24 +146,30 @@ else
     fi
 fi
 
-# 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件是 REVIEW_CLAIMED
-#    （审查进行中，无后续 REVIEW_SUBMITTED / RETRACT）→ 拒绝提交，保护审查基线。
-if [ -f "$LEDGER" ]; then
-    LAST_REVIEW=$(grep -F "\\"task_id\\":\\"$TASK_ID\\"" "$LEDGER" 2>/dev/null | grep -E '"type":"(REVIEW_CLAIMED|REVIEW_SUBMITTED|RETRACT)"' | tail -1)
-    case "$LAST_REVIEW" in
-        *REVIEW_CLAIMED*)
-            echo "orchd E017: review in progress, commit blocked on $BRANCH"
-            echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
-            echo "To bypass: git commit --no-verify"
-            exit 1
-            ;;
-    esac
+# 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件 REVIEW_CLAIMED
+#    （审查进行中）→ 拒绝提交，保护审查基线（任何分支，保留既有契约）。
+#    debug-pack B2：**引擎内部提交身份豁免**——staged 全为引擎固定资产
+#    （_master.json / IDEAS.md / ROADMAP.md / _full_regression.json）时视为引擎
+#    自身 amend/intake/full-regression 提交，不施加冻结；人为提交含任何非固定
+#    资产文件仍冻结（负控），越界另由第 4 步范围校验拦截。
+_ORCHD_ENGINE_ONLY=yes
+_ORCHD_E_STAGED=$(git diff --cached --name-only --no-renames 2>/dev/null)
+if [ -z "$_ORCHD_E_STAGED" ]; then
+    _ORCHD_ENGINE_ONLY=no
 else
-    # 无 jsonl 且 python 回退成功时，用回退查到的审查态做同等冻结判定
-    # （task-hook-sqlite-python-fallback）；回退不可用时沿旧语义跳过
-    # （步骤 1 已保守按活跃处理并留痕）。
-    if [ "$_LS_OK" = "yes" ]; then
-        case "$_PY_REVIEW" in
+    for _ORCHD_E_FILE in $_ORCHD_E_STAGED; do
+        case "$_ORCHD_E_FILE" in
+            .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md|ROADMAP.md|.orchd/_full_regression.json) ;;
+            *) _ORCHD_ENGINE_ONLY=no ;;
+        esac
+    done
+fi
+if [ "$_ORCHD_ENGINE_ONLY" != "yes" ]; then
+    # 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件是 REVIEW_CLAIMED
+    #    （审查进行中，无后续 REVIEW_SUBMITTED / RETRACT）→ 拒绝提交，保护审查基线。
+    if [ -f "$LEDGER" ]; then
+        LAST_REVIEW=$(grep -F "\\"task_id\\":\\"$TASK_ID\\"" "$LEDGER" 2>/dev/null | grep -E '"type":"(REVIEW_CLAIMED|REVIEW_SUBMITTED|RETRACT)"' | tail -1)
+        case "$LAST_REVIEW" in
             *REVIEW_CLAIMED*)
                 echo "orchd E017: review in progress, commit blocked on $BRANCH"
                 echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
@@ -165,6 +177,20 @@ else
                 exit 1
                 ;;
         esac
+    else
+        # 无 jsonl 且 python 回退成功时，用回退查到的审查态做同等冻结判定
+        # （task-hook-sqlite-python-fallback）；回退不可用时沿旧语义跳过
+        # （步骤 1 已保守按活跃处理并留痕）。
+        if [ "$_LS_OK" = "yes" ]; then
+            case "$_PY_REVIEW" in
+                *REVIEW_CLAIMED*)
+                    echo "orchd E017: review in progress, commit blocked on $BRANCH"
+                    echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
+                    echo "To bypass: git commit --no-verify"
+                    exit 1
+                    ;;
+            esac
+        fi
     fi
 fi
 

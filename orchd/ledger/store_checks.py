@@ -10,7 +10,14 @@
 """
 from __future__ import annotations
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.events import (
+    EVENT_CLAIMED,
+    EVENT_DONE,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_READY,
+    EVENT_REVIEW_SUBMITTED,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger.store_types import TaskState, _CHECKPOINT_SCHEMA_VERSION
 from orchd.lockfile import _depth_registry
@@ -300,21 +307,21 @@ class _StoreChecksMixin:
         invariant: str | None = None
         reason = ""
         if status in TERMINAL_STATUSES and etype in (
-            "CLAIMED", "DONE", "REVIEW_READY", "REVIEW_SUBMITTED",
+            EVENT_CLAIMED, EVENT_DONE, EVENT_REVIEW_READY, EVENT_REVIEW_SUBMITTED,
         ):
             # 终态后推进优先判定（比「缺活跃认领」更精确：终态本身就是最强判据）
             invariant = "terminal_reentry"
             reason = f"任务已 {status} 却再次出现 {etype}（终态后推进）"
-        elif etype == "CLAIMED" and status == "claimed":
+        elif etype == EVENT_CLAIMED and status == "claimed":
             invariant = "double_claim"
             reason = (
                 "同一任务在 claimed 状态下再次 CLAIMED（中间无终态/审查事件）——"
                 "典型成因为跨设备双认领或事件顺序被合并打乱"
             )
-        elif etype == "DONE" and status != "claimed":
+        elif etype == EVENT_DONE and status != "claimed":
             invariant = "done_without_active_claim"
             reason = f"任务处于 {status} 状态却出现 DONE（无活跃认领）"
-        elif etype in ("REVIEW_READY", "REVIEW_CLAIMED", "REVIEW_SUBMITTED") and \
+        elif etype in (EVENT_REVIEW_READY, EVENT_REVIEW_CLAIMED, EVENT_REVIEW_SUBMITTED) and \
                 status not in ("done", "in_review"):
             invariant = "review_without_done"
             reason = f"任务处于 {status} 状态却出现 {etype}（未经 DONE/进入审查）"

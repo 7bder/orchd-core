@@ -307,6 +307,9 @@ OTHER_PACKAGE_REASONS: dict[str, str] = {
 TOP_LEVEL_MODULE_REASONS: dict[str, str] = {
     "orchd/__init__.py": "包入口（版本号 + git 分支导出）",
     "orchd/__main__.py": "CLI 入口壳（与 .orchd/__main__.py 同职责）",
+    # task-stale-red-guards：前序包新增的两个常量真源单文件（顶层模块登记补齐）。
+    "orchd/constants.py": "全局常量真源（环境变量名/上限等）；由各域守卫覆盖",
+    "orchd/names.py": "运行时资产名/目录名真源；由各域守卫覆盖",
     "orchd/definition_archive.py": "任务定义归档域；行为面由归档相关测试覆盖",
     "orchd/errors.py": "错误码与异常类型（纯常量 + 单一类，扇入高但无职责交错）",
     "orchd/line.py": "分线模型；行为面由 tests/test_line*.py 覆盖",

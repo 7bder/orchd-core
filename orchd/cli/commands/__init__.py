@@ -31,6 +31,7 @@ from orchd.cli.commands import (
     sync as _sync,
     line as _line,
     check as _check,
+    release as _release,
 )
 
 _REGISTER_ORDER = [
@@ -45,6 +46,7 @@ _REGISTER_ORDER = [
     _sync,
     _line,
     _check,
+    _release,
 ]
 
 

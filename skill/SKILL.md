@@ -24,12 +24,12 @@
 1. **禁手动 git 写操作**：任何会话中，不得执行 `git checkout / branch / reset / stash / gc / prune / clean / rebase / cherry-pick / merge / push`。git 写操作仅由引擎自动执行；豁免 = 任务分支上的 `git commit` + 任务分支上的 `orchd git merge main`（精确形态，受管出口，详见 rules/git.md）。若确需其他手动 git 写，先向人报告获许可。
 2. **禁破坏性 git**：`reset --hard` / `gc --prune=now` / `clean -fdx` / `branch -D` / `push --force` 一律禁止，无豁免。
 3. **禁改范围外文件**：只读 files_to_read、只写 files_to_edit；不触 `.git/`；删文件前确认属验收范围。确需增删声明文件时回主工作树执行 amend 补登，不手改 _master.json。
-4. **禁绕过身份（自审三档）**：
-   - 默认（enforce=false）：`self_review_notice` 标注仅提示，不阻断。
-   - `config.enforce_self_review_block=true` 或任务级 `require_independent_review=true`（与全局开关 OR）：E016 硬阻断。
-   - 单会话自托管确需自审时：须在 review comments 显式披露。
+4. **禁绕过身份（自审默认阻断）**：
+   - 缺省 `config.enforce_self_review_block=true`（读 config 缺省 true）：claim review 异指纹不满足即 `E016 self_review_blocked` 中断，guidance 指引起独立 subagent / 换新会话。
+   - 任务级 `require_independent_review=true`（与全局开关 OR）同阻断。
+   - 显式 `config.enforce_self_review_block=false`：退回提示档（附 `self_review_notice`），须在 review comments 显式披露。
 5. **禁未提交即中断**：改动后必须提交（或报告未提交原因）才结束；session end 硬拦截，`--force` 可放行。
-6. **禁止自动摄入与自动写入**：intake 仅用户指定；灵感只 `idea propose` 记 study；confirm/drop 仅用户可执行。
+6. **禁止自动摄入与自动写入**：intake 仅用户指定；灵感只 `idea propose` 记 study；confirm/close 仅用户可执行。
 7. **禁擅自 auto-claim**：`request --auto-claim` 默认拒绝（E032），仅 `config.allow_auto_claim: true` 时可调。
 8. **禁任务分支执行 intake/amend**：amend 仅在 canonical 主工作树 main 且工作区干净时执行；任务分支 E007 拒绝，回主工作树补声明。
 9. **禁手改运行时文件**：`_ledger.jsonl` / `_checkpoint.json` / `mod-*/spec.json` 由引擎维护，不手改；只读诊断（`status` / `doctor`）不受限，数据异常按 rules/recovery.md 处置或报告。
@@ -73,11 +73,11 @@
 ## 身份约定（会话级指纹）
 - 身份 = `ORCHD_SESSION_ID` 派生 12 位 hex 指纹；同对话不变，不同对话不同。
 - 归属 / 忙度 / 自审 / 锁所有权以指纹为主键；同 agent 不同 session 可并行领不同任务。
-- 自审口径（默认提示 / E016 / comments 披露）见红线 4 与 rules/session.md。
+- 自审口径（默认阻断 / 显式 opt-out 提示 / comments 披露）见红线 4 与 rules/session.md。
 
 ## 摄入口令（统一管线）
 - 四句口令：先记下来 / 确认<slug> / 这条不做 / 拉出来先对一下再拆。
-- 对照卡：原文 / 现状 / 拆分 / 推断；confirm/drop 仅用户可执行。
+- 对照卡：原文 / 现状 / 拆分 / 推断；confirm/close 仅用户可执行。
 - 三硬界限：假设被改先问；共享文件默认 `depends_on`；单任务一次做完一次审完。
 
 ## 规则目录（见 rules/README.md）

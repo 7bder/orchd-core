@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
+from orchd.contracts.responses import (
+    MESSAGE_KEY,
+)
 
 
 # 默认分解指南：当项目 docs/decomposition-guide.md 不存在时，
@@ -66,13 +69,13 @@ def bootstrap(project_root: Path | None = None) -> dict[str, Any]:
         raise OrchdError(
             ErrorCode.E001,
             f"file not found: {schema_path}",
-            [{"path": str(schema_path), "message": "schema 文件缺失"}],
+            [{"path": str(schema_path), MESSAGE_KEY: "schema 文件缺失"}],
         )
     if not prompt_path.exists():
         raise OrchdError(
             ErrorCode.E001,
             f"file not found: {prompt_path}",
-            [{"path": str(prompt_path), "message": "architect prompt 模板缺失"}],
+            [{"path": str(prompt_path), MESSAGE_KEY: "architect prompt 模板缺失"}],
         )
 
     schema_text = schema_path.read_text(encoding="utf-8")

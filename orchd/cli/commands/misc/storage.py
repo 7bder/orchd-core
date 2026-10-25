@@ -10,8 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from orchd.errors import ErrorCode, OrchdError
 from orchd.cli._util import _find_orchd_dir
+from orchd.errors import ErrorCode, OrchdError
+
+# 本模块不读环境变量：hint 文案里的 ``ORCHD_STORAGE_BACKEND=file`` 是给用户的操作指引，
+# 变量名真源见 ``orchd.constants.ORCHD_STORAGE_BACKEND_ENV``（Wave1-T3b）。
 
 def _cmd_layout_migrate(args) -> dict:
     """flat → container 布局迁移（task-14-worktree-layout，AC4）。

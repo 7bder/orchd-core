@@ -9,6 +9,128 @@ from .declarations import _decl_withdraw_branch_overlap, _log_decl_withdraw
 from .patch_validation import _validate_additional_sources_patch, _validate_verify_timeout_patch
 
 
+def _apply_text_field_patch(*, store, target, patch_task, patch_brief,
+                            patch_name, revise_terminal) -> None:
+    """brief / name 文本字段补丁（task-stale-red-guards 自 ``_amend_patch_fields``
+    抽出，回收函数级预算；行为逐条保持：空串 E007、非 pending 态须配
+    ``--revise-terminal``、命中后 ``target.update``。"""
+    # task-amend-text-field-patch-channel：brief / name 文本旗标（E038 的
+    # pending 出口）。状态矩阵与 --acceptance-criteria 通道同构（同一
+    # _ac_field_routing_hint 生成器，不另写文案）：pending 直接改；
+    # claimed/done/in_review E007 并给既有出路；终态按现规则——不带
+    # --revise-terminal 拒绝（hint 指向 revise-terminal），带
+    # --revise-terminal 且指向本任务时放行（brief/name 本就在
+    # _TERMINAL_TEXT_REVISABLE_FIELDS，--reason 必填校验沿用既有通道，
+    # AMEND 审计 reason=terminal_spec_revision）。不进
+    # schema x-amendable（否则 claimed 白名单连带放行，打穿 E007 矩阵）。
+    _text_patches = {
+        "brief": patch_brief,
+        "name": patch_name,
+    }
+    _active_text = {k: v for k, v in _text_patches.items() if v is not None}
+    if _active_text:
+        from orchd.split import _ac_field_routing_hint
+
+        _empty = sorted(k for k, v in _active_text.items()
+                        if not str(v).strip())
+        if _empty:
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_text_empty: --brief/--name 须为非空文本"
+                "（schema minLength=1；空值拒绝而非清空）",
+                [{
+                    "reason": "amend_text_empty",
+                    "task_id": patch_task,
+                    "fields": _empty,
+                    "hint": "文本字段不接受空串/纯空白；确需清空属删除语义，"
+                            "不在本通道（无用户裁决不删必填字段）",
+                }],
+            )
+        _txt_state = store.replay().get(patch_task)
+        _txt_status = (_txt_state.status
+                       if _txt_state is not None else "pending")
+        if _txt_status != "pending" and revise_terminal != patch_task:
+            raise OrchdError(
+                ErrorCode.E007,
+                f"invalid_state: 任务 {patch_task} 当前为 {_txt_status} 态，"
+                "--brief/--name 仅 pending 态直接放行（终态须配 "
+                "--revise-terminal + --reason 走纯文本修订）",
+                [{
+                    "reason": "text_status_invalid",
+                    "task_id": patch_task,
+                    "status": _txt_status,
+                    "hint": _ac_field_routing_hint(_txt_status,
+                                                   set(_active_text)),
+                }],
+            )
+        target.update(_active_text)
+
+
+def _apply_depends_on_patch(*, master, store, target, patch_task,
+                           patch_depends, patch_depends_present) -> None:
+    """depends_on 结构补丁（task-stale-red-guards 自 ``_amend_patch_fields`` 抽出，
+    以回收函数级 300 行预算；行为逐条保持：空值 / 自指 / 非 pending 态 E007、
+    并集追加后 ``validate_references`` 兜底。"""
+    # task-amend-depends-on-channel：depends_on 是结构属性，只在 pending 态
+    # 定稿；并集追加、只增不删（撤回通道不在本轮）。补丁后立即用 spec 的
+    # 引用/环校验兜底——admission 的结构校验发生在 patch 之前，不能覆盖本次
+    # 新增边；校验失败必须在落盘前抛出，canonical master 零修改。
+    if patch_depends_present:
+        if not patch_depends:
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_depends_empty: --depends-on 至少须给 1 个 task id"
+                "（空值拒绝而非清空；本通道只增不删）",
+                [{
+                    "reason": "amend_depends_empty",
+                    "task_id": patch_task,
+                    "hint": "给出要追加的上游任务 id；清空依赖不在本通道",
+                }],
+            )
+        if patch_task in patch_depends:
+            raise OrchdError(
+                ErrorCode.E007,
+                "amend_depends_self: depends_on 不得包含任务自身",
+                [{
+                    "reason": "amend_depends_self",
+                    "task_id": patch_task,
+                    "hint": "依赖必须是有向无环图的上游任务，不能自指",
+                }],
+            )
+        dep_state = store.replay().get(patch_task)
+        dep_status = dep_state.status if dep_state is not None else "pending"
+        if dep_status != "pending":
+            raise OrchdError(
+                ErrorCode.E007,
+                f"invalid_state: 任务 {patch_task} 当前为 {dep_status} 态，"
+                "--depends-on 仅 pending 态放行",
+                [{
+                    "reason": "dep_status_invalid",
+                    "task_id": patch_task,
+                    "status": dep_status,
+                    "hint": ("depends_on 是结构属性，须在 claim 前定稿；"
+                             "claimed/done/in_review 请先 retract 或另开任务"),
+                }],
+            )
+        current_depends = set(target.get("depends_on", []) or [])
+        target["depends_on"] = sorted(current_depends | set(patch_depends))
+        from orchd.spec import validate_references
+
+        dep_errors = validate_references(master)
+        if dep_errors:
+            first = dep_errors[0]
+            raise OrchdError(
+                first.code,
+                f"depends_on_patch_invalid: {first.message}",
+                [{
+                    "task_id": patch_task,
+                    "path": first.path,
+                    "hint": ("补登 depends_on 后校验失败（未知引用或依赖环），"
+                             "本次未落盘；修正后重试"),
+                }],
+            )
+
+
 def _amend_patch_fields(*, args, master, store, project_root: Path,
                         revise_terminal: str | None) -> str | None:
     """amend 补丁段：CLI 补丁旗标解析 + 状态矩阵门 + 字段应用（原 L542-822）。
@@ -33,6 +155,8 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
     patch_remove_exempt = list(
         getattr(args, "remove_exempt_files", None) or [])
     patch_verify = getattr(args, "verify_command", None)
+    patch_depends_present = getattr(args, "depends_on", None) is not None
+    patch_depends = list(getattr(args, "depends_on", None) or [])
     patch_sources = list(getattr(args, "additional_sources", None) or [])
     # task-verify-timeout-amend-channel：任务级 verify 预算补丁（default None = 不改）。
     patch_timeout = getattr(args, "verify_timeout_seconds", None)
@@ -51,6 +175,7 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
     if patch_task is not None:
         if not (patch_files or patch_exempt or patch_remove_files
                 or patch_remove_exempt or patch_verify is not None
+                or patch_depends_present
                 or patch_sources or patch_timeout is not None
                 or patch_reviewers is not None
                 or patch_files_to_read is not None
@@ -66,7 +191,8 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
                     patch_task,
                     "hint":
                     "补登示例：--files-to-edit <file> / --exempt-files <file> / "
-                    "--verify-command \"<cmd>\" / --verify-timeout-seconds <N> / "
+                    "--depends-on <task-id...> / --verify-command \"<cmd>\" / "
+                    "--verify-timeout-seconds <N> / "
                     "--additional-sources <ref> / --reviewers <id...> / "
                     "--files-to-read <path...> / "
                     "--acceptance-criteria \"<ac>\" ... / --brief \"<text>\" / "
@@ -165,56 +291,15 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
                     }],
                 )
             target["acceptance_criteria"] = list(patch_ac)
-        # task-amend-text-field-patch-channel：brief / name 文本旗标（E038 的
-        # pending 出口）。状态矩阵与 --acceptance-criteria 通道同构（同一
-        # _ac_field_routing_hint 生成器，不另写文案）：pending 直接改；
-        # claimed/done/in_review E007 并给既有出路；终态按现规则——不带
-        # --revise-terminal 拒绝（hint 指向 revise-terminal），带
-        # --revise-terminal 且指向本任务时放行（brief/name 本就在
-        # _TERMINAL_TEXT_REVISABLE_FIELDS，--reason 必填校验沿用既有通道，
-        # AMEND 审计 reason=terminal_spec_revision）。不进
-        # schema x-amendable（否则 claimed 白名单连带放行，打穿 E007 矩阵）。
-        _text_patches = {
-            "brief": patch_brief,
-            "name": patch_name,
-        }
-        _active_text = {k: v for k, v in _text_patches.items() if v is not None}
-        if _active_text:
-            from orchd.split import _ac_field_routing_hint
-
-            _empty = sorted(k for k, v in _active_text.items()
-                            if not str(v).strip())
-            if _empty:
-                raise OrchdError(
-                    ErrorCode.E007,
-                    "amend_text_empty: --brief/--name 须为非空文本"
-                    "（schema minLength=1；空值拒绝而非清空）",
-                    [{
-                        "reason": "amend_text_empty",
-                        "task_id": patch_task,
-                        "fields": _empty,
-                        "hint": "文本字段不接受空串/纯空白；确需清空属删除语义，"
-                                "不在本通道（无用户裁决不删必填字段）",
-                    }],
-                )
-            _txt_state = store.replay().get(patch_task)
-            _txt_status = (_txt_state.status
-                           if _txt_state is not None else "pending")
-            if _txt_status != "pending" and revise_terminal != patch_task:
-                raise OrchdError(
-                    ErrorCode.E007,
-                    f"invalid_state: 任务 {patch_task} 当前为 {_txt_status} 态，"
-                    "--brief/--name 仅 pending 态直接放行（终态须配 "
-                    "--revise-terminal + --reason 走纯文本修订）",
-                    [{
-                        "reason": "text_status_invalid",
-                        "task_id": patch_task,
-                        "status": _txt_status,
-                        "hint": _ac_field_routing_hint(_txt_status,
-                                                       set(_active_text)),
-                    }],
-                )
-            target.update(_active_text)
+        _apply_depends_on_patch(
+            master=master, store=store, target=target, patch_task=patch_task,
+            patch_depends=patch_depends, patch_depends_present=patch_depends_present,
+        )
+        _apply_text_field_patch(
+            store=store, target=target, patch_task=patch_task,
+            patch_brief=patch_brief, patch_name=patch_name,
+            revise_terminal=revise_terminal,
+        )
         withdrawn: list[dict[str, str]] = []
         not_present: list[dict[str, str]] = []
         cur_files = set(target.get("files_to_edit", []))

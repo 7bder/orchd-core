@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from orchd.contracts.events import (
+    EVENT_DONE,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_SUBMITTED,
+)
 from orchd.ledger import Store
 from orchd.ledger import TaskDerived
 
@@ -43,7 +48,7 @@ def extract_review_comments(
         return comments
     events = store._read_ledger_lines(from_line=1)
     for ev in events:
-        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+        if ev.get("task_id") != task_id or ev.get("type") != EVENT_REVIEW_SUBMITTED:
             continue
         if ev.get("comments"):
             comments.append(ev["comments"])
@@ -70,7 +75,7 @@ def extract_review_history(store: Store, task_id: str) -> list[dict[str, Any]]:
         return history
     events = store._read_ledger_lines(from_line=1)
     for ev in events:
-        if ev.get("task_id") != task_id or ev.get("type") != "REVIEW_SUBMITTED":
+        if ev.get("task_id") != task_id or ev.get("type") != EVENT_REVIEW_SUBMITTED:
             continue
         if ev.get("comments"):
             body = ev["comments"]
@@ -109,7 +114,7 @@ def extract_last_done(
     author: str | None = None
     changes: str | None = None
     for ev in events:
-        if ev.get("task_id") == task_id and ev.get("type") == "DONE":
+        if ev.get("task_id") == task_id and ev.get("type") == EVENT_DONE:
             author = ev.get("agent_id")
             changes = ev.get("changes_description")
     return author, changes
@@ -130,7 +135,7 @@ def find_last_done_event(
     events = store._read_ledger_lines(from_line=1)
     last: dict[str, Any] | None = None
     for ev in events:
-        if ev.get("task_id") == task_id and ev.get("type") == "DONE":
+        if ev.get("task_id") == task_id and ev.get("type") == EVENT_DONE:
             last = ev
     return last
 
@@ -147,7 +152,7 @@ def extract_review_baseline(
         return None
     for event in reversed(events):
         if (
-            event.get("type") == "REVIEW_CLAIMED"
+            event.get("type") == EVENT_REVIEW_CLAIMED
             and event.get("task_id") == task_id
             and event.get("agent_id") == agent_id
         ):

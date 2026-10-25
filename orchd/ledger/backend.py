@@ -5,7 +5,8 @@
 ``ORCHD_STORAGE_BACKEND`` 归一化（``resolve_backend_kind``）、后端构造（``_select_backend``）
 与对外的 ``open_store``。
 
-依赖方向：顶层依赖标准库、``orchd.errors``、``orchd.storage``（``StorageBackend``）与
+依赖方向：顶层依赖标准库、``orchd.constants``（环境变量名真源，零 orchd 内部依赖的叶子）、
+``orchd.errors``、``orchd.storage``（``StorageBackend``）与
 ``orchd.storage.filesystem``（``FilesystemBackend``）；``SqliteBackend`` 沿用搬移前的函数级
 惰性导入。对 ``resolve_store_dir``（paths 域）与 ``Store``（store 域，L7 起在 ledger/store.py）
 的引用一律用**函数级惰性导入** ``from orchd.ledger import ...``：① 避免与聚合入口形成加载期环；
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from orchd.constants import ORCHD_STORAGE_BACKEND_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.storage import StorageBackend
 from orchd.storage.filesystem import FilesystemBackend
@@ -110,7 +112,7 @@ def _sqlite_has_state(path: Path) -> bool:
 #: 存储后端选择环境变量（task-sqlite-cutover-default，B-max 切默认）。
 #: 取值 ``sqlite``（缺省，行为与 ROADMAP v1.4.6 P1 一致）/ ``file``（显式回滚
 #: 路径，行为与切默认前完全一致）/ 非法非空值：结构化 E007（拼写错误不得静默回退）。
-_STORAGE_BACKEND_ENV = "ORCHD_STORAGE_BACKEND"
+_STORAGE_BACKEND_ENV = ORCHD_STORAGE_BACKEND_ENV  # 变量名真源：orchd.constants
 
 
 def resolve_backend_kind() -> str:
@@ -171,7 +173,7 @@ def _select_backend(orchd_dir: Path, *, readonly: bool = False) -> StorageBacken
         return backend
     raise OrchdError(
         ErrorCode.E007,
-        f"storage_backend_unknown: ORCHD_STORAGE_BACKEND={kind!r} 非法",
+        f"storage_backend_unknown: {ORCHD_STORAGE_BACKEND_ENV}={kind!r} 非法",
         [{"env": _STORAGE_BACKEND_ENV, "value": kind,
           "allowed": ["file", "sqlite"],
           "hint": "取值仅 file / sqlite（缺省 sqlite）"}],

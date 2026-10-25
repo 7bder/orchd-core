@@ -6,6 +6,7 @@
 """
 
 from __future__ import annotations
+from orchd.errors import ErrorCode
 
 import os
 from pathlib import Path
@@ -16,6 +17,9 @@ from .paths import read_for, resolve_read_paths
 from .rules import attach_rule_summaries
 
 
+# 环境变量名真源见 ``orchd.constants`` 的 ``*_ENV``（Wave1-T3b）：本表提示文案里的
+# ``ORCHD_SESSION_ID`` / ``ORCHD_ALLOW_CONTAINER_ROOT`` 等是给人看的**指引文本**，
+# 不参与任何 env 读取，故按可读性保留原名。
 # 错误恢复指引映射（error recovery guidance）：错误码 → 恢复指引。
 # 只提示不代行——不自动执行任何修复命令，修复决策权始终在人/agent。
 # (task-audit-error-guidance-coverage) 数据化：14 个结构相同的 dict 收敛为
@@ -42,54 +46,57 @@ EXIT_TYPE_ACTION_MEANING: dict[str, str] = {
 }
 _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ...] = (
     # (错误码, recovery, read 规则文件, command, tier, exit_type)
-    ("E001", "源码/任务文件缺失：补齐或修正 details.path 指向的文件路径后重试，运行 python .orchd/__main__.py validate 定位缺失文件", ("rules/intake.md",), f"{_ENTRY_CMD} validate", "suggest", "manual-action"),
-    ("E002", "JSON 解析失败：用 doctor 检查并修复损坏的 intake/schema 文件", ("rules/intake.md",), f"{_ENTRY_CMD} doctor", "suggest", "exec-command"),
-    ("E003", "schema 校验失败：运行 validate 定位并修复不符项后重试", ("rules/intake.md",), f"{_ENTRY_CMD} validate", "suggest", "exec-command"),
-    ("E004", "检测到 DAG 依赖环：检查 depends_on 引用，消除循环依赖", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E005", "引用缺失：补全被引用的任务/源条目（IDEAS/ROADMAP/source）", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E006", "ID 重复：确认任务标识唯一，合并或重命名冲突项", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E007", "任务状态不合法：当前 <current> 不允许 <event_type>→<target>，允许集合 <allowed>，请用 python .orchd/__main__.py status 查看当前状态并修正", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E008", "任务未就绪：确认任务处于 pending 状态再 claim", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E009", "任务已被认领：已被 <holder> 认领，不要重试原命令，等待其完成或由其 retract", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
-    ("E010", "文件冲突：与 <claimed_by> 任务 files_to_edit 重叠（<files>），需串行化或合并任务，等待其 done 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E011", "agent 忙：已持有其他任务，不要重试原命令，先完成或 retract 再领新任务", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
-    ("E012", "锁持有超时：用 watchdog 查看锁持有者，不要重试原命令，失效则清理并重试", ("rules/recovery.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
-    ("E013", "引擎未初始化：先运行 init 初始化工作区再操作", ("rules/install.md",), f"{_ENTRY_CMD} init", "auto", "exec-command"),
-    ("E014", "verify 失败：查看 verify 输出，修复实现后重试 done", ("rules/verify.md",), "python -m pytest <定向测试>", "suggest", "exec-command"),
-    ("E015", "合并冲突/基线陈旧：在任务分支执行受管出口 git merge main（禁手写 git merge、禁强推），解决冲突后 commit 并重跑 verify；细节看 command 输出的冲突清单", ("rules/git.md",), f"{_ENTRY_CMD} git merge main", "manual", "exec-command"),
+    (ErrorCode.E001.name, "源码/任务文件缺失：补齐或修正 details.path 指向的文件路径后重试，运行 python .orchd/__main__.py validate 定位缺失文件", ("rules/intake.md",), f"{_ENTRY_CMD} validate", "suggest", "manual-action"),
+    (ErrorCode.E002.name, "JSON 解析失败：用 doctor 检查并修复损坏的 intake/schema 文件", ("rules/intake.md",), f"{_ENTRY_CMD} doctor", "suggest", "exec-command"),
+    (ErrorCode.E003.name, "schema 校验失败：运行 validate 定位并修复不符项后重试", ("rules/intake.md",), f"{_ENTRY_CMD} validate", "suggest", "exec-command"),
+    (ErrorCode.E004.name, "检测到 DAG 依赖环：检查 depends_on 引用，消除循环依赖", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E005.name, "引用缺失：补全被引用的任务/源条目（IDEAS/ROADMAP/source）", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E006.name, "ID 重复：确认任务标识唯一，合并或重命名冲突项", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E007.name, "任务状态不合法：当前 <current> 不允许 <event_type>→<target>，允许集合 <allowed>，请用 python .orchd/__main__.py status 查看当前状态并修正", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E008.name, "任务未就绪：确认任务处于 pending 状态再 claim", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E009.name, "任务已被认领：已被 <holder> 认领，不要重试原命令，等待其完成或由其 retract", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
+    (ErrorCode.E010.name, "文件冲突：与 <claimed_by> 任务 files_to_edit 重叠（<files>），需串行化或合并任务，等待其 done 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E011.name, "agent 忙：已持有其他任务，不要重试原命令，先完成或 retract 再领新任务", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
+    (ErrorCode.E012.name, "锁持有超时：用 watchdog 查看锁持有者，不要重试原命令，失效则清理并重试", ("rules/recovery.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
+    (ErrorCode.E013.name, "引擎未初始化：先运行 init 初始化工作区再操作", ("rules/install.md",), f"{_ENTRY_CMD} init", "auto", "exec-command"),
+    (ErrorCode.E014.name, "verify 失败：查看 verify 输出，修复实现后重试 done", ("rules/verify.md",), "python -m pytest <定向测试>", "suggest", "exec-command"),
+    (ErrorCode.E015.name, "合并冲突/基线陈旧：在任务分支执行受管出口 git merge main（禁手写 git merge、禁强推），解决冲突后 commit 并重跑 verify；细节看 command 输出的冲突清单", ("rules/git.md",), f"{_ENTRY_CMD} git merge main", "manual", "exec-command"),
     # E016 命令相位无关（task-guidance-completeness-gate AC6）：claim 的 --type choices
     # 仅 [spec, code]，unified 单阶段须省略该参数——历史上此处写 `--type review` 属非法取值
     # （与 _review_step_guidance 的 unified 分支口径一致）。
-    ("E016", "自审被阻断：当前会话已实现 <task_id>——请起独立指纹的 subagent/新对话领审（换会话/身份后重新 claim --task <task_id> --confirm，相位无关），或由他人审查", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
-    ("E017", "工作区脏：先提交/清理未提交改动，再重试", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
-    ("E018", "分支错误：确认处于正确分支；主工作树滞留 task/<id> 且该任务已放弃/无活跃认领时，重新 claim 将自动恢复 trunk 基线（implementer_trunk_restore），或走 force-status + amend 受管往返", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
-    ("E019", "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
-    ("E020", "范围外提交：只改 files_to_edit 声明文件", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
-    ("E021", "身份不匹配：确认 ORCHD_SESSION_ID 与认领者一致，必要时重连", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E022", f"缺少 verify_command：任务 <task_id> 缺少 verify_command，请运行 {amend_patch_cmd('<id>', verify='<cmd --basetemp=...>')} 补充后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd>"), "suggest", "exec-command"),
-    ("E023", "验收标准模糊（警告不阻断）：建议用可量化标准，可 amend 修订；结构术语（如六环/论证链）在库内无定义时同属本码——补定义或登记 shared/conventions.md 术语表", ("rules/intake.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
-    ("E024", "verify_command 缺 --basetemp：用 amend 补充跨平台 basetemp", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd --basetemp=...>"), "suggest", "exec-command"),
-    ("E025", "source 引用缺失：任务 <task_id> 需关联 IDEAS.md/ROADMAP.md 条目 <source>，请补齐 source 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E026", "测试连带未声明（警告不阻断）：用 amend 声明测试或加入 exempt_files", ("rules/verify.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
-    ("E027", "verify_command 含不安全/不兼容段：用 amend 改为跨平台安全命令", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<安全命令>"), "suggest", "exec-command"),
-    ("E028", f"dry-run 断言不匹配：任务 <task_id> 的 verify_command 断言失败，请核对断言或运行 {amend_patch_cmd('<id>', verify='<修正命令>')} 调整；A 通道下该失败**阻断注册**（不写 snapshot），修正后重试即解除", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<修正命令>"), "suggest", "exec-command"),
-    ("E029", "任务拆解粒度越界：任务 <task_id> 按 R4 文件≤5/行≤60/小时≤8 拆分为更小任务，参考 docs/decomposition-guide.md；B 通道下为告警不阻断，A 通道下**拒绝注册**——须先拆小并补登记新任务后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E030", "运行时文件完整性校验失败：用 doctor 诊断并修复引擎文件；B/C 通道下为告警不阻断，A 通道下**阻断回收**（无法确认 in_review 保护），doctor 修复后重试", ("rules/recovery.md",), f"{_ENTRY_CMD} doctor", "manual", "exec-command"),
-    ("E031", "ROADMAP 规划章节 <chapter> 未落地 IDEAS：先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS study（待用户 confirm 升 pending）后再 intake；若该版本已发布或已放弃，在 ROADMAP 标记「历史」或移出", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
-    ("E032", "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
-    ("E033", "会话身份缺失：先 session start 取 token 并执行其注入命令（$env:ORCHD_SESSION_ID=\"<token>\" / export ORCHD_SESSION_ID=\"<token>\"），再重试", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
-    ("E034", "撤认归属守卫：仅事件作者 <owner> 或 admin 可撤回 <task_id>，当前 <caller> 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E035", "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
-    ("E036", "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    ("E037", "verify_command 引用路径未声明且不存在：将路径加入 files_to_edit/exempt_files，或改指向实际存在的文件（声明口径一致性）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit <path>", "suggest", "exec-command"),
+    (ErrorCode.E016.name, "自审被阻断：当前会话已实现 <task_id>——请起独立 subagent 领审（起法：session start 取新 token → 起 subagent → 带该 ORCHD_SESSION_ID 重新 claim --task <task_id> --confirm，相位无关），或手动换新会话；不保留显式自审旁路（rules/review.md「审查者身份约定」）", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
+    (ErrorCode.E017.name, "工作区脏：先提交/清理未提交改动，再重试", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
+    (ErrorCode.E018.name, "分支错误：确认处于正确分支；主工作树滞留 task/<id> 且该任务已放弃/无活跃认领时，重新 claim 将自动恢复 trunk 基线（implementer_trunk_restore），或走 force-status + amend 受管往返", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
+    (ErrorCode.E019.name, "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
+    (ErrorCode.E020.name, "范围外提交：只改 files_to_edit 声明文件", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
+    (ErrorCode.E021.name, "身份不匹配：确认 ORCHD_SESSION_ID 与认领者一致，必要时重连", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E022.name, f"缺少 verify_command：任务 <task_id> 缺少 verify_command，请运行 {amend_patch_cmd('<id>', verify='<cmd --basetemp=...>')} 补充后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd>"), "suggest", "exec-command"),
+    (ErrorCode.E023.name, "验收标准模糊（警告不阻断）：建议用可量化标准，可 amend 修订；结构术语（如六环/论证链）在库内无定义时同属本码——补定义或登记 shared/conventions.md 术语表", ("rules/intake.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
+    (ErrorCode.E024.name, "verify_command 缺 --basetemp：用 amend 补充跨平台 basetemp", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<cmd --basetemp=...>"), "suggest", "exec-command"),
+    (ErrorCode.E025.name, "source 引用缺失：任务 <task_id> 需关联 IDEAS.md/ROADMAP.md 条目 <source>，请补齐 source 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E026.name, "测试连带未声明（警告不阻断）：用 amend 声明测试或加入 exempt_files", ("rules/verify.md",), f"{_ENTRY_CMD} amend", "suggest", "continue"),
+    (ErrorCode.E027.name, "verify_command 含不安全/不兼容段：用 amend 改为跨平台安全命令", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<安全命令>"), "suggest", "exec-command"),
+    (ErrorCode.E028.name, f"dry-run 断言不匹配：任务 <task_id> 的 verify_command 断言失败，请核对断言或运行 {amend_patch_cmd('<id>', verify='<修正命令>')} 调整；A 通道下该失败**阻断注册**（不写 snapshot），修正后重试即解除", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<修正命令>"), "suggest", "exec-command"),
+    (ErrorCode.E029.name, "任务拆解粒度越界：任务 <task_id> 按 R4 文件≤5/行≤60/小时≤8 拆分为更小任务，参考 docs/decomposition-guide.md；B 通道下为告警不阻断，A 通道下**拒绝注册**——须先拆小并补登记新任务后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E030.name, "运行时文件完整性校验失败：用 doctor 诊断并修复引擎文件；B/C 通道下为告警不阻断，A 通道下**阻断回收**（无法确认 in_review 保护），doctor 修复后重试", ("rules/recovery.md",), f"{_ENTRY_CMD} doctor", "manual", "exec-command"),
+    (ErrorCode.E031.name, "ROADMAP 规划章节 <chapter> 未落地 IDEAS：先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS study（待用户 confirm 升 pending）后再 intake；若该版本已发布或已放弃，在 ROADMAP 标记「历史」或移出", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
+    (ErrorCode.E032.name, "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
+    (ErrorCode.E033.name, "会话身份缺失：先 session start 取 token 并执行其注入命令（$env:ORCHD_SESSION_ID=\"<token>\" / export ORCHD_SESSION_ID=\"<token>\"），再重试", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
+    (ErrorCode.E034.name, "撤认归属守卫：仅事件作者 <owner> 或 admin 可撤回 <task_id>，当前 <caller> 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E035.name, "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
+    (ErrorCode.E036.name, "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E037.name, "verify_command 引用路径未声明且不存在：将路径加入 files_to_edit/exempt_files，或改指向实际存在的文件（声明口径一致性）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit <path>", "suggest", "exec-command"),
     # task-hint-ghost-fix（pass7 P1-5/D2）：原建议命令 `amend --brief` 旗标不存在（幽灵命令）。
     # 改为两条可执行通道：补声明（--files-to-edit）或终态文本修订（--revise-terminal）。
-    ("E038", f"brief 声明的 files_to_edit 数量口径与实际声明不一致（warning 不阻断）：对齐二者——补声明 {amend_patch_cmd('<id>', files=['<f>'])}，或修订 brief 文本（pending 态 {amend_patch_cmd('<id>', brief='<对齐后的 brief>')}；终态任务用 {_ENTRY_CMD} amend --revise-terminal <id> --brief \"<对齐后的 brief>\" --reason <理由>）", ("rules/intake.md",), amend_patch_cmd("<id>", files=["<f>"]), "suggest", "continue"),
-    ("E039", f"共享入口改动未覆盖登记的既有测试：<missing> 必须出现在 verify_command 的 pytest 目标里（否则既有断言静默变红），用 {amend_patch_cmd('<id>', verify='<补入登记测试后的命令>')} 补登后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<补入登记测试后的命令>"), "suggest", "exec-command"),
+    (ErrorCode.E038.name, f"brief 声明的 files_to_edit 数量口径与实际声明不一致（warning 不阻断）：对齐二者——补声明 {amend_patch_cmd('<id>', files=['<f>'])}，或修订 brief 文本（pending 态 {amend_patch_cmd('<id>', brief='<对齐后的 brief>')}；终态任务用 {_ENTRY_CMD} amend --revise-terminal <id> --brief \"<对齐后的 brief>\" --reason <理由>）", ("rules/intake.md",), amend_patch_cmd("<id>", files=["<f>"]), "suggest", "continue"),
+    (ErrorCode.E039.name, f"共享入口改动未覆盖登记的既有测试：<missing> 必须出现在 verify_command 的 pytest 目标里（否则既有断言静默变红），用 {amend_patch_cmd('<id>', verify='<补入登记测试后的命令>')} 补登后重试", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<补入登记测试后的命令>"), "suggest", "exec-command"),
     # task-ac-verify-coverage：AC → verify 反向一致性（E040 ac_verify_gap）。AC 声称
     # 全仓零残留 / 全仓可判定性质而 verify_command 无对应覆盖时告警；warning 不阻断
     # （exit_type=continue）。全仓声称要求 repo 级 grep，文件级不算覆盖。
-    ("E040", f"AC 声称「全仓零残留 / 全仓可判定」性质但 verify_command 未覆盖（warning 不阻断）：补 repo 级 grep（grep -r / rg / git grep）到 verify_command，用 {amend_patch_cmd('<id>', verify='<含 repo 级 grep 的命令>')} 补登后重试；或把该 AC 降级为文件级 / manual（review 表据此标红，指引补 repo 级 grep）", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<含 repo 级 grep 的命令>"), "suggest", "continue"),
+    (ErrorCode.E040.name, f"AC 声称「全仓零残留 / 全仓可判定」性质但 verify_command 未覆盖（warning 不阻断）：补 repo 级 grep（grep -r / rg / git grep）到 verify_command，用 {amend_patch_cmd('<id>', verify='<含 repo 级 grep 的命令>')} 补登后重试；或把该 AC 降级为文件级 / manual（review 表据此标红，指引补 repo 级 grep）", ("rules/verify.md",), amend_patch_cmd("<id>", verify="<含 repo 级 grep 的命令>"), "suggest", "continue"),
+    # E041 同 source 串行门（engine-discipline-hardening 停服施工 2026-10-23）：
+    # await-external——兄弟任务在手属外部时序，勿重试本命令。
+    (ErrorCode.E041.name, "同 source 串行门：同 source 已有在手（claimed/done/in_review）任务——串行包逐张推进，等待其在手兄弟任务终态（completed）或由其 retract 释放后再重试 claim；用 status 查看兄弟任务进度；伞收口卡须待兄弟卡全部终态（rules/intake.md serial-package 节）", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
 )
 # 显式豁免集：允许裸弱出口的码（默认空集，加入需逐一说理注释）
 ALLOWED_WEAK: frozenset[str] = frozenset()
@@ -119,59 +126,60 @@ E007_INTERNAL_DEFENSE: frozenset[str] = frozenset({
 # C=`structured_error(…)` 首参或 dict 字面量 `"code": Exxx`，D=gitops/hook.py 内
 # `echo`/`print(` 同排之后出现的 E0xx（注释行不计）。
 ERROR_CODE_CHANNELS: dict[str, frozenset[str]] = {
-    "E001": frozenset({"A"}),       # file_not_found: raise OrchdError ×4
-    "E002": frozenset({"A"}),       # invalid_json: raise OrchdError ×1
-    "E003": frozenset({"A", "B"}),  # schema_validation_failed: raise ×2 + spec ValidationError
-    "E004": frozenset({"B"}),       # dag_cycle: spec ValidationError
-    "E005": frozenset({"A", "B"}),  # reference_not_found: raise ×1 + spec ValidationError
-    "E006": frozenset({"B"}),       # duplicate_id: spec ValidationError
-    "E007": frozenset({"A", "C"}),  # invalid_state: raise ×48
+    ErrorCode.E001.name: frozenset({"A"}),       # file_not_found: raise OrchdError ×4
+    ErrorCode.E002.name: frozenset({"A"}),       # invalid_json: raise OrchdError ×1
+    ErrorCode.E003.name: frozenset({"A", "B"}),  # schema_validation_failed: raise ×2 + spec ValidationError
+    ErrorCode.E004.name: frozenset({"B"}),       # dag_cycle: spec ValidationError
+    ErrorCode.E005.name: frozenset({"A", "B"}),  # reference_not_found: raise ×1 + spec ValidationError
+    ErrorCode.E006.name: frozenset({"B"}),       # duplicate_id: spec ValidationError
+    ErrorCode.E007.name: frozenset({"A", "C"}),  # invalid_state: raise ×48
                                     # + C：cli/__init__.py:193 argparse 解析失败的 JSON 封套
                                     #   （复用了 E007 名义，语义存疑，见 OUT_OF_ENUM_CODES 邻注）
-    "E008": frozenset({"A"}),       # task_not_ready: raise ×5
-    "E009": frozenset({"A"}),       # already_claimed: raise ×2
-    "E010": frozenset({"A"}),       # file_conflict: raise ×5
-    "E011": frozenset({"A"}),       # agent_busy: raise ×3
-    "E012": frozenset({"A"}),       # lock_timeout: raise ×4
-    "E013": frozenset({"A"}),       # not_initialized: raise ×1
-    "E014": frozenset({"A"}),       # verify_command_failed: lifecycle/core/verify.py（_run_verify）
+    ErrorCode.E008.name: frozenset({"A"}),       # task_not_ready: raise ×5
+    ErrorCode.E009.name: frozenset({"A"}),       # already_claimed: raise ×2
+    ErrorCode.E010.name: frozenset({"A"}),       # file_conflict: raise ×5
+    ErrorCode.E011.name: frozenset({"A"}),       # agent_busy: raise ×3
+    ErrorCode.E012.name: frozenset({"A"}),       # lock_timeout: raise ×4
+    ErrorCode.E013.name: frozenset({"A"}),       # not_initialized: raise ×1
+    ErrorCode.E014.name: frozenset({"A"}),       # verify_command_failed: lifecycle/core/verify.py（_run_verify）
                                     #   builder 构造后由调用方 raise（旧扫描器看不见，靠 discard 豁免）
-    "E015": frozenset({"A", "C"}),  # merge_conflict: A=done 前置对账 raise（core/reconcile.py 挂载点①）
-                                    # + C：review.py:1009 structured_error("E015") 挂 result.error
-    "E016": frozenset({"A"}),       # self_review_blocked: raise ×1
-    "E017": frozenset({"A", "D"}),  # dirty_workspace: raise ×5
+    ErrorCode.E015.name: frozenset({"A", "C"}),  # merge_conflict: A=done 前置对账 raise（core/reconcile.py 挂载点①）
+                                    # + C：review.py:1009 structured_error(ErrorCode.E015.name) 挂 result.error
+    ErrorCode.E016.name: frozenset({"A"}),       # self_review_blocked: raise ×1
+    ErrorCode.E041.name: frozenset({"A"}),       # serial_source_claim_conflict: raise ×1（engine-discipline-hardening）
+    ErrorCode.E017.name: frozenset({"A", "D"}),  # dirty_workspace: raise ×5
                                     # + D：hook.py:892 echo "orchd E017: review in progress"
-    "E018": frozenset({"A"}),       # wrong_branch: raise ×5
-    "E019": frozenset({"A"}),       # workspace_busy: raise ×2
-    "E020": frozenset({"D"}),       # out_of_scope_commit: git hook echo（文本由本表 E020 行派生）
-    "E021": frozenset({"C"}),       # identity_mismatch: cli 手工 dict (warning)
-    "E022": frozenset({"A", "B"}),  # missing_verify_command: raise ×1 + spec ValidationError
-    "E023": frozenset({"B"}),       # vague_acceptance_criteria: spec ValidationError (warning)
-    "E024": frozenset({"B"}),       # verify_command_missing_basetemp: spec ValidationError
-    "E025": frozenset({"A", "B"}),  # source_reference_not_found: raise ×1
+    ErrorCode.E018.name: frozenset({"A"}),       # wrong_branch: raise ×5
+    ErrorCode.E019.name: frozenset({"A"}),       # workspace_busy: raise ×2
+    ErrorCode.E020.name: frozenset({"D"}),       # out_of_scope_commit: git hook echo（文本由本表 E020 行派生）
+    ErrorCode.E021.name: frozenset({"C"}),       # identity_mismatch: cli 手工 dict (warning)
+    ErrorCode.E022.name: frozenset({"A", "B"}),  # missing_verify_command: raise ×1 + spec ValidationError
+    ErrorCode.E023.name: frozenset({"B"}),       # vague_acceptance_criteria: spec ValidationError (warning)
+    ErrorCode.E024.name: frozenset({"B"}),       # verify_command_missing_basetemp: spec ValidationError
+    ErrorCode.E025.name: frozenset({"A", "B"}),  # source_reference_not_found: raise ×1
                                     # + B：spec.py:1210 起 10 处 ValidationError(code=E025)
-    "E026": frozenset({"B"}),       # unexempted_test_coupling: spec ValidationError (warning)
-    "E027": frozenset({"A", "B"}),  # verify_command_unsafe: raise ×1 + B：spec.py:1035
-    "E028": frozenset({"A", "C"}),  # dry_run_assertion_mismatch: A=control.py:879 条件 raise（阻断注册）
-                                    # + C：control.py:807 structured_error("E028")
+    ErrorCode.E026.name: frozenset({"B"}),       # unexempted_test_coupling: spec ValidationError (warning)
+    ErrorCode.E027.name: frozenset({"A", "B"}),  # verify_command_unsafe: raise ×1 + B：spec.py:1035
+    ErrorCode.E028.name: frozenset({"A", "C"}),  # dry_run_assertion_mismatch: A=control.py:879 条件 raise（阻断注册）
+                                    # + C：control.py:807 structured_error(ErrorCode.E028.name)
                                     # 旧登记写作 {B,C}：spec.py 内并无 code=ErrorCode.E028，B 是死档
-    "E029": frozenset({"A", "B"}),  # granularity_overflow: B=spec ValidationError (warning)
+    ErrorCode.E029.name: frozenset({"A", "B"}),  # granularity_overflow: B=spec ValidationError (warning)
                                     # + A：control.py:576 amend --acceptance-criteria 拒绝注册（硬阻断）
-    "E030": frozenset({"A", "B", "C"}),  # runtime_file_integrity: C=gitops/ledger warn dict (warning)
+    ErrorCode.E030.name: frozenset({"A", "B", "C"}),  # runtime_file_integrity: C=gitops/ledger warn dict (warning)
                                           # + A：recycle.py:247 账本不可读阻断回收
                                           # + B：spec.py:848 degraded guard 条目
-    "E031": frozenset({"C"}),       # roadmap_landing_warning: spec.py:1582 structured_error("E031")
+    ErrorCode.E031.name: frozenset({"C"}),       # roadmap_landing_warning: spec.py:1582 structured_error(ErrorCode.E031.name)
                                     # 旧登记含 B：spec.py 内无 code=ErrorCode.E031，B 是死档
-    "E032": frozenset({"C"}),       # auto_claim_disabled: cli 手工 dict
-    "E033": frozenset({"A"}),       # session_identity_missing: raise ×6
-    "E034": frozenset({"A"}),       # retract_not_authorized: raise ×1
-    "E035": frozenset({"C"}),       # session_collision_warning: cli 手工 dict (warning)
-    "E036": frozenset({"A"}),       # container_root_cwd: raise ×1
-    "E037": frozenset({"B"}),       # verify_reference_drift: spec ValidationError (blocking)
-    "E038": frozenset({"B"}),       # brief_decl_count_mismatch: spec ValidationError (warning)
-    "E039": frozenset({"A"}),       # shared_entry_verify_gap: done 前置挂载点 raise ×1
+    ErrorCode.E032.name: frozenset({"C"}),       # auto_claim_disabled: cli 手工 dict
+    ErrorCode.E033.name: frozenset({"A"}),       # session_identity_missing: raise ×6
+    ErrorCode.E034.name: frozenset({"A"}),       # retract_not_authorized: raise ×1
+    ErrorCode.E035.name: frozenset({"C"}),       # session_collision_warning: cli 手工 dict (warning)
+    ErrorCode.E036.name: frozenset({"A"}),       # container_root_cwd: raise ×1
+    ErrorCode.E037.name: frozenset({"B"}),       # verify_reference_drift: spec ValidationError (blocking)
+    ErrorCode.E038.name: frozenset({"B"}),       # brief_decl_count_mismatch: spec ValidationError (warning)
+    ErrorCode.E039.name: frozenset({"A"}),       # shared_entry_verify_gap: done 前置挂载点 raise ×1
                                     # （onboard/lifecycle/core/entry_guard.py _guard_shared_entry_coverage）
-    "E040": frozenset({"B"}),       # ac_verify_gap: spec ValidationError (warning)
+    ErrorCode.E040.name: frozenset({"B"}),       # ac_verify_gap: spec ValidationError (warning)
 }
 
 # 非 ErrorCode 枚举成员的兜底发射码：code → 实测位点。
@@ -200,10 +208,10 @@ ERROR_GUIDANCE: dict[str, dict[str, Any]] = {
 _FALLBACK_RECOVERY = "遇到错误：立即停止并报告，不自行猜测处置"
 _FALLBACK_COMMAND = f"{_ENTRY_CMD} status"
 
-_VERIFY_DOMAIN = frozenset({"E014", "E022", "E023", "E024", "E026", "E027", "E028",
-                            "E037", "E039", "E040"})
-_GIT_DOMAIN = frozenset({"E010", "E015", "E017", "E018", "E019", "E020"})
-_INTAKE_DOMAIN = frozenset({"E001", "E002", "E003", "E004", "E005", "E006", "E025", "E029"})
+_VERIFY_DOMAIN = frozenset({ErrorCode.E014.name, ErrorCode.E022.name, ErrorCode.E023.name, ErrorCode.E024.name, ErrorCode.E026.name, ErrorCode.E027.name, ErrorCode.E028.name,
+                            ErrorCode.E037.name, ErrorCode.E039.name, ErrorCode.E040.name})
+_GIT_DOMAIN = frozenset({ErrorCode.E010.name, ErrorCode.E015.name, ErrorCode.E017.name, ErrorCode.E018.name, ErrorCode.E019.name, ErrorCode.E020.name})
+_INTAKE_DOMAIN = frozenset({ErrorCode.E001.name, ErrorCode.E002.name, ErrorCode.E003.name, ErrorCode.E004.name, ErrorCode.E005.name, ErrorCode.E006.name, ErrorCode.E025.name, ErrorCode.E029.name})
 _FALLBACK_READ_BY_DOMAIN: dict[str, tuple[str, ...]] = {
     "verify": ("rules/verify.md",),
     "git": ("rules/git.md",),
@@ -260,7 +268,7 @@ def error_guidance(code: str) -> dict[str, Any]:
     """按错误码返回恢复指引（纯函数）。
 
     Args:
-        code: 错误码名（ErrorCode.name，如 ``"E017"``）。
+        code: 错误码名（ErrorCode.name，如 ``ErrorCode.E017.name``）。
 
     Returns:
         ``{step: "recover", recovery, read, command}``；未命中映射时返回
@@ -292,7 +300,7 @@ def annotate_validation_items(
     对象（cycle_nodes / 重复 id / 缺失引用 id）透传进 ``guidance.hint``。
 
     Args:
-        items: 校验错误/告警列表，每条含 ``code``（错误码名，如 ``"E004"``）、
+        items: 校验错误/告警列表，每条含 ``code``（错误码名，如 ``ErrorCode.E004.name``）、
               ``path``（JSON Path）、``message``（人类可读描述）。
         base_dir: 项目 .orchd/ 目录，用于 resolve_read_paths；None 时跳过路径校验。
 
@@ -306,7 +314,7 @@ def annotate_validation_items(
         entry = dict(item)
         code = item.get("code", "")
         # 批量项的 code 可能是 ValidationError 的 str(code) 全名（"ErrorCode.E038"），
-        # 查表键是码名（"E038"）——归一化后查表，否则恒落 fallback（实测 E038
+        # 查表键是码名（ErrorCode.E038.name）——归一化后查表，否则恒落 fallback（实测 E038
         # warning 的 guidance 一直是通用兜底，E038 词条里的对齐命令从未到达用户；
         # task-amend-text-field-patch-channel AC4：响应必须给出可执行的对齐命令）。
         code_name = code.rsplit(".", 1)[-1] if isinstance(code, str) else code

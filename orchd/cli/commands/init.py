@@ -26,6 +26,13 @@ from orchd.cli._util import (
     _reject_container_root_cwd,
     _resolve_text_arg,
 )
+from orchd.contracts.responses import (
+    ERRORS_KEY,
+    HINT_KEY,
+    MESSAGE_KEY,
+    VALID_KEY,
+    WARNINGS_KEY,
+)
 
 
 
@@ -151,12 +158,12 @@ def _cmd_validate(args) -> dict | tuple[dict, int]:
     def _warn_dict(e) -> dict:
         """把 ValidationError 或告警 dict 归一化为输出结构（含 roadmap-land E031 dict）。"""
         if isinstance(e, dict):
-            return {"code": e.get("code"), "path": e.get("path"), "message": e.get("message")}
-        return {"code": e.code.name, "path": e.path, "message": e.message}
+            return {"code": e.get("code"), "path": e.get("path"), MESSAGE_KEY: e.get("message")}
+        return {"code": e.code.name, "path": e.path, MESSAGE_KEY: e.message}
 
     from orchd.guide import annotate_validation_items
 
-    errors_list = [{"code": e.code.name, "path": e.path, "message": e.message} for e in structure_errors]
+    errors_list = [{"code": e.code.name, "path": e.path, MESSAGE_KEY: e.message} for e in structure_errors]
     warnings_list = [_warn_dict(e) for e in quality_warnings]
     full = bool(getattr(args, "full", False))
 
@@ -175,18 +182,18 @@ def _cmd_validate(args) -> dict | tuple[dict, int]:
         # task-cli-exit-honesty：结构错误是硬失败——返回 (dict, 1) 使退出码非零，
         # 脚本只读退出码时不再把 valid:false 误判为通过（B3）。
         return ({
-            "valid": False,
-            "errors": errors_out,
-            "warnings": warnings_out,
+            VALID_KEY: False,
+            ERRORS_KEY: errors_out,
+            WARNINGS_KEY: warnings_out,
             "errors_summary": errors_summary,
             "warnings_summary": warnings_summary,
             "exempted_terminal_warnings": exempted_terminal_warnings,
             "terminal_exemption": terminal_exemption,
         }, 1)
     return {
-        "valid": True,
-        "errors": errors_out,
-        "warnings": warnings_out,
+        VALID_KEY: True,
+        ERRORS_KEY: errors_out,
+        WARNINGS_KEY: warnings_out,
         "errors_summary": errors_summary,
         "warnings_summary": warnings_summary,
         "exempted_terminal_warnings": exempted_terminal_warnings,
@@ -251,7 +258,7 @@ def _cmd_init(args) -> dict:
                 [{
                     "master": str(master_path),
                     "root": str(declared),
-                    "hint": (
+                    HINT_KEY: (
                         "--root 须为 master 所在 .orchd/ 的父目录；"
                         "如 --master <root>/.orchd/_master.json --root <root>，"
                         "或去掉 --root 改从目标目录内执行"
@@ -273,7 +280,7 @@ def _cmd_init(args) -> dict:
                     "master": str(master_path),
                     "inferred_root": str(project_root),
                     "cwd": str(Path.cwd().resolve()),
-                    "hint": (
+                    HINT_KEY: (
                         "请 cd 到目标项目目录内再执行 init，或显式声明目标根："
                         "python .orchd/__main__.py init"
                         f" --master {args.master} --root <目标项目根>"

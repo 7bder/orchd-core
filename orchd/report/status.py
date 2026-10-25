@@ -15,7 +15,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.contracts.events import TERMINAL_STATUSES
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    DEPENDS_ON_FIELD,
+    FILES_TO_EDIT_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    REVIEWERS_FIELD,
+    SOURCE_FIELD,
+    VERIFY_COMMAND_FIELD,
+)
+from orchd.contracts.events import (
+    STATUS_CANCELLED,
+    STATUS_CLAIMED,
+    STATUS_COMPLETED,
+    STATUS_DONE,
+    STATUS_IN_REVIEW,
+    STATUS_PENDING,
+    TERMINAL_STATUSES,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.ledger import Store, TaskState, resolve_workspace_root
@@ -78,7 +99,7 @@ def status(
         revive_by_task = _scan_revive_markers(store)
     except Exception:
         revive_by_task = {}
-    task_map = {t.get("id", ""): t for t in tasks}
+    task_map = {t.get(ID_FIELD, ""): t for t in tasks}
 
     if task_id is not None:
         task_def = task_map.get(task_id)
@@ -90,19 +111,19 @@ def status(
             )
         ts = state.get(task_id)
         detail: dict[str, Any] = {
-            "id": task_id,
-            "name": task_def.get("name", ""),
-            "brief": task_def.get("brief", ""),
-            "status": ts.status if ts else "pending",
-            "module": task_def.get("module", ""),
-            "depends_on": task_def.get("depends_on", []),
-            "importance": task_def.get("importance", "normal"),
-            "reviewers": task_def.get("reviewers", []),
-            "verify_command": task_def.get("verify_command", ""),
+            ID_FIELD: task_id,
+            NAME_FIELD: task_def.get(NAME_FIELD, ""),
+            BRIEF_FIELD: task_def.get(BRIEF_FIELD, ""),
+            "status": ts.status if ts else STATUS_PENDING,
+            MODULE_FIELD: task_def.get(MODULE_FIELD, ""),
+            DEPENDS_ON_FIELD: task_def.get(DEPENDS_ON_FIELD, []),
+            IMPORTANCE_FIELD: task_def.get(IMPORTANCE_FIELD, "normal"),
+            REVIEWERS_FIELD: task_def.get(REVIEWERS_FIELD, []),
+            VERIFY_COMMAND_FIELD: task_def.get(VERIFY_COMMAND_FIELD, ""),
             # task-hostfix-pack-a B1：单任务详情含声明域（看完整卡面不再绕道读
             # _master.json；加法字段，零破坏）。
-            "files_to_edit": task_def.get("files_to_edit", []),
-            "acceptance_criteria": task_def.get("acceptance_criteria", []),
+            FILES_TO_EDIT_FIELD: task_def.get(FILES_TO_EDIT_FIELD, []),
+            ACCEPTANCE_CRITERIA_FIELD: task_def.get(ACCEPTANCE_CRITERIA_FIELD, []),
         }
         if ts:
             if ts.claimed_by:
@@ -122,32 +143,38 @@ def status(
         # 构造兼容 _format_text 的最小结构（tasks=[detail] + summary），
         # 避免提前 return 跳过 _text 生成导致 --text 恒输出 JSON。
         if text:
-            _s = detail.get("status", "pending")
+            _s = detail.get("status", STATUS_PENDING)
             # _format_text 期望 task_id 字段，而单任务 detail 用 id，做一次映射
             _row = dict(detail)
-            _row["task_id"] = _row.get("id", task_id)
+            _row["task_id"] = _row.get(ID_FIELD, task_id)
             _single = {
                 "tasks": [_row],
                 "summary": {
-                    "total": 1, "active": 1 if _s in ("pending", "claimed", "done", "in_review") else 0,
-                    "pending": 1 if _s == "pending" else 0,
-                    "claimed": 1 if _s == "claimed" else 0,
-                    "done": 1 if _s == "done" else 0,
-                    "in_review": 1 if _s == "in_review" else 0,
-                    "completed": 1 if _s == "completed" else 0,
-                    "cancelled": 1 if _s == "cancelled" else 0,
+                    "total": 1,
+                    "active": 1 if _s in (
+                        STATUS_PENDING, STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW,
+                    ) else 0,
+                    STATUS_PENDING: 1 if _s == STATUS_PENDING else 0,
+                    STATUS_CLAIMED: 1 if _s == STATUS_CLAIMED else 0,
+                    STATUS_DONE: 1 if _s == STATUS_DONE else 0,
+                    STATUS_IN_REVIEW: 1 if _s == STATUS_IN_REVIEW else 0,
+                    STATUS_COMPLETED: 1 if _s == STATUS_COMPLETED else 0,
+                    STATUS_CANCELLED: 1 if _s == STATUS_CANCELLED else 0,
                 },
             }
             return {"task": detail, "_text": _format_text(_single)}
         return {"task": detail}
 
     task_statuses: list[dict[str, Any]] = []
-    counts = {"pending": 0, "claimed": 0, "done": 0, "in_review": 0, "completed": 0, "cancelled": 0}
+    counts = {
+        STATUS_PENDING: 0, STATUS_CLAIMED: 0, STATUS_DONE: 0,
+        STATUS_IN_REVIEW: 0, STATUS_COMPLETED: 0, STATUS_CANCELLED: 0,
+    }
 
     for task in tasks:
-        tid = task.get("id", "")
+        tid = task.get(ID_FIELD, "")
         ts = state.get(tid)
-        s = ts.status if ts else "pending"
+        s = ts.status if ts else STATUS_PENDING
         counts[s] = counts.get(s, 0) + 1
         # task-status-active-only：默认仅输出活跃任务（非终态），
         # 终态 completed/cancelled 在 tasks[] 中隐藏；summary 计数不受影响。
@@ -155,11 +182,11 @@ def status(
             continue
         entry: dict[str, Any] = {
             "task_id": tid,
-            "name": task.get("name", ""),
+            NAME_FIELD: task.get(NAME_FIELD, ""),
             "status": s,
-            "module": task.get("module", ""),
+            MODULE_FIELD: task.get(MODULE_FIELD, ""),
             "attempt_count": ts.attempt_count if ts else 0,
-            "source": task.get("source"),
+            SOURCE_FIELD: task.get(SOURCE_FIELD),
         }
         if ts and ts.claimed_by:
             entry["claimed_by"] = ts.claimed_by
@@ -176,7 +203,9 @@ def status(
     summary = {
         "total": len(tasks),
         "active": sum(
-            counts[k] for k in ("pending", "claimed", "done", "in_review")
+            counts[k] for k in (
+                STATUS_PENDING, STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW,
+            )
         ),
         **counts,
     }

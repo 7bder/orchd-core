@@ -1,6 +1,7 @@
 """经验回灌域常量（长度/截断/cap/字符预算/锁超时/ID 正则/否定词/告警码），叶域。"""
 
 from __future__ import annotations
+from orchd.errors import ErrorCode
 
 import re
 
@@ -38,8 +39,11 @@ _NEG_WORDS = {"不要", "禁止", "不应", "不应该", "不能", "勿", "避�
 
 
 # warning 级错误码（需触发注入标注「参考（warning）」）。
-_WARNING_CODES = {"E023", "E026", "E028", "E029", "E030"}
+_WARNING_CODES = {
+    ErrorCode.E023.name, ErrorCode.E026.name, ErrorCode.E028.name,
+    ErrorCode.E029.name, ErrorCode.E030.name,
+}
 
 
 # 引擎预判「值得上报」的 warning 码（§5.1 信号 A）。
-_SUGGEST_REPORT_CODES = {"E030"}
+_SUGGEST_REPORT_CODES = {ErrorCode.E030.name}

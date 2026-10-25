@@ -16,6 +16,10 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from orchd.names import (
+    CHECKPOINT_FILE,
+    LEDGER_FILE,
+)
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock, _depth_registry
 from orchd.storage import StorageBackend
@@ -31,8 +35,8 @@ class FilesystemBackend(StorageBackend):
 
     def __init__(self, orchd_dir: Path) -> None:
         self.orchd_dir = orchd_dir
-        self.ledger_path = orchd_dir / "_ledger.jsonl"
-        self.checkpoint_path = orchd_dir / "_checkpoint.json"
+        self.ledger_path = orchd_dir / LEDGER_FILE
+        self.checkpoint_path = orchd_dir / CHECKPOINT_FILE
         self.lock_path = orchd_dir / ".lock"
         self._file_lock = ExclusiveFileLock(self.lock_path)
 

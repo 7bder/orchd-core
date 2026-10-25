@@ -21,6 +21,30 @@ from .precheck import _review_submit_precheck
 from .record import _review_submit_record
 
 
+def _init_review_routing(project_root: Path | None) -> None:
+    """为 review 收尾 guidance 初始化路由；容器 worktree 缺 rules 时用 canonical。
+
+    任务 worktree 的 ``.orchd/`` 可能只有 sparse 副本、没有 ``rules/``。此时
+    直接 ``init_routing(local)`` 会空返回且不填缓存，后续 completion guidance
+    的 ``read_for`` 会 fail-closed。优先用 canonical 主工作树 ``.orchd``（规则
+    真源）；本地有 ``rules/`` 时保持原行为。任何失败静默（guidance 仍会安全回退）。
+    """
+    if project_root is None:
+        return
+    from orchd.guide import init_routing
+
+    local_orchd = Path(project_root) / ".orchd"
+    if local_orchd.is_dir() and (local_orchd / "rules").is_dir():
+        init_routing(local_orchd, project_root)
+        return
+    from orchd.worktree import resolve_canonical_project_root
+
+    canonical = resolve_canonical_project_root(Path(project_root))
+    canonical_orchd = Path(canonical) / ".orchd"
+    if canonical_orchd.is_dir() and (canonical_orchd / "rules").is_dir():
+        init_routing(canonical_orchd, Path(canonical))
+
+
 def review_submit(
     store: Store,
     tasks: list[dict[str, Any]],
@@ -46,11 +70,7 @@ def review_submit(
     # .orchd 存在但 rules/ 缺失 → 跳过（保留既有缓存）；其余失败静默（响应路径
     # 不因子虚乌有而崩，缺失路由由 read_for 的 fail-closed 在使用点报错）。
     try:
-        from orchd.guide import init_routing
-
-        _rr_orchd = Path(project_root) / ".orchd" if project_root else None
-        if _rr_orchd is not None and _rr_orchd.is_dir():
-            init_routing(_rr_orchd, project_root)
+        _init_review_routing(project_root)
     except Exception:
         pass
     try:

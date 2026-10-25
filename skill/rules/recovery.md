@@ -81,7 +81,7 @@ guide: {}
 | **C 手工 dict** | `structured_error("Exxx", …)` 或手拼 `{"code":"Exxx", …}` 后 return | ❌ 否（需 structured_error 接线） | 8 码：E007/E015/E021/E028/E030/E031/E032/E035 |
 | **D Shell hook** | pre-commit hook 内 echo 文本 | ❌ 否（非 JSON） | 2 码：E017（审查期实现者冻结）/E020（越界提交） |
 
-**通道登记核对（指针式 2026-09-28 task-pass10-counts-pointers：实时以 `orchd/guide.py::ERROR_CODE_CHANNELS` 与 `orchd/errors.py` 为准，快照会过期）**：2026-10-06 快照（pass13 §11-8b 按实测更正登记表后）A 单通道 16 码（E001/E002/E008-E014/E016/E018/E019/E033/E034/E036/E039）、B 单通道 8 码（E004/E006/E023/E024/E026/E037/E038/E040）、C 单通道 4 码（E021/E031/E032/E035）、D 单通道 1 码（E020）；双/多通道码：A+B 6 码（E003/E005/E022/E025/E027/E029）、A+C 3 码（E007/E015/E028）、A+D 1 码（E017）、A+B+C 1 码（E030）。本快照由 `tests/test_docs_single_source.py::TestRedLineSummaryLock` 的通道计数判据锁死（判据从登记表实时取数）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
+**通道登记核对（指针式 2026-09-28 task-pass10-counts-pointers：实时以 `orchd/guide.py::ERROR_CODE_CHANNELS` 与 `orchd/errors.py` 为准，快照会过期）**：2026-10-06 快照（pass13 §11-8b 按实测更正登记表后）A 单通道 17 码（E001/E002/E008-E014/E016/E018/E019/E033/E034/E036/E039/E041）、B 单通道 8 码（E004/E006/E023/E024/E026/E037/E038/E040）、C 单通道 4 码（E021/E031/E032/E035）、D 单通道 1 码（E020）；双/多通道码：A+B 6 码（E003/E005/E022/E025/E027/E029）、A+C 3 码（E007/E015/E028）、A+D 1 码（E017）、A+B+C 1 码（E030）。本快照由 `tests/test_docs_single_source.py::TestRedLineSummaryLock` 的通道计数判据锁死（判据从登记表实时取数）。按**码段范围**书写时须排除仅 B 的 E004/E006——旧表述 `E001-E019` 把二者误算进 A 通道，是本行更正的直接原因。
 
 **通道码的「一码双面」**（pass13 §11-8b 实测，读表时别当成矛盾）：E028/E029/E030 同属
 `WARNING_CODES`（B 通道批量校验里是 warning，不阻断），但在 A 通道是**硬阻断**——

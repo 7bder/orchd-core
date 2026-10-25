@@ -11,7 +11,20 @@ from __future__ import annotations
 
 import warnings
 
-from orchd.contracts.events import TASK_STATUSES
+from orchd.contracts.events import (
+    STATUS_CLAIMED,
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_PENDING,
+    TASK_STATUSES,
+    EVENT_CLAIMED,
+    EVENT_DONE,
+    EVENT_FORCE_STATUS,
+    EVENT_RETRACT,
+    EVENT_REVIEW_CLAIMED,
+    EVENT_REVIEW_READY,
+    EVENT_REVIEW_SUBMITTED,
+)
 from orchd.ledger.events import _event_target_status
 from orchd.ledger.store_types import TaskState
 from typing import TYPE_CHECKING, Any
@@ -64,7 +77,7 @@ class _StoreApplyMixin:
                 # 没有 task_id 的事件（如系统级事件）不影响任务状态，直接跳过
                 continue
 
-            if event.get("type") == "RETRACT":
+            if event.get("type") == EVENT_RETRACT:
                 # RETRACT 在任务初始化之前处理：它是系统级回滚事件，不应为某任务
                 # 凭空创建状态条目（活跃路径与重建路径一致，见 _apply_event 注释）。
                 target_eid = event.get("target_event_id", "")
@@ -122,7 +135,7 @@ class _StoreApplyMixin:
         all_events = self._read_ledger_lines(from_line=1)
         # 先完整收集所有 RETRACT 的目标事件 ID，再应用事件（两遍扫描）
         for event in all_events:
-            if event.get("type") == "RETRACT":
+            if event.get("type") == EVENT_RETRACT:
                 target_eid = event.get("target_event_id", "")
                 if target_eid:
                     retracted.add(target_eid)
@@ -156,7 +169,7 @@ class _StoreApplyMixin:
         """
         self._record_soft_violation(event, ts)
         etype = event.get("type", "")
-        if etype == "CLAIMED":
+        if etype == EVENT_CLAIMED:
             ts.claimed_by = event.get("agent_id")
             ts.claimed_session = event.get("session_id")
             ts.review_phase = None
@@ -165,10 +178,10 @@ class _StoreApplyMixin:
             ts.review_claimed_at = None
             ts.review_self_review = False
 
-        elif etype == "DONE":
+        elif etype == EVENT_DONE:
             ts.attempt_count = event.get("attempt_count", ts.attempt_count + 1)
 
-        elif etype == "REVIEW_READY":
+        elif etype == EVENT_REVIEW_READY:
             ts.review_phase = event.get("review_type")
             ts.review_claimed_by = None
             ts.review_claimed_session = None
@@ -176,7 +189,7 @@ class _StoreApplyMixin:
             # v4：新一轮审查开始，自审标记随上一轮清零（事实由历史事件承载）
             ts.review_self_review = False
 
-        elif etype == "REVIEW_CLAIMED":
+        elif etype == EVENT_REVIEW_CLAIMED:
             ts.review_claimed_by = event.get("agent_id")
             ts.review_claimed_session = event.get("session_id")
             ts.review_claimed_at = event.get("timestamp")
@@ -185,11 +198,16 @@ class _StoreApplyMixin:
             # agent_id 相等性启发式推导，二者不冲突。
             ts.review_self_review = bool(event.get("is_self_review"))
 
-        elif etype == "REVIEW_SUBMITTED":
+        elif etype == EVENT_REVIEW_SUBMITTED:
             verdict = event.get("verdict", "")
             review_type = event.get("review_type")
             if verdict == "APPROVED":
-                if review_type == "code" or review_type is None:
+                if event.get("merge_pending"):
+                    # A4（debug-pack A 组）：merge 未落地——verdict 落账但保持
+                    # in_review；不清审查字段，目标状态由转移表推导为 in_review
+                    # （同一 reviewer 可重试 code APPROVED）。
+                    pass
+                elif review_type == "code" or review_type is None:
                     # review-unify-r2：code review 通过，或 unified 单阶段
                     # （事件无 review_type 字段）APPROVED → 任务彻底完成；
                     # 老事件含 review_type: spec 仍按两阶段语义（仅 spec 通过，
@@ -238,10 +256,10 @@ class _StoreApplyMixin:
                     UserWarning, stacklevel=2,
                 )
 
-        elif etype == "FORCE_STATUS":
+        elif etype == EVENT_FORCE_STATUS:
             # 强制状态覆盖：根据 target_status 重置关联字段，
             # 确保派生状态与被强制设置的状态保持一致
-            target = event.get("target_status", "pending")
+            target = event.get("target_status", STATUS_PENDING)
             if not isinstance(target, str) or target not in TASK_STATUSES:
                 # 与未知 REVIEW_SUBMITTED verdict 同口径（B5）：replay 是纯派生路径，
                 # 无 store/响应可挂 E030，故记进程级 warning 并**保持派生态不变**——
@@ -259,7 +277,7 @@ class _StoreApplyMixin:
                 target = None
             if target is not None:
                 ts.status = target
-            if target == "pending":
+            if target == STATUS_PENDING:
                 # 回退到待认领：清空所有执行和审核相关字段
                 ts.attempt_count = 0
                 ts.review_phase = None
@@ -269,11 +287,11 @@ class _StoreApplyMixin:
                 ts.review_self_review = False
                 ts.claimed_by = None
                 ts.claimed_session = None
-            elif target == "claimed":
+            elif target == STATUS_CLAIMED:
                 # 强制认领：设置指派的 agent
                 ts.claimed_by = event.get("assignee")
                 ts.claimed_session = event.get("session_id")
-            elif target == "cancelled":
+            elif target == STATUS_CANCELLED:
                 # 强制取消：清空所有执行和审核相关字段
                 ts.claimed_by = None
                 ts.claimed_session = None
@@ -282,7 +300,7 @@ class _StoreApplyMixin:
                 ts.review_claimed_session = None
                 ts.review_claimed_at = None
                 ts.review_self_review = False
-            elif target == "completed":
+            elif target == STATUS_COMPLETED:
                 # 强制完成：保留实现者信息（claimed_by），仅清空审查字段，
                 # 与 code APPROVED 语义对齐（避免 completed 状态残留审查阶段/审查者）
                 ts.review_phase = None
@@ -310,7 +328,7 @@ class _StoreApplyMixin:
         if not self.ledger_exists():
             return retracted
         for event in self._read_ledger_lines(from_line=1):
-            if event.get("type") == "RETRACT":
+            if event.get("type") == EVENT_RETRACT:
                 target_eid = event.get("target_event_id", "")
                 if target_eid:
                     retracted.add(target_eid)

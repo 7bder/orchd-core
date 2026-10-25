@@ -5,6 +5,24 @@
 
 from __future__ import annotations
 
+from orchd.contracts.task_schema import (
+    ACCEPTANCE_CRITERIA_FIELD,
+    BRIEF_FIELD,
+    DEPENDS_ON_FIELD,
+    DIFFICULTY_FIELD,
+    ESTIMATED_HOURS_FIELD,
+    FILES_TO_EDIT_FIELD,
+    FILES_TO_READ_FIELD,
+    ID_FIELD,
+    IMPORTANCE_FIELD,
+    MODULE_FIELD,
+    NAME_FIELD,
+    REQUIRES_FIELD,
+    REVIEWERS_FIELD,
+    SOURCE_FIELD,
+)
+
+
 import json
 import os
 import shutil
@@ -181,7 +199,7 @@ def resolve_declaration_source(
 
     Returns:
         ``(tasks, source)``：tasks 为权威任务定义列表；source 为
-        ``{"source": "main_blob"|"canonical_file"|"local_file"|"fallback_local",
+        ``{SOURCE_FIELD: "main_blob"|"canonical_file"|"local_file"|"fallback_local",
         ...}``（ref/reason 按需附带）。
     """
     fallback_tasks = list(fallback_tasks or [])
@@ -197,23 +215,23 @@ def resolve_declaration_source(
         })
 
     if project_root is None:
-        return fallback_tasks, {"source": "local_file", "reason": "no_project_root"}
+        return fallback_tasks, {SOURCE_FIELD: "local_file", "reason": "no_project_root"}
     try:
         layout = detect_layout(Path(project_root)).get("layout")
     except Exception as exc:
         _trace("layout_unreadable", str(exc)[:200])
-        return fallback_tasks, {"source": "fallback_local", "reason": "layout_unreadable"}
+        return fallback_tasks, {SOURCE_FIELD: "fallback_local", "reason": "layout_unreadable"}
     if layout == "container":
         # container 调用方（CLI _load_tasks）已从 canonical 主工作树读取，
         # 此处逐字保留、不重读（任务 worktree 副本被抑制，重读本地必空）。
-        return fallback_tasks, {"source": "canonical_file"}
+        return fallback_tasks, {SOURCE_FIELD: "canonical_file"}
     from orchd.nogit import git_available as _git_avail
     try:
         _git_ok = bool(_git_avail(Path(project_root)))
     except Exception:
         _git_ok = False
     if not _git_ok:
-        return fallback_tasks, {"source": "local_file", "reason": "no_git"}
+        return fallback_tasks, {SOURCE_FIELD: "local_file", "reason": "no_git"}
     try:
         from orchd.gitops.query import get_default_branch as _get_default_branch
         ref = _get_default_branch(Path(project_root)) or "main"
@@ -227,10 +245,10 @@ def resolve_declaration_source(
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:
         _trace("blob_unreadable", f"{type(exc).__name__}: {exc}"[:200])
-        return fallback_tasks, {"source": "fallback_local", "reason": "blob_unreadable"}
+        return fallback_tasks, {SOURCE_FIELD: "fallback_local", "reason": "blob_unreadable"}
     if proc.returncode != 0 or not (proc.stdout or "").strip():
         _trace("blob_unreadable", (proc.stderr or "")[:200] or f"ref {ref} 无该 blob")
-        return fallback_tasks, {"source": "fallback_local", "reason": "blob_unreadable"}
+        return fallback_tasks, {SOURCE_FIELD: "fallback_local", "reason": "blob_unreadable"}
     try:
         data = json.loads(proc.stdout)
         blob_tasks = data.get("tasks") if isinstance(data, dict) else None
@@ -238,8 +256,8 @@ def resolve_declaration_source(
             raise ValueError("tasks 表缺失")
     except (ValueError, TypeError) as exc:
         _trace("blob_unreadable", f"blob 解析失败: {exc}"[:200])
-        return fallback_tasks, {"source": "fallback_local", "reason": "blob_unreadable"}
-    return list(blob_tasks), {"source": "main_blob", "ref": ref}
+        return fallback_tasks, {SOURCE_FIELD: "fallback_local", "reason": "blob_unreadable"}
+    return list(blob_tasks), {SOURCE_FIELD: "main_blob", "ref": ref}
 
 
 
@@ -248,31 +266,31 @@ def _default_master(main_worktree: Path) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "project": {
-            "name": "New Orchd Project",
-            "brief": "A new orchd-managed project (container layout).",
+            NAME_FIELD: "New Orchd Project",
+            BRIEF_FIELD: "A new orchd-managed project (container layout).",
         },
         "modules": [
             {
-                "id": "mod-core",
-                "name": "Core",
+                ID_FIELD: "mod-core",
+                NAME_FIELD: "Core",
                 "role": "Engine core module",
             }
         ],
         "tasks": [
             {
-                "id": "task-sample",
-                "name": "Sample Task",
-                "brief": "Sample task created by orchd init.",
-                "module": "mod-core",
-                "depends_on": [],
-                "estimated_hours": 1,
-                "importance": "high",
-                "difficulty": "low",
-                "requires": ["python"],
-                "acceptance_criteria": ["sample"],
-                "files_to_read": [],
-                "files_to_edit": ["README.md"],
-                "reviewers": ["reviewer-1"],
+                ID_FIELD: "task-sample",
+                NAME_FIELD: "Sample Task",
+                BRIEF_FIELD: "Sample task created by orchd init.",
+                MODULE_FIELD: "mod-core",
+                DEPENDS_ON_FIELD: [],
+                ESTIMATED_HOURS_FIELD: 1,
+                IMPORTANCE_FIELD: "high",
+                DIFFICULTY_FIELD: "low",
+                REQUIRES_FIELD: ["python"],
+                ACCEPTANCE_CRITERIA_FIELD: ["sample"],
+                FILES_TO_READ_FIELD: [],
+                FILES_TO_EDIT_FIELD: ["README.md"],
+                REVIEWERS_FIELD: ["reviewer-1"],
             }
         ],
     }

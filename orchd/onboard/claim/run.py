@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from orchd.constants import CLAIMED_BY_PENDING
 from orchd.gitops import release_session_lock_if_owned
 from orchd.ledger import Store
 from orchd.line_ctx import resolve_task_branch_for
@@ -82,7 +83,7 @@ def claim(
     pending_conflicts = [
         {"task_id": c.task_id, "files": c.files, "claimed_by": c.claimed_by}
         for c in detect_file_conflict(state, tasks, task_def, include_pending=True)
-        if c.claimed_by == "pending"
+        if c.claimed_by == CLAIMED_BY_PENDING
     ]
     # task-amend-scope-add：claim 连带文件预警（与 claim_preview 共用 build_scope_warning 单一来源）
     scope_warning = build_scope_warning(task_def, project_root=project_root)
