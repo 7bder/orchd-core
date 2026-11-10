@@ -36,11 +36,15 @@ def _cmd_storage_rollback(args) -> dict:
     （命令不改进程外环境变量，只负责把回滚素材备齐并证明对得上）。
     非 sqlite 后端调用 → E007（回滚无对象）。
 
-    CLI 参数：无。返回：exported / verified / match / hint。
+    缺库守卫（task-layout-no-shell-ledger）：库文件尚未物化（懒建库：新部署 /
+    只读命令从未写入）时不存在可导出对象——返回信息性结果 ``reason="no_db"``，
+    **不导出空 jsonl、不建库**，与 doctor 缺库判据给同一句提示。
+
+    CLI 参数：无。返回：exported / verified / match / hint（缺库时附加 reason）。
     """
     from orchd.ledger import open_store, resolve_store_dir
     from orchd.storage.filesystem import FilesystemBackend
-    from orchd.storage.sqlite import SqliteBackend
+    from orchd.storage.sqlite import DB_ABSENT_NOTE, SqliteBackend
 
     orchd_dir = _find_orchd_dir()
     store = open_store(orchd_dir)
@@ -50,6 +54,17 @@ def _cmd_storage_rollback(args) -> dict:
             "storage_rollback_requires_sqlite: 当前非 sqlite 后端，无需回滚",
             [{"hint": "仅 sqlite 缺省部署需要导出；file 后端账本即活名文件"}],
         )
+    if not store.backend.db_path.is_file():
+        return {
+            "backend": "sqlite",
+            "exported": 0,
+            "verified": 0,
+            "match": True,
+            "reason": "no_db",
+            "hint": (f"{DB_ABSENT_NOTE}：无可导出事件（未触碰账本、未建库）；"
+                     "如需切回 file 后端，直接设 ORCHD_STORAGE_BACKEND=file 即可"
+                     "（空账本无需导出素材）"),
+        }
     store.acquire_lock()
     try:
         exported = store.backend.export_jsonl()
@@ -142,6 +157,11 @@ def _cmd_storage_recutover(args) -> dict:
     ``performed=False``（``no_missing_events``）。非 sqlite 后端 → E007
     （与 ``storage-rollback`` 对称：file 后端下活名文件即账本本体）。
 
+    缺库守卫（task-layout-no-shell-ledger）：库文件尚未物化时不存在「库内活跃
+    段」可并账——返回信息性结果 ``reason="no_db"``（``verified``/``match`` 为
+    ``None``，未取锁、未建库、未改名），活名增量留给下一写命令的首次迁移导入；
+    提示语与 doctor 缺库检查同句（``DB_ABSENT_NOTE``）。
+
     CLI 参数：args.dry_run（只算计划）。返回：backend / performed / dry_run /
     reason / live_events / db_events / missing_events / missing_event_ids /
     merged_events / verified / match / backed_up / hint。语义边界：
@@ -154,7 +174,7 @@ def _cmd_storage_recutover(args) -> dict:
     from orchd.ledger import open_store, resolve_store_dir
     from orchd.storage import read_archive_events
     from orchd.storage.filesystem import FilesystemBackend
-    from orchd.storage.sqlite import SqliteBackend
+    from orchd.storage.sqlite import DB_ABSENT_NOTE, SqliteBackend
 
     orchd_dir = _find_orchd_dir()
     store = open_store(orchd_dir)
@@ -169,6 +189,29 @@ def _cmd_storage_recutover(args) -> dict:
         )
     dry_run = bool(getattr(args, "dry_run", False))
     store_dir = resolve_store_dir(orchd_dir)
+    if not backend.db_path.is_file():
+        # 缺库守卫（task-layout-no-shell-ledger）：懒建库下「库未物化」是正常态，
+        # 不是错误——不建库、不取锁（避免空锁文件）、不改名，只把只能由迁移
+        # 承担的活名增量如实报出来（reason="no_db"），与 doctor 缺库判据同句提示。
+        live_events = list(FilesystemBackend(store_dir).read_events())
+        live_ids = [e["event_id"] for e in live_events if e.get("event_id")]
+        return {
+            "backend": "sqlite",
+            "performed": False,
+            "dry_run": dry_run,
+            "reason": "no_db",
+            "live_events": len(live_events),
+            "db_events": 0,
+            "missing_events": len(live_ids),
+            "missing_event_ids": live_ids,
+            "merged_events": 0,
+            "verified": None,
+            "match": None,
+            "backed_up": [],
+            "hint": (f"{DB_ABSENT_NOTE}：无可并账的库内活跃段；活名增量"
+                     f"（{len(live_ids)} 条）会由下一次写命令的首次迁移导入，"
+                     "无需本命令介入"),
+        }
     store.acquire_lock()
     try:
         live_events = list(FilesystemBackend(store_dir).read_events())

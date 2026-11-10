@@ -11,11 +11,20 @@
 - 通过 ``Store(orchd_dir, backend=SqliteBackend(...))`` 注入即"后端可切"（Store 的
   ``backend`` 参数为既定切换点）。
 
-默认路径：``<store_dir>/_ledger.sqlite3``；``_ledger.jsonl`` 存在时可一次性迁移。
+默认路径：``sqlite_db_path(store_dir)``（``<store_dir>`` ＋
+``orchd.names.LEDGER_SQLITE_FILE``）；``_ledger.jsonl`` 存在时可一次性迁移。
 启用方式（task-sqlite-cutover-default，B-max 切默认）：缺省即本后端（``Store``
 构造经 ``ledger._select_backend`` 选中，``ORCHD_STORAGE_BACKEND`` 未设/空即
 sqlite）；显式 ``ORCHD_STORAGE_BACKEND=file`` 切回文件后端。首次使用自动迁移
 （``import_jsonl``，成功后存量文件改名备份；回滚用 ``export_jsonl`` 导出）。
+
+懒建库（task-layout-no-shell-ledger）：构造后端**不再建库建表**。只读打开
+（``readonly=True``）以 ``mode=ro`` 打开已物化的库，文件缺失时读路径统一返回
+空视图（``read_events() == []`` / ``event_count() == 0`` / ``load_checkpoint()
+`` is None），不抛错也不落盘；写入路径（``append_event`` / ``save_checkpoint``
+ / ``replace_active_events`` / ``import_jsonl``）才在真正落盘前物化库文件与表。
+此前「初始化即建库」让只读命令在各布局根留下 0 字节/0 事件的空壳库文件
+（container 布局实测 4 处）。
 """
 
 from __future__ import annotations
@@ -30,7 +39,7 @@ from typing import Any, Iterator
 
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock, _depth_registry
-from orchd.storage import StorageBackend
+from orchd.storage import StorageBackend, sqlite_db_path
 
 # 本文件不直接读环境变量：后端选择由 ``orchd.ledger.backend`` 按
 # ``orchd.constants.ORCHD_STORAGE_BACKEND_ENV`` 决定（文首 docstring 里的变量名仅说明语义）。
@@ -47,6 +56,11 @@ _IMPORT_SKIPPED_KEY = "import_skipped"
 
 #: 迁移备份后缀（见上）。
 _MIGRATED_BACKUP_SUFFIX = ".pre-sqlite-bak"
+
+#: 缺库时的统一信息性措辞（task-layout-no-shell-ledger）：doctor 的缺库检查与
+#: storage CLI 的缺库守卫引用同一常量，保证「懒建库尚未物化」在两条调用链上
+#: 给出同一句话（避免一边 ok 一边 ENOENT 堆栈的口径分叉）。
+DB_ABSENT_NOTE = "库文件不存在（懒建库未物化）"
 
 #: 迁移备份后缀（task-sqlite-cutover-default）：``import_jsonl`` 成功后把
 #: 存量 ``_ledger.jsonl`` / ``_checkpoint.json`` 改名备份（不删除）——既消除
@@ -73,23 +87,24 @@ class SqliteBackend(StorageBackend):
 
         Args:
             orchd_dir: 账本根目录。
-            db_path: 库文件覆写（缺省 ``<账本根>/_ledger.sqlite3``）。
-            readonly: 只读模式（task-readonly-no-migrate）：跳过
-                ``_ensure_schema``（不建库），连接以 SQLite ``mode=ro``
-                打开——库文件缺失时直接抛错而非创建。doctor 等只读入口
-                经此模式读取已迁移部署，绝不触发建库 / 迁移 / 改名。
+            db_path: 库文件覆写（缺省 ``sqlite_db_path(账本根)``）。
+            readonly: 只读模式（task-readonly-no-migrate）：连接以
+                SQLite ``mode=ro`` 打开，绝不建库 / 建表 / 迁移 / 改名；
+                库文件缺失时读路径返回空视图（``_db_present``），不抛错。
+                doctor 等只读入口经此模式读取已迁移部署。
         """
         self.orchd_dir = Path(orchd_dir)
         self.ledger_path = self.orchd_dir / "_ledger.jsonl"
-        self.db_path = db_path or (self.orchd_dir / "_ledger.sqlite3")
+        self.db_path = db_path or sqlite_db_path(self.orchd_dir)
         self.checkpoint_path = self.orchd_dir / "_checkpoint.json"
         self.lock_path = self.orchd_dir / ".lock"
         self._file_lock = ExclusiveFileLock(self.lock_path)
         self.corrupt_lines: list[dict[str, Any]] = []
         self._import_skipped: list[dict[str, Any]] = []
         self.readonly = readonly
-        if not readonly:
-            self._ensure_schema()
+        # 懒建库（task-layout-no-shell-ledger）：构造零副作用——库文件与表
+        # 推迟到首次写入时物化（``_ensure_schema``），只读命令不再留下空壳库文件。
+        self._schema_ready = False
 
     # -- 内部 ----------------------------------------------------------------
 
@@ -102,6 +117,10 @@ class SqliteBackend(StorageBackend):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
+
+    def _db_present(self) -> bool:
+        """库文件是否已物化（懒建库：仅写入路径创建；读路径据此给空视图）。"""
+        return self.db_path.is_file()
 
     @contextmanager
     def _connected(self) -> Iterator[sqlite3.Connection]:
@@ -122,13 +141,24 @@ class SqliteBackend(StorageBackend):
             conn.close()
 
     def _ensure_schema(self) -> None:
-        """建表（幂等）。
+        """物化库文件与表（幂等；懒建库：只在写入路径调用）。
+
+        task-layout-no-shell-ledger：构造后端不再建库；只读打开
+        （``readonly=True``）永不建库建表。本方法由 ``append_event`` /
+        ``save_checkpoint`` / ``replace_active_events`` / ``import_jsonl``
+        在真正落盘前调用——先建表（DDL 幂等提交）再写数据（安全顺序）：
+        两步之间崩溃只留下「空库无表/无事件」的合法态，读路径统一返回
+        空视图，下次写入再次幂等建表，不丢事件。
 
         并发构造（task-migration-store-lock）：两进程同时首开同一账本根时，
         ``PRAGMA journal_mode`` 会短暂撞 ``database is locked``——DDL 均为
         IF NOT EXISTS 幂等，有界重试（~5s）而非直接抛错；建表本身的并发安全
         由 SQLite 锁语义保证。
         """
+        if self.readonly:
+            return  # 只读后端绝不物化（调用方误经只读 append 时由写语句报错）
+        if self._schema_ready and self._db_present():
+            return
         import time as _time
 
         last: Exception | None = None
@@ -144,6 +174,7 @@ class SqliteBackend(StorageBackend):
                         "CREATE TABLE IF NOT EXISTS meta "
                         "(k TEXT PRIMARY KEY, v TEXT NOT NULL)"
                     )
+                self._schema_ready = True
                 return
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc).lower():
@@ -172,6 +203,7 @@ class SqliteBackend(StorageBackend):
                     "hint": "写路径须先 store.acquire_lock() 再 append_event",
                 }],
             )
+        self._ensure_schema()  # 懒建库：首次 append 前物化库与表（安全顺序）
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self._connected() as conn:
             conn.execute("INSERT INTO events (payload) VALUES (?)", (payload,))
@@ -206,43 +238,54 @@ class SqliteBackend(StorageBackend):
         arch, arch_corrupt = read_archive_events(self.orchd_dir)
         for entry in arch_corrupt:
             self.corrupt_lines.append(entry)
-        try:
-            with self._connected() as _conn:
-                _row = _conn.execute(
-                    "SELECT v FROM meta WHERE k = ?",
-                    (_IMPORT_SKIPPED_KEY,)).fetchone()
-            if _row is not None:
-                _persisted = json.loads(_row[0])
-                if isinstance(_persisted, list):
-                    _seen = {
-                        (e.get("line"), e.get("message"))
-                        for e in self.corrupt_lines
-                        if isinstance(e, dict)
-                    }
-                    for e in _persisted:
-                        if (isinstance(e, dict)
-                                and (e.get("line"), e.get("message")) not in _seen):
-                            self.corrupt_lines.append(e)
-        except Exception:
-            pass  # 旧库无该键 / 库不可读：best-effort，不阻断读
+        if self._db_present():
+            # 懒建库：库未物化时无持久化跳过行可回填（不建库、不抛错）。
+            try:
+                with self._connected() as _conn:
+                    _row = _conn.execute(
+                        "SELECT v FROM meta WHERE k = ?",
+                        (_IMPORT_SKIPPED_KEY,)).fetchone()
+                if _row is not None:
+                    _persisted = json.loads(_row[0])
+                    if isinstance(_persisted, list):
+                        _seen = {
+                            (e.get("line"), e.get("message"))
+                            for e in self.corrupt_lines
+                            if isinstance(e, dict)
+                        }
+                        for e in _persisted:
+                            if (isinstance(e, dict)
+                                    and (e.get("line"), e.get("message"))
+                                    not in _seen):
+                                self.corrupt_lines.append(e)
+            except Exception:
+                pass  # 旧库无该键 / 库不可读：best-effort，不阻断读
         ka = len(arch)
         s = max(0, from_line - 1)
         if to_line is not None and to_line <= ka:
             return arch[s:to_line]
         arch_ids = {e.get("event_id", "") for e in arch if e.get("event_id")}
+        if not self._db_present():
+            # 懒建库：库未物化（从未写入）→ 活跃段为空，只有归档段可见。
+            return arch[s:]
         # 位置窗口（与文件端物理切片同口径，读后去重；禁 WHERE rowid BETWEEN——
         # replace_active 后 rowid 不回绕，值切片隐含稠密假设，spec 返工项）。
         a = max(1, from_line - ka)
-        with self._connected() as conn:
-            if to_line is None:
-                rows = conn.execute(
-                    "SELECT payload FROM events ORDER BY rowid "
-                    "LIMIT -1 OFFSET ?", (a - 1,)).fetchall()
-            else:
-                limit = max(0, to_line - ka - (a - 1))
-                rows = conn.execute(
-                    "SELECT payload FROM events ORDER BY rowid "
-                    "LIMIT ? OFFSET ?", (limit, a - 1)).fetchall()
+        try:
+            with self._connected() as conn:
+                if to_line is None:
+                    rows = conn.execute(
+                        "SELECT payload FROM events ORDER BY rowid "
+                        "LIMIT -1 OFFSET ?", (a - 1,)).fetchall()
+                else:
+                    limit = max(0, to_line - ka - (a - 1))
+                    rows = conn.execute(
+                        "SELECT payload FROM events ORDER BY rowid "
+                        "LIMIT ? OFFSET ?", (limit, a - 1)).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return arch[s:]  # 崩溃残留的空库（无表）：按空活跃段处理
         active: list[dict[str, Any]] = []
         for (payload,) in rows:
             try:
@@ -267,9 +310,17 @@ class SqliteBackend(StorageBackend):
         import_jsonl（归档 + 活跃总数）维护。meta 缺失（旧库）时回退全量
         口径（与旧实现一致，不抛错）。
         """
-        with self._connected() as conn:
-            row = conn.execute(
-                "SELECT v FROM meta WHERE k = ?", (_COUNT_KEY,)).fetchone()
+        if not self._db_present():
+            # 懒建库：库未物化 → 逻辑空视图（归档段仍计入，见 read_events）
+            return len(self.read_events())
+        try:
+            with self._connected() as conn:
+                row = conn.execute(
+                    "SELECT v FROM meta WHERE k = ?", (_COUNT_KEY,)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return len(self.read_events())
         if row is None:
             return len(self.read_events())
         try:
@@ -290,7 +341,12 @@ class SqliteBackend(StorageBackend):
             arch_n = len(arch)
         except Exception:
             arch_n = 0
-        (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        try:
+            (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            n = 0  # 崩溃残留的空库（无 events 表）：活跃段视作 0 行
         return arch_n + int(n)
 
     def recalibrate_event_count(self) -> dict[str, Any] | None:
@@ -301,7 +357,21 @@ class SqliteBackend(StorageBackend):
         ``repaired=False`` 的明细供消费方取真值——漂移被命名，不被误审。
 
         只动计数缓存与观测键，**绝不触碰 events 实体**（AC 红线）。
+
+        懒建库（task-layout-no-shell-ledger）：库未物化时无缓存也无真值，
+        直接返回 None（不建库、不抛错）。
         """
+        if not self._db_present():
+            return None
+        try:
+            return self._recalibrate_locked()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return None  # 崩溃残留的空库（无 meta 表）：无缓存可纠
+
+    def _recalibrate_locked(self) -> dict[str, Any] | None:
+        """持有连接内的纠偏主体（只经 :meth:`recalibrate_event_count` 调用）。"""
         with self._connected() as conn:
             if not self.readonly:
                 # BEGIN IMMEDIATE：truth 读取与缓存写回同事务、写意图即刻互斥，
@@ -341,6 +411,8 @@ class SqliteBackend(StorageBackend):
     def counter_reconcile_stats(self) -> dict[str, Any]:
         """纠偏哨兵读数（D4）：累计次数 + 末次明细；纯读，不触发纠偏。"""
         out: dict[str, Any] = {"count": 0, "last": None}
+        if not self._db_present():
+            return out  # 懒建库：库未物化 → 无哨兵可读，且不得因此建库
         try:
             with self._connected() as conn:
                 row = conn.execute(
@@ -365,7 +437,10 @@ class SqliteBackend(StorageBackend):
 
         清空后按序重插，rowid 从 1 重排（稠密），计数器同步。调用方（Store
         compact 流程）须已持 store 锁。
+
+        懒建库：写路径先物化库与表（安全顺序），再从空表重建。
         """
+        self._ensure_schema()
         with self._connected() as conn:
             conn.execute("DELETE FROM events")
             for ev in events:
@@ -388,10 +463,17 @@ class SqliteBackend(StorageBackend):
             )
 
     def load_checkpoint(self) -> dict[str, Any] | None:
-        with self._connected() as conn:
-            row = conn.execute(
-                "SELECT v FROM meta WHERE k = ?", (_CHECKPOINT_KEY,)
-            ).fetchone()
+        if not self._db_present():
+            return None  # 懒建库：库未物化 → 无 checkpoint（不建库、不抛错）
+        try:
+            with self._connected() as conn:
+                row = conn.execute(
+                    "SELECT v FROM meta WHERE k = ?", (_CHECKPOINT_KEY,)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            return None  # 崩溃残留的空库（无 meta 表）
         if row is None:
             return None
         try:
@@ -400,6 +482,7 @@ class SqliteBackend(StorageBackend):
             return None
 
     def save_checkpoint(self, data: dict[str, Any]) -> None:
+        self._ensure_schema()  # 懒建库：首次落 checkpoint 前物化库与表
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         with self._connected() as conn:
             conn.execute(
@@ -425,11 +508,21 @@ class SqliteBackend(StorageBackend):
         self._file_lock.release()
 
     def ledger_exists(self) -> bool:
-        """账本库文件是否存在（构造即建库，故新项目也为真）。"""
-        return self.db_path.exists()
+        """账本库文件是否已物化（懒建库：首次写入前为假）。
+
+        task-layout-no-shell-ledger：构造后端不再建库，故「后端已构造」不再
+        等价于「账本存在」；本方法如实反映文件在场，供 ``Store.ledger_exists``
+        / 只读命令判断「从未写入」的干净态。
+        """
+        return self.db_path.is_file()
 
     def create_empty_ledger(self) -> str | None:
-        """sqlite 后端账本库在构造时已建（``_ensure_schema``），无需额外文件。"""
+        """sqlite 懒建库：空账本不落文件，返回 None（不产生空壳库）。
+
+        库由首次写入物化（``orchd init`` 经 ``save_checkpoint`` 落 checkpoint
+        即物化，见 :meth:`save_checkpoint`）；调用方（``split.init``）按返回
+        真值决定是否记入 created_files，语义原样保留。
+        """
         return None
 
     # -- 迁移 ----------------------------------------------------------------
@@ -451,8 +544,17 @@ class SqliteBackend(StorageBackend):
         ledger_bak = self.ledger_path.with_name(
             self.ledger_path.name + _MIGRATED_BACKUP_SUFFIX).is_file()
         if live and not ledger_bak:
-            with self._connected() as conn:
-                (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+            if not self._db_present():
+                # 懒建库：库未物化 → 物理表按 0 行计，首写仍须迁移导入。
+                return True
+            try:
+                with self._connected() as conn:
+                    (n,) = conn.execute(
+                        "SELECT COUNT(*) FROM events").fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+                return True  # 崩溃残留的空库（无表）：同样按 0 行处理
             return n == 0
         cp_live = self.checkpoint_path.is_file()
         if ledger_bak and not live and cp_live:
@@ -489,6 +591,7 @@ class SqliteBackend(StorageBackend):
         live = self.ledger_path.is_file()
         count = 0
         if live:
+            self._ensure_schema()  # 懒建库：迁移（写路径）前先物化库与表
             with self._connected() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 (n,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()

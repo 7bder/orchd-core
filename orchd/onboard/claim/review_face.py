@@ -3,12 +3,11 @@
 自 ``orchd/onboard/claim.py`` 拆出（task-split2-w8-1-claim-pkg，纯搬移）：
 
 - :func:`_claim_review_branch`：reviewer claim 的响应组装（files_to_review /
-  分支 diff 诊断 / mergeability 对账 / verify 同源校验 / 自审提示）。
+  分支 diff 诊断 / mergeability 对账 / verify 同源校验 / lineage 回显）。
 - :func:`_resolve_review_worktree`：诊断/复跑作用域解析到任务 worktree
   （单源委托 gitops_ops.resolve_task_worktree）。
 - :func:`_attach_verify_head_drift`：DONE 存证与所审内容同源校验（无位移零成本）。
 - :func:`_reconcile_mergeability`：审查期前置对账（纯探测不落地）。
-- :func:`_build_self_review_notice`：自审提示实体化。
 
 依赖：不导入同包其它域（review_face 是叶子；run.py 编排层负责串联）。
 """
@@ -30,10 +29,11 @@ from orchd.gitops import (
     run_guard,
 )
 from orchd.gitops.repo import for_project as _repo_for_project
-from orchd.ledger import Store, TaskDerived
+from orchd.ledger import Store, TaskDerived, session_lineage
 from orchd.line_ctx import resolve_task_branch_for
 from orchd.review import (
     extract_review_comments as _extract_review_comments,
+    files_to_review as _files_to_review,
     find_last_done_event as _find_last_done_event,
 )
 from orchd.worktree import (
@@ -168,48 +168,6 @@ def _reconcile_mergeability(
     }
 
 
-def _build_self_review_notice(
-    done_by: str | None,
-    enforce_self_review_block: bool,
-) -> dict[str, Any]:
-    """构造自审提示（task-self-review-disclosure-and-log-channel，AC1/AC2）。
-
-    历史实现是占位符（``message="self_review"`` / ``hint="enforce flag"``）：
-    agent 收到后既不知道「正在审自己的实现」，也不知道既有约定的披露义务
-    （只写在 rules/review.md 与 conventions.md 文本里，引擎响应从未表达）；
-    且 ``enforce_self_review_block`` 硬编码 False——enforce=True 时
-    :func:`_claim_write_event` 已先抛 E016 早退，恒假字段零信息量。
-
-    实体化后文案含两项可执行信息（审查者据此可直接行动）：
-
-    - **判定依据**：DONE 实现指纹 == 当前 session（同指纹即判自审）；
-    - **披露要求**：继续审查须在 review comments 首句披露自审，或改由另一
-      会话（换指纹）/他人审查。
-
-    Args:
-        done_by: 最后一次 DONE 事件的 agent_id（实现者指纹）。
-        enforce_self_review_block: 引擎自审阻断开关的**真实取值**（不再硬编码）。
-
-    Returns:
-        claim 响应的 ``self_review_notice`` 字段值。
-    """
-    who = done_by or "<unknown>"
-    return {
-        "message": (
-            "自审：本任务最后一次 DONE 由当前会话提交"
-            f"（判定依据：DONE 实现指纹 {who} == 当前 session），"
-            "你正在审查自己的实现"
-        ),
-        "hint": (
-            "继续审查须在 review comments 首句披露自审"
-            f"（写明「本审查为自审，实现者 = 审查者 = {who}」）；"
-            "更稳妥的做法是换一个会话（换指纹）或交由他人审查"
-        ),
-        "done_by": done_by,
-        "enforce_self_review_block": enforce_self_review_block,
-    }
-
-
 def _claim_review_branch(
     store: Store,
     task_id: str,
@@ -222,30 +180,12 @@ def _claim_review_branch(
     event: dict[str, Any],
     degraded_guards: list[dict[str, Any]],
     shared: dict[str, Any] | None = None,
-    enforce_self_review_block: bool = False,
 ) -> dict[str, Any] | None:
     if role != "reviewer":
         return None
-    files_to_review = [
-        {"path": p, "priority": "must_read"}
-        for p in task_def.get(FILES_TO_EDIT_FIELD, [])
-    ]
-    if shared:
-        if review_phase == "spec":
-            arch = shared.get("architecture")
-            if arch:
-                files_to_review.append({"path": arch, "priority": "reference", "hint": "arch"})
-        elif review_phase == "code":
-            conv = shared.get("conventions")
-            if conv:
-                files_to_review.append({"path": conv, "priority": "must_read", "hint": "conv"})
-        else:
-            arch = shared.get("architecture")
-            if arch:
-                files_to_review.append({"path": arch, "priority": "reference", "hint": "arch"})
-            conv = shared.get("conventions")
-            if conv:
-                files_to_review.append({"path": conv, "priority": "must_read", "hint": "conv"})
+    # task-review-handoff-engine AC5：审查清单抽为共享 helper（handoff 与 claim
+    # 同源，禁止各写一份 phase 映射）。绑定名保留供 identity 断言与打点。
+    files_to_review = _files_to_review(task_def, shared, review_phase)
     done_event = _find_last_done_event(store, task_id, derived)
     changes_description = done_event.get("changes_description") if done_event else None
     result = {
@@ -256,11 +196,14 @@ def _claim_review_branch(
         "review_comments": _extract_review_comments(store, task_id, derived),
         "event_id": event["event_id"],
     }
-    if is_self_review:
-        _done_by = done_event.get("agent_id") if done_event else None
-        result["self_review_notice"] = _build_self_review_notice(
-            _done_by, enforce_self_review_block
-        )
+    # task-review-subagent-lineage-record（档 1）+ P0-3（task-review-hardblock-e3-
+    # lineage-gate，档 2）：把 reviewer 会话自己声明的 lineage 附到认领响应上，
+    # 供调用方核对「取号时声明成什么」。**档 2 起失败面不再走响应告警**：lineage
+    # 不符由 execute/`require_review_lineage` 在写事件前 E016 阻断，缺声明/伪造
+    # parent 的说明只在错误 details 里（本响应能到达，说明硬门已通过）。
+    # 刻意不写进 REVIEW_CLAIMED 事件字段集（新增事件字段属 §9.1 边界），
+    # 也不落 degraded_guards（那是「守卫没能执行」的留痕面；这里守卫跑成功了）。
+    result["review_lineage"] = session_lineage(store.orchd_dir)
     if done_event and done_event.get("verify"):
         result["verify"] = done_event["verify"]
     # task-review-completion-guidance（AC3）：reviewer 可粘贴的定向重跑命令模板，

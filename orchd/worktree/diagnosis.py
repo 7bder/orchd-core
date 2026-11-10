@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:  # 仅类型标注：叶子模块，运行时不依赖 ledger（防循环）
     from orchd.ledger import Store
@@ -138,10 +138,72 @@ def is_current_task_branch(project_root: Path, task_id: str) -> bool:
     return _is_flat_task_branch(Path(project_root), task_id)
 
 
+def _normalize_change_paths(paths: Iterable[str | Path]) -> set[str]:
+    """把若干路径规整为 posix 相对路径集合（空值剔除、去重）。"""
+    out: set[str] = set()
+    for p in paths:
+        rel = str(p).replace("\\", "/").strip()
+        if rel:
+            out.add(rel)
+    return out
+
+
+def pending_change_paths(project_root: Path | None) -> dict[str, set[str]]:
+    """返回工作区尚未提交的改动视图（task-engine-defect-fix-unified-u4）。
+
+    ``{"tracked": 已跟踪的已改/已删/已暂存路径, "untracked": 未跟踪新路径}``。
+    done preflight 用它在**提交之前**判定声明完整性与越界改动——未提交 / 未跟踪的
+    声明文件在任务分支 diff 里不可见，必须靠本视图等价补齐（否则「先判后提交」会把
+    合法的新建文件误判为 not_committed）。非 git / 探测失败返回空 dict，调用方按空
+    视图继续，与既有「git 不可见即不计」口径一致，不扩大阻断面。
+    """
+    if not project_root:
+        return {}
+    pr = Path(project_root)
+    try:
+        from orchd.nogit import git_available as _git_avail
+
+        if not _git_avail(pr):
+            return {}
+    except Exception:
+        return {}
+
+    def _run(args: list[str]) -> set[str] | None:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(pr),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_GIT_TIMEOUT,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+        raw = (proc.stdout or "").split("\0")
+        return _normalize_change_paths(x for x in raw if x)
+
+    staged = _run(["diff", "--name-only", "-z", "--cached"])
+    unstaged = _run(["diff", "--name-only", "-z"])
+    untracked = _run(["ls-files", "--others", "--exclude-standard", "-z"])
+    tracked: set[str] = set()
+    if staged is not None:
+        tracked |= staged
+    if unstaged is not None:
+        tracked |= unstaged
+    return {
+        "tracked": tracked,
+        "untracked": untracked if untracked is not None else set(),
+    }
+
+
 def missing_declared_branch_files(
     project_root: Path,
     task_id: str,
     declared_files: list[str] | set[str],
+    extra_changed: set[str] | list[str] | None = None,
 ) -> list[str]:
     """返回任务分支 diff 中缺失的声明文件（best-effort）。
 
@@ -152,9 +214,15 @@ def missing_declared_branch_files(
 
         if not is_task_worktree(Path(project_root)):
             return []
-        # task-rename-declaration-deadlock-fix：重命名展开口径（删+增），旧路径
-        # 删除态走 path_not_found + deleted 标记（提交删除态后保持声明），不死锁
+        # task-rename-declaration-deadlock-fix：重命名展开口径（删+增）；旧路径
+        # 删除态仍需保持声明（交付分支 diff 已含 D 才放行）。
+        # task-engine-defect-fix-unified-u2：删除/ghost 分流已迁至
+        # orchd.spec.declarations.path_state（单一判定源），此处不再打 deleted 标记。
         branch_files = set(task_branch_files(Path(project_root), task_id, no_renames=True))
+        # task-engine-defect-fix-unified-u4：preflight 在提交前调用，未提交/未跟踪
+        # 但已确认属于本任务的改动按「已变更」等价并入视图。
+        if extra_changed:
+            branch_files |= _normalize_change_paths(extra_changed)
         if not branch_files:
             # 无实际任务分支改动（测试/flat/未实现）不强制比对，避免误伤
             return []
@@ -178,6 +246,7 @@ def diagnose_missing_branch_files(
     project_root: Path,
     task_id: str,
     declared_files: list[str] | set[str],
+    extra_changed: set[str] | list[str] | None = None,
 ) -> list[dict[str, str]]:
     """返回缺失声明文件的结构化诊断（Bug #20b，2026-08-27）。
 
@@ -196,6 +265,9 @@ def diagnose_missing_branch_files(
             return []
         # task-rename-declaration-deadlock-fix：同上展开口径
         branch_files = set(task_branch_files(pr, task_id, no_renames=True))
+        # task-engine-defect-fix-unified-u4：同上，preflight 的「待提交改动」视图。
+        if extra_changed:
+            branch_files |= _normalize_change_paths(extra_changed)
         if not branch_files:
             return []
         from orchd.pool import _is_path_covered as is_path_covered
@@ -217,42 +289,15 @@ def diagnose_missing_branch_files(
         for fp in missing:
             full = pr / fp
             if not full.exists():
-                # task-e010-delete-parity-done-guards：区分「删除态未提交」与幽灵
-                # 路径。两者 reason 均保持 path_not_found（未提交的声明内删除仍报
-                # path_not_found，防「删了不提交」漏网），但 hint 引导不同——删除态
-                # 应「提交删除态后保持声明」（与 _guard_out_of_scope 的 D 感知口径
-                # 对齐；勿移除声明，否则删除变声明外改动触发 out_of_scope E010）；
-                # 幽灵路径才是「修正路径或从声明中移除」。deleted 标记仅供
-                # _guard_declared_diff 组装 hint 使用，不进事件 details。
-                deleted_flag = "false"
-                try:
-                    st = subprocess.run(
-                        ["git", "status", "--short", "--", fp],
-                        cwd=str(pr),
-                        capture_output=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=10,
-                    )
-                    # 删除态：status 短格式的 XY 位含 D（staged 'D ' / unstaged ' D'）；
-                    # XY 与路径间有空格分隔，strip 后首位即 X/Y 状态位，不会误匹配路径名。
-                    if st.returncode == 0 and any(
-                        ln.strip().startswith("D")
-                        for ln in st.stdout.splitlines() if ln.strip()
-                    ):
-                        deleted_flag = "true"
-                except (subprocess.SubprocessError, FileNotFoundError, OSError):
-                    pass  # 探测失败按非删除态处理（维持原 hint，不放大阻断面）
-                detail = (
-                    f"路径 {fp} 在磁盘不存在（检测到未提交的删除态）"
-                    if deleted_flag == "true"
-                    else f"路径 {fp} 在磁盘不存在"
-                )
+                # task-engine-defect-fix-unified-u2：删除态 / 幽灵路径的分流已
+                # 迁至声明层 path_state（由 _guard_declared_diff 消费），本函数
+                # 只报「磁盘不存在」事实——单一判定源，避免 git status 探针与
+                # path_state 两套口径漂移。reason 仍保持 path_not_found（未提交
+                # 的声明内删除必须被检出，不得因删除语义而漏网）。
                 results.append({
                     "file": fp,
                     "reason": "path_not_found",
-                    "detail": detail,
-                    "deleted": deleted_flag,
+                    "detail": f"路径 {fp} 在磁盘不存在",
                 })
                 continue
             # git check-ignore：退出码 0 = 被忽略，1 = 未被忽略

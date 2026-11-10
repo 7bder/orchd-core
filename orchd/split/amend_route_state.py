@@ -8,7 +8,119 @@ from orchd.contracts.task_schema import (
 from orchd.contracts.events import TERMINAL_STATUSES
 from orchd.schema_policy import amendable_fields, terminal_attachable_fields
 from typing import Any
+from pathlib import Path
 from .validate import _TERMINAL_TEXT_REVISABLE_FIELDS
+
+
+def _canonical_decl_path(path: Any, project_root: Path) -> str:
+    """声明路径的容器布局归一化（task-feedback-amend-scope）。
+
+    容器布局下同一文件可能被写成 ``main/design/x.md``（相对容器根）或
+    ``design/x.md``（相对 main 工作树）。仅当**带前缀路径不存在、去前缀路径
+    存在**时视为同一路径；两侧都存在或都不存在时保持原样，避免掩盖真实
+    的新增/删除或笔误。
+    """
+    raw = str(path or "").replace("\\", "/")
+    if raw.startswith("main/"):
+        stripped = raw[len("main/"):]
+        if not (project_root / raw).exists() and (project_root / stripped).exists():
+            return stripped
+    return raw
+
+
+def _normalized_route_decl_sync(
+    *,
+    task,
+    tid,
+    status,
+    old_task,
+    remaining,
+    project_root,
+    errors,
+    terminal_decl_sync,
+    updated_tasks,
+) -> bool:
+    """终态声明路径规范化通道（原 helper ``remaining ⊆ 声明字段`` 分支等价抽取）。
+
+    仅当删的全不存在、增的全存在（相对 ``project_root``）时放行并登记 sync 条目、
+    记入 ``updated_tasks``（返回 True）；否则写 E007 并返回 False——调用方以
+    ``return`` 结束本迭代，等价原块内 ``return``。
+
+    T18 修订依据：task-v163-pkg-registry-convergence（同文件等价抽取，仅把
+    ``_amend_route_state_matrix`` 压回 300 行预算，判定顺序与错误语义逐条不变）。
+    """
+    # task-terminal-decl-drift-channel：终态声明路径规范化通道。
+    # 仅当删的全不存在、增的全存在（相对 project_root）时放行并
+    # 同步 snapshot；否则仍 E007。防"借规范化之名篡改声明"。
+    sync_entries: list[dict[str, Any]] = []
+    normalized_ok = True
+    for field in (FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD):
+        if field not in remaining:
+            continue
+        old_decl = [str(p) for p in (old_task.get(field, []) or [])]
+        new_decl = [str(p) for p in (task.get(field, []) or [])]
+        # 容器布局等价路径先归一：main/design/x.md ↔ design/x.md
+        # （仅当带前缀路径不存在、去前缀路径存在）。等价项不算
+        # removed/added，避免把「写法归一」误判成删旧增新。
+        old_canon = {
+            _canonical_decl_path(p, project_root) for p in old_decl
+        }
+        new_canon = {
+            _canonical_decl_path(p, project_root) for p in new_decl
+        }
+        removed_decl = [
+            p for p in old_decl
+            if _canonical_decl_path(p, project_root) not in new_canon
+        ]
+        added_decl = [
+            p for p in new_decl
+            if _canonical_decl_path(p, project_root) not in old_canon
+        ]
+        if any(
+            (project_root / _canonical_decl_path(p, project_root)).exists()
+            for p in removed_decl
+        ):
+            normalized_ok = False
+            break
+        if any(
+            not (project_root / _canonical_decl_path(p, project_root)).exists()
+            for p in added_decl
+        ):
+            normalized_ok = False
+            break
+        if not removed_decl and not added_decl:
+            # 纯路径写法归一（等价集合相同）：无需登记 sync 条目，
+            # snapshot 仍由 persist 按 master 重写。
+            continue
+        sync_entries.append({
+            "task_id": tid,
+            "field": field,
+            "removed": sorted(removed_decl),
+            "added": sorted(added_decl),
+        })
+    if normalized_ok:
+        updated_tasks.append(tid)
+        terminal_decl_sync.extend(sync_entries)
+        return True
+    errors.append({
+        "task_id": tid,
+        "status": status,
+        "message": (
+            f"{status} 为终态，声明路径变更非规范化"
+            "（删的须不存在、增的须存在），不可修改"
+        ),
+        "changed_fields": sorted(remaining),
+        "diff": {
+            field: {
+                "snapshot": old_task.get(field),
+                "master": task.get(field),
+            }
+            for field in sorted(remaining)
+        },
+        "hint": _terminal_rejection_hint(tid, remaining, status),
+    })
+    return False
+
 
 def _amend_route_state_matrix(
     *,
@@ -46,26 +158,48 @@ def _amend_route_state_matrix(
         if changed_fields <= amendable_fields():
             # task-amend-scope-add：claimed 任务 files_to_edit 只增不删
             # 添加遗漏连带文件允许，删除已声明文件拒绝（E007）
+            # task-engine-defect-fix-unified-u1 AC2：撤回窗口——仅 ghost 声明
+            # （磁盘不存在且未被 git 跟踪的残留路径）允许移除；已存在/已实现
+            # 路径仍只增不删（E007 错误码与 retry 出路不变）。ghost 判定复用
+            # declarations.path_state 单一来源；git 索引不可用时 fail-closed
+            # （回退旧行为，不因环境降级放开删除）。
             if FILES_TO_EDIT_FIELD in changed_fields:
                 old_files = set(old_task.get(FILES_TO_EDIT_FIELD, []))
                 new_files = set(task.get(FILES_TO_EDIT_FIELD, []))
                 removed = old_files - new_files
                 if removed:
-                    errors.append({
-                        "task_id": tid,
-                        "status": status,
-                        "message": (
-                            "claimed task files_to_edit 只增不删："
-                            f"禁止删除已声明文件 {sorted(removed)}，"
-                            "仅允许添加遗漏连带文件"
-                        ),
-                        "hint": (
-                            "出路（task-amend-patch-write-after-validate）："
-                            "确需删声明请 retract --disposition retry（免认领冷却）"
-                            "退回 pending 后 amend，再 claim（无需 --force）"
-                        ),
-                    })
-                    return
+                    from orchd.spec.declarations import (
+                        PATH_STATE_GHOST,
+                        git_tracked_files,
+                        path_state,
+                    )
+                    _tracked = git_tracked_files(project_root)
+                    ghost_removed: set[str] = set()
+                    if _tracked is not None:
+                        ghost_removed = {
+                            p for p in removed
+                            if path_state(
+                                p, project_root,
+                                tracked_files=_tracked) == PATH_STATE_GHOST
+                        }
+                    rejected = sorted(removed - ghost_removed)
+                    if rejected:
+                        errors.append({
+                            "task_id": tid,
+                            "status": status,
+                            "message": (
+                                "claimed task files_to_edit 只增不删："
+                                f"禁止删除已存在/已实现的声明文件 {rejected}，"
+                                "仅允许添加遗漏连带文件或移除 ghost"
+                                "（磁盘不存在且未被 git 跟踪）路径"
+                            ),
+                            "hint": (
+                                "出路（task-amend-patch-write-after-validate）："
+                                "确需删声明请 retract --disposition retry（免认领冷却）"
+                                "退回 pending 后 amend，再 claim（无需 --force）"
+                            ),
+                        })
+                        return
             updated_tasks.append(tid)
             whitelisted_updates.append({
                 "task_id": tid,
@@ -147,48 +281,18 @@ def _amend_route_state_matrix(
             # task-terminal-decl-drift-channel：终态声明路径规范化通道。
             # 仅当删的全不存在、增的全存在（相对 project_root）时放行并
             # 同步 snapshot；否则仍 E007。防"借规范化之名篡改声明"。
-            sync_entries: list[dict[str, Any]] = []
-            normalized_ok = True
-            for field in (FILES_TO_EDIT_FIELD, EXEMPT_FILES_FIELD):
-                if field not in remaining:
-                    continue
-                old_decl = old_task.get(field, []) or []
-                new_decl = task.get(field, []) or []
-                removed_decl = [p for p in old_decl if p not in new_decl]
-                added_decl = [p for p in new_decl if p not in old_decl]
-                if any((project_root / p).exists() for p in removed_decl):
-                    normalized_ok = False
-                    break
-                if any(not (project_root / p).exists() for p in added_decl):
-                    normalized_ok = False
-                    break
-                sync_entries.append({
-                    "task_id": tid,
-                    "field": field,
-                    "removed": sorted(removed_decl),
-                    "added": sorted(added_decl),
-                })
-            if normalized_ok:
-                updated_tasks.append(tid)
-                terminal_decl_sync.extend(sync_entries)
-            else:
-                errors.append({
-                    "task_id": tid,
-                    "status": status,
-                    "message": (
-                        f"{status} 为终态，声明路径变更非规范化"
-                        "（删的须不存在、增的须存在），不可修改"
-                    ),
-                    "changed_fields": sorted(remaining),
-                    "diff": {
-                        field: {
-                            "snapshot": old_task.get(field),
-                            "master": task.get(field),
-                        }
-                        for field in sorted(remaining)
-                    },
-                    "hint": _terminal_rejection_hint(tid, remaining, status),
-                })
+            # T18 抽取为 _normalized_route_decl_sync：返回 False == 原块内 return。
+            if not _normalized_route_decl_sync(
+                task=task,
+                tid=tid,
+                status=status,
+                old_task=old_task,
+                remaining=remaining,
+                project_root=project_root,
+                errors=errors,
+                terminal_decl_sync=terminal_decl_sync,
+                updated_tasks=updated_tasks,
+            ):
                 return
         else:
             # AC6：列出差异字段两侧取值（snapshot vs master）+ 可执行指引，

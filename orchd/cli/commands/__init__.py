@@ -15,6 +15,10 @@
   9. sync      — sync（账本 git 跨设备同步，task-ledger-git-sync）
  10. line      — line（跨线回移通道 line-sync，task-line-sync）
  11. check     — check（静态门禁 ruff + mypy，task-check-command）
+ 12. release   — release（发布流程，task-release-tooling）
+ 13. guards    — guards 二级子命令组（宿主 guard 配置只读展示，task-host-guard-config）
+ 14. deps      — deps 二级子命令组（依赖图 init / check / sync，task-deps-host-init）
+ 15. docs      — docs 二级子命令组（契约文档 list / check / write，task-docsgen-manifest）
 """
 
 from __future__ import annotations
@@ -32,6 +36,10 @@ from orchd.cli.commands import (
     line as _line,
     check as _check,
     release as _release,
+    guards as _guards,
+    deps as _deps,
+    docs as _docs,
+    surfaces as _surfaces,
 )
 
 _REGISTER_ORDER = [
@@ -47,6 +55,10 @@ _REGISTER_ORDER = [
     _line,
     _check,
     _release,
+    _guards,
+    _deps,
+    _docs,
+    _surfaces,
 ]
 
 

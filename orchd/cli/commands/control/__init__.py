@@ -16,6 +16,7 @@ from .declarations import _log_decl_withdraw, _decl_withdraw_branch_overlap
 from .patch_validation import _validate_verify_timeout_patch, _validate_additional_sources_patch
 from .proposals import (
     _apply_register_proposals,
+    _archived_copy,
     _closeout_ids,
     _consume_registered_proposal,
     _expand_serial_order,
@@ -27,8 +28,9 @@ from .amend_patch_fields import (
     _amend_patch_fields,
     _apply_depends_on_patch,
     _apply_text_field_patch,
+    _resolve_verify_command_file,
 )
-from .amend_register_gate import _amend_register_gate
+from .amend_register_gate import _amend_register_gate, _register_precheck_warnings
 from .amend_persist_commit import _amend_persist_commit
 from .amend_impl import _amend_impl
 from .roundtrip import (
@@ -52,12 +54,15 @@ __all__ = (
     '_validate_verify_timeout_patch',
     '_validate_additional_sources_patch',
     '_consume_registered_proposal',
+    '_archived_copy',
     '_apply_register_proposals',
     '_persist_master_durable',
     '_fsync_file_durable',
     '_amend_admission',
     '_amend_patch_fields',
+    '_resolve_verify_command_file',
     '_amend_register_gate',
+    '_register_precheck_warnings',
     '_amend_persist_commit',
     '_amend_impl',
     '_amend_roundtrip_applicable',

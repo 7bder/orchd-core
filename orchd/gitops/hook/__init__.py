@@ -24,7 +24,6 @@ from __future__ import annotations
 from orchd.gitops._run import _run_git, _shell_quote
 from orchd.gitops.cleanup import _safe_delete
 from .content import (
-    _baked_hook_endpoints,
     _e020_hook_escape_block,
     _line_ref_tx_env,
     _precommit_hook_content,
@@ -32,6 +31,7 @@ from .content import (
     ref_tx_hook_content,
 )
 from .install import (
+    _baked_hook_endpoints,
     _install_ref_tx_hook,
     _is_orchd_hook,
     _log_hook_skip,

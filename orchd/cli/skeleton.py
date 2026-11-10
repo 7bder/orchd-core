@@ -75,12 +75,15 @@ _UNSAFE_JSON_CHARS = re.compile(
 def _output(data: Any) -> None:
     """将数据序列化为 JSON 并打印到 stdout（stdout 恒为严格可解析 JSON）。
 
-    使用 indent=2 美化、ensure_ascii=False 保留中文直写；序列化后把「不安全字符」
-    （孤立代理 / DEL / C1 控制符 / 私用区 PUA，见 ``_UNSAFE_JSON_CHARS``）统一替换为
-    U+FFFD，确保管道/脚本消费方对 stdout 一次 ``json.loads``（strict）即可解析，
-    且不因脏字符在 Windows 控制台触发 GBK/编码错误。
+    使用 indent=2 美化；TTY 下 ensure_ascii=False 保留中文直写，非 TTY
+    （重定向 / 管道 / 测试捕获）下 ensure_ascii=True，输出纯 ASCII 转义，避免
+    Windows 默认 GBK 代码页把中文直写弄成非法字节、导致消费方 UTF-8 解析失败。
+    序列化后把「不安全字符」（孤立代理 / DEL / C1 控制符 / 私用区 PUA，见
+    ``_UNSAFE_JSON_CHARS``）统一替换为 U+FFFD，确保管道/脚本消费方对 stdout 一次
+    ``json.loads``（strict）即可解析，且不因脏字符在 Windows 控制台触发 GBK/编码错误。
     """
-    text = json.dumps(data, ensure_ascii=False, indent=2)
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    text = json.dumps(data, ensure_ascii=not is_tty, indent=2)
     text = _UNSAFE_JSON_CHARS.sub("\ufffd", text)
     print(text)
 

@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
 from orchd.errors import ErrorCode, OrchdError
-from orchd.contracts.task_schema import (
-    ACCEPTANCE_CRITERIA_FIELD,
-    BRIEF_FIELD,
-    DEPENDS_ON_FIELD,
-    DIFFICULTY_FIELD,
-    ESTIMATED_HOURS_FIELD,
-    FILES_TO_EDIT_FIELD,
-    ID_FIELD,
-    MODULE_FIELD,
-    NAME_FIELD,
-    REQUIRES_FIELD,
-    SOURCE_FIELD,
-)
+from orchd.contracts.task_schema import DEPENDS_ON_FIELD, ID_FIELD, SOURCE_FIELD
+from orchd.schema_policy import required_task_fields, task_field_defaults
+
+
+#: 注册成功后的草稿归档目录（同 `.orchd/proposals/` 下；被 `.orchd/*` 忽略，不入库）。
+_REGISTERED_DIRNAME = "registered"
+
+
+def _archived_copy(proposal_file: Path) -> Path:
+    """返回该提案的归档路径（`proposals/registered/<原名>`）。"""
+    return proposal_file.parent / _REGISTERED_DIRNAME / proposal_file.name
 
 
 def _consume_registered_proposal(proposal_file: Path,
@@ -45,24 +44,33 @@ def _consume_registered_proposal(proposal_file: Path,
         不抛异常——注册已成功（master 已原子落盘），草稿滞留会被卫生门禁
         ``[proposals]`` 检查与 ``doctor --fix`` 再点名一次，故只留痕不反噬注册结果。
     """
-    from orchd.gitops.cleanup import _safe_delete
+    import shutil
 
+    archived = _archived_copy(proposal_file)
     if not proposal_file.exists():
-        return {"path": str(proposal_file), "consumed": True,
-                "reason": "already_absent"}
+        reason = "already_archived" if archived.exists() else "already_absent"
+        return {"path": str(proposal_file), "consumed": True, "reason": reason,
+                "archived": str(archived) if archived.exists() else None}
+    # task-debug-claim-register-ux：由「删除」改为**归档移动**。删除让重跑同一命令只能
+    # 得到「提案文件不存在」；归档后重试可命中原名归档 → 报 register_proposal_dup_id
+    # 这句真话，且草稿正文可回溯（原先零信息量丢失）。
     try:
-        _safe_delete(proposal_file, project_root)
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        if archived.exists():
+            archived.unlink()
+        shutil.move(str(proposal_file), str(archived))
     except OSError as exc:
         return {
             "path": str(proposal_file),
             "consumed": False,
             "error": f"{type(exc).__name__}: {exc}",
-            "hint": ("注册已成功（任务已入 _master.json），仅草稿文件未清理；"
-                     "可运行 orchd doctor --fix 受管移入 .doctor-backup 后删除"),
+            "hint": ("注册已成功（任务已入 _master.json），仅草稿未归档；"
+                     "可运行 orchd doctor --fix 受管移入 .doctor-backup 后清理"),
         }
     return {
         "path": str(proposal_file),
-        "consumed": not proposal_file.exists(),
+        "consumed": True,
+        "archived": str(archived),
     }
 
 
@@ -218,6 +226,42 @@ def _expand_serial_order(data: dict, register: str) -> list[dict]:
     return tasks
 
 
+def _schema_task_contract() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """注册必填字段与 schema 缺省值（唯一真源：``schema/_master.schema.json``）。
+
+    task-engine-defect-fix-unified-u8 AC1：旧实现把 11 字段清单硬编码在代码里，
+    与 schema ``tasks[].required``（6 项）及 ``rules/intake.md`` 三处漂移。改为
+    直接读 schema；schema 不可读时 fail-closed（E001）——退化成手写清单会重新
+    制造第二真源。
+
+    Returns:
+        ``(required, defaults)``：必填字段名（排序稳定）与带 default 的缺省值表。
+    """
+    try:
+        required = tuple(sorted(required_task_fields()))
+        defaults = dict(task_field_defaults())
+    except Exception as exc:  # noqa: BLE001 —— schema 缺失/损坏都必须显式失败
+        raise OrchdError(
+            ErrorCode.E001,
+            f"register_schema_unreadable: 无法读取 schema 的 tasks[] 契约: {exc}",
+            [{
+                "schema": "schema/_master.schema.json",
+                "hint": ("确认仓库内 schema/_master.schema.json 存在，且 "
+                         "tasks[].items.required / default 可解析后重试"),
+            }],
+        ) from exc
+    if not required:
+        raise OrchdError(
+            ErrorCode.E001,
+            "register_schema_unreadable: schema 的 tasks[].required 为空",
+            [{
+                "schema": "schema/_master.schema.json",
+                "hint": "schema 的 properties.tasks.items.required 必须列出注册必填字段",
+            }],
+        )
+    return required, defaults
+
+
 def _apply_register_proposals(master, register_path: str) -> None:
     """task-amend-register-channel：读提案 JSON（单任务对象或任务数组）追加到 master。
 
@@ -235,12 +279,31 @@ def _apply_register_proposals(master, register_path: str) -> None:
 
     proposal_file = Path(register_path)
     if not proposal_file.is_file():
+        archived = _archived_copy(proposal_file)
+        if archived.is_file():
+            # task-debug-claim-register-ux：注册成功后草稿会被归档；重跑同一命令时
+            # 必须报「已注册」而不是「文件不存在」（后者把 agent 引向找错文件）。
+            raise OrchdError(
+                ErrorCode.E007,
+                f"register_proposal_dup_id: 提案 {proposal_file.name} 此前已注册成功"
+                "（草稿已归档，非文件缺失）",
+                [{
+                    "register": str(proposal_file),
+                    "archived": str(archived),
+                    "reason": "register_proposal_dup_id",
+                    "hint": ("该提案已入库：先用 status 核对该任务是否已存在；确需重新注册"
+                             "请改写 id 后新建提案，不要重跑旧路径"),
+                }],
+            )
         raise OrchdError(
             ErrorCode.E007,
             "register_proposal_missing: 提案文件不存在",
             [{
                 "register": str(proposal_file),
-                "hint": "传入 proposals/<id>.json（单任务对象）路径",
+                "reason": "register_proposal_missing",
+                "hint": ("传入 proposals/<id>.json（单任务对象）路径；若此前已注册成功，"
+                         f"草稿会被归档到 {proposal_file.parent / _REGISTERED_DIRNAME}/，"
+                         "请用 status 核对任务是否已入库"),
             }],
         )
     try:
@@ -268,11 +331,8 @@ def _apply_register_proposals(master, register_path: str) -> None:
         proposals = data if isinstance(data, list) else [data]
         _validate_closeout_coverage(proposals, str(proposal_file))
     existing = {t.get(ID_FIELD) for t in master.tasks}
-    required = (
-        ID_FIELD, NAME_FIELD, BRIEF_FIELD, MODULE_FIELD, DEPENDS_ON_FIELD,
-        ESTIMATED_HOURS_FIELD, DIFFICULTY_FIELD, REQUIRES_FIELD,
-        ACCEPTANCE_CRITERIA_FIELD, FILES_TO_EDIT_FIELD, SOURCE_FIELD,
-    )
+    # 必填字段 / 缺省值真源 = schema（AC1）：schema 增删 required / default 即时生效。
+    required, defaults = _schema_task_contract()
     for prop in proposals:
         if not isinstance(prop, dict):
             raise OrchdError(
@@ -284,10 +344,17 @@ def _apply_register_proposals(master, register_path: str) -> None:
         if missing:
             raise OrchdError(
                 ErrorCode.E007,
-                "register_proposal_missing_fields: 提案缺必填字段",
+                "register_proposal_missing_fields: 提案缺 schema 必填字段",
                 [{
                     "register": str(proposal_file),
+                    "reason": "register_proposal_missing_fields",
                     "missing": missing,
+                    "required": list(required),
+                    "hint": (
+                        "按 schema/_master.schema.json 的 tasks[].required 补齐下列字段后重试："
+                        + "、".join(missing)
+                        + "（带 default 的字段由注册自动补齐，无需手填）"
+                    ),
                 }],
             )
         tid = prop.get(ID_FIELD)
@@ -300,5 +367,9 @@ def _apply_register_proposals(master, register_path: str) -> None:
                     ID_FIELD: tid,
                 }],
             )
+        # schema default 补齐（AC1）：缺省语义由 schema 决定，不再硬编码。
+        for field, default in defaults.items():
+            if field not in prop:
+                prop[field] = copy.deepcopy(default)
         master.raw.setdefault("tasks", []).append(prop)
         existing.add(tid)

@@ -2,7 +2,7 @@
 
 本模块提供以下核心功能：
 - build_pool：就绪池构建，按状态→依赖→能力→排除的管线过滤出可执行候选任务。
-- sort_candidates：候选任务按重要性（importance）及其他维度进行排序。
+- rank_candidates / sort_candidates：候选任务排序唯一真源（importance 等维度 + 软冲突惩罚键）。
 - detect_file_conflict：文件级写冲突检测，识别目标任务与活跃 claimed 任务之间的文件重叠。
 - compute_downstream_blocked：统计每个任务被多少 pending 任务依赖，用于自动推导 importance。
 
@@ -189,50 +189,49 @@ def build_pool(
     return candidates
 
 
+def rank_candidates(
+    candidates: list[Candidate],
+    conflicts: dict[str, Any] | None = None,
+    sort_key: str | None = None,
+    importance_thresholds: dict[str, Any] | None = None,
+) -> list[Candidate]:
+    """候选排序**唯一真源**（u14：request 选 best 与 guide hint 共用）。
+
+    ``conflicts`` = ``{task_id: pending_soft 冲突列表}``：软冲突只作惩罚键参与同一次
+    排序，且置于 ``rework`` 之后 ⇒ 不再整批压后覆盖返工优先（旧 conflicts.py 末尾的
+    二次稳定排序已删除，即本任务根因）。sort_key 语义同旧 ``sort_candidates``
+    （None/"default" → 复合默认序；单维序前置软冲突惩罚键）；importance_thresholds
+    为 _master.json ``config.importance`` 自定义阈值，None 用默认。
+    """
+    conflict_ids = set(conflicts or {})
+
+    def _key(c: Candidate) -> tuple[Any, ...]:
+        free = c.task.get(ID_FIELD, "") not in conflict_ids
+        if sort_key == IMPORTANCE_FIELD:
+            return (free, _importance_key(c, importance_thresholds))
+        if sort_key == "downstream":
+            return (free, c.blocked_downstream_count)
+        if sort_key == "hours":
+            return (free, -c.task.get(ESTIMATED_HOURS_FIELD, 0))
+        # rework 跨 importance 层全局优先（返工卡不论 importance 均排在新任务前，避免饿死）。
+        return (
+            c.rework,
+            free,
+            _importance_key(c, importance_thresholds),
+            c.blocked_downstream_count,
+            -c.task.get(ESTIMATED_HOURS_FIELD, 0),
+        )
+
+    return sorted(candidates, key=_key, reverse=True)
+
+
 def sort_candidates(
     candidates: list[Candidate],
     sort_key: str | None = None,
     importance_thresholds: dict[str, Any] | None = None,
 ) -> list[Candidate]:
-    """排序候选列表。
-
-    sort_key:
-        None / "default" → importance desc → blocked_downstream_count desc → estimated_hours asc
-        "importance" → importance desc
-        "downstream" → blocked_downstream_count desc
-        "hours" → estimated_hours asc
-
-    importance_thresholds: _master.json ``config.importance`` 自定义阈值
-    （derive_importance 覆盖），None 用默认阈值。
-    """
-    if sort_key == IMPORTANCE_FIELD:
-        return sorted(
-            candidates,
-            key=lambda c: _importance_key(c, importance_thresholds),
-            reverse=True,
-        )
-    elif sort_key == "downstream":
-        return sorted(candidates,
-                      key=lambda c: c.blocked_downstream_count,
-                      reverse=True)
-    elif sort_key == "hours":
-        return sorted(candidates,
-                      key=lambda c: c.task.get(ESTIMATED_HOURS_FIELD, 0))
-    else:
-        # 默认复合排序：rework（返工全局优先，与 guide.py rework_first 对齐）
-        # → importance desc → blocked_downstream desc → estimated_hours asc。
-        # rework 跨 importance 层全局优先：返工任务不论 importance 高低均排在新任务前，
-        # 避免低 importance 返工任务被高 importance 新任务长期饿死（与引导层 hint 一致）。
-        return sorted(
-            candidates,
-            key=lambda c: (
-                c.rework,
-                _importance_key(c, importance_thresholds),
-                c.blocked_downstream_count,
-                -c.task.get(ESTIMATED_HOURS_FIELD, 0),
-            ),
-            reverse=True,
-        )
+    """排序候选列表（向后兼容包装；唯一实现见 :func:`rank_candidates`）。"""
+    return rank_candidates(candidates, None, sort_key, importance_thresholds)
 
 
 def _is_path_covered(declared: str, target: str) -> bool:

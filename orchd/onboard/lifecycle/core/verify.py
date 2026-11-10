@@ -242,11 +242,23 @@ def _verify_fail_error(
     # task-pass9-verify-path-guard（pass9 实测）：exit 5 = "no tests ran"——
     # addopts 强制 xdist 下 verify_command 参数含不存在路径时 usage error 被
     # 整吞，合法测试静默不跑。失败已发生，把根因 hint 顶到最前。
-    if result.returncode == 5 or "no tests ran" in _output_l:
+    # task-debug-dryrun-classify-order：exit 4（usage error）同样会往 stdout 打
+    # "no tests ran in 0.00s"，旧实现无条件写「（exit 5）」⇒ message 的退出码与
+    # hint 标签互相矛盾。标签一律取**实际** returncode；两种成因分开说明，避免
+    # 在 exit 5 的文案里出现 "exit 4" 之类的交叉噪声。
+    _no_tests_prefix = (
+        f"未收集到任何测试（exit {result.returncode}）：核对 verify_command 路径拼写——")
+    if result.returncode == 5:
         _hint = (
-            "未收集到任何测试（exit 5）：核对 verify_command 路径拼写——"
-            "addopts 强制 xdist 下参数含不存在路径的 usage error 会被整吞"
+            _no_tests_prefix
+            + "addopts 强制 xdist 下参数含不存在路径的 usage error 会被整吞"
             "（task-pass9-verify-path-guard）；" + _hint
+        )
+    elif "no tests ran" in _output_l:
+        _hint = (
+            _no_tests_prefix
+            + "参数含不存在路径时 pytest 的 usage error 也会打出该行"
+            "（常见退出码 4，与 xdist 整吞的 5 不同源）；" + _hint
         )
     return OrchdError(
         ErrorCode.E014,

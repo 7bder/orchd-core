@@ -36,6 +36,7 @@ from typing import Any
 from orchd.constants import ORCHD_SNAPSHOT_ROOT_ENV
 from orchd.errors import ErrorCode, OrchdError
 from orchd.lockfile import ExclusiveFileLock
+from orchd.names import LEDGER_SQLITE_FILE
 
 # 快照存储根（默认 <project_root>/.orchd/snapshots，可用 ORCHD_SNAPSHOT_ROOT 覆盖）
 SNAPSHOT_DIRNAME = "snapshots"
@@ -71,7 +72,7 @@ from orchd.doctor import _RUNTIME_STATE_FILES as _HASH_EXCLUDED_FILES
 # **引擎运行时状态**，无 git 快照口径必须一并排除：否则「切换存储后端」本身就会被
 # 越界门禁判成项目改动（task-storage-test-matrix 实测：sqlite 后端在无 git 项目下
 # done 被 E010 拦下——A3 × A0 交互缺口）。按前缀排除以覆盖全部侧车文件。
-_HASH_EXCLUDED_PREFIXES = ("_ledger.sqlite3",)
+_HASH_EXCLUDED_PREFIXES = (LEDGER_SQLITE_FILE,)
 _HASH_EXCLUDED_DIRS = frozenset({
     ".doctor-backup",
     "proposals",

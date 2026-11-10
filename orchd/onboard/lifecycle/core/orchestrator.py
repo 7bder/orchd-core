@@ -20,6 +20,9 @@ from orchd.gitops import (
 )
 from orchd.ledger import Store
 
+from orchd import surfaces
+from orchd.contracts.task_schema import EXEMPT_FILES_FIELD
+from orchd.errors import ErrorCode, OrchdError
 from orchd.onboard.lifecycle.guards import _guard_cross_worktree_dirty
 from orchd.onboard.lifecycle.regression import _maybe_full_regression
 
@@ -28,6 +31,14 @@ from .finish import _assemble_done_result, _done_lessons_hook, _write_done_event
 from .reconcile import _check_base_freshness, _reconcile_before_verify
 from .stages import _commit_and_verify_integrity, _done_precheck
 from .verify import _run_verify
+
+
+def _merge_surface_exempt(task_def: dict[str, Any], rel_paths: list[str]) -> None:
+    """把 done 期新写片段路径并入 ``exempt_files``（进入本次自动提交 + 范围守卫放行）。"""
+    if not rel_paths:
+        return
+    existing = list(task_def.get(EXEMPT_FILES_FIELD, []) or [])
+    task_def[EXEMPT_FILES_FIELD] = list(dict.fromkeys([*existing, *rel_paths]))
 
 
 def done(
@@ -39,6 +50,7 @@ def done(
     concerns: str | None = None,
     project_root: Path | None = None,
     skip_lesson_review: bool = False,
+    surface_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """报告任务完成（task-session-lock-lifecycle：异常路径也保证释放会话锁）。
 
@@ -50,7 +62,7 @@ def done(
     try:
         return _done_impl(
             store, tasks, agent_id, task_id, changes_description, concerns,
-            project_root, skip_lesson_review,
+            project_root, skip_lesson_review, surface_entries,
         )
     finally:
         if project_root:
@@ -66,6 +78,7 @@ def _done_impl(
     concerns: str | None = None,
     project_root: Path | None = None,
     skip_lesson_review: bool = False,
+    surface_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """报告任务完成。verify_command 锁外执行，锁内二次校验 + 写事件。
 
@@ -87,49 +100,84 @@ def _done_impl(
         from orchd.gitops_ops import resolve_task_worktree
         project_root = resolve_task_worktree(project_root, task_id, strict=True)
 
-    # 1) 预校验（无锁）：任务查找 + files_to_edit + claimed 状态 + L1/root 守卫
-    task_def, files_to_edit, degraded_guards = _done_precheck(
-        store, tasks, task_id, agent_id, project_root,
-    )
+    # 0.5) 落地面片段（task-shared-surface-engine）：先写片段、再跑落地面预检，
+    #      使预检的 scan 能看到本任务片段（否则 E039「落地将不在册」会误拦）；
+    #      新写路径随后并入 exempt_files，随本次 done 自动提交入库（不手改 CHANGELOG）。
+    surface_created: list[str] = []
+    surface_exempt: list[str] = []
+    if surface_entries:
+        if not project_root:
+            raise OrchdError(
+                ErrorCode.E007,
+                "done 期写落地面片段需要 project_root（当前无仓库根）",
+                [{"rule": "surface_entry"}],
+            )
+        _prepared_entries = surfaces.prepare_entries(project_root, task_id, surface_entries)
+        surface_created = surfaces.write_entries(project_root, _prepared_entries)
+        # 重试场景：片段在上一轮已写/已提交，本次 created 为空——仍须把该任务
+        # 已有片段并入 exempt_files，否则 preflight 的越界/残留守卫会拦自己。
+        surface_exempt = list(
+            dict.fromkeys(
+                [*surface_created, *surfaces.existing_fragment_rel_paths(project_root, task_id)]
+            )
+        )
 
-    # 2) 跨 worktree 脏写检测（fail-closed，E017）
-    _guard_cross_worktree_dirty(project_root, files_to_edit, task_id, degraded_guards)
+    try:
+        # 1) 预校验（无锁）：任务查找 + files_to_edit + claimed 状态 + L1/root 守卫
+        task_def, files_to_edit, degraded_guards = _done_precheck(
+            store, tasks, task_id, agent_id, project_root,
+        )
+        _merge_surface_exempt(task_def, surface_exempt)
 
-    # 2.5) 基线新鲜度闸口（task-done-base-freshness）：main 已在实现期间持续推进（本
-    #      仓库 main 已 297+ completed），任务分支基线与 main 漂移。既有 reconcile
-    #      （挂载点 ① 下一段）只在“main 推进且触及本任务文件”时才阻断，而“main 推进但
-    #      未触及 task 改动文件”的场景当前静默放行——实现者带陈旧基线 done、合并后到
-    #      review 期才暴露 drift（E015）。此处先判 task 分支是否落后 main，落后即阻断，
-    #      早发现避免 review 期 E015。仅判落后与否，不产生 git 写操作；与随后的
-    #      reconcile 冲突对账互补互不冲突。
-    _check_base_freshness(project_root, task_id, degraded_guards)
+        # 2) 跨 worktree 脏写检测（fail-closed，E017）
+        _guard_cross_worktree_dirty(project_root, files_to_edit, task_id, degraded_guards)
 
-    # 3) 与 main 对账（task-done-reconcile-main 挂载点 ①）：顺序约束——必须先对账、
-    #     后 verify，否则 verify 跑在对账前的旧内容上。此处仅在 main 推进且触及本任务
-    #     文件时检出冲突（2.5 已覆盖“未触及文件”的陈旧基线场景，二者互补）。
-    _reconcile_before_verify(project_root, task_id, degraded_guards)
+        # 2.5) 基线新鲜度闸口（task-done-base-freshness）：main 已在实现期间持续推进（本
+        #      仓库 main 已 297+ completed），任务分支基线与 main 漂移。既有 reconcile
+        #      （挂载点 ① 下一段）只在“main 推进且触及本任务文件”时才阻断，而“main 推进但
+        #      未触及 task 改动文件”的场景当前静默放行——实现者带陈旧基线 done、合并后到
+        #      review 期才暴露 drift（E015）。此处先判 task 分支是否落后 main，落后即阻断，
+        #      早发现避免 review 期 E015。仅判落后与否，不产生 git 写操作；与随后的
+        #      reconcile 冲突对账互补互不冲突。
+        _check_base_freshness(project_root, task_id, degraded_guards)
 
-    # 3.5) 共享入口 verify 覆盖门禁（task-shared-entry-verify-gate，E039）：改了被多个
-    #      既有测试文件断言的共享入口（如 .githooks/pre-push、orchd/cli/__init__.py）时，
-    #      verify_command 必须含其登记的既有测试——否则「只跑自己新写的测试」会让既有断言
-    #      静默变红并随双审入库（2026-09-19 一夜三次：prepush-tag-gate / cli-json-envelope
-    #      / canonical-root-dedup）。刻意早于 verify 执行：缺口是静态可判定的，先判先省。
-    #      无 project_root 时同样执行：函数内 changed 回退声明的 files_to_edit（纯函数可判
-    #      registry 规则），形态 A 的基线判定在无 project_root 时自行跳过（fail-open）。
-    _guard_shared_entry_coverage(
-        project_root, task_def, task_id, files_to_edit, degraded_guards
-    )
+        # 3) 与 main 对账（task-done-reconcile-main 挂载点 ①）：顺序约束——必须先对账、
+        #     后 verify，否则 verify 跑在对账前的旧内容上。此处仅在 main 推进且触及本任务
+        #     文件时检出冲突（2.5 已覆盖“未触及文件”的陈旧基线场景，二者互补）。
+        _reconcile_before_verify(project_root, task_id, degraded_guards)
 
-    # 4) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
-    verify_record, early_done = _run_verify(store, task_def, task_id, project_root)
-    if early_done is not None:
-        return early_done
+        # 3.5) 共享入口 verify 覆盖门禁（task-shared-entry-verify-gate，E039）：改了被多个
+        #      既有测试文件断言的共享入口（如 .githooks/pre-push、orchd/cli/__init__.py）时，
+        #      verify_command 必须含其登记的既有测试——否则「只跑自己新写的测试」会让既有断言
+        #      静默变红并随双审入库（2026-09-19 一夜三次：prepush-tag-gate / cli-json-envelope
+        #      / canonical-root-dedup）。刻意早于 verify 执行：缺口是静态可判定的，先判先省。
+        #      无 project_root 时同样执行：函数内 changed 回退声明的 files_to_edit（纯函数可判
+        #      registry 规则），形态 A 的基线判定在无 project_root 时自行跳过（fail-open）。
+        _guard_shared_entry_coverage(
+            project_root, task_def, task_id, files_to_edit, degraded_guards
+        )
 
-    # 5) 自动提交 + 声明/残留/越界/干净完整性门禁（均 fail-closed）
-    commit_result = _commit_and_verify_integrity(
-        store, task_def, task_id, agent_id, project_root,
-        files_to_edit, changes_description, degraded_guards,
-    )
+        # 4) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
+        verify_record, early_done = _run_verify(store, task_def, task_id, project_root)
+        if early_done is not None:
+            if surface_created:
+                surfaces.discard_new_fragments(project_root, surface_created)
+            return early_done
+
+        # 5) 自动提交 + 声明/残留/越界/干净完整性门禁（均 fail-closed）
+        commit_result = _commit_and_verify_integrity(
+            store, task_def, task_id, agent_id, project_root,
+            files_to_edit, changes_description, degraded_guards,
+        )
+
+    except BaseException as exc:
+        if surface_created:
+            surfaces.discard_new_fragments(
+                project_root,
+                surface_created,
+                commit_landed=surfaces.commit_landed_from_error(exc),
+            )
+        raise
 
     # 6) 全量回归（task-full-regression-gate-r2：默认关闭，仅 config 显式 true 时跑）
     full_regression = _maybe_full_regression(store, files_to_edit, project_root)
@@ -172,6 +220,7 @@ def _done_impl(
         task_id=task_id,
         attempt_count=written["attempt_count"],
         review_type=written["review_type"],
+        review_created=written["review_created"],
         done_event_id=written["done_event"]["event_id"],
         integrity_warnings=written["integrity_warnings"],
         degraded_guards=degraded_guards,
@@ -198,9 +247,35 @@ def _done_impl(
     else:
         result["post_done_cwd"] = ""
 
-    # 11) L3 pre-commit hook 卸载 + 释放本 agent session 锁（best-effort，锁外）
+    # 10.5) task-cont-autoclean-triggers：done 触发**本任务 worktree 局部**清理
+    #       （本任务 verify tmp / 残留目录等，上限 10 项）。此处的 project_root 已被
+    #       解析为任务 worktree，故以「扫描根 + scope_roots」界定局部范围：不按
+    #       task_id 过滤——stale_verify_tmp 的 path/reason 不含任务 id（检测器只认
+    #       vf-*/orchd-vf-* 命名），按 id 过滤会让本轮恒不命中（空转）。
+    #       注：默认 basetemp 落在系统临时目录（${TMPDIR}/orchd-vf-$$），此时本轮
+    #       扫不到任何项属预期——本触发点是「有本地残留就顺手清」的 best-effort，
+    #       不做跨盘扫描；残留的兜底清理仍在 status/watchdog 的全量轮次。
+    #       best-effort，异常与失败都不影响 done 结果。
     if project_root:
-        hook_uninstall(project_root)
+        try:
+            from orchd.doctor import auto_clean
+
+            ac_done = auto_clean(
+                project_root,
+                emit_stderr=False,
+                trigger="done",
+                scope_roots=[project_root],
+            )
+            if (ac_done.get("auto_cleaned") or ac_done.get("auto_moved")
+                    or ac_done.get("manual_notice")):
+                result["auto_clean"] = ac_done
+        except Exception:
+            pass
+
+    # 11) L3 pre-commit hook 卸载 + 释放本 agent session 锁（best-effort，锁外）
+    #     传 orchd_dir：其他任务仍持活跃认领时保留共享 hook（task-debug-hook-active-gate）
+    if project_root:
+        hook_uninstall(project_root, orchd_dir=store.orchd_dir)
     if project_root:
         orchd_dir = project_root / ".orchd"
         lock_check = session_lock_check(orchd_dir)

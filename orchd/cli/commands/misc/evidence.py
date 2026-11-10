@@ -18,6 +18,38 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+def _write_regression_evidence(
+    project_root: Path,
+    *,
+    last_pass_commit: str,
+    command: str,
+    passed_at: str | None = None,
+) -> Path:
+    """纯写盘：把一次**真跑过的全量回归**通过证据写到 ``.orchd/_full_regression.json``。
+
+    与 ``_commit_regression_evidence`` 的分工是本卡的单一真源边界：写盘可被非引擎
+    脚本（``scripts/check_test_baseline.py --record``）复用，提交仍只由引擎执行
+    （红线：git 写只走引擎）。调用方负责保证 ``last_pass_commit`` 对应的运行是
+    全量等价且零失败——本函数不校验、不猜，避免把子集运行写成「全量已过」。
+
+    返回写入路径；payload 字段与 ``full-regression`` 命令保持同源。
+    """
+    from datetime import datetime, timezone
+
+    from orchd.ledger import _write_text_atomic
+
+    payload = {
+        "last_pass_commit": last_pass_commit,
+        "passed_at": passed_at or datetime.now(timezone.utc).isoformat(
+            timespec="seconds"),
+        "command": command,
+    }
+    path = project_root / ".orchd" / FULL_REGRESSION_FILE
+    path.parent.mkdir(exist_ok=True)
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2))
+    return path
+
+
 def _commit_regression_evidence(project_root: Path) -> dict:
     """把刚写入的 ``.orchd/_full_regression.json`` 随同提交到 default 分支。
 
@@ -117,7 +149,6 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
     """
     import subprocess
     import time
-    from datetime import datetime, timezone
 
     from orchd.subproc import run_shell
     from orchd.gitops_ops import (
@@ -172,17 +203,13 @@ def _cmd_full_regression(args) -> tuple[dict, int]:
         ["git", "rev-parse", "HEAD"], cwd=str(project_root),
         capture_output=True, encoding="utf-8", errors="replace",
     ).stdout.strip()
-    payload = {
-        "last_pass_commit": head,
-        "passed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "command": "python -m pytest tests/ -q -c pyproject.toml -n 8 --max-worker-restart=5",
-    }
-    from orchd.ledger import _write_text_atomic
-
-    orchd_dir.mkdir(exist_ok=True)
-    _write_text_atomic(
-        orchd_dir / FULL_REGRESSION_FILE,
-        json.dumps(payload, ensure_ascii=False, indent=2),
+    _write_regression_evidence(
+        project_root,
+        last_pass_commit=head,
+        command=(
+            "python -m pytest tests/ -q -c pyproject.toml "
+            "-n 8 --max-worker-restart=5"
+        ),
     )
     commit_result = _commit_regression_evidence(project_root)
     response = {

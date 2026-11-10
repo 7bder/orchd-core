@@ -1,7 +1,7 @@
 """Orchd 统一错误处理模块。
 
 本模块提供四个核心组件：
-- ErrorCode 枚举：定义 E001–E041 码段的错误码（含 E031/E032/E035 三个
+- ErrorCode 枚举：定义 E001–E042 码段的错误码（含 E031/E032/E035 三个
   告警/拒绝码，统一纳入枚举以保证错误响应契约完整性）。**成员数量以枚举成员
   为准，本处不记账**——历史教训：此处写死的计数与成员数漂移（写 36 实为 38），
   根治见 task-contract-drift-and-metatest-sync，契约由
@@ -21,7 +21,7 @@ from typing import Any
 
 
 class ErrorCode(Enum):
-    """全码段错误码枚举（E001–E041，无空洞）。
+    """全码段错误码枚举（E001–E042，无空洞）。
 
     成员数量以本枚举成员为准：注释与文档不重复记账，避免与枚举漂移
     （写死计数曾出现「注释 36 / 实际 38」）。码段范围同样由本类 docstring
@@ -72,6 +72,7 @@ class ErrorCode(Enum):
     E039 = "shared_entry_verify_gap"  # 共享入口改动的 verify 覆盖缺口（done 前置阻断，channel A，task-shared-entry-verify-gate）
     E040 = "ac_verify_gap"  # AC 声称「零残留 / 全仓」可判定性质但 verify_command 未覆盖（warning 级，task-ac-verify-coverage）
     E041 = "serial_source_claim_conflict"  # 同 source 串行门：同 source 存在在手（claimed/done/in_review）任务时拒绝 claim 该 source 其他卡（channel A，engine-discipline-hardening 停服施工 2026-10-23）
+    E042 = "deps_edge_undeclared"  # 注册期/done 期依赖边未登记（channel A，task-deps-hard-gate）
 
 
 # warning 级错误码（设计 §5）：不阻断操作，默认不触发 lesson 注入，仅 agent 主动打点。

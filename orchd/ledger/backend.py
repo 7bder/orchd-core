@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from orchd.constants import ORCHD_STORAGE_BACKEND_ENV
 from orchd.errors import ErrorCode, OrchdError
-from orchd.storage import StorageBackend
+from orchd.storage import StorageBackend, sqlite_db_path
 from orchd.storage.filesystem import FilesystemBackend
 
 # 仅类型检查期存在：运行期由 open_store 内的函数级惰性导入解析，避免与聚合入口成环
@@ -37,7 +37,8 @@ def ledger_status_available(store_dir: Path) -> bool:
     脚本侧 ``verify_registry_paths._ledger_status_available``（转发本函数）与声明
     门禁的 skip 谓词共用同一判定，禁写第二份。
 
-    判据：``_ledger.jsonl`` 非空 / 归档件非空 / ``_ledger.sqlite3`` 的 ``events``
+    判据：``_ledger.jsonl`` 非空 / 归档件非空 / 账本 sqlite 库（路径经
+    ``sqlite_db_path`` 派生）的 ``events``
     表有活跃事件 / ``_checkpoint.json`` **可解析为非空对象**（checkpoint 是合法
     状态载体：``Store.replay`` 能从中重建任务状态）。判定实质是「状态可重建」，
     故排除的是**空载体**（构造即建库的空库、0 字节 jsonl、空对象 checkpoint），
@@ -61,7 +62,7 @@ def ledger_status_available(store_dir: Path) -> bool:
         archive = store_dir / ARCHIVE_FILENAME
         if archive.is_file() and archive.stat().st_size > 0:
             return True
-        sqlite_path = store_dir / "_ledger.sqlite3"
+        sqlite_path = sqlite_db_path(store_dir)
         if sqlite_path.is_file() and _sqlite_has_state(sqlite_path):
             return True
         # checkpoint 是**合法**状态载体（`Store.replay` 可从中重建任务状态，实测见
@@ -147,7 +148,7 @@ def _select_backend(orchd_dir: Path, *, readonly: bool = False) -> StorageBacken
     if kind == "sqlite":
         from orchd.storage.sqlite import SqliteBackend
 
-        if readonly and not (store_dir / "_ledger.sqlite3").is_file():
+        if readonly and not sqlite_db_path(store_dir).is_file():
             return FilesystemBackend(store_dir)
         backend = SqliteBackend(store_dir, readonly=readonly)
         if readonly:

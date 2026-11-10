@@ -96,6 +96,22 @@ def resolve_store_dir(orchd_dir: Path) -> Path:
     return orchd_dir
 
 
+def resolve_store_sqlite_path(orchd_dir: Path) -> Path:
+    """解析账本 sqlite 库文件路径（task-layout-paths-converge）。
+
+    库文件名唯一真源为 :data:`orchd.names.LEDGER_SQLITE_FILE`；库文件恒位于
+    :func:`resolve_store_dir` 返回的账本根之下（container 布局即
+    ``<容器>/.orchd-runtime/`` ＋ ``LEDGER_SQLITE_FILE``，flat 即
+    ``<主工作树>/.orchd/`` ＋ 同一文件名）。
+
+    函数级惰性导入 ``orchd.names``，保持本模块顶层零 orchd 依赖的结构面
+    守卫（见模块 docstring 与 tests/test_ledger_paths.py）。
+    """
+    from orchd.names import LEDGER_SQLITE_FILE
+
+    return resolve_store_dir(orchd_dir) / LEDGER_SQLITE_FILE
+
+
 def resolve_review_mode(orchd_dir: Path) -> str:
     """解析项目审查模式（review-unify-r2：unified / two_phase）。
 

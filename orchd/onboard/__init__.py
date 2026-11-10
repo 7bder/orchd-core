@@ -103,9 +103,11 @@ from orchd.onboard.lifecycle import (
 
 # _config 域：配置加载 + 文档单阶段判定
 from orchd.onboard._config import (
+    REVIEW_CREATED_MODES,
     _DOC_SINGLE_STAGE_SUFFIXES,
     _is_doc_single_stage,
     _load_config_blocked,
+    resolve_review_created,
 )
 
 # control 域：retract / force_status + 常量

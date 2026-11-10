@@ -88,3 +88,22 @@ Windows 下同样用正斜杠（`c:/path/to/repo/.githooks`）；每台机器 / 
 2. Create `.orchd/_master.json` following the schema (write `.orchd/shared/architecture.md` + `conventions.md` before validate if `shared` declared, E005)
 3. Run `python .orchd/__main__.py validate`, then `python .orchd/__main__.py init` (snapshots + empty ledger)
 4. Project ready. Exit. Next session enters 日常阶段 automatically.
+
+## shipped 文件所有权与 `--update` 备份（task-installer-shipped-ownership，2026-11-01）
+
+> 根因：rules/engine 由安装器管理却同时被宿主 git 跟踪，`--update` 直接覆盖宿主修改（无备份无告警）；用户手册/runtime-spec 不在发布清单，宿主无从查阅。
+
+**谁管理什么**
+
+| 路径 | 所有权 | `--update` 行为 |
+|---|---|---|
+| `.orchd/orchd/`、`schema/`、`templates/`、`rules/`、`docs/`、`SKILL.md`、`__main__.py`、打包配置 | 安装器（shipped） | 覆盖为随包版本 |
+| `.orchd/shared/`、`proposals/`、`_master.json`、`IDEAS*.md`、账本/checkpoint/session 锁 | 宿主（用户数据） | 保留，不动 |
+| `.orchd/.install-manifest.json` | 安装器 | 每次安装/更新后重写 |
+| `.githooks/` | 宿主仓库 | **不随包**：安装器只配置 `core.hooksPath`，不写 hook 内容；pre-push 全量门禁不自动安装 |
+
+**覆盖前备份**：`--update` 读 `.install-manifest.json` 的 sha256 清单，逐文件比对；宿主改过的 shipped 文件先完整备份到 `.orchd/.doctor-backup/install-<UTC>/<相对路径>`，再覆盖。安装 JSON 返回 `modified_shipped_files`（相对路径数组）与 `backup_dir`（无改动时为 `[]` / `null`，不产生备份）。首次安装（或从无清单的旧版本首次 `--update`）只建立基线、不误判为宿主改动；清单文件损坏按「无基线」处理（同样不备份）——再跑一次 `--update` 即重建清单，**不要用 `--force` 修清单**（它会清空 `.orchd/` 用户数据）；`--force` 是显式销毁语义，不做备份。
+
+**用户文档随包**：`docs/decomposition-guide.md`、`docs/user-manual.md`、`docs/runtime-spec.md` 三份随安装落宿主 `.orchd/docs/`，`scripts/sync_orchd_core.sh` 的 `CORE_DOCS` 同步维护（两处清单必须一致）。
+
+> 校验：装好后先读 `.orchd/docs/user-manual.md`；`git check-ignore .orchd/.install-manifest.json` 应命中 `.orchd/.gitignore` 的 `/*`（即不入库）。

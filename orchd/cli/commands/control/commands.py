@@ -26,6 +26,13 @@ def _cmd_amend(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """
     from orchd.gitops import get_current_branch, get_default_branch
 
+    # task-feedback-amend-runtime-gate：amend / --register 与 claim/done 同属写命令，
+    # 必须过 session runtime 硬校验（存在 / active / 未过 TTL）。此前沿用
+    # @_cli_skeleton 的 _resolve_agent_id，只要求 ORCHD_SESSION_ID 非空——宿主注入
+    # 项目级共享 token 时仍可写 master，绕过「每对话唯一 session」契约。
+    # 放在任何 git/worktree 动作之前：无 runtime 时零写入、零 checkout。
+    agent_id = _require_agent_id(orchd_dir)
+
     caller_root = Path.cwd()
     caller_branch = get_current_branch(caller_root)
     default_branch = get_default_branch(caller_root) or "main"
@@ -102,6 +109,8 @@ def _cmd_force_status(args) -> dict:
     args.evidence_sha（可选，completed→pending 复活所需的 git 证据 commit SHA）、
     args.force_recycle（可选，终态回收时显式丢弃未合并的 task/<id> 分支——用
     git branch -D，提交不可恢复；缺省拒绝删除未合并分支并留痕 branch_delete_refused）。
+    args.discard_uncommitted + args.confirm（可选，脏 worktree 显式丢弃出口——
+    双旗标齐备才允许 force 丢弃未提交改动，单旗标 E007；缺省走五级降级救援）。
     agent 身份由引擎自动按宿主注入的 ORCHD_SESSION_ID 派生（session-id-fingerprint），
     不再有 --agent。
     返回: 强制状态变更事件信息。
@@ -123,6 +132,8 @@ def _cmd_force_status(args) -> dict:
         project_root=orchd_dir.parent,
         evidence_sha=args.evidence_sha,
         force_recycle=getattr(args, "force_recycle", False),
+        discard_uncommitted=getattr(args, "discard_uncommitted", False),
+        discard_confirmed=getattr(args, "confirm", False),
     )
     # 任务进入终态后自动触发 IDEAS 归档（best-effort，用户无感）
     if result.get("new_status") == "cancelled":

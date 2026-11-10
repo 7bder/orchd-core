@@ -111,7 +111,17 @@ _match = [t for t in _tasks if t.get("id") == _task]
 if not _match:
     print("[orchd E020] 动态解析失败：%s 中无任务 %s" % (_master, _task), file=sys.stderr)
     sys.exit(3)
-for _p in list(_match[0].get("files_to_edit") or []) + list(_match[0].get("exempt_files") or []):
+_def = _match[0]
+# task-surface-refresh-channel：generated 面受控刷新声明的路径必须进动态写集，
+# 否则生成物刷新会被 E020 判越界（表面登记见 schema 的 surface_refresh）。
+_refresh = [
+    _item.get("path")
+    for _item in (_def.get("surface_refresh") or [])
+    if isinstance(_item, dict) and _item.get("path")
+]
+for _p in (list(_def.get("files_to_edit") or [])
+           + list(_def.get("exempt_files") or [])
+           + _refresh):
     if _p:
         print(_p)
 """
@@ -139,21 +149,47 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", newline="\\n")
     except Exception:
         pass
-_baked = sys.argv[2] if len(sys.argv) > 2 else ""
-if _baked and _baked not in sys.path:
-    sys.path.insert(0, _baked)
+# task-precommit-hook-bake-guard：引擎定位改为**候选链 + 存在性判**（与 ref-tx 同构）——
+# shell 侧已解析 ORCHD_SRC（显式 ORCHD_SRC_DIR → 当前仓 .orchd → 仓库根），经 argv[2]
+# 传入；此处再按候选链（传入值 → cwd/.orchd → cwd）判「含 orchd 包的目录」，烘焙/传入
+# 路径仅作候选之一，**不再单点依赖**。定位失败不再 exit(4)（那会被 shell 解释成
+# 「任务活跃」并用已完结卡白名单误拦 main 提交），改为输出 NO_ENGINE 标记 + exit 0。
+from pathlib import Path as _OrchdPath
+# 判定口径与既有「烘焙值直接插 sys.path」语义对齐：候选目录**含 orchd/ 子目录**即命中
+# （不要求 orchd/__init__.py 存在——烘焙值可能是包的父目录或 .orchd 载体）；
+# 有意与 shell（precommit_template）及 doctor（residue）的 `orchd/__init__.py` 严格判据
+# 不同：本处宽松判 `orchd/` 目录，避免因烘焙值形态差异漏定位
+# （task-hook-degrade-hint-truth）。
+_src_root = ""
+for _c in [str(a).strip().strip('"').strip("'")
+           for a in (sys.argv[2] if len(sys.argv) > 2 else "", ".orchd", ".") if a]:
+    try:
+        _p = _OrchdPath(_c)
+        if (_p / "orchd").is_dir():
+            _src_root = str(_p.resolve())
+            break
+    except Exception:
+        continue
+if _src_root and _src_root not in sys.path:
+    sys.path.insert(0, _src_root)
+if not _src_root:
+    print("[orchd E020] 引擎不可定位（烘焙路径与当前仓候选均无 orchd 包）", file=sys.stderr)
+    print("NO_ENGINE")
+    print("NO_ENGINE")
+    sys.exit(0)
 try:
     from orchd.ledger import Store, resolve_store_dir
-    from orchd.storage import ARCHIVE_FILENAME
-    from pathlib import Path
+    from orchd.storage import ARCHIVE_FILENAME, SQLITE_DB_FILENAME
 except Exception as _exc:
-    print("[orchd E020] ledger-state 查询不可用（引擎导入失败）：%s" % _exc, file=sys.stderr)
-    sys.exit(4)
+    print("[orchd E020] ledger-state 查询不可用（引擎不可定位）：%s" % _exc, file=sys.stderr)
+    print("NO_ENGINE")
+    print("NO_ENGINE")
+    sys.exit(0)
 _task = sys.argv[1] if len(sys.argv) > 1 else ""
 try:
-    _sdir = resolve_store_dir(Path(".orchd"))
+    _sdir = resolve_store_dir(_OrchdPath(".orchd"))
     _has = False
-    for _name in ("_ledger.jsonl", "_ledger.sqlite3", ARCHIVE_FILENAME):
+    for _name in ("_ledger.jsonl", SQLITE_DB_FILENAME, ARCHIVE_FILENAME):
         if (_sdir / _name).is_file():
             _has = True
             break
@@ -161,7 +197,7 @@ try:
         print("NO_LEDGER")
         print("NO_LEDGER")
         sys.exit(0)
-    _store = Store(Path(".orchd"))
+    _store = Store(_OrchdPath(".orchd"))
     _events = _store.backend.read_events()
 except SystemExit:
     raise
@@ -205,3 +241,117 @@ _HOOK_PY_LEDGER_STATE = _HOOK_PY_LEDGER_STATE.replace(
     ),
 )
 
+
+# merge 操作状态 / 父侧带入集（task-engine-defect-fix-unified-u6）：pre-commit 的
+# E020 越界判定此前只看 staged 集合，把 merge 父侧带入的任务范围外文件判越界；
+# 这里**直接内联 import 引擎实现**（orchd/gitops/commit.py::merge_in_progress /
+# _merge_parent_side_paths），与 commit 层共用同一操作状态判定，不另起一套
+# MERGE_HEAD 逻辑（单一真源）。由 hook 以 heredoc 方式调用，argv =
+# [engine_src, flag_path, list_path]：flag 写 "yes"/"no"；list 写入父侧带入
+# 路径（逐行）；stdout 输出 NUL 分隔路径。任何异常都降级为「非 merge、无带入」，
+# 即回到原判定强度（fail-closed，不误放行）。
+_PRE_COMMIT_HOOK_PY_MERGE_STATE = """\
+import os
+import subprocess
+import sys
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", newline="")
+    except Exception:
+        pass
+
+_engine_src = sys.argv[1] if len(sys.argv) > 1 else ""
+_flag_path = sys.argv[2] if len(sys.argv) > 2 else ""
+_list_path = sys.argv[3] if len(sys.argv) > 3 else ""
+if _engine_src and os.path.isdir(_engine_src) and _engine_src not in sys.path:
+    sys.path.insert(0, _engine_src)
+
+
+def _write_text(path, value):
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(value)
+    except Exception:
+        pass
+
+
+def _repo_root():
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip()
+    return text or None
+
+
+try:
+    from orchd.gitops.commit import _merge_parent_side_paths, merge_in_progress
+except Exception as exc:
+    print(
+        "[orchd E020] merge 操作状态判定不可用：%s（父侧带入分档未生效，越界判定保持原强度）"
+        % exc,
+        file=sys.stderr,
+    )
+    _write_text(_flag_path, "no")
+    sys.exit(0)
+
+root = _repo_root()
+if root is None:
+    _write_text(_flag_path, "no")
+    sys.exit(0)
+try:
+    merging = merge_in_progress(root)
+except Exception as exc:
+    print(
+        "[orchd E020] merge 操作状态判定异常：%s（父侧带入分档未生效，越界判定保持原强度）"
+        % exc,
+        file=sys.stderr,
+    )
+    merging = False
+if not merging:
+    _write_text(_flag_path, "no")
+    sys.exit(0)
+_write_text(_flag_path, "yes")
+try:
+    paths = sorted(_merge_parent_side_paths(root))
+except Exception as exc:
+    print(
+        "[orchd E020] merge 父侧带入集解析异常：%s（按无带入处理，越界判定保持原强度）"
+        % exc,
+        file=sys.stderr,
+    )
+    sys.exit(0)
+_write_text(_list_path, "".join(path + chr(10) for path in paths))
+for path in paths:
+    if path:
+        sys.stdout.write(path + chr(0))
+sys.stdout.flush()
+"""
+
+
+def _manifest_docs_patterns() -> str:
+    """manifest 中 ``docs/`` 根整文件产物的 bound 豁免 case pattern（单一真源派生）。
+
+    只取 ``kind=file`` 且父目录为 ``docs`` 的产物（``docs/_generated/*`` 已由模板
+    目录通配覆盖）；同时给出宿主 ``.orchd/docs/`` 镜像路径。返回值以 ``|`` 开头，
+    供模板追加在既有通配之后（空串时 case 语法仍合法）。
+    """
+    try:
+        from orchd.docs_manifest import artifacts
+    except Exception:  # noqa: BLE001 - 清单不可读时沿用既有目录豁免
+        return ""
+    patterns: list[str] = []
+    for artifact in artifacts():
+        rel = str(artifact.artifact).replace("\\", "/")
+        if artifact.kind != "file" or rel.rsplit("/", 1)[0] != "docs":
+            continue
+        patterns.extend((rel, f".orchd/{rel}"))
+    return "".join(f"|{item}" for item in dict.fromkeys(patterns))

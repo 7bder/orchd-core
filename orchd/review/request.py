@@ -28,15 +28,15 @@ def request_reviewer(
     tasks: list[dict[str, Any]],
     agent_id: str,
     derived: TaskDerived | None = None,
-    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """查找处于 in_review 且未被审查者 claim 的任务。
 
     排序规则：spec 阶段的审查优先于 code 阶段。同等阶段内按 ledger 遍历顺序排列。
     调用方（onboard.request）在 reviewer 角色下转发到此函数。
 
-    self-review（实现者 == 审查者）：默认仅标注 ``is_self_review`` 并照常进入
-    候选；``enforce_self_review_block=True``（线上版）时排除（AC1）。
+    self-review（实现者 == 审查者）：一律排除出候选（P0-2 无条件硬约束）——
+    自审任务既不会成为候选，也不再标注 ``is_self_review``；判定真源仍是
+    ``is_self_review_author``（与 claim / review_submit 严格同源）。
     """
     review_candidates: list[dict[str, Any]] = []
     not_in_list: list[dict[str, Any]] = []
@@ -58,8 +58,7 @@ def request_reviewer(
                     REVIEWERS_FIELD: task_def.get(REVIEWERS_FIELD, []),
                 })
                 continue
-            # self-review：DONE 实现指纹 == 当前 reviewer 指纹。
-            # 默认仅标注照常分配；enforce=True 时排除（AC1）。
+            # self-review：DONE 实现指纹 == 当前 reviewer 指纹 → 一律排除。
             # v4（2026-09-15 停服升级）：判定收敛到 is_self_review_author（单一事实源），
             # 与 claim / review_submit 的落账口径严格一致，消除私有副本漂移。
             from orchd.ledger import resolve_session_identity
@@ -67,15 +66,13 @@ def request_reviewer(
             is_self = is_self_review_author(
                 find_last_done_event(store, tid, derived), agent_id, current_session
             )
-            if is_self and enforce_self_review_block:
+            if is_self:
                 continue
             entry: dict[str, Any] = {
                 "task_id": tid,
                 "task": task_def,
                 "review_phase": ts.review_phase,
             }
-            if is_self:
-                entry["is_self_review"] = True
             review_candidates.append(entry)
     review_candidates.sort(key=lambda c: (0 if c["review_phase"] == "spec" else 1))
     if not review_candidates:
@@ -115,8 +112,6 @@ def request_reviewer(
     }
     if author:
         candidate["author"] = author
-    if best.get("is_self_review"):
-        candidate["is_self_review"] = True
 
     return {
         "candidate": candidate,

@@ -203,6 +203,160 @@ def _proxy_merge(project_root: Path, args: list[str], cls: dict[str, Any]) -> di
 
 
 
+def _merge_continue_declared_paths(
+    project_root: Path, orchd_dir: Path | None,
+) -> list[str]:
+    """解析绑定到本工作树任务的声明路径（files_to_edit ∪ exempt_files）。
+
+    受管收口只暂存声明范围：无法解析（无绑定任务 / 账本或 master 不可读）时
+    fail-closed 拒绝，并指向「重跑 orchd done」这条同样受管的收口路径。
+    """
+    bound = _bound_tasks_for_root(project_root, orchd_dir)
+    if not bound:
+        raise OrchdError(
+            ErrorCode.E007,
+            "merge_continue_no_bound_task: 无法解析绑定到本目录的任务，受管 merge 收口拒绝执行",
+            [{
+                "git_args": ["merge", "--continue"],
+                "hint": (
+                    "本命令须在 claim 建立的任务 worktree 内执行；"
+                    "若只想收口并提交，直接重跑 orchd done（结束时按声明范围自动提交）"
+                ),
+            }],
+        )
+    try:
+        from orchd.ledger import resolve_store_dir
+        from orchd.spec import load_master
+        from orchd.worktree import resolve_master_path_from_dir
+
+        root = resolve_store_dir(orchd_dir or (Path(project_root) / ".orchd"))
+        master = load_master(resolve_master_path_from_dir(root))
+    except Exception as exc:  # 账本/master 不可读 → fail-closed 拒绝
+        raise OrchdError(
+            ErrorCode.E007,
+            "merge_continue_declaration_unreadable: 无法读取任务声明，受管 merge 收口拒绝执行",
+            [{
+                "git_args": ["merge", "--continue"],
+                "reason": str(exc)[:300],
+                "hint": "确认 .orchd/_master.json 与账本可读；或直接重跑 orchd done 由引擎收口",
+            }],
+        ) from exc
+    by_id = {
+        str(t.get("id")): t
+        for t in master.tasks
+        if isinstance(t, dict) and t.get("id")
+    }
+    declared: list[str] = []
+    for tid in bound:
+        task = by_id.get(tid)
+        if not task:
+            continue
+        for field in ("files_to_edit", "exempt_files"):
+            for p in task.get(field) or []:
+                if isinstance(p, str) and p and p not in declared:
+                    declared.append(p)
+    if not declared:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"merge_continue_no_declaration: 绑定任务 {bound} 无声明路径，受管收口无提交范围",
+            [{"git_args": ["merge", "--continue"], "bound_tasks": bound,
+              "hint": "若声明缺失（空 files_to_edit），直接重跑 orchd done 由引擎收口"}],
+        )
+    return declared
+
+
+
+def _proxy_merge_continue(
+    project_root: Path,
+    args: list[str],
+    cls: dict[str, Any],
+    *,
+    orchd_dir: Path | None = None,
+) -> dict[str, Any]:
+    """``orchd git merge --continue``：受管收口 merge 冲突现场（红线 #1 豁免二收口形态）。
+
+    与 ``merge main`` 同码同语义的分支闸口（仅 ``task/*``）；要求 ``MERGE_HEAD``
+    存在；暂存集受控（声明集 ∪ trunk 父侧带入集），随后由
+    :func:`orchd.gitops.commit.close_merge_in_progress` 不带 pathspec 提交。
+    """
+    state = check_workspace_state(project_root)
+    branch = state.get("branch")
+    task_prefix = "task/"
+    if not branch or not str(branch).startswith(task_prefix):
+        raise OrchdError(
+            ErrorCode.E018,
+            f"wrong_branch: git merge --continue 仅在任务分支允许（红线 #1 豁免二），"
+            f"当前在 '{branch}'",
+            [{
+                "git_args": args,
+                "current_branch": branch,
+                "rule": "merge_requires_task_branch",
+                "hint": (
+                    "受管收口须在 claim 建立的任务分支内执行；"
+                    "主分支合并由引擎在 code APPROVED 时承担"
+                ),
+            }],
+        )
+    from orchd.gitops.commit import close_merge_in_progress, merge_in_progress
+
+    if not merge_in_progress(project_root):
+        raise OrchdError(
+            ErrorCode.E007,
+            "merge_not_in_progress: 当前不在 merge 冲突现场（无 MERGE_HEAD），无需收口",
+            [{
+                "git_args": args,
+                "current_branch": branch,
+                "hint": "不处于 merge 中：直接重跑 orchd done 即可（引擎按声明范围自动提交）",
+            }],
+        )
+    declared = _merge_continue_declared_paths(project_root, orchd_dir)
+    result = close_merge_in_progress(project_root, declared)
+    if not result.get("performed"):
+        reason = result.get("reason")
+        if reason == "staged_out_of_scope":
+            raise OrchdError(
+                ErrorCode.E010,
+                "file_conflict: merge 中暂存改动超出任务声明范围，受管收口拒绝提交",
+                [{
+                    "git_args": args,
+                    "current_branch": branch,
+                    "staged_out_of_scope": result.get("staged_out_of_scope") or [],
+                    "declared_files": declared,
+                    "hint": (
+                        "把多余改动从暂存撤出或还原：确属本任务的连带文件先在主工作树 "
+                        "amend --files-to-edit 补声明；trunk 父侧带入的文件无需声明"
+                    ),
+                }],
+            )
+        raise OrchdError(
+            ErrorCode.E007,
+            f"merge_continue_failed: 受管收口提交失败（{reason}）",
+            [{
+                "git_args": args,
+                "current_branch": branch,
+                "reason": reason,
+                "message": result.get("message"),
+                "hint": "解决冲突后重试 orchd git merge --continue；或重跑 orchd done 由引擎收口",
+            }],
+        )
+    payload: dict[str, Any] = {
+        "proxied": True,
+        "executed": True,
+        "kind": cls["kind"],
+        "subcommand": cls.get("subcommand"),
+        "git_args": args,
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "merge_closed": True,
+        "declared_files": declared,
+    }
+    payload.update(
+        {k: v for k, v in result.items() if k not in ("performed",)}
+    )
+    return payload
+
+
 def _write_rejection(
     args: list[str], cls: dict[str, Any], agent_id: str | None
 ) -> OrchdError:

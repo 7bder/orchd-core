@@ -58,6 +58,12 @@ def register(sub) -> None:
                    help="补登 depends_on（并集追加，只增不删；重复 id 去重；"
                    "仅 pending 态放行；未知引用/依赖环由 spec 校验拒绝且不落盘）")
     p.add_argument("--verify-command", default=None, help="覆写 verify_command")
+    p.add_argument(
+        "--verify-command-file", default=None, metavar="PATH",
+        help="从文件读取 verify_command（去尾换行；与 --verify-command 互斥；"
+        "仅 --task 生效，--register 请写入提案 JSON；"
+        "Windows 下推荐用文件避免 PowerShell 吃引号）",
+    )
     p.add_argument("--reviewers",
                    nargs="*",
                    action="extend",
@@ -111,7 +117,32 @@ def register(sub) -> None:
                    "deliverables，写 AMEND 审计事件并同步快照）")
     p.add_argument("--reason",
                    default=None,
-                   help="修订理由（--revise-terminal 必填、非空；写入 AMEND 审计事件）")
+                   help="修订理由（--revise-terminal 必填、非空；写入 AMEND 审计事件；"
+                   "同时作为 --allow-shared-write 的共享面放行理由）")
+    p.add_argument("--refresh-surface",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="refresh_surface",
+                   metavar="NAME",
+                   help="声明 generated 面受控刷新（可重复；同面覆盖）。面名须在共享面"
+                   "注册表且 mode=generated；path/generator 由注册表解析，不进写集；"
+                   "须配 --reason <非空理由>；仅 pending/claimed 态放行")
+    p.add_argument("--remove-refresh-surface",
+                   nargs="*",
+                   action="extend",
+                   default=None,
+                   dest="remove_refresh_surface",
+                   metavar="NAME",
+                   help="撤回 surface_refresh 声明（按面名；幂等 no-op）")
+    p.add_argument("--allow-shared-write",
+                   action="append",
+                   default=None,
+                   dest="allow_shared_write",
+                   metavar="PATH",
+                   help="显式放行共享面写集声明（重复使用可放行多条；须配 --reason "
+                   "<非空理由>）：fragments 面视为串行例外，serial 面仅留痕；"
+                   "generated 面不接受该逃生口")
     p.set_defaults(func=_cmd_amend)
 
     # retract
@@ -153,6 +184,15 @@ def register(sub) -> None:
                    action="store_true",
                    help="终态回收时显式丢弃未合并的 task/<id> 分支（git branch -D，"
                    "提交不可恢复）；缺省拒绝删除未合并分支并留痕 branch_delete_refused")
+    p.add_argument("--discard-uncommitted",
+                   action="store_true",
+                   help="终态回收允许丢弃脏 worktree 未提交改动（必须与 --confirm "
+                   "同时给出，缺一 E007 拒绝；缺省走五级降级：L2 救援提交保全数据"
+                   "进 orchd/rescue ref → L3 目录隔离 → L4 bundle+patch → L5 原地保留）")
+    p.add_argument("--confirm",
+                   action="store_true",
+                   help="--discard-uncommitted 的二次确认旗标（双旗标齐备才执行 "
+                   "force 丢弃）")
     p.add_argument("--evidence-sha",
                    default=None,
                    help="复活已完成任务的 git 证据 commit SHA（仅 completed→pending 时需要）")
@@ -166,7 +206,7 @@ def register(sub) -> None:
 
     # restore（task-restore-channel）
     p = sub.add_parser("restore", help="受管工作树还原：指定路径回到 HEAD，不碰历史")
-    p.add_argument("--path", nargs="+", required=True,
+    p.add_argument("--path", action="extend", nargs="+", required=True,
                    help="相对仓库根的文件路径（可多个；仅已跟踪且有 HEAD 版本的文件，"
                    "目录/仓库外/未跟踪新建一律拒绝）")
     p.set_defaults(func=_cmd_restore)

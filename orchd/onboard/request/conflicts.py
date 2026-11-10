@@ -1,4 +1,4 @@
-"""冲突策略解析与文件冲突过滤（_resolve_conflict_policy/_filter_conflicts）。"""
+"""冲突策略解析与候选可得性过滤（_resolve_conflict_policy/_filter_conflicts/_filter_serial_source）。"""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ from orchd.contracts.task_schema import (
 from orchd.errors import ErrorCode, NotApplicableError, OrchdError
 from orchd.gitops import GUARD_FAIL_CLOSED, check_workspace_state, run_guard
 from orchd.ledger import TaskState
+from orchd.onboard.serial_source import serial_busy_siblings
 from orchd.pool import (
     Candidate, INFLIGHT_MARKER, _build_claimed_files, build_dependency_index, detect_file_conflict,
-    get_dependency_closure,
+    get_dependency_closure, rank_candidates,
 )
 from .constants import CONFLICT_POLICIES, CONFLICT_POLICY_DEFAULT
 from .gitinfo import _inflight_files
@@ -51,6 +52,8 @@ def _filter_conflicts(
     tasks: list[dict[str, Any]],
     project_root: Path | None,
     conflict_policy: str | None = None,
+    sort_key: str | None = None,
+    importance_thresholds: dict[str, Any] | None = None,
 ) -> tuple[
     list[Candidate],
     list[dict[str, Any]],
@@ -69,14 +72,11 @@ def _filter_conflicts(
     claimed_files = _build_claimed_files(
         state, tasks, include_pending=True, inflight_files=inflight_files
     )
-    # 依赖索引一次构建（与候选数 N 无关）：闭包原实现单次 O(T²)（子孙遍历每步全表扫描），
-    # 且在每个候选循环里被反复调用 ⇒ 整体 O(候选数 × T²)（task-pool-build-sort 实测：
-    # 任务量增长时 request 的主要热点）。此处提到循环外，单次闭包降为 O(T + E)。
+    # 依赖索引一次构建（与候选数 N 无关）：闭包原实现单次 O(T²) 且被 request 逐候选
+    # 调用 ⇒ 整体 O(候选数 × T²)（task-pool-build-sort 实测热点）。提到循环外降为 O(T+E)。
     dep_index = build_dependency_index(tasks)
-    # 工作区可用性一次探测（task-pool-build-sort）：原实现把它放在**每个候选**的守卫里
-    # ⇒ 每候选一次 git 子进程（实测 n=200 时 173 次 spawn、占本路径绝大部分耗时）。
-    # 探测是循环不变量，故提到循环外；失败/不适用时按原语义逐候选记 guard_unavailable
-    # 并跳过（决策语义不变，降级留痕由「每候选一条」收敛为「一轮一条」）。
+    # 工作区可用性一次探测（task-pool-build-sort）：原实现每候选一次 git 子进程（实测
+    # n=200 时 173 次 spawn）；探测是循环不变量，故提到循环外，失败仍逐候选留痕降级。
     actual_probe: dict[str, Any] | None = None
     actual_probe_failed = False
     if project_root is not None:
@@ -166,9 +166,8 @@ def _filter_conflicts(
             if ac.get("task_id") in dep_closure:
                 continue
             excluded.append({"task_id": ac["task_id"], "files": ac.get("files", []), "claimed_by": ac.get("claimed_by", "actual"), SOURCE_FIELD: "actual"})
-        # 去重（task-request-response-fidelity AC2）：同一（对方任务, 文件集合）组合只保留
-        # 一条，actual 优先于 declared（实际在途比声明更精确）。循环变量取 ac 以与上方
-        # Conflict dataclass 循环（c）区分，避免同作用域内两种类型混用。
+        # 去重（task-request-response-fidelity AC2）：同一（对方任务, 文件集合）只保留
+        # 一条，actual 优先于 declared（实际在途比声明更精确）。
         _seen: dict[tuple[str, frozenset[str]], dict[str, Any]] = {}
         for _e in excluded:
             _key = (_e["task_id"], frozenset(_e.get("files", [])))
@@ -181,5 +180,36 @@ def _filter_conflicts(
         kept.append(cand)
         if pending_soft:
             candidate_conflicts[cand.task.get(ID_FIELD, "")] = pending_soft
-    kept.sort(key=lambda c: c.task.get(ID_FIELD, "") in candidate_conflicts)
-    return kept, excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count
+    # u14：排序单一真源——软冲突作惩罚键参与同一次排序，不再二次稳定排序整批压后
+    # （旧实现会把返工卡压到非返工卡之后，覆盖 rework 优先）。
+    return (rank_candidates(kept, candidate_conflicts, sort_key, importance_thresholds),
+            excluded_conflicts, candidate_conflicts, degraded_guards, guard_unavailable_count)
+
+def _filter_serial_source(
+    candidates: list[Candidate],
+    state: dict[str, TaskState],
+    tasks: list[dict[str, Any]],
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    """剔除同 source 忙态兄弟未终态的候选（E041 前置过滤，绝不静默）。
+
+    口径与 claim 侧 E041 门同源（:func:`serial_busy_siblings`）：同 source 兄弟处于
+    claimed / done / in_review 时该卡不具备可领性。request 只读快照，本过滤仅减少
+    「推送后必被拒」的无效候选；request → claim 之间的状态变化仍由 claim 门兜底
+    （TOCTOU），故不得把本过滤当作强制点。
+
+    返回 ``(kept, serial_blocked)``；``serial_blocked`` 每项含 task_id / source /
+    busy_siblings，供响应留痕与人工判断。
+    """
+    kept: list[Candidate] = []
+    blocked: list[dict[str, Any]] = []
+    for cand in candidates:
+        busy = serial_busy_siblings(cand.task, tasks, state)
+        if busy:
+            blocked.append({
+                "task_id": cand.task.get(ID_FIELD, ""),
+                SOURCE_FIELD: cand.task.get(SOURCE_FIELD),
+                "busy_siblings": busy,
+            })
+            continue
+        kept.append(cand)
+    return kept, blocked

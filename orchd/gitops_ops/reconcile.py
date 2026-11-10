@@ -247,7 +247,8 @@ def reconcile_with_main(
             f"任务分支 {branch} 与 {trunk} 对账发现冲突"
             f"（{len(conflict_files) or '若干'} 个文件）："
             + ("合并现场已保留在任务 worktree（MERGE_HEAD 存在），" if apply else "")
-            + "请解决冲突 → git add → git commit，然后重新 done"
+            + "请解决冲突 → orchd git merge --continue（受管收口：引擎暂存声明范围并"
+            "不带 pathspec 提交，无需手执行 git add / git commit）→ 重跑 orchd done"
         ),
     )
     return result

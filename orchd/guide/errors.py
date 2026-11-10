@@ -13,30 +13,26 @@ from pathlib import Path
 from typing import Any
 
 from .digest import _ENTRY_CMD, amend_patch_cmd
+from .e007 import e007_guidance_override
 from .paths import read_for, resolve_read_paths
 from .rules import attach_rule_summaries
 
 
 # 环境变量名真源见 ``orchd.constants`` 的 ``*_ENV``（Wave1-T3b）：本表提示文案里的
-# ``ORCHD_SESSION_ID`` / ``ORCHD_ALLOW_CONTAINER_ROOT`` 等是给人看的**指引文本**，
-# 不参与任何 env 读取，故按可读性保留原名。
-# 错误恢复指引映射（error recovery guidance）：错误码 → 恢复指引。
-# 只提示不代行——不自动执行任何修复命令，修复决策权始终在人/agent。
-# (task-audit-error-guidance-coverage) 数据化：14 个结构相同的 dict 收敛为
-# 表格常量 + 循环构建，覆盖 ErrorCode 全部枚举成员（数量**不写死**，避免随枚举增删漂移；
-# 既有「36」于 task-pass13-p3-pack-recheck 实测已漂移为 39）——新增错误码未补指引时，
-# 测试 set(ERROR_GUIDANCE) ⊇ {e.name for e in ErrorCode} 直接失败。
-# (task-errexit-type-contract) 静态表 5 元组：新增 exit_type 五分法。
-# (pass13 §11-8a task-exit-type-decoupled-from-blocking) 更正旧表述「warning 码
-# 统一 continue」——exit_type 只回答「agent 接下来怎么行动」，**不回答「是否阻断」**；
-# 阻断性由 ERROR_CODE_CHANNELS 的通道 A 决定。旧表述会把可硬阻断的告警码
-# （E028/E029/E030 同属 WARNING_CODES 又有 A 通道位点）指成「继续干」。
+# ``ORCHD_SESSION_ID`` / ``ORCHD_ALLOW_CONTAINER_ROOT`` 等是给人看的**指引文本**，不参与任何
+# env 读取，故按可读性保留原名。
+# 错误恢复指引映射（error recovery guidance）：错误码 → 恢复指引；只提示不代行——不自动执行
+# 任何修复命令，修复决策权始终在人/agent。
+# (task-audit-error-guidance-coverage) 数据化：14 个结构相同的 dict 收敛为表格常量 + 循环构建，
+# 覆盖 ErrorCode 全部枚举成员（数量**不写死**，避免增删漂移；既有「36」于 task-pass13-p3-pack-recheck
+# 实测已漂移为 39）——新增错误码未补指引时，测试 set(ERROR_GUIDANCE) ⊇ {e.name for e in ErrorCode} 直接失败。
+# (task-errexit-type-contract) 静态表 5 元组：新增 exit_type 五分法。(pass13 §11-8a task-exit-type-decoupled-from-blocking) 更正旧表述「warning 码统一 continue」——exit_type 只回答「agent 接下来怎么行动」，**不回答「是否阻断」**；阻断性由 ERROR_CODE_CHANNELS 的通道 A 决定（E028/E029/E030 同属 WARNING_CODES 又有 A 通道位点，旧表述会把它们指成「继续干」）。
 _VALID_EXIT_TYPES: frozenset[str] = frozenset({
     "exec-command", "git-diagnose", "manual-action", "await-external", "continue",
 })
 
-# 每档的动作语义 + 是否隐含「不阻断」。隐含不阻断只有 continue 一档，
-# 且其准入条件是「该码无通道 A」（由 tests/test_guide.py 判据实时按登记表校验）。
+# 每档的动作语义 + 是否隐含「不阻断」；隐含不阻断只有 continue 一档，其准入条件是「该码无通道 A」
+# （由 tests/test_guide.py 判据实时按登记表校验）。
 EXIT_TYPE_ACTION_MEANING: dict[str, str] = {
     "exec-command": "执行 command 字段给出的命令即可解除阻塞（命令是动作本体）；不隐含不阻断",
     "git-diagnose": "先做 git 侧诊断（状态/分支/工作树）再决定；不隐含不阻断",
@@ -52,7 +48,10 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     (ErrorCode.E004.name, "检测到 DAG 依赖环：检查 depends_on 引用，消除循环依赖", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E005.name, "引用缺失：补全被引用的任务/源条目（IDEAS/ROADMAP/source）", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E006.name, "ID 重复：确认任务标识唯一，合并或重命名冲突项", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
-    (ErrorCode.E007.name, "任务状态不合法：当前 <current> 不允许 <event_type>→<target>，允许集合 <allowed>，请用 python .orchd/__main__.py status 查看当前状态并修正", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    # T19 补路由：E007 同时承载共享落地面拒绝（fragments/generated/serial 写进声明、
+    # surface_refresh 非法、片段重复等，见 orchd/surfaces.py），故 rules/surfaces.md
+    # 需与 session.md 一并进 read（规则文件不得零路由）。
+    (ErrorCode.E007.name, "任务状态不合法：当前 <current> 不允许 <event_type>→<target>，允许集合 <allowed>，请用 python .orchd/__main__.py status 查看当前状态并修正（共享落地面/生成物写入被拒时同码，处置见 rules/surfaces.md）", ("rules/session.md", "rules/surfaces.md"), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E008.name, "任务未就绪：确认任务处于 pending 状态再 claim", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E009.name, "任务已被认领：已被 <holder> 认领，不要重试原命令，等待其完成或由其 retract", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
     (ErrorCode.E010.name, "文件冲突：与 <claimed_by> 任务 files_to_edit 重叠（<files>），需串行化或合并任务，等待其 done 后重试", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
@@ -64,7 +63,7 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     # E016 命令相位无关（task-guidance-completeness-gate AC6）：claim 的 --type choices
     # 仅 [spec, code]，unified 单阶段须省略该参数——历史上此处写 `--type review` 属非法取值
     # （与 _review_step_guidance 的 unified 分支口径一致）。
-    (ErrorCode.E016.name, "自审被阻断：当前会话已实现 <task_id>——请起独立 subagent 领审（起法：session start 取新 token → 起 subagent → 带该 ORCHD_SESSION_ID 重新 claim --task <task_id> --confirm，相位无关），或手动换新会话；不保留显式自审旁路（rules/review.md「审查者身份约定」）", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
+    (ErrorCode.E016.name, "自审被阻断：当前会话已实现 <task_id>——唯一合法形态是起本会话 spawn 的独立 subagent 领审（起法：session start 取新 token → 起 subagent → 带该 ORCHD_SESSION_ID 重新 claim --task <task_id> --confirm，相位无关）；不得自铸 session token 自用、手设 ORCHD_SESSION_ID 或复用他人 token（rules/review.md「审查者身份约定」）", ("rules/review.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "manual-action"),
     (ErrorCode.E017.name, "工作区脏：先提交/清理未提交改动，再重试", ("rules/git.md",), "git status", "suggest", "git-diagnose"),
     (ErrorCode.E018.name, "分支错误：确认处于正确分支；主工作树滞留 task/<id> 且该任务已放弃/无活跃认领时，重新 claim 将自动恢复 trunk 基线（implementer_trunk_restore），或走 force-status + amend 受管往返", ("rules/git.md",), "git branch --show-current", "suggest", "git-diagnose"),
     (ErrorCode.E019.name, "工作区忙：检查持有会话锁的 agent，不要重试原命令，等待其释放或按需接管", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "await-external"),
@@ -82,7 +81,7 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     (ErrorCode.E031.name, "ROADMAP 规划章节 <chapter> 未落地 IDEAS：先运行 python .orchd/__main__.py roadmap-land <版本> 落地为 IDEAS study（待用户 confirm 升 pending）后再 intake；若该版本已发布或已放弃，在 ROADMAP 标记「历史」或移出", ("rules/intake.md",), f"{_ENTRY_CMD} roadmap-land <版本>", "suggest", "continue"),
     (ErrorCode.E032.name, "auto-claim 被禁：需人工确认 claim 或 config.allow_auto_claim", ("rules/session.md",), f"{_ENTRY_CMD} claim --task <id> --confirm", "suggest", "exec-command"),
     (ErrorCode.E033.name, "会话身份缺失：先 session start 取 token 并执行其注入命令（$env:ORCHD_SESSION_ID=\"<token>\" / export ORCHD_SESSION_ID=\"<token>\"），再重试", ("rules/session.md",), f"{_ENTRY_CMD} session start", "suggest", "exec-command"),
-    (ErrorCode.E034.name, "撤认归属守卫：仅事件作者 <owner> 或 admin 可撤回 <task_id>，当前 <caller> 无权；跨 agent 撤认仅限超时（僵尸）认领（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖），未超时请停止", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
+    (ErrorCode.E034.name, "撤认归属守卫：仅事件作者 <owner> 或 admin 可撤回 <task_id>，当前 <caller> 无权；跨 agent 撤认按目标 session runtime 分流——active 恒拒绝（即使超龄，长实现无引擎写操作不等于僵尸），inactive/expired 放行，missing/unknown 走年龄兜底（CLAIMED 600s / REVIEW_CLAIMED 300s，env 可覆盖）；请检查目标会话状态，等待其退出后再重试；管理员可执行 force-status --task <task_id> --status pending --reason <原因> 强制重置", ("rules/session.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E035.name, "会话冲突告警（警告不阻断）：同一工作区多会话碰撞，确认各会话职责避免写入竞争", ("rules/session.md",), f"{_ENTRY_CMD} watchdog", "suggest", "continue"),
     (ErrorCode.E036.name, "容器根执行被拒：切换到主工作树（details.main_worktree）下执行，或设 ORCHD_ALLOW_CONTAINER_ROOT=1 豁免", ("rules/git.md",), f"{_ENTRY_CMD} status", "suggest", "manual-action"),
     (ErrorCode.E037.name, "verify_command 引用路径未声明且不存在：将路径加入 files_to_edit/exempt_files，或改指向实际存在的文件（声明口径一致性）", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit <path>", "suggest", "exec-command"),
@@ -97,9 +96,13 @@ _ERROR_GUIDANCE_TABLE: tuple[tuple[str, str, tuple[str, ...], str, str, str], ..
     # E041 同 source 串行门（engine-discipline-hardening 停服施工 2026-10-23）：
     # await-external——兄弟任务在手属外部时序，勿重试本命令。
     (ErrorCode.E041.name, "同 source 串行门：同 source 已有在手（claimed/done/in_review）任务——串行包逐张推进，等待其在手兄弟任务终态（completed）或由其 retract 释放后再重试 claim；用 status 查看兄弟任务进度；伞收口卡须待兄弟卡全部终态（rules/intake.md serial-package 节）", ("rules/intake.md",), f"{_ENTRY_CMD} status", "suggest", "await-external"),
+    # task-deps-hard-gate：依赖边硬门（注册期与 done 期同在 A 通道阻断）。同任务声明
+    # .orchd/shared/deps.json 即登记意图，边随该任务提交；未声明则不放行。
+    (ErrorCode.E042.name, "依赖边未登记（deps.json）：把该边登记进 .orchd/shared/deps.json（顶层 import 归 hard、函数内延迟 import 归 delayed）并随本任务提交——注册期与 done 期均阻断，未登记不放行", ("rules/intake.md",), f"{_ENTRY_CMD} amend --task <id> --files-to-edit .orchd/shared/deps.json", "suggest", "exec-command"),
 )
 # 显式豁免集：允许裸弱出口的码（默认空集，加入需逐一说理注释）
 ALLOWED_WEAK: frozenset[str] = frozenset()
+
 # E007 内部防御白名单：正常协作流不可达的位点，无需补 hint（按文件显式登记）
 E007_INTERNAL_DEFENSE: frozenset[str] = frozenset({
     # W8-8：lessons.py 拆为 lessons/ 包（task-split2-w8-8-lessons-pkg）；8 处字段校验随域落位——
@@ -147,6 +150,7 @@ ERROR_CODE_CHANNELS: dict[str, frozenset[str]] = {
                                     # + C：review.py:1009 structured_error(ErrorCode.E015.name) 挂 result.error
     ErrorCode.E016.name: frozenset({"A"}),       # self_review_blocked: raise ×1
     ErrorCode.E041.name: frozenset({"A"}),       # serial_source_claim_conflict: raise ×1（engine-discipline-hardening）
+    ErrorCode.E042.name: frozenset({"A"}),       # deps_edge_undeclared: 注册期/done 期未登记边 raise ×2（task-deps-hard-gate）
     ErrorCode.E017.name: frozenset({"A", "D"}),  # dirty_workspace: raise ×5
                                     # + D：hook.py:892 echo "orchd E017: review in progress"
     ErrorCode.E018.name: frozenset({"A"}),       # wrong_branch: raise ×5
@@ -177,8 +181,9 @@ ERROR_CODE_CHANNELS: dict[str, frozenset[str]] = {
     ErrorCode.E036.name: frozenset({"A"}),       # container_root_cwd: raise ×1
     ErrorCode.E037.name: frozenset({"B"}),       # verify_reference_drift: spec ValidationError (blocking)
     ErrorCode.E038.name: frozenset({"B"}),       # brief_decl_count_mismatch: spec ValidationError (warning)
-    ErrorCode.E039.name: frozenset({"A"}),       # shared_entry_verify_gap: done 前置挂载点 raise ×1
-                                    # （onboard/lifecycle/core/entry_guard.py _guard_shared_entry_coverage）
+    ErrorCode.E039.name: frozenset({"A"}),       # shared_entry_verify_gap: done 前置挂载点 raise ×2
+    # （entry_guard.py：_guard_shared_entry_coverage 的 registry/global_shared_file/subpackage_entry 一处，
+    #   _record_drift_closure 的 drift_closure rule 一处；B1，task-guard-drift-done-closure）
     ErrorCode.E040.name: frozenset({"B"}),       # ac_verify_gap: spec ValidationError (warning)
 }
 
@@ -199,12 +204,12 @@ ERROR_GUIDANCE: dict[str, dict[str, Any]] = {
     for code, recovery, reads, command, tier, exit_type in _ERROR_GUIDANCE_TABLE
 }
 
-# 未命中映射时的通用兜底指引（保证任何错误码都有恢复指引）。
-# 设计 §3 补丁1：本兜底「立即停止并报告」**不算"明确指引"**——归入"无 guidance"
-# 分支，允许 agent 分析自愈（否则所有未映射错误码都有 fallback 指引，自愈永不触发）。
-# (task-audit-error-guidance-coverage) fallback 的 read 不再硬编码 rules/session.md，
-# 而是按错误码所属域推导：verify→rules/verify.md、git→rules/git.md、
-# intake→rules/intake.md，其余默认 rules/session.md，使兜底指引贴近错误发生场景。
+# 未命中映射时的通用兜底指引（保证任何错误码都有恢复指引）：设计 §3 补丁1：本兜底「立即停止并
+# 报告」**不算"明确指引"**——归入"无 guidance"分支，允许 agent 分析自愈（否则所有未映射错误码
+# 都有 fallback 指引，自愈永不触发）。
+# (task-audit-error-guidance-coverage) fallback 的 read 不再硬编码 rules/session.md，而是按错误码
+# 所属域推导：verify→rules/verify.md、git→rules/git.md、intake→rules/intake.md，其余默认
+# rules/session.md，使兜底指引贴近错误发生场景。
 _FALLBACK_RECOVERY = "遇到错误：立即停止并报告，不自行猜测处置"
 _FALLBACK_COMMAND = f"{_ENTRY_CMD} status"
 
@@ -414,6 +419,18 @@ def attach_error_guidance(
                 f"{_ENTRY_CMD} {sub} --help" if sub else f"{_ENTRY_CMD} --help"
             )
             break
+    # E007 原因分档（u8 AC2）：文案/数据在 ``guide/e007.py``（errors 预算棘轮只紧不松）。
+    if code == "E007":
+        for detail in error_details:
+            override = e007_guidance_override(detail)
+            if override is not None:
+                read_paths = override.pop("read", None)
+                guidance.update(override)
+                if read_paths:
+                    guidance["read"] = list(read_paths)
+                    guidance["rules"] = attach_rule_summaries(
+                        guidance, base_dir)["rules"]
+                break
     # 版本占位代入（task-caliber-residue-and-surface-gate AC1）：E031 一类的文案**真源是
     # 本模块的错误码注册表**（带 `<版本>` 占位），调用方只传 ``details[].version``，**不再
     # 自带一份措辞**——此前 validate 用另一处文案覆盖注册表，同一件事两份说法、改一处

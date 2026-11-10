@@ -272,7 +272,7 @@
           "require_independent_review": {
             "type": "boolean",
             "default": false,
-            "description": "可选。true 时该任务的审查必须异指纹：claim review 在 DONE 实现指纹 == 当前会话时抛 E016（与 config.enforce_self_review_block=true 同效）；request 将其从自审候选排除。缺省 false（仅 self_review_notice 标注）。不触碰 required 字段与既有枚举语义。",
+            "description": "已废弃/忽略（deprecated、ignored）：保留该键仅为兼容旧 _master.json 的 schema 校验，引擎行为与本值无关——审查恒需独立会话（实现指纹 == 审查指纹时 claim 与 submit 一律 E016），request 也恒排除自审候选；任何取值都不会放宽该门禁（设 false 不放行、设 true 无额外作用）。不要用本字段表达审查策略，详见 .orchd/rules/review.md「审查者身份约定」。不触碰 required 字段与既有枚举语义。",
             "x-amendable": false,
             "x-terminal-attachable": false
           },
@@ -438,6 +438,40 @@
             "x-amendable": true,
             "x-terminal-attachable": true
           },
+          "surface_refresh": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "surface",
+                "path",
+                "reason"
+              ],
+              "properties": {
+                "surface": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "generator": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "default": [],
+            "uniqueItems": true,
+            "description": "generated 面受控刷新声明（可选）：条目 {surface,path,generator,reason}，path/generator 由共享面注册表解析，仅 mode=generated 可声明；引擎在 pre-commit 动态写集与 done 的 commit_files 中展开 path，使生成物刷新可审计地随任务提交（不进入 files_to_edit/exempt_files 写集）。",
+            "x-amendable": true,
+            "x-terminal-attachable": false
+          },
           "source": {
             "type": [
               "string",
@@ -555,7 +589,7 @@
         "enforce_self_review_block": {
           "type": "boolean",
           "default": false,
-          "description": "是否强制阻断实现者审查自己实现的任务（线上版）。默认 false：单机模型下自审仅提示（self_review_notice / is_self_review 标注），不参与任务分配与认领决策。设 true 时恢复 E016 硬阻断（reviewer claim 拒绝、request 候选排除）。"
+          "description": "已废弃/忽略（deprecated、ignored）：保留该键仅为兼容旧 config 的 schema 校验，引擎不再读取该值——自审恒被 E016 阻断（claim 与 submit 双侧），无 config 开关、无降级档；设为 false 不会放行自审，设为 true 也无额外作用。审查独立性由会话 lineage 硬门保证（kind=reviewer + parent_session_id=该任务最后一次 DONE 的会话 id）。"
         }
       },
       "additionalProperties": false

@@ -3,7 +3,8 @@
 来源：``orchd/gitops/guard.py``（1652 行，W6-C1 纯搬移）。
 
 ``restore_worktree_paths`` / ``_count_git_processes`` /
-``_restore_refusal_reason``。
+``_restore_refusal_reason``，以及工作树布局探测
+``_layout_is_not_container``（供 write 域的 done 分支守卫使用）。
 
 依赖 ``core``（``_clear_timeout_index_lock``，顶层导入）。
 """
@@ -192,3 +193,17 @@ def _restore_refusal_reason(root: Path, rel: str) -> str | None:
     if probe.returncode != 0:
         return "no_head_version"
     return None
+
+def _layout_is_not_container(project_root: Path) -> bool:
+    """判定项目是否为非 container 布局（best-effort，布局未知 / 探测失败 → True）。
+
+    done 分支守卫的布局分流依据：container 布局（多 worktree）下只允许任务分支，
+    默认分支（主工作树）不在白名单内——从主工作树执行 done 会被拒绝；flat /
+    布局未知一律视为"非 container"，保持既有默认分支放行语义（零回归）。
+    """
+    try:
+        from orchd.worktree import detect_layout
+
+        return detect_layout(project_root).get("layout") != "container"
+    except Exception:
+        return True

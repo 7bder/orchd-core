@@ -139,9 +139,6 @@ ignore = [
 # 再随代码落点迁到 store_write.py（store.py 退化为骨架、自身已无超宽行），键随实际
 # 落点迁移（不是放宽，是债务随文件搬家）。
 "orchd/ledger/store_write.py" = ["E501"]
-# L3（task-split2-ledger-l3-identity）：身份与会话域的存量超宽行随代码落点迁移到
-# identity.py——键跟随实际落点，与 L1 的口径一致（不是放宽，是债务随文件搬家）。
-"orchd/ledger/identity.py" = ["E501"]
 "orchd/lockfile.py" = ["E501"]
 "orchd/onboard/bootstrap.py" = ["E501"]
 "orchd/onboard/control.py" = ["E501"]

@@ -11,22 +11,31 @@ guide:
 ---
 # 审查规则（ID 约定 / 自审默认阻断 / 证据分层 / merge 前置 / 单阶段判定）
 
-> TL;DR: ① 审查须**独立 subagent**（异指纹；见「审查者身份约定」）——引擎门已落地：`config.enforce_self_review_block` 缺省 true，自审触发 `E016 self_review_blocked`② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
+> TL;DR: ① 审查须由**当前会话 spawn 的独立 subagent** 执行（异指纹只是下限；三条禁止 + 无 subagent 能力即中断，见「审查者身份约定」）——引擎门已落地：自审恒 `E016 self_review_blocked`（claim 与 submit 双侧、无任何开关）、审查会话 lineage 硬门（kind=reviewer + parent=实现会话）② two_phase：spec-reviewer.md + code-reviewer.md；unified：reviewer.md ③ 审查通过任务才算完成 ④ 审查期实现者冻结（E017），补提交先 retract ⑤ 引擎语义变更（新状态 / 流程 / 规则文件 / 命令）→ 引导层三查，spec 与 code 两阶段均适用
 
 > 原 .orchd/SKILL.md「审查者 ID 约定」+ Reviewer workflow 的细节说明（清单化模板 / 证据分层 / merge 前置 / 文档类单阶段），外置自 task-skill-hub-refactor。
 
-## 审查者身份约定（独立 subagent 审查为默认）
+## 审查者身份约定（默认档：独立 subagent 审查为唯一合法形态）
 - 实现任务用各 agent 会话级指纹（12 位 hex，由 `ORCHD_SESSION_ID` 派生），**禁止跨对话复用同一指纹**；审查以当前会话指纹领取（不再使用固定 `reviewer-1` ID）
-- **独立 subagent 审查为默认（重点，2026-10-23 engine-discipline-hardening）**：审查由**独立 subagent**（独立 session token：`session start` 派生新指纹）执行，实现者与审查者须**异指纹**。agent 无 subagent 调用能力时：claim review 触发 `E016 self_review_blocked` **自动中断**，guidance 引导起独立 subagent 或手动换新会话；**不保留显式自审旁路，唯一出路 = 手动换新会话**。
-  - **引擎门已落地（f819e3a1 停服施工单）**：CLI 缺省 `config.enforce_self_review_block=true`（`orchd/cli/commands/workflow.py` 读 config 缺省 true），运行时即 E016 阻断 + guidance 强化（如何起 subagent：`session start` 取新 token → 起 subagent → 带该 `ORCHD_SESSION_ID` 领审）。内部 API 形参缺省仍为 false，仅 CLI/config 缺省 true；本节为口径真源
-- **自审默认阻断**（2026-10-23 engine-discipline-hardening 已落地；历史 2026-08-17 提示档降为显式 opt-out）：
-  - **默认（enforce 缺省 true 且无任务级 flag）**：claim review 时若 DONE 实现指纹 == 当前指纹，`E016 self_review_blocked` **拒绝认领**，guidance 指引起独立 subagent / 换新会话；request 候选 / review_first 中自审任务按排除处理
-  - **显式 `config.enforce_self_review_block=false`**：退回提示档——照常放行，认领结果附 `self_review_notice`（含 `done_by` + 引导），自审须在 review comments 首句披露
-  - **任务 `require_independent_review=true`**：与全局开关 OR，任一为真即 `E016 self_review_blocked`——claim review 拒绝、request 候选排除自审任务
+- **审查必须由当前会话主动 spawn 的独立 subagent 执行（重点，2026-10-31 review-subagent-contract-strict；2026-11-04 review-handoff 起身份由引擎交接）**：领审并撰写审查意见的，必须是**本会话用 Agent 工具起出来的子代理上下文**。`done` 成功后引擎在响应里返回 `review_handoff`（已 mint `kind=reviewer`、`parent=本任务最后一次 DONE 的 session_id` 的审查会话，并渲染好 `prompt`——含 token 注入段、claim/review 命令、模板与必读清单、comments 首句双指纹）：实现会话把 `prompt` **原样**交给 subagent，由它在交接的工作树里直接领审与提交，不需要任何额外的会话身份动作。判据是**执行上下文是否独立**，不是指纹是否新——异指纹只是引擎 `E016` 的最低门槛，它只能证明「身份不同」，证明不了「是子代理」。`review_handoff` 缺失或带 `error` 时按 fail-closed 处理（停止并上报），不得退回手写 prompt 或自行拼命令。
+  - **三条禁止（冒充独立审查的旁路，命中任一即违规）**：
+    ① **自铸 session token 自用**——实现会话自己再取一个新指纹，领的仍是自己刚实现的那份审；
+    ② **手设 `ORCHD_SESSION_ID`**——在本会话命令里直接赋值/导出一个环境变量伪造新身份（等价于 ①，且绕开 `session start` 的 runtime 记录）；
+    ③ **复用他人 token**——取别的对话或他人正在使用的 session_token 领审，署名不属于本会话 spawn 的任何上下文。
+    以上三条都不产生独立上下文，因此都不满足本节口径。引擎已在 claim 与 submit 双侧落 **lineage 硬门**，能拦住「没有专用审查会话」的情形，但拦不住「token 拿到手却没交给真 subagent」——那部分仍以文档口径为准，**不得以「引擎没拒」当作「契约允许」**。
+  - **审查会话 lineage 硬门（2026-11-02 review-subagent-hard-block P0-3；DONE 归属口径 task-cont-done-lineage-docs）**：领审与提交都必须来自 `kind=reviewer` 且 `parent_session_id` = 该任务最后一次 DONE 的会话 id 的会话——DONE 事件归属口径为 `agent_id=claimed_by`、`session_id`=执行 done 的调用方会话（真源 `orchd/onboard/lifecycle/core/finish.py`），故 expected parent 即执行 done 的那个实现会话；缺失/伪造一律 `E016`，`details.reason` 区分 `lineage_missing` / `kind_not_reviewer` / `lineage_mismatch`。claim 与 submit 双检；旧账本 DONE 无 session_id 时 fail-closed（仅无引擎身份的 SDK 直连不判定——CLI 写命令在更早 E033 会话门已拦截）。单一真源 `orchd/ledger/session.py::require_review_lineage`。
+  - **旁路写法约束（task-review-contract-guard-hardening，守卫 fail-closed）**：契约面**不得以自然语句复述被禁旁路（含否定式）**——「禁止 + 旁路」这类否定句也一律判红（否定 / 建议 / 引述在词面不可穷举区分，守卫不做语义豁免）。需要引用时统一用**占位名**「会话切换旁路」/「身份切换旁路」，再在旁边说明处置；守卫实现见 `orchd/contract_docs.py`；引擎仓由 `tests/test_review_contract_strict.py` 做负控，宿主由 `python .orchd/__main__.py doctor` 的 `contract_docs` 检查执行。本文件中的 `tests/` 路径引用仅指引擎仓（宿主无 tests/）。
+  - **无 subagent 能力即中断（默认档唯一处置）**：起不出子代理的 agent，claim review 触发 `E016 self_review_blocked` 自动中断后，动作 = `retract` 释放认领 → **停止并上报**，等人工安排独立审查者。不得改用 ①②③ 任何一种旁路继续；把审查外包给一条平级会话链也不算 subagent（那是同级上下文，不是本会话 spawn 出来的子代理）。
+  - **审查 comments 首句写明 subagent 来源（独立审查档硬性）**：首句形如「本审查由实现会话 `<实现者指纹>` spawn 的独立 subagent 执行，审查指纹 `<审查者指纹>`」；缺该来源声明的意见按审查无效处理（此为流程纪律，与 `E016` 的指纹门叠加）。
+  - **引擎门已落地（2026-11-02 review-subagent-hard-block P0；本节为口径真源）**：自审在 claim 与 submit 双侧恒 `E016`（判点 `orchd/onboard/claim/execute.py` 与 `orchd/review/precheck.py`，两侧都不读任何开关）；审查身份的建立方式 = 引擎在 `done` 成功时 mint 审查会话并把 `prompt` / token / lineage 放进 `review_handoff` → 实现会话把 `prompt` 原样交给独立 subagent → 由它在该交接身份下领审与提交。身份由引擎落盘（`sessions/<id>.json` 的 `kind` / `parent_session_id`），不依赖宿主自己拼参数。
+- **自审恒阻断（不可配置，2026-11-02 P0 收口）**：
+  - 实现指纹 == 审查指纹 ⇒ claim 与 submit 均 `E016 self_review_blocked`；**不存在降级档**，config 级与任务级开关已从引擎删除。
+  - request 候选与 review_priority 恒排除自审任务（`excluded_self_review` 可见），不再标注成可领候选。
+  - submit 侧在 in_review / 阶段 / 认领三重门之后复判自审，防「claim 被旁路或状态被篡改」。
 - **Review 优先调度（自动执行时为硬默认，2026-09-20 用户裁定）**：implementer 请求任务时，若存在该 agent 可认领的 in_review 任务，引擎返回 `next_action: "review_first"` + `review_priority` 提示先领取审查；**无人值守 / 连续自动跑圈时必须先把可领审查做完（claim review → `review` 提交结论 → 尚有 code 阶段则到 merged）再领实现**，且**不得用 `claim --task <pending-id>` 点名绕过本闸门**——`claim` 只按该任务自身状态分流、不查全局审查积压（2026-09-20 实测：3 个 in_review 因此积压数小时未被领）。详见 rules/session.md「工作优先级」
 - 领审查前两项自查（决策权在人，此为可见性辅助）：
   - `python .orchd/__main__.py status` 中不存在本 session 实现 ID 名下的 claimed 任务（busy 检查按 ID 判定，换 ID 即可绕过，故须自查）
-  - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 自审，缺省被 `E016 self_review_blocked` 拒绝（仅显式 `config.enforce_self_review_block=false` 才退回提示档）
+  - 读取目标任务实现侧 `claimed_by`，与本 session 实现 ID 相同 → 自审，恒被 `E016 self_review_blocked` 拒绝（无降级档）
 - **code review APPROVED 后必须运行 merge audit 验证**：提交 code APPROVED 且 merge 成功（任务进入 completed）后，立即运行 `python .orchd/__main__.py status --audit-merge`，确认 `merge_audit.warnings` 为空（零告警）。若有告警（completed 任务对应分支仍悬空未入 main），不得将漏 merge 遗留到下游——处置：reviewer 先 `retract` 本次审查结论（释放 R1-b 审查冻结），由实现者（或人工）在 task 分支补提交后重新 `done`，同一 reviewer 再次提交 code APPROVED 重试 → merge 成功 → completed。**禁 reviewer 直接在任务分支提交或 cherry-pick 修复**（R1-b 审查期实现者冻结 + git 代理必拒 E007，无例外）。
 - **合入前验碰撞集而非整树干净（2026-09-21）**：code APPROVED 提交前，只需确认主工作树没有"未跟踪、且任务分支已跟踪"的同路径文件（真碰撞会触发 untracked 覆盖拒绝）；已跟踪改动若为 IDEAS / IDEAS-archive / _master.json / ROADMAP 等引擎自提交产物，属后台提交瞬态（ideas-archive 自动归档等），等待数秒重验即可，不得当真脏拦截。真撞上时 merge 诊断会精确报文件名，按指引处置重试。
 

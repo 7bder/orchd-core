@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,9 @@ from orchd.errors import ErrorCode, OrchdError
 from orchd.contracts.events import (
     EVENT_CLAIMED,
     EVENT_REVIEW_CLAIMED,
+    STATUS_CLAIMED,
     STATUS_COMPLETED,
+    STATUS_DONE,
     STATUS_IN_REVIEW,
     STATUS_PENDING,
     TERMINAL_STATUSES,
@@ -70,12 +73,15 @@ from orchd.contracts.responses import (
     COMMAND_KEY,
     COMMENTS_KEY,
     COUNT_KEY,
+    DONE_KEY,
     ERROR_KEY,
     GUIDANCE_KEY,
     HINT_KEY,
     MESSAGE_KEY,
     NEXT_ACTION_KEY,
+    SUMMARY_KEY,
     TASK_ID_KEY,
+    TASK_STATUS_KEY,
 )
 
 
@@ -93,9 +99,8 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     from orchd.ledger import stale_review_claims
     from orchd.onboard import request
     from orchd.onboard.claim import claim
-    enforce_self_review_block = bool(
-        master.config.get("enforce_self_review_block", True) if hasattr(master, "config") else True
-    )
+    # P0-2（task-review-hardblock-e2-request-gate）：自审候选在 request 侧
+    # 恒被排除（无 config / 任务级开关），不会产出「派了必被 E016 拒」的候选。
     result = request(
         store, tasks, agent_id=agent_id,
         capabilities=_flatten_nargs(args.capabilities),
@@ -106,7 +111,6 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             (master.config.get(IMPORTANCE_FIELD) if hasattr(master, "config") else None)
             or None
         ),
-        enforce_self_review_block=enforce_self_review_block,
         conflict_policy=(
             (master.config.get("conflict_policy") if hasattr(master, "config") else None)
             or None
@@ -189,7 +193,6 @@ def _cmd_request(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             store, tasks, agent_id=agent_id, task_id=candidate_id,
             project_root=orchd_dir.parent, shared=shared,
             with_context=getattr(args, "with_context", False),
-            enforce_self_review_block=enforce_self_review_block,
         )
         result["auto_claimed"] = True
         result[CLAIMED_KEY] = claim_result
@@ -204,7 +207,6 @@ def claim_preview(
     role: str = "implementer",
     project_root: Path | None = None,
     review_type: str | None = None,
-    enforce_self_review_block: bool = False,
 ) -> dict[str, Any]:
     """claim 前确认闸门预览（task-claim-confirm-gate，只读，不写事件不建分支）。
 
@@ -291,6 +293,24 @@ def claim_preview(
     ]
 
     # 校验预期（与 claim() 锁内校验一致，透明展示；失败仅提示不阻断预览）
+    # task-debug-claim-register-ux：E011 的两类在手判定对两个角色都生效，故在分支前
+    # 统一计算，并复用 execute 的 _owns_task / _owns_review（session 优先，禁止另写副本）。
+    from orchd.ledger import resolve_session_identity as _resolve_session
+    from orchd.onboard.claim.execute import _owns_review, _owns_task
+
+    session_id = _resolve_session(store.orchd_dir)["session_id"]
+    busy_tasks = [
+        tid for tid, t_state in state.items()
+        if tid != task_id
+        and t_state.status in (STATUS_CLAIMED, STATUS_DONE, STATUS_IN_REVIEW)
+        and _owns_task(t_state, agent_id, session_id)
+    ]
+    busy_reviews = [
+        tid for tid, t_state in state.items()
+        if tid != task_id
+        and t_state.status == STATUS_IN_REVIEW
+        and _owns_review(t_state, agent_id, session_id)
+    ]
     if role == "reviewer":
         done_author, _ = _extract_last_done(store, task_id, derived)
         preview["done_by"] = done_author
@@ -304,13 +324,27 @@ def claim_preview(
             {"check": "审查阶段与当前 review_phase 匹配",
              "expected_pass": (not review_type) or review_type == current_phase},
         ]
-        # 自审（E016）：默认硬阻断（config 缺省 true，engine-discipline-hardening）；显式 false 时降级为提示项仅标注
+        # 自审（E016）：无条件硬阻断（P0-1，task-review-hardblock-e1-claim-gate）。
+        # 无 config 开关、无任务级覆盖、无降级提示项——审查必须由独立 subagent 承担。
         if is_self:
             preview["expected_checks"].append({
-                "check": "自审提示（E016：实现者 = 审查者）",
-                "expected_pass": not enforce_self_review_block,
-                "note": "默认 E016 硬阻断（engine-discipline-hardening 2026-10-23 停服施工：config 缺省翻转为 true）；config 显式 false 可退回仅提示",
+                "check": "自审阻断（E016：实现者 = 审查者，无条件）",
+                "expected_pass": False,
+                "note": "自审恒阻断：审查须由实现会话 spawn 的独立 subagent 执行，无降级档",
             })
+        # E011 对审查认领同样生效（confirm 侧循环不分角色）——此前预览只在实现分支给条目。
+        preview["expected_checks"].append({
+            "check": "本 agent 无其它在手任务（E011）",
+            "expected_pass": not busy_tasks,
+            "note": ("在手任务：" + "、".join(busy_tasks)) if busy_tasks else "",
+        })
+        # review-busy 同样对两角色生效：reviewer 手里若已持另一张卡的审查认领，
+        # confirm 侧会以 E011 review busy 拒绝（execute 的循环在 role 分支之外）。
+        preview["expected_checks"].append({
+            "check": "本 agent 无其它在手审查（E011 review-busy）",
+            "expected_pass": not busy_reviews,
+            "note": ("在手审查：" + "、".join(busy_reviews)) if busy_reviews else "",
+        })
     else:
         preview["expected_checks"] = [
             {"check": "任务处于 pending（可认领）",
@@ -323,6 +357,50 @@ def claim_preview(
             {"check": "未被其他 agent 认领",
              "expected_pass": not (ts and ts.claimed_by and ts.claimed_by != agent_id)},
         ]
+        # task-debug-claim-register-ux：预览与 --confirm 判据对齐（E010 / E041 / 冷却 /
+        # E011），复用同一批只读谓词；E011 的两类在手判定已在分支前统一算好。
+        from orchd.onboard.claim.precheck import _check_retract_cooldown
+        from orchd.onboard.serial_source import serial_busy_siblings
+        from orchd.pool import detect_file_conflict
+
+        conflicts = detect_file_conflict(state, tasks, task_def)
+        preview["expected_checks"].append({
+            "check": "与在途任务声明文件不冲突（E010）",
+            "expected_pass": not conflicts,
+            "note": ("冲突任务：" + "、".join(c.task_id for c in conflicts)) if conflicts else "",
+        })
+        siblings = serial_busy_siblings(task_def, tasks, state)
+        preview["expected_checks"].append({
+            "check": "同一 source 无在途任务（E041）",
+            "expected_pass": not siblings,
+            "note": ("在途同源卡：" + "、".join(siblings)) if siblings else "",
+        })
+        cooldown = _check_retract_cooldown(store, task_id)
+        preview["expected_checks"].append({
+            "check": "不在 retract 认领冷却期",
+            "expected_pass": cooldown is None,
+            "note": ((f"{cooldown['seconds_ago']:.0f}s 前被撤回（冷却 300s；"
+                      "--confirm 带 --force 可跳过）") if cooldown else ""),
+        })
+        preview["expected_checks"].append({
+            "check": "本 agent 无其它在手任务（E011）",
+            "expected_pass": not busy_tasks,
+            "note": ("在手任务：" + "、".join(busy_tasks)) if busy_tasks else "",
+        })
+        preview["expected_checks"].append({
+            "check": "本 agent 无其它在手审查（E011 review-busy）",
+            "expected_pass": not busy_reviews,
+            "note": ("在手审查：" + "、".join(busy_reviews)) if busy_reviews else "",
+        })
+        if project_root is not None:
+            from orchd.worktree import actual_changes_conflict
+
+            actual = actual_changes_conflict(project_root, state, tasks, task_def)
+            preview["expected_checks"].append({
+                "check": "任务分支实际改动不与他人在途冲突（E010）",
+                "expected_pass": not actual,
+                "note": ("冲突文件：" + "、".join(str(a) for a in actual)) if actual else "",
+            })
     # 复活标记（task-force-status-revive-audit）：该任务曾有 completed→pending 复活
     # 历史时透明展示（reason+evidence_sha+时间），正常任务不展示（零误伤）。
     markers = task_revive_markers(store)
@@ -335,6 +413,32 @@ def claim_preview(
         if scope_warning is not None:
             preview["scope_warning"] = scope_warning
     return preview
+
+
+def _claim_e033_with_task_context(
+    exc: OrchdError, store, task_id: str,
+) -> OrchdError:
+    """claim 的 E033 补齐任务状态上下文（task_status/claimed_by/review_claimed_by）。
+
+    E033 的抛出点在 ``require_session_runtime``，那里不知道 claim 目标；claim 命令
+    捕获后补上任务当前状态，便于定位「会话失配时任务被谁占着 / 卡在哪个阶段」。
+    """
+    ts = store.replay().get(task_id)
+    details = [dict(d) for d in (exc.details or [])]
+    head = details[0] if details else {}
+    head.update({
+        TASK_ID_KEY: task_id,
+        TASK_STATUS_KEY: getattr(ts, "status", None) or STATUS_PENDING,
+        "claimed_by": getattr(ts, "claimed_by", None),
+        "review_claimed_by": getattr(ts, "review_claimed_by", None),
+    })
+    hint = head.get(HINT_KEY)
+    context = (
+        f"当前任务 {task_id} 状态为 {head[TASK_STATUS_KEY]}"
+        f"（claimed_by={head['claimed_by']}, review_claimed_by={head['review_claimed_by']}）"
+    )
+    head[HINT_KEY] = f"{hint}；{context}" if hint else context
+    return OrchdError(exc.code, exc.message, [head, *details[1:]])
 
 
 @_cli_skeleton
@@ -358,11 +462,13 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     # _propagate_container_marker 会把任务 worktree 布局标记的 main_worktree
     # 写成容器根，导致任务 worktree 账本解析错位（done 报 not in claimed）。
     project_root = resolve_canonical_project_root(orchd_dir.parent)
-    agent_id = _require_agent_id(orchd_dir)
     role = _detect_claim_role(store, tasks, args.task)
-    enforce_self_review_block = bool(
-        master.config.get("enforce_self_review_block", True) if hasattr(master, "config") else True
-    )
+    try:
+        agent_id = _require_agent_id(orchd_dir)
+    except OrchdError as exc:
+        if exc.code is ErrorCode.E033:
+            raise _claim_e033_with_task_context(exc, store, args.task) from exc
+        raise
 
     # 确认闸门：无 --confirm 仅输出预览（只读，不写事件、不建分支）
     if not getattr(args, "confirm", False):
@@ -370,7 +476,6 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
             store, tasks, agent_id=agent_id, task_id=args.task,
             role=role, project_root=project_root,
             review_type=getattr(args, "review_type", None),
-            enforce_self_review_block=enforce_self_review_block,
         )
         result = {
             "confirm_required": True,
@@ -394,7 +499,6 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         project_root=project_root, shared=shared,
         review_type=getattr(args, "review_type", None),
         with_context=getattr(args, "with_context", False),
-        enforce_self_review_block=enforce_self_review_block,
         force=getattr(args, "force", False),
     )
     # engine-discipline-hardening 轻 guidance（2026-10-23 停服施工）：同 source 串行包
@@ -420,6 +524,240 @@ def _cmd_claim(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     return result
 
 
+def _done_deps_gate(
+    project_root: Path, task_id: str, task_def: dict | None,
+) -> None:
+    """done 期依赖边复检（task-deps-hard-gate）：实际 diff 的未登记边阻断 done。
+
+    口径与注册期同源（orchd.deps.undeclared_edges_for_files）；diff 取
+    ``orchd.nogit.changed_paths``（git 优先、快照兜底），并叠加``pending_change_paths``
+    中**已声明但未提交**的改动（done 的 auto-commit 在本门禁之后，只读已提交 diff
+    会留下未提交窗口绕过路径）。
+
+    仅引擎仓在本函数硬阻断（E042）；宿主仓的 deps 判定统一由宿主 guard
+    （``orchd/guards/deps.py``，按 ``guards.json`` 的 ``warn``/``hard`` 档位与
+    ``root``/``package`` 配置分流，``off``/无图跳过）在 done 链路接管，避免两套口径。
+    引擎仓坏图（坏 JSON / 坏 schema）不再 fail-open：统一判定走
+    ``decide_gate``，status=hard 时以 E007 + reason ``deps_graph_unavailable`` 阻断。
+    """
+    from orchd import deps as _deps
+    from orchd.guards.deps import (
+        GATE_HARD,
+        GATE_OFF,
+        GATE_SKIPPED,
+        REASON_GRAPH_UNAVAILABLE,
+        decide_gate,
+    )
+    from orchd.nogit import changed_paths
+    from orchd.repo_role import is_engine_repo
+
+    if not is_engine_repo(Path(project_root)):
+        return
+
+    decision = decide_gate(project_root)
+    if decision.status in (GATE_SKIPPED, GATE_OFF):
+        return
+    if decision.status == GATE_HARD:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"deps_graph_unavailable: {decision.message}",
+            [{
+                "code": ErrorCode.E007.name,
+                TASK_ID_KEY: task_id,
+                "reason": REASON_GRAPH_UNAVAILABLE,
+                "path": decision.policy.deps_rel,
+                MESSAGE_KEY: decision.message,
+                HINT_KEY: (
+                    "修复 .orchd/shared/deps.json 后重试；引擎仓坏图必须 "
+                    "fail-closed，不允许以告警放行"
+                ),
+            }],
+        )
+    graph = decision.graph
+    if graph is None:  # GATE_OK 保证图非空；其余状态已在上面分流
+        return
+    declared = set((task_def or {}).get(FILES_TO_EDIT_FIELD) or []) | set(
+        (task_def or {}).get(EXEMPT_FILES_FIELD) or [],
+    )
+    pending: set[str] = set()
+    try:
+        from orchd.worktree.diagnosis import pending_change_paths
+
+        view = pending_change_paths(Path(project_root))
+        pending = {
+            p for p in view.get("tracked", set()) | view.get("untracked", set())
+            if p in declared
+        }
+    except Exception:
+        pending = set()
+    changed = sorted(
+        {
+            p for p in changed_paths(Path(project_root), task_id)
+            if p.endswith(".py")
+        }
+        | {p for p in pending if p.endswith(".py")}
+    )
+    missing = _deps.undeclared_edges_for_files(
+        changed, project_root=Path(project_root), graph=graph,
+        exclude=(task_def or {}).get(EXEMPT_FILES_FIELD) or (),
+    )
+    if not missing:
+        return
+    details = [
+        {
+            "code": ErrorCode.E042.name,
+            TASK_ID_KEY: task_id,
+            MODULE_FIELD: owner,
+            COUNT_KEY: len(edges),
+            "edges": [f"{owner} -> {edge}" for edge in edges],
+            MESSAGE_KEY: f"模块 {owner} 有 {len(edges)} 条依赖边未登记",
+        }
+        for owner, edges in sorted(missing.items())
+    ]
+    raise OrchdError(
+        ErrorCode.E042,
+        "deps_edge_undeclared: done 期检测到本任务 diff 含未登记依赖边"
+        "（done 已阻断，未提交）",
+        details,
+    )
+
+
+def _attach_review_handoff(
+    result: dict[str, Any],
+    store: Any,
+    orchd_dir: Path,
+    task_def: dict[str, Any] | None,
+    task_id: str,
+    master: Any,
+) -> None:
+    """done 成功后挂 ``review_handoff``（交接失败只降级，不改 done 语义）。
+
+    task-review-handoff-engine AC1 / AC6：done 既有字段与成功语义不变；审查会话
+    mint、prompt 渲染的任何失败都收敛为结构化 ``error``，调用方（宿主）据
+    ``error`` 字段 fail-closed，而不是让 done 变成失败。
+
+    Args:
+        result: done 响应（原地并入 ``review_handoff``）。
+        store: 账本 Store（取最后一次 DONE 的 session_id 作 lineage 父）。
+        orchd_dir: ``<项目>/.orchd``（mint 审查会话的 runtime 根）。
+        task_def: 任务定义（取 files_to_edit 组审查清单）；None 时按空定义降级。
+        task_id: 任务 id。
+        master: 已加载的 master（取 shared 上下文；缺失按 None 处理）。
+
+    Returns:
+        None（副作用落在 ``result`` 上）。
+    """
+    if not result.get(DONE_KEY):
+        return
+    try:
+        # import 也必须在 try 内：DONE 已落账，模块导入失败同样只能降级，
+        # 不得把 done 翻成失败（AC6）。
+        from orchd.review.handoff import build_review_handoff
+
+        handoff = build_review_handoff(
+            store,
+            orchd_dir,
+            task_def or {},
+            task_id,
+            project_root=orchd_dir.parent,
+            review_created=result.get("review_created"),
+            shared=getattr(master, "shared", None),
+        )
+    except Exception as exc:  # noqa: BLE001 —— done 已落账，交接异常一律降级
+        handoff = {
+            ERROR_KEY: {
+                "code": "review_handoff_failed",
+                "reason": "unexpected_exception",
+                MESSAGE_KEY: f"{type(exc).__name__}: {exc}",
+                HINT_KEY: "done 已成功；交接生成失败，请人工取号后再领审并核对 lineage",
+            }
+        }
+    result["review_handoff"] = handoff
+
+
+def _surface_summary_fallback(changes: str | None, task_def: dict[str, Any] | None) -> str:
+    """``--changelog-summary`` 缺省摘要：取 ``--changes`` 首个非空行，其次任务名。"""
+    for line in (changes or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return str((task_def or {}).get(NAME_FIELD, "") or "").strip()
+
+
+def _resolve_surface_entries(
+    args: Any,
+    task_def: dict[str, Any] | None,
+    changes: str | None,
+    project_root: Path | None = None,
+) -> list[dict[str, Any]] | None:
+    """解析 done 期落地面片段入参（``--surface-entry`` JSON + ``--changelog-*`` 糖）。"""
+    entries: list[dict[str, Any]] = []
+    for raw in getattr(args, "surface_entry", None) or []:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise OrchdError(
+                ErrorCode.E007,
+                f"--surface-entry 不是合法 JSON：{raw!r}",
+                [{"detail": str(exc)}],
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OrchdError(
+                ErrorCode.E007,
+                "--surface-entry 必须是 JSON 对象",
+                [{"detail": raw}],
+            )
+        entries.append(payload)
+    category = getattr(args, "changelog_category", None)
+    summary = getattr(args, "changelog_summary", None)
+    if category is not None or summary is not None:
+        if summary is None:
+            # AC4「默认 summary 可安全截断」：只有派生摘要做截断，显式摘要不截断
+            # （超长由 surfaces.prepare_entries → validate_fragment 报 E007）。
+            summary = _surface_summary_fallback(changes, task_def)
+            try:
+                from orchd import surfaces as _surface_mod
+
+                specs = _surface_mod.load_surfaces(project_root or Path("."))
+                changelog_spec = specs.get("changelog")
+                task_id = str(getattr(args, "task", "") or "")
+                if changelog_spec is not None and task_id:
+                    summary = _surface_mod.truncate_summary(
+                        changelog_spec, task_id, summary
+                    )
+            except Exception:  # noqa: BLE001 - 截断失败不得阻断 done 参数解析
+                pass
+        entries.append(
+            {
+                "surface": "changelog",
+                "category": category or "changed",
+                SUMMARY_KEY: summary,
+            }
+        )
+    return entries or None
+
+
+def _allow_existing_surface_fragments(
+    project_root: Path,
+    task_def: dict[str, Any],
+    task_id: str,
+) -> None:
+    """done 重试放行：把该任务已存在的片段路径并入 early 范围守卫的 exempt_files。"""
+    try:
+        from orchd import surfaces
+
+        from orchd.gitops_ops import resolve_task_worktree
+
+        root = resolve_task_worktree(project_root, task_id, strict=False) or project_root
+        existing = surfaces.existing_fragment_rel_paths(root, task_id)
+    except Exception:  # noqa: BLE001 - 片段域异常不得阻断 done 主流程
+        return
+    if not existing:
+        return
+    merged = list(dict.fromkeys([*(task_def.get(EXEMPT_FILES_FIELD, []) or []), *existing]))
+    task_def[EXEMPT_FILES_FIELD] = merged
+
+
 @_cli_skeleton
 def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     """报告任务完成，提交变更描述与可选的关切事项。
@@ -440,18 +778,28 @@ def _cmd_done(args, tasks, orchd_dir, master, store, agent_id) -> dict:
     from orchd.worktree import resolve_declaration_source as _resolve_decl_early
     _tasks_early = _resolve_decl_early(orchd_dir.parent, tasks, None)[0]
     _task_def_early = {t.get(ID_FIELD, ""): t for t in _tasks_early}.get(args.task)
+    surface_entries = _resolve_surface_entries(
+        args, _task_def_early, changes, orchd_dir.parent
+    )
     if _task_def_early is not None:
+        _allow_existing_surface_fragments(orchd_dir.parent, _task_def_early, args.task)
         from orchd.onboard import _guard_out_of_scope as _early_scope_guard
         _early_scope_guard(orchd_dir.parent, _task_def_early, args.task, [])
+    # done 期 deps 复检（task-deps-hard-gate）：实际 diff 未登记边 → E042 阻断。
+    _done_deps_gate(orchd_dir.parent, args.task, _task_def_early)
     result = done(
         store, tasks, agent_id=agent_id, task_id=args.task,
         changes_description=changes or "", concerns=args.concerns,
         project_root=orchd_dir.parent,
         skip_lesson_review=getattr(args, "skip_lesson_review", False),
+        surface_entries=surface_entries,
     )
     warning = _identity_warning(agent_id, orchd_dir)
     if warning:
         result["warning"] = warning
+    # task-review-handoff-engine：done 成功即交接审查身份与 spawn prompt
+    # （引擎 mint reviewer session，实现方无需再拼取号命令）。
+    _attach_review_handoff(result, store, orchd_dir, _task_def_early, args.task, master)
     return result
 
 
@@ -583,6 +931,12 @@ def register(sub) -> None:
     p.add_argument("--skip-lesson-review", dest="skip_lesson_review",
                    action="store_true",
                    help="跳过 lesson 收尾 hook（CI/CD/自动化场景，§8.6 bypass）")
+    p.add_argument("--surface-entry", dest="surface_entry", action="append",
+                   help="done 期写落地面片段（JSON：{surface,category,summary}；可重复）")
+    p.add_argument("--changelog-category", dest="changelog_category",
+                   help="CHANGELOG 片段分类（added/changed/deprecated/removed/fixed/security）")
+    p.add_argument("--changelog-summary", dest="changelog_summary",
+                   help="CHANGELOG 片段摘要（缺省取 --changes 首行，其次任务名）")
     p.set_defaults(func=_cmd_done)
 
     # review

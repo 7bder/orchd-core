@@ -43,13 +43,13 @@ from orchd.doctor.locks import (
 from orchd.doctor.residue import (
     _GHOST_TERMINAL_STATUSES as _GHOST_TERMINAL_STATUSES, _AUTO_CLEAN_TYPES, _LEGACY_MOVE_TYPES,
     _MANUAL_ACTIONS, _classify_residual_dir, _detect_ghost_tasks, _detect_hook_enforcement_gaps,
-    _detect_legacy_flat_residues, _detect_residual_dirs, _detect_stale_worktree_registry,
-    _dir_contains_real_content, _ghost_detection_store, _ghost_retract_target, _residue_disposition,
-    _run_detector, detect_residues,
+    _detect_hook_guard_gaps, _detect_legacy_flat_residues, _detect_residual_dirs,
+    _detect_stale_worktree_registry, _dir_contains_real_content, _ghost_detection_store,
+    _ghost_retract_target, _residue_disposition, _run_detector, detect_residues,
 )
 from orchd.doctor.checks_repo import (
     _GENERATED_DOCS, _GENERATED_MARKER, _REFS_ROOT_IGNORE, _check_contract_drift,
-    _check_in_review_worktree_integrity, _check_master_single_copy, check_repo,
+    _check_in_review_worktree_integrity, _check_master_single_copy, _engine_root, check_repo,
 )
 from orchd.doctor.fix import (
     AUTO_CLEAN_DISPOSITIONS, _BACKUP_RETENTION_DAYS, _BACKUP_RETENTION_KEEP_NEWEST,

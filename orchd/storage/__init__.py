@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from orchd.names import (
     LEDGER_ARCHIVE_FILE,
+    LEDGER_SQLITE_FILE,
 )
 
 
 import json
 import os
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,38 @@ ARCHIVE_FILENAME = LEDGER_ARCHIVE_FILE
 
 #: 中断恢复标记（compact 三写中途崩溃的唯一可观测痕迹，见 Store.compact_archive）。
 COMPACT_JOURNAL_FILENAME = ".compact-journal.json"
+
+#: 账本 sqlite 库文件名（单一真源 = ``orchd.names.LEDGER_SQLITE_FILE``；
+#: 消费方一律经 :func:`sqlite_db_path` 派生，禁止再写字面量）。
+SQLITE_DB_FILENAME = LEDGER_SQLITE_FILE
+
+#: sqlite 库文件的伴生文件后缀（-wal / -shm / -journal；迁移/探针/排除前缀共用）。
+SQLITE_DB_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+#: 归档解析缓存的逃生开关：设为 1/true/yes/on 时禁用进程内缓存。
+ARCHIVE_CACHE_ENV = "ORCHD_DISABLE_ARCHIVE_CACHE"
+
+#: 单条进程内缓存（task-ledger-archive-cache）：``(key, events, corrupt)``。
+#: 只缓存「文件存在且解析成功」的结果；缺失/不可读走负结果不缓存路径，
+#: 避免把瞬时故障固化成长期空归档。
+_ARCHIVE_CACHE: (
+    tuple[tuple[str, int, int, int], list[dict[str, Any]], list[dict[str, Any]]]
+    | None
+) = None
+_ARCHIVE_CACHE_LOCK = threading.Lock()
+
+
+def _archive_cache_disabled() -> bool:
+    """缓存逃生开关是否开启（每次调用读环境变量，便于测试与现场排障）。"""
+    raw = os.environ.get(ARCHIVE_CACHE_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def clear_archive_cache() -> None:
+    """清空归档解析缓存（测试隔离与 compact 写后显式失效）。"""
+    global _ARCHIVE_CACHE
+    with _ARCHIVE_CACHE_LOCK:
+        _ARCHIVE_CACHE = None
 
 
 def archive_path(store_dir: Path | str) -> Path:
@@ -43,25 +77,66 @@ def compact_journal_path(store_dir: Path | str) -> Path:
     return Path(store_dir) / COMPACT_JOURNAL_FILENAME
 
 
-def read_archive_events(
-    store_dir: Path | str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """读取归档事件（去重保序）与损坏条目（task-ledger-archive-compact）。
+def sqlite_db_path(store_dir: Path | str) -> Path:
+    """账本 sqlite 库文件路径（task-layout-paths-converge 单一真源）。
 
-    - 按 event_id 去重（保留首次出现）：中断崩溃可能导致同一事件体同时落在
-      归档与活跃文件，读侧去重使重跑天然幂等；
-    - 损坏行跳过 + 结构化条目（行号为归档文件内物理行号，调用方叠加偏移上报，
-      与 ``corrupt_lines`` 同形）；
-    - 文件不存在 → ([], [])；
-    - 文件存在但不可读（OSError）→ ([], [archive_unreadable 条目])：调用侧
-      无从区分「无归档」与「归档不可读」会误判规模（task-enforcement-
-      degrade-audit-trail），故不可读单独留痕（E030 warning，不抛异常，
-      不改放行语义；双后端原样透传进 ``corrupt_lines``）。
-
-    Returns:
-        ``(events, corrupt)``。
+    库文件恒位于账本根（:func:`orchd.ledger.resolve_store_dir` 的返回值）
+    之下：container 布局即 ``<容器>/.orchd-runtime/`` ＋ ``SQLITE_DB_FILENAME``，
+    flat 即 ``<主工作树>/.orchd/`` ＋ 同一文件名。本函数只做拼接：不判存在、
+    不建库、不迁移。
     """
-    path = archive_path(store_dir)
+    return Path(store_dir) / SQLITE_DB_FILENAME
+
+
+def _archive_cache_key(path: Path) -> tuple[str, int, int, int] | None:
+    """缓存键：解析后路径 + inode + mtime_ns + size；缺失/不可 stat 返回 None。"""
+    if not path.is_file():
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (
+        str(path.resolve()),
+        int(getattr(st, "st_ino", 0)),
+        st.st_mtime_ns,
+        st.st_size,
+    )
+
+
+def _copy_archive_events(
+    events: list[dict[str, Any]], corrupt: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """逐条 dict 浅拷贝：调用方修改返回值（含事件体）不污染缓存。"""
+    return [dict(ev) for ev in events], [dict(entry) for entry in corrupt]
+
+
+def _cached_archive(
+    key: tuple[str, int, int, int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """命中返回缓存中的原始列表（调用方必须再拷贝后才能外传）。"""
+    with _ARCHIVE_CACHE_LOCK:
+        cached = _ARCHIVE_CACHE
+    if cached is not None and cached[0] == key:
+        return cached[1], cached[2]
+    return None
+
+
+def _store_archive_cache(
+    key: tuple[str, int, int, int],
+    events: list[dict[str, Any]],
+    corrupt: list[dict[str, Any]],
+) -> None:
+    """写入单条缓存（后写覆盖先写；只存解析成功结果）。"""
+    global _ARCHIVE_CACHE
+    with _ARCHIVE_CACHE_LOCK:
+        _ARCHIVE_CACHE = (key, events, corrupt)
+
+
+def _parse_archive_file(
+    path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """解析归档文件（不做缓存）；错误/损坏条目语义见 read_archive_events。"""
     events: list[dict[str, Any]] = []
     corrupt: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -118,6 +193,45 @@ def read_archive_events(
     return events, corrupt
 
 
+def read_archive_events(
+    store_dir: Path | str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """读取归档事件（去重保序）与损坏条目（task-ledger-archive-compact）。
+
+    - 按 event_id 去重（保留首次出现）：中断崩溃可能导致同一事件体同时落在
+      归档与活跃文件，读侧去重使重跑天然幂等；
+    - 损坏行跳过 + 结构化条目（行号为归档文件内物理行号，调用方叠加偏移上报，
+      与 ``corrupt_lines`` 同形）；
+    - 文件不存在 → ([], [])；
+    - 文件存在但不可读（OSError）→ ([], [archive_unreadable 条目])：调用侧
+      无从区分「无归档」与「归档不可读」会误判规模（task-enforcement-
+      degrade-audit-trail），故不可读单独留痕（E030 warning，不抛异常，
+      不改放行语义；双后端原样透传进 ``corrupt_lines``）。
+
+    进程内单条缓存（task-ledger-archive-cache）：以「解析后路径 + inode +
+    mtime_ns + size」为键，同一进程内重复读取同一未变化的归档只解析一次
+    （status 一次调用会读 9 遍）。命中时返回**逐条 dict 浅拷贝**，调用方修改
+    返回值不会污染缓存；缺失/不可读等负结果不缓存，避免固化瞬时故障。
+    ``ORCHD_DISABLE_ARCHIVE_CACHE=1`` 可整体关闭缓存，``clear_archive_cache()``
+    供测试与 compact 写后显式失效。
+
+    Returns:
+        ``(events, corrupt)``。
+    """
+    path = archive_path(store_dir)
+    key = _archive_cache_key(path)
+    if key is not None and not _archive_cache_disabled():
+        cached = _cached_archive(key)
+        if cached is not None:
+            return _copy_archive_events(cached[0], cached[1])
+    events, corrupt = _parse_archive_file(path)
+    unreadable = any(entry.get("kind") == "archive_unreadable"
+                     for entry in corrupt)
+    if key is not None and not unreadable and not _archive_cache_disabled():
+        _store_archive_cache(key, events, corrupt)
+    return _copy_archive_events(events, corrupt)
+
+
 def archive_event_count(store_dir: Path | str) -> int:
     """归档解析成功事件数（逻辑行号基数；损坏行不计）。"""
     events, _ = read_archive_events(store_dir)
@@ -152,6 +266,7 @@ def write_archive_events(
         os.fsync(f.fileno())
     _atomic_replace(tmp_path, path)
     _fsync_dir(path.parent)
+    clear_archive_cache()
     return path
 
 

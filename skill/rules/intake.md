@@ -51,7 +51,9 @@ guide:
 
 - **批量注册骨架**：摄入时一次 `amend --register` 把包内全部子卡（含最后的收口卡）以骨架定义注册（同 source 挂伞）。注册侧**不设串行门**——逐个注册（执行完一张才注册下一张）会与自动归档判据（引用任务全终态→归档）互斥：末张终态时下一张尚未注册即成空窗，伞被提前归档，后续注册 E025（2026-10-23 实测）。
 - **串行包 `serial_order` 信封（2026-10-24）**：`amend --register` 接受 `{tasks, serial_order, closeout}` 信封；`serial_order` 须为除唯一 closeout 外全部 id 的排列，注册时自动展开为链（首张 `[]`、第 N 张 `[N-1]`）并让 closeout 依赖全部子卡。要求同 source、全为新任务、各卡无非空显式 `depends_on`；旧数组含 closeout 时 closeout 必须显式覆盖全部子卡，否则拒绝注册。
+  - **`closeout` 是 id 字符串，不是任务对象**（task-feedback-register-fields-show，2026-10-31）：收口卡对象放在 `tasks[]` 内，`closeout` 只写其 `id`，且必须等于 `tasks[]` 中唯一的 `*-closeout` id。正例：`{"tasks":[{"id":"task-a",...},{"id":"task-a-closeout",...}],"serial_order":["task-a"],"closeout":"task-a-closeout"}`。把对象传给 `closeout` 会以 `E007 register_serial_closeout_missing` 拒绝（错误信息会点名缺 closeout id）。
 - **串行实现 + claim 侧引擎门**：同 source 任务卡**逐张 claim→闭环**，禁止并行领取。引擎门落 **claim 侧**（同 source 存在在手 / 在途任务 → 拒绝 claim 该 source 其他卡，新错误码；由停服施工单落地，本契约为口径真源）。E010 只看 `files_to_edit` 重叠，组内文件不重叠的卡由本门兜底。
+- **request 前置过滤（task-request-serial-source-pregate）**：同一判定抽为 `serial_busy_siblings` 单一谓词（`orchd/onboard/serial_source.py`），request 在文件冲突过滤后剔除忙态同源候选并入 `serial_blocked`（task_id / source / busy_siblings）；全部实现候选被剔除时返回 `candidate=null` + `next_action=wait` + `reason=serial_source_busy`，**不落回 none_ready**（后者文案是「所有任务已完成或被阻塞」，会被读成池空）。**边界**：request 是只读快照，request→claim 间状态可变（TOCTOU），**claim 侧 E041 仍是唯一强制点**；两会话并发 request 同 source 不同 pending 卡时，后 claim 者仍可能被拒——彻底消除需 request 阶段预约（未做，禁止据「已前置过滤」推断必可领）。
 - **实现前修订**：每张卡 claim 前若前序卡已改动相关现场，须先 `amend` 校正 `files_to_edit` / AC 再 claim（防定义失效——批量骨架定义基于拆解时现场，逐张实现时现场已漂移）。
 - **伞与归档**：idea 条目 pending 挂伞（E025 锚存活）；**收口卡最后 claim** → 写包收口清单 → 终态；引用任务全终态 → idea 条目自动归档。
 - **行为敏感任务人工硬阻断**：**行为敏感**类任务（典型：根 / 路径解析逻辑等改行为语义者）的**立卡**须**人工显式确认**后方可注册，禁止与其余任务一并自动注册。
@@ -66,7 +68,7 @@ guide:
 ### 阶段一·整理（agent，吸收原步骤 1 + 4）
 
 - 整理（原步骤 1）：本批摄入条目先统一整理——规范化表述、术语统一、单条单主题、推断项标注、原文可追溯（`goal:` 字段帮助判断拆解方向）
-- 一次产出完整任务定义草案：产物是完整任务定义草案（存放 `.orchd/proposals/<task_id>.json`，已被 .gitignore 忽略，过程产物不入库）。必填：id（`task-` 前缀、小写字母数字连字符）、name、brief、module、acceptance_criteria、files_to_edit；推荐补 depends_on 与 verify_command（见 rules/verify.md）；字段形态、连带声明与值域细则见附录 D
+- 一次产出完整任务定义草案：产物是完整任务定义草案（存放 `.orchd/proposals/<task_id>.json`，已被 .gitignore 忽略，过程产物不入库）。必填字段**唯一真源**是 `schema/_master.schema.json` 的 `tasks[].required`（当前 6 项：id（`task-` 前缀、小写字母数字连字符）、name、brief、module、acceptance_criteria、files_to_edit）——`amend --register` 直接读 schema 校验，仓内不再维护第二份清单；带 `default` 的字段（`depends_on`/`estimated_hours`/`requires`/`files_to_read`/`require_independent_review`/`max_attempts`/`exempt_files`/`additional_sources`）由注册按 schema 缺省值自动补齐。推荐补 verify_command（见 rules/verify.md）；字段形态、连带声明与值域细则见附录 D
 
 ### 阶段二·对账（＝批次内查重 + 与在池任务的冲突/依赖规划；agent + 引擎，吸收原步骤 2 + 3，位置移到草案之后）
 
@@ -87,7 +89,7 @@ guide:
 
 ## 附录 A：注册落盘细则（git 分支、干净判定与提交面）
 
-- 分支与干净守卫：仅在 main 且工作区干净时执行 `python .orchd/__main__.py amend`（**"工作区干净"判定：以无已跟踪文件改动为准，untracked 工具/配置文件（如 .workbuddy/、reasonix.toml）不阻塞 intake/amend/claim**；**intake-commit-enforcement（2026-08-14）**：摄入产物（IDEAS.md / IDEAS-archive.md / ROADMAP.md / _master.json）允许未提交态进入 amend，其余已跟踪改动 → E017 阻断注册）。
+- 分支与干净守卫：仅在 main 且工作区干净时执行 `python .orchd/__main__.py amend`（**"工作区干净"判定：以无已跟踪文件改动为准，untracked 工具/配置文件（如 .workbuddy/、reasonix.toml）不阻塞 intake/amend/claim**；**intake-commit-enforcement（2026-08-14）**：摄入产物（IDEAS.md / IDEAS-archive.md / ROADMAP.md / _master.json）允许未提交态进入 amend，其余已跟踪改动 → E017 阻断注册）；**amend 自 task-feedback-amend-runtime-gate 起与 claim/done 同受 session runtime 硬校验**：先 `session start` 并把 session_token 注入 `ORCHD_SESSION_ID`，无 runtime 的非空 token 会在写盘前 E033 拒绝（`--register` 与裸 amend 均适用）。
 - 提交面（原步骤 6 的④⑤）：成功后**立即提交** `.orchd/_master.json` 与当次 IDEAS.md 变更（引擎自动提交；commit 失败写入 commit_warning 可审计）——**ROADMAP.md 唯一源 = 宿主项目根且纳入 git**（flat=仓库根，container=`<容器>/main/`），随同次 amend/intake 提交；`.orchd/ROADMAP.md` 已非合法形态、不在提交范围，引擎 ensure_committed 对 gitignore 忽略路径自动剔除（见 rules/git.md）。
 - 输出与解析契约：规则真源见 `.orchd/SKILL.md`「输出契约」（定义不在本文件复述）；本域仅补充渲染细节：注册/摄入类命令在 JSON 响应之后会向 stderr 输出 `orchd ▸` 前缀 + 分隔线的「下一步」提示块，**仅供人看、勿当命令结果解析**。
 
@@ -108,6 +110,14 @@ guide:
 ## 附录 E：冲突校验、共享文件并行与在途可见性（原步骤 3 下沉）
 
 **2026-08-08 语义更新**：`amend` 冲突校验已降级为 warning（`conflict_warnings`，不再拒绝注册），冲突边界在 **request 依赖感知强制过滤**——与 **claimed** 非依赖任务冲突的候选被硬排除（`excluded_conflicts`）；与 **pending** 非依赖任务冲突的候选为**软提示**（2026-09-27 对齐实现 task-pass9-conflict-docs-align：响应 `candidate_conflicts` 注解 + 降权排序，**不排除**，串行化意图由拆解期 depends_on 规划执行）；依赖链（祖先/子孙）共享文件的任务放行（`conflict_with`）。**共享文件并行知情决策**（2026-08-06 实踩：6 任务并行共享 onboard.py/errors.py → code APPROVED 连续 merge 冲突）：共享引擎核心文件（orchd/onboard/ / orchd/gitops/ / orchd/cli/ / errors.py / spec.py / tests/*）的任务**默认 depends_on 串行化**；确需并行（多 agent 并发吞吐）时，必须在任务 notes 显式记录"并行理由 + 冲突风险"，不得静默并行——引擎已提供兜底（request excluded_conflicts + merge 自动化解，见 ROADMAP 1.1 L1/L3）。**2026-09-12 在途冲突可见性（task-inflight-conflict-visibility）**：「在途」= 分支上已有改动、尚未落 main 的任务（含 done / in_review / force-status 悬空态），**以 git 事实判定，与状态字段无关**——历史上仅按 `claimed` 判冲突，导致刚 done 尚未 merge 的任务逃出视野（实测数十秒盲区，随后在 merge 期才撞上）。在途重叠按 `config.conflict_policy` 分流：**缺省 `warn` = 仅 `conflict_with` 注解（在途条目含 `source=inflight`）+ 降权排序，不新增任何阻断**（拆解期无需为在途重叠额外串行化）；`serialize` / `block` 才把在途重叠候选硬排除。故本阶段的串行化要求仍聚焦 **claimed / pending 声明文件重叠**，在途重叠属"可见性提示"，不改变可领取性。
+
+**共享面收口（2026-11-04，task-shared-surface-\*）**：`CHANGELOG.md`、
+`file-census-baseline.json`、`docs/_generated/dependency-graph.md`、`conventions.md`、
+`user-manual.md`、`SKILL.md` 等共享面**不得再写进** `files_to_edit` / `exempt_files`：
+fragments 面（CHANGELOG）改由 done 交片段（`--changelog-category/--changelog-summary`
+或 `--surface-entry`），generated 面交给生成器，serial 面用 `depends_on` 串行；
+`surfaces list` 查看注册表；新增/修改声明被引擎硬拒时按提示迁移旧声明；确需并行 serial 面
+才用 `--allow-shared-write <path> --reason "<并行理由>"`（详见 [surfaces.md](surfaces.md)）。
 
 **任务拆解粒度启发式（锚点，防过度合并/过度拆分）**：
 

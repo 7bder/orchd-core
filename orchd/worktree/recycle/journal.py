@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -149,6 +150,23 @@ def _tx_journal_write(path: Path | None, payload: dict[str, Any]) -> bool:
     tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # task-debug-worktree-merge-hint：同任务只保留最新一份。tmp 名带 pid，
+        # 进程崩溃/被杀会留下 ``<task>.json.<pid>.tmp`` 孤儿——同一任务反复失败
+        # 就按 pid 累积，把 .recycle-journal 变成垃圾堆。写前清理**陈旧**残留：
+        # 只清 mtime 老于 60s 且非本进程的 tmp。无条件删会把同任务并发回收的另一
+        # 进程正在写的 tmp 删掉，使其 _atomic_replace 报 ENOENT → 静默降级为
+        # journal-less（丢重放保证且零留痕）。
+        _now = time.time()
+        _self_suffix = f".{os.getpid()}.tmp"
+        for _stale in path.parent.glob(f"{path.name}.*.tmp"):
+            try:
+                if _stale.name.endswith(_self_suffix):
+                    continue
+                if _now - _stale.stat().st_mtime < 60:
+                    continue
+                _stale.unlink(missing_ok=True)
+            except OSError:
+                pass
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False))

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import orchd
 
@@ -48,3 +49,27 @@ def terminal_attachable_fields() -> frozenset[str]:
 def task_schema_fields() -> frozenset[str]:
     """任务全部 schema 字段（真源：``properties.tasks.items.properties`` 键集）。"""
     return frozenset(_task_properties().keys())
+
+
+@lru_cache(maxsize=1)
+def _task_items() -> dict:
+    data = json.loads(_schema_path().read_text(encoding="utf-8"))
+    return data["properties"]["tasks"]["items"]
+
+
+@lru_cache(maxsize=1)
+def required_task_fields() -> frozenset[str]:
+    """``tasks[].required`` —— 注册必填字段唯一真源
+    （task-engine-defect-fix-unified-u8 AC1：代码不再硬编码第二份清单）。"""
+    return frozenset(_task_items().get("required") or ())
+
+
+@lru_cache(maxsize=1)
+def task_field_defaults() -> dict[str, Any]:
+    """schema 中带 ``default`` 的任务字段缺省值（注册时按真源补齐）。"""
+    props = _task_items().get("properties") or {}
+    return {
+        name: prop["default"]
+        for name, prop in props.items()
+        if "default" in prop
+    }

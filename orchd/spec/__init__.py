@@ -1,7 +1,10 @@
 """Orchd _master.json 加载、结构校验与跨引用校验（聚合入口）。
 
 W4 起本包按域拆分，本文件只做**重导出**（无任何实现）：
-- ``spec/declarations.py``：连带文件自动登记（E026 推导 / 越界分诊白名单 / 目录式声明检出）
+- ``spec/declarations.py``：连带文件自动登记（E026 推导 / 越界分诊白名单 / 目录式声明检出）；
+  声明路径磁盘事实（path_state 四态分类）经本模块重导出
+- ``spec/path_state.py``：声明路径磁盘事实四态分类（exists / untracked-new /
+  tracked-deleted / ghost）、claim 预检预警与 git 索引探测
 - ``spec/schema.py``：JSON Schema 版本解析、加载、校验器构建与缺依赖降级
 - ``spec/structure.py``：ValidationError / Master / load_master / 结构校验与阶段值域检查
 - ``spec/references.py``：跨引用完整性校验（ID 唯一性 / 引用存在性 / DAG 无环）
@@ -33,6 +36,7 @@ from __future__ import annotations
 from orchd.spec.declarations import (
     derive_related_test_file,
     derive_related_test_files,
+    derive_related_test_files_wide,
     detect_dir_or_glob_declarations,
     is_concession_file,
     is_path_covered,

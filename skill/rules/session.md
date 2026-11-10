@@ -8,6 +8,11 @@ guide:
   claimed_impl: 1
   changes_requested: 2
   warning_unmapped: 1
+  handoff: 1
+  takeover: 1
+  show_resume: 2
+  session_adopt: 2
+  agents_card_update: 1
 ---
 # Session 规则（状态检查 / 接管 / 优先级 / claim 细节）
 
@@ -32,7 +37,7 @@ guide:
   1. 查 ledger 断点（用 python 替代 grep|tail，跨平台无 POSIX 工具依赖）：`python -c "import pathlib; ls=[l for l in pathlib.Path('.orchd/_ledger.jsonl').read_text(encoding='utf-8').splitlines() if '<task_id>' in l]; print(chr(10).join(ls[-10:]))"`——确认实现进行到哪一步（已提交？已 done？）
   2. **清理僵死锁**：`.orchd/.session.lock` 超 60min → 按 L2 watchdog 语义释放（`python .orchd/__main__.py watchdog --timeout 0` 或 Python 删除）；**僵死 `.git/index.lock` 不要手动删**（红线 3：不触 `.git/`）——引擎在下一次 git 写操作前内建清理（`_clean_stale_index_lock`）；持续阻塞则按异常报告等待处置
   3. **确认实现完整性**：检查 task 分支是否有已提交实现（`git log task/{id}`）；工作区未提交改动若属于该任务 files_to_edit → 提交到 task 分支（不丢实现）
-  4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）。**前提（E034 撤认归属守卫）**：跨 agent 撤认他人事件仅当目标认领已超时（僵尸）时放行——`CLAIMED` 超时阈值 `claim_stale_timeout_s()`（默认 **600s**，`ORCHD_CLAIM_STALE_SECS` 可覆盖）、`REVIEW_CLAIMED` 超时阈值 `review_stale_timeout_s()`（`ORCHD_REVIEW_STALE_SECS` 可覆盖）；**未超时撤认他人 CLAIMED 会被 E034 拒绝**（仅事件作者本人或 admin 可撤），此时应等待其退出或走 `force-status` 控制面，不得重试硬撤。另注意：`retract` 默认 `disposition=abandon` 触发 **300s 认领冷却**（`_RETRACT_COOLDOWN_S`），冷却期内重新 `claim` 被拒，需加 `--force` 绕过；`disposition=retry` / `handoff` 不触发冷却。
+  4. **retract 原 claim**：`python .orchd/__main__.py retract --event <CLAIMED 事件 id> --reason "中断接管"`（身份由引擎自动识别当前会话指纹）。**前提（E034 撤认归属守卫）**：跨 agent 撤认他人 CLAIMED / REVIEW_CLAIMED 时，引擎先解析目标事件的 session runtime 状态——`active`（active=true 且未过 TTL）→ **恒 E034 拒绝**（即使认领已超龄），提示“长实现无引擎写操作不等于僵尸”，应等待其退出或由事件作者撤回；`inactive` / `expired` → 放行；`missing`（runtime 缺失）/ `unknown`（runtime 不可解析）→ 保留年龄兜底：`CLAIMED` 超时阈值 `claim_stale_timeout_s()`（默认 **600s**，`ORCHD_CLAIM_STALE_SECS` 可覆盖）、`REVIEW_CLAIMED` 超时阈值 `review_stale_timeout_s()`（默认 **300s**，`ORCHD_REVIEW_STALE_SECS` 可覆盖），超时才放行，未超时仍 E034。事件作者本人与 admin 恒可撤（admin 无认证属既有缺陷 P2-11）。另注意：`retract` 默认 `disposition=abandon` 触发 **300s 认领冷却**（`_RETRACT_COOLDOWN_S`），冷却期内重新 `claim` 被拒，需加 `--force` 绕过；`disposition=retry` / `handoff` 不触发冷却。
   5. **重新 claim**：`python .orchd/__main__.py claim --task <id> --confirm`（身份由引擎自动识别当前会话指纹；或按用户指示）
   6. **继续**：从 ledger 断点继续（已实现 → done；未完成 → 补实现）
 - **禁忌**：不得跳过 retract 直接 done（E007 agent 不匹配）；不得丢弃原 agent 的已提交实现（先确认再接管）
@@ -76,12 +81,13 @@ guide:
 agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈希，如 `a1b2c3d4e5f6`），由宿主注入的每对话唯一会话标识派生（`orchd.ledger.resolve_agent_id`）。
 
 - **会话生命周期**：`orchd session start [--agent NAME]` 生成唯一 `session_id` 与 `session_token`，写入 `.orchd-runtime/sessions/<session_id>.json`；宿主把 `session_token` 注入 `ORCHD_SESSION_ID`，该会话内所有命令恒同身份。`session current` 查看当前会话；`session end` 结束会话并释放会话锁（flock 活性锁，进程异常退出后引擎自动清理，无需手工清锁）。
-- **宿主接入**：TRAE 会话由 `ICUBE_CODEMAIN_SESSION` 自动搬运到 `ORCHD_SESSION_ID`（开箱即用）；codex / opencode / workbuddy 等由各自接入层在会话启动时调用 `orchd session start` 并把 session_token 写入 `ORCHD_SESSION_ID`。
+- **宿主接入**：TRAE 旧接入把 `ICUBE_CODEMAIN_SESSION`（项目级会话码，非会话级 session_token）直搬到 `ORCHD_SESSION_ID`，该值没有对应 `sessions/<session_id>.json`，只能跑只读命令；codex / opencode / workbuddy 等接入层须在会话启动时调用 `orchd session start`，把返回的 session_token 写入 `ORCHD_SESSION_ID`（写命令必需）。**审查会话例外**：审查 subagent 不适用本条——其会话身份由引擎在 `done` 成功时 mint 并随 `review_handoff` 交接，宿主只把 `prompt` 原样转交。
 - **`.agent_id` 已废除**：引擎不再读写该文件，未注入 `ORCHD_SESSION_ID` 时不生成、不借用、不落盘任何身份（写命令拒绝并提示先 `session start`；只读命令可匿名运行）。存量历史 `.agent_id` 文件不再参与身份判定。
+- **写命令 runtime 硬校验（task-feedback-session-runtime-gate；task-feedback-amend-runtime-gate 起含 amend）**：`claim` / `done` / `review` / `retract` / `force-status` / `lessons` 写与 `amend`（含 `--register`、裸 amend、`--task` 补登）共用同一谓词——`sessions/<session_id>.json` 必须存在、`active`、未过 TTL；缺失 / 停用 / 过期分别返回 E033 `session_not_found` / `session_inactive` / `session_expired`。只注入 `ORCHD_SESSION_ID` 而不 `session start` 的旧接入会被拒绝；只读 `status` / `request` / `validate` 不受影响。
 - **会话级判定**：归属 / 忙度 / 自审 / 锁所有权均以 `session_id` 为主键；同 agent 不同 session 视为不同身份，可并行领取不同任务。
-- **指纹生命周期**：同一对话内指纹与 `session_id` 永不变；不同对话（不同 `ORCHD_SESSION_ID` / 不同 session runtime）返回不同指纹。切换对话即可获得新身份——这是「换对话领 review」的机制保证。
-- **宿主注入契约**：`ORCHD_SESSION_ID` 最好是 `session start` 返回的 `session_token`；若宿主自行注入，必须是**会话级**标识——每个对话启动时生成唯一值，并在该对话所有命令中保持不变。项目级/工作区级或其他跨对话共享的标识不符合契约。判定标准：同一对话命令得到同一指纹，不同并行对话即使位于同一项目/工作区也必须得到不同指纹。
-- **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，造成任务归属混淆、E011 单任务忙度冲突、E016 自审纠缠。发现同指纹并行时应先核对宿主注入粒度并切换到正确的会话级标识，不得通过伪造 agent ID 绕过身份校验。
+- **指纹生命周期**：同一对话内指纹与 `session_id` 永不变；不同对话（不同 `ORCHD_SESSION_ID` / 不同 session runtime）返回不同指纹。异指纹只是 `E016` 的**下限**，不构成领审资格——审查资格由「执行上下文是否为本会话主动 spawn 的独立 subagent」决定；实现会话给自己刚做的实现走「身份切换旁路」领审属三条禁止（见 rules/review.md「审查者身份约定」）。
+- **宿主注入契约**：`ORCHD_SESSION_ID` 的**唯一合法来源**是 `session start` 返回的 `session_token`——宿主接入层在每个**实现/宿主对话**启动时调用一次 `session start`，把返回的 token 注入该对话后续的所有命令；引擎据此确定性派生 `session_id`/指纹。**审查会话例外**：审查 subagent 的身份来自 `done` 响应的 `review_handoff.session_token`，宿主不另建会话身份、不重复启动。**不存在「宿主自行编造会话级标识」的旁路**：自造值、项目级/工作区级值没有对应的 `sessions/<session_id>.json`，写命令一律 E033（`session_not_found`；`session_identity_missing` / `session_inactive` / `session_expired` 同理）；复用他人有效 token 属三条禁止的策略违规（身份切换旁路），由 lineage/E016 与审计处置，**不是** E033。因此「会话级注入粒度」由 token 天然保证（每次 `session start` 唯一），判定标准不变：同一对话命令得到同一指纹，不同并行对话即使位于同一项目/工作区也必须得到不同指纹。
+- **宿主违约后果**：多个对话共享项目级指纹时，引擎会把并行工作误判为同一身份，造成任务归属混淆、E011 单任务忙度冲突、E016 自审纠缠。发现同指纹并行时应先核对宿主注入粒度，并在接入层调用 `session start` 取 token 后注入，不得通过伪造 agent ID 绕过身份校验。
 - **E021 豁免**：12 位 hex 形态的 agent_id 视为自动化会话身份，不与人名 `git user.name` 硬比对，`claim` / `done` / `review` 不触发 E021 `identity_mismatch` warning。
 - **指纹 vs 具名身份**：宿主受管自动化会话用指纹作身份锚定；具名 agent 身份（如 `marvis-1`、`workbuddy-1`）用于人工可追溯场景。
 
@@ -93,4 +99,4 @@ agent 会话用**会话级指纹**作为身份 id：12 位 hex（SHA-256 短哈�
 - **在握任务不因 session 过期自动回收**：过期仅报告（`stale_sessions` / `stale_claims`，reason=missing_runtime/inactive/session_expired），默认不释放；需接管时显式 `--takeover`（经 `force-status → pending`），回池后重新 claim。
 - **一键取号**：`python .orchd/__main__.py session start` 返回 token，执行其 `inject_action`（PowerShell：`$env:ORCHD_SESSION_ID="<token>"`；bash：`export ORCHD_SESSION_ID="<token>"`）即完成注入；`session current` 复用 token，无需重复 start。
 - **读路径顺手卫生**：`status` / `watchdog` 会清理**账本判死**（`last_seen` 超 TTL 或 `active=false`）的 session 文件与 orphan session lock——久置未操作后会话消失属正常，直接重 `session start` 即可（勿当事故）。活跃会话（TTL 内或持 live flock）的身份文件不会被顺手清掉。
-- **自审默认阻断与分级策略**（task-self-review-independence-policy，D7 裁定；task-review-independence-enforce 落地字段级强制；2026-10-23 engine-discipline-hardening 翻转缺省）：CLI 缺省 `config.enforce_self_review_block=true`，claim review 时实现指纹 == 当前指纹即 `E016 self_review_blocked` 拒绝（request 候选亦排除自审任务），唯一出路 = 起独立 subagent / 换新会话（新指纹）；仅显式 `config.enforce_self_review_block=false` 才退回提示档（认领结果附 `self_review_notice`、request 候选标注 `is_self_review`），退回时须首句披露（详见 rules/review.md）。**分级建议（非强制，2026-09-19 按用户裁决收口）**：引擎语义 / 门禁行为变更 / 错误码语义 / 状态机类任务**建议**换一个独立会话（不同指纹）担任审查者；低风险任务（纯文档 / 纯测试 / 不触及上述类别的局部实现）可自审（仍受缺省阻断约束，须显式 opt-out）。**字段级强制（B1，task-review-independence-enforce 已落地，不再是“建议”）**：任务 `require_independent_review=true` 时 E016 硬阻断 + request 排除，与全局开关 OR——调度者给高危任务置该字段即获强制异指纹。**退回提示档自审必附三项披露（流程纪律）**：① review comments 首句披露自审（`实现者 = 审查者 = <指纹>`）② 证伪性探针（主动构造反例/边界并记录结果）③ 全量回归证据（verify_command 全绿 + 触及测试链路时重跑定向测试）。完整建议表与可执行命令示例见 `shared/conventions.md`「审查者 ID 约定与分级自审策略」。
+- **自审恒阻断与审查 lineage 硬门**（2026-11-02 review-subagent-hard-block P0 收口；口径真源 rules/review.md「审查者身份约定」）：claim review 时实现指纹 == 当前指纹即 `E016 self_review_blocked` 拒绝（submit 侧复判一次），request 候选与 review_priority 恒排除自审任务；**无任何降级档**——config 级与任务级开关已从引擎删除。审查者会话须 `kind=reviewer` 且 `parent_session_id` = 该任务最后一次 DONE 的会话 id（该会话由引擎在 `done` 成功时 mint 并随 `review_handoff` 交接，宿主把 `prompt` 原样交给 subagent 即可；DONE 事件 `agent_id=claimed_by`、`session_id`=执行 done 的调用方会话，故 expected parent 即执行 done 的实现会话），缺失/伪造同样 E016（`details.reason` ∈ `lineage_missing` / `kind_not_reviewer` / `lineage_mismatch`；claim 与 submit 双检）；旧账本 DONE 缺 session_id 时 fail-closed，仅无引擎身份的 SDK 直连不判定（CLI 写命令在更早 E033 拦截）。**三条禁止**（自铸 session token 自用 / 手设 `ORCHD_SESSION_ID` / 复用他人 token）与「无 subagent 能力即 `retract` 后停止并上报」不变；审查 comments 首句写明 subagent 来源（`实现会话 <指纹> spawn 的独立 subagent，审查指纹 <指纹>`）。引擎语义 / 门禁行为 / 错误码语义 / 状态机类任务一律由当前会话 spawn 的独立 subagent 审查，无例外。

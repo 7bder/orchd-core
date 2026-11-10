@@ -236,12 +236,72 @@ def archive_ideas_before_master_archive(
         "error",
         "deduped",
         "commit",
+        "rolled_back",
+        "rollback_reason",
+        "rollback_error",
         "deferred_comment_unbalanced",
         "comment_hidden_candidate",
         "comment_unclosed_at",
     ):
         if key in first:
             result[key] = first[key]
+    return result
+
+
+#: 需要把 IDEAS 文档还原到写盘前快照的提交失败原因（task-cont-archive-commit-rollback）。
+_ARCHIVE_ROLLBACK_COMMIT_REASONS = frozenset({
+    "commit_failed",
+    "commit_timeout",
+    "commit_error",
+})
+
+
+def _snapshot_workspace_docs(project_root: Path) -> dict[str, bytes | None]:
+    """归档写盘前快照 IDEAS.md / IDEAS-archive.md 的字节（缺失记为 None）。"""
+    from orchd.ledger import resolve_workspace_root
+
+    ws_root = resolve_workspace_root(project_root)
+    snapshot: dict[str, bytes | None] = {}
+    for name in (IDEAS_FILE, IDEAS_ARCHIVE_FILE):
+        path = ws_root / name
+        snapshot[str(path)] = path.read_bytes() if path.is_file() else None
+    return snapshot
+
+
+def _restore_workspace_docs(snapshot: dict[str, bytes | None]) -> tuple[list[str], list[str]]:
+    """把文档还原成快照字节；快照为 None 的本次新建文件直接删除。
+
+    Returns:
+        ``(restored, errors)``——``errors`` 非空表示回滚未完整完成，调用方须留痕。
+    """
+    restored: list[str] = []
+    errors: list[str] = []
+    for path_str, data in snapshot.items():
+        path = Path(path_str)
+        try:
+            if data is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                path.write_bytes(data)
+            restored.append(path.name)
+        except OSError as exc:
+            errors.append(f"{path.name}: {type(exc).__name__}: {exc}"[:300])
+    return restored, errors
+
+
+def _attach_archive_rollback(
+    result: dict[str, Any],
+    snapshot: dict[str, bytes | None],
+    reason: str,
+) -> dict[str, Any]:
+    """回滚本次归档写盘并附加 ``rolled_back`` / ``rollback_reason``。"""
+    restored, errors = _restore_workspace_docs(snapshot)
+    result["rolled_back"] = not errors
+    if not errors:
+        result["rollback_reason"] = reason
+    else:
+        result["rollback_error"] = {"restored": restored, "errors": errors}
     return result
 
 
@@ -322,16 +382,34 @@ def _maybe_archive_ideas(orchd_dir: Path, master_path: Path | None = None) -> di
         return _archive_error_result("load_master", exc)
     project_root = orchd_dir.parent
     try:
+        snapshot = _snapshot_workspace_docs(project_root)
+    except Exception as exc:
+        return _archive_error_result("snapshot", exc)
+    try:
         result = archive_resolved_ideas(project_root, master)
     except Exception as exc:
         if _orchd_source_recycled():
             return _archive_ideas_via_subprocess(orchd_dir)
-        return _archive_error_result("archive", exc)
+        outcome = _archive_error_result("archive", exc)
+        return _attach_archive_rollback(outcome, snapshot, "archive_error")
+    if result.get("skipped") == "write_error":
+        # 半写态（归档件已落、IDEAS.md 回写失败）必须还原，避免两文档互相矛盾。
+        return _attach_archive_rollback(result, snapshot, "write_error")
     if degraded:
         # 降级必须可审计：否则「这条本来该归档的为什么没归档」重新变成人肉排查。
         result["archive_degraded"] = degraded
     if result.get("archived"):
-        result["commit"] = _commit_archived_ideas(project_root)
+        commit = _commit_archived_ideas(project_root)
+        result["commit"] = commit
+        if (
+            commit.get("performed") is False
+            and commit.get("reason") in _ARCHIVE_ROLLBACK_COMMIT_REASONS
+        ):
+            # commit 被拒 / 超时 / 异常时文件仍在工作区（index 已由 commit 层回滚），
+            # 还原字节并删除本次新建文件，不留 staged 残留（AC2）。
+            _attach_archive_rollback(
+                result, snapshot, str(commit.get("reason") or "commit_failed")
+            )
     return result
 
 

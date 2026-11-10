@@ -29,6 +29,7 @@ from .write import (
     _nogit_payload,
     _proxy_commit,
     _proxy_merge,
+    _proxy_merge_continue,
     _write_rejection,
 )
 
@@ -91,5 +92,7 @@ def run_git_proxy(
         return _proxy_commit(root, args, cls)
     if cls["kind"] == "merge":
         return _proxy_merge(root, args, cls)
+    if cls["kind"] == "merge_continue":
+        return _proxy_merge_continue(root, args, cls, orchd_dir=orchd_dir)
 
     raise _write_rejection(args, cls, agent_id)

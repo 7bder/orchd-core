@@ -22,7 +22,11 @@ from orchd.pool import detect_file_conflict
 from orchd.review import extract_review_comments as _extract_review_comments
 
 from .execute import _claim_setup_worktree, _claim_write_event
-from .precheck import _check_master_uncommitted, _claim_precheck
+from .precheck import (
+    _check_master_uncommitted,
+    _claim_precheck,
+    _declaration_path_warnings,
+)
 from .review_face import _claim_review_branch
 from .scope import (
     _extract_previous_changes,
@@ -41,15 +45,15 @@ def claim(
     shared: dict[str, Any] | None = None,
     review_type: str | None = None,
     with_context: bool = False,
-    enforce_self_review_block: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
-    task_def, role, session_id, degraded_guards, auto_checkout, trunk_restore = (
-        _claim_precheck(store, tasks, agent_id, task_id, role, project_root,
-                        review_type, enforce_self_review_block))
+    (task_def, role, session_id, degraded_guards, auto_checkout, trunk_restore,
+     verify_preview) = _claim_precheck(
+         store, tasks, agent_id, task_id, role, project_root, review_type,
+         force=force)
     event, state, derived, integrity_warnings, is_self_review = _claim_write_event(
         store, tasks, agent_id, task_id, task_def, role, session_id, review_type,
-        enforce_self_review_block, project_root, force=force)
+        project_root, force=force)
     worktree_path = None
     degraded_warning = None
     if role == "implementer" and project_root:
@@ -60,9 +64,11 @@ def claim(
     if role == "reviewer":
         rb = _claim_review_branch(
             store, task_id, task_def, project_root, role, derived, review_phase,
-            is_self_review, event, degraded_guards, shared,
-            enforce_self_review_block=enforce_self_review_block)
+            is_self_review, event, degraded_guards, shared)
         if rb is not None:
+            # task-engine-defect-fix-unified-u7：claim 响应统一带 verify 预演
+            # （审查认领亦回显，便于审查者核对 verify 目标是否就绪）。
+            rb.setdefault("verify_preview", verify_preview)
             if auto_checkout is not None:
                 # task-review-auto-checkout：reviewer 分支提前返回前挂载，
                 # 与 checked_out_main 往返对称。
@@ -87,6 +93,9 @@ def claim(
     ]
     # task-amend-scope-add：claim 连带文件预警（与 claim_preview 共用 build_scope_warning 单一来源）
     scope_warning = build_scope_warning(task_def, project_root=project_root)
+    # task-engine-defect-fix-unified-u1：声明路径的磁盘事实预警（path_state 单一
+    # 来源产出；ghost 带 amend 撤回出路，tracked-deleted 提示删除目标）。
+    declaration_warnings = _declaration_path_warnings(task_def, project_root)
     result = {
         "claimed": True, "task": task_def,
         "files_to_read": files_to_read,
@@ -99,6 +108,11 @@ def claim(
     }
     if scope_warning:
         result["scope_warning"] = scope_warning
+    if declaration_warnings:
+        result["declaration_warnings"] = declaration_warnings
+    # task-engine-defect-fix-unified-u7 AC2：claim 响应新增 verify_preview
+    # （classification / hint；expected_pending 提示「先创建 verify 目标文件」）。
+    result["verify_preview"] = verify_preview
     if role == "implementer" and worktree_path is not None:
         result["worktree_path"] = worktree_path
     if integrity_warnings:

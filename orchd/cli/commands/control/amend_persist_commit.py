@@ -19,6 +19,7 @@ def _amend_persist_commit(
     register_path: str | None,
     changed: list[str],
     project_root: Path,
+    register_warnings: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """amend 落盘段：master 持久化 + 提案消费 + 自动提交与告警（原 L1065-1134）。
 
@@ -111,4 +112,6 @@ def _amend_persist_commit(
                          "巡检未提交摄入产物，或运行 'orchd intake' 手动提交"),
             }
 
+    if register_warnings:
+        result["register_warnings"] = register_warnings
     return result, proposal_consumed

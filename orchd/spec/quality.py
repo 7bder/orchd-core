@@ -20,7 +20,15 @@ from orchd.contracts.task_schema import (
     VERIFY_COMMAND_FIELD,
 )
 from orchd.errors import ErrorCode
-from orchd.spec.declarations import derive_related_test_files
+from orchd.spec.declarations import (
+    PATH_STATE_EXISTS,
+    PATH_STATE_GHOST,
+    PATH_STATE_TRACKED_DELETED,
+    declared_path_exists,
+    derive_related_test_files_wide,
+    git_tracked_files,
+    path_state,
+)
 from orchd.spec.quality_terms import (
     _DECL_COUNT_RE,
     _GRANULARITY_MAX_AC,
@@ -129,6 +137,23 @@ def validate_quality(
         if _term_corpus is None:
             _term_corpus = _build_term_corpus(project_root) if _term_candidates else ""
         return _term_corpus
+
+    # task-engine-defect-fix-unified-u1 AC3：E026 消费 declarations.path_state 的
+    # 单一四态分类——tracked-deleted（声明的是删除目标）不要求配套测试；ghost
+    # （磁盘不存在且未被跟踪）保持预警并附撤回出路。"跟踪索引"只在首次遇到磁盘
+    # 缺失的声明路径时拉一次（git 子进程开销量级与一次校验相同），全存在时零开销；
+    # git 不可用则降级为 exists/ghost 两态（tracked-deleted 退化为 ghost，仍有提示）。
+    _decl_tracked: set[str] | None = None
+    _decl_tracked_ready = False
+
+    def _decl_state(decl_path: str) -> str:
+        nonlocal _decl_tracked, _decl_tracked_ready
+        if declared_path_exists(decl_path, project_root):
+            return PATH_STATE_EXISTS
+        if not _decl_tracked_ready:
+            _decl_tracked_ready = True
+            _decl_tracked = git_tracked_files(project_root)
+        return path_state(decl_path, project_root, tracked_files=_decl_tracked)
 
     for i, t in enumerate(tasks):
         tid = t.get(ID_FIELD, "")
@@ -370,13 +395,27 @@ def validate_quality(
         if terminal:
             continue
         for fe in files_edit:
+            # task-engine-defect-fix-unified-u1 AC3：删除目标（tracked-deleted）
+            # 不要求配套测试——声明删除的文件无需 test_ 连带；ghost 仍提示。
+            _fe_state = _decl_state(fe)
+            if _fe_state == PATH_STATE_TRACKED_DELETED:
+                continue
             # task-e026-related-test-candidates：同 stem 全部候选逐一预警——
             # 任一未声明即一条 warning（control.py 域声明 test_cli_control.py
             # 后仍提示 test_control.py），同域多候选不再漏报。
-            for expect_test in derive_related_test_files(fe, tests_root):
+            # task-decl-subpackage-test-anchor：E026 用**宽口径**（窄两档 + 父包链/
+            # 一级包回退）——拆包后的子包文件其真实覆盖在域级测试里，宽口径负责把
+            # 「该声明哪个测试」在事前提示出来；而 done 自动放行仍走窄口径
+            # （is_concession_file 不放宽，红线 #3 护栏不下降）。
+            for expect_test in derive_related_test_files_wide(fe, tests_root):
                 if (expect_test not in files_edit
                         and expect_test not in exempts
                         and any(f.startswith("tests/") for f in files_edit)):
+                    _ghost_hint = (
+                        "；该声明路径在磁盘不存在且未被 git 跟踪——若是待新建文件"
+                        "可忽略，否则可用 amend 撤回 ghost 声明"
+                        "（--remove-files-to-edit <path>）"
+                        if _fe_state == PATH_STATE_GHOST else "")
                     errors.append(
                         ValidationError(
                             code=ErrorCode.E026,
@@ -384,7 +423,7 @@ def validate_quality(
                             message=(
                                 f"task '{tid}' 修改 {fe} 但对应测试 {expect_test} 未在 "
                                 "files_to_edit 或 exempt_files 声明（必要连带文件须声明，"
-                                "否则 E020 hook 会拦截）"),
+                                "否则 E020 hook 会拦截）" + _ghost_hint),
                         ))
 
     return errors

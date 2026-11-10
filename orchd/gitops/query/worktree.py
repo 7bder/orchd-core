@@ -60,12 +60,14 @@ def main_worktree_root(project_root: Path) -> Path:
     if ckey is not None and ckey in _PROBE_CACHE:
         return _PROBE_CACHE[ckey]
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+        # G1 收敛（task-guard-drift-b2-g1-converge）：归因实测 --git-common-dir
+        # 第二大调用点（1562 次/37.8s，rc=128 占 55%），改走 _run_git probe memo；
+        # 站点级 main_root 缓存（含确定性失败缓存）原样保留，语义不变。
+        from orchd.gitops._run import _run_git
+
+        proc = _run_git(
+            project_root,
+            ["rev-parse", "--git-common-dir"],
             timeout=_GIT_TIMEOUT,
         )
         if proc.returncode != 0:
@@ -96,12 +98,13 @@ def is_task_worktree(project_root: Path) -> bool:
     非 git / 解析失败返回 False（best-effort）。
     """
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+        # G1 收敛（task-guard-drift-b2-g1-converge）：--git-dir 第三大调用点
+        # （1386 次/32.0s），改走 _run_git probe memo；best-effort 语义不变。
+        from orchd.gitops._run import _run_git
+
+        proc = _run_git(
+            project_root,
+            ["rev-parse", "--git-dir"],
             timeout=_GIT_TIMEOUT,
         )
         if proc.returncode != 0:

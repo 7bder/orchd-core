@@ -40,12 +40,15 @@ def _git_toplevel(project_root: Path) -> Path | None:
     if _PROBE_CACHE is not None and ckey is not None and ckey in _PROBE_CACHE:
         return _PROBE_CACHE[ckey]
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+        # G1 收敛（task-guard-drift-b2-g1-converge）：--show-toplevel 最大调用点
+        # （1185 次/31.0s），改走 _run_git probe memo；站点级 toplevel 缓存
+        # （含 None 值缓存）原样保留。惰性导入同本文件 query.cache 既有口径
+        # （worktree 不在顶层依赖 gitops，避免循环）。
+        from orchd.gitops._run import _run_git
+
+        proc = _run_git(
+            project_root,
+            ["rev-parse", "--show-toplevel"],
             timeout=_GIT_TIMEOUT,
         )
         value: Path | None = None
@@ -94,12 +97,14 @@ def _git_common_dir(project_root: Path) -> Path | None:
     except OSError:
         pass
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+        # G1 收敛（task-guard-drift-b2-g1-converge）：就地取证失败后的 git 兜底
+        # 改走 _run_git probe memo（与 query/worktree.py:63 同命令同根共享缓存）；
+        # WARN 留痕与降级语义不变。惰性导入同 _git_toplevel 口径。
+        from orchd.gitops._run import _run_git
+
+        proc = _run_git(
+            project_root,
+            ["rev-parse", "--git-common-dir"],
             timeout=_GIT_TIMEOUT,
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:

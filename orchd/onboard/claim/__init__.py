@@ -30,7 +30,6 @@ from .precheck import (
 )
 from .review_face import (
     _attach_verify_head_drift,
-    _build_self_review_notice,
     _claim_review_branch,
     _reconcile_mergeability,
     _resolve_review_worktree,
@@ -39,6 +38,8 @@ from .run import claim
 from .execute import (
     _claim_setup_worktree,
     _claim_write_event,
+    _owns_review,
+    _owns_task,
 )
 from .scope import (
     _SCOPE_FILE_RE,
@@ -52,7 +53,6 @@ __all__ = [
     "_SCOPE_FILE_RE",
     "_attach_verify_head_drift",
     "_branch_degraded_guard",
-    "_build_self_review_notice",
     "_check_master_uncommitted",
     "_check_retract_cooldown",
     "_claim_precheck",
@@ -63,6 +63,8 @@ __all__ = [
     "_is_high_risk",
     "_reconcile_mergeability",
     "_resolve_review_worktree",
+    "_owns_review",
+    "_owns_task",
     "build_scope_warning",
     "claim",
 ]

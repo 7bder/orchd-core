@@ -15,6 +15,7 @@ import json
 
 from datetime import datetime, timezone
 from orchd.contracts.events import (
+    EVENT_RETRACT,
     STATUS_PENDING,
     TERMINAL_STATUSES,
     normalize_event,
@@ -22,9 +23,10 @@ from orchd.contracts.events import (
 )
 from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger.events import _event_target_status
-from orchd.ledger.identity import _touch_session_last_seen
+from orchd.ledger.session import _touch_session_last_seen
 from orchd.ledger.store_types import TaskState, _CHECKPOINT_SCHEMA_VERSION
 from orchd.lockfile import _depth_registry
+from orchd.storage import SQLITE_DB_FILENAME
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -212,11 +214,18 @@ class _StoreWriteMixin:
 
         self.backend.save_checkpoint(checkpoint)
 
-    def compact_archive(self, *, dry_run: bool = False) -> dict[str, Any]:
+    def compact_archive(
+        self, *, dry_run: bool = False, min_prefix_ratio: float | None = None,
+    ) -> dict[str, Any]:
         """压实：终态任务事件归档至共享归档文件（task-ledger-archive-compact）。
 
         前缀闭包规则：逻辑事件流（归档去重 + 活跃后缀）自头起的最大连续段，
-        其中每条满足「task_id 为空」或「所属任务当前终态（completed/cancelled）」。
+        其中每条满足「task_id 为空」或「所属任务当前终态（completed/cancelled）」
+        或「该事件已被 RETRACT 撤回」或「事件本身是 RETRACT」；首个不满足即停。
+        （task-ledger-compact-retracted-prefix：撤回事件不参与状态派生——被撤回
+        事件被 replay 跳过、RETRACT 在任务初始化前处理——不构成活跃状态，故可
+        与终态任务同档搬运；缺失该豁免时，事件被全撤回而 TaskState 整条消失的
+        任务既非 completed 亦非 cancelled，会把前缀永久钉死在其首条事件上。）
         已归档 event_id 直接跳过（不重复搬运）；首个不满足即停（其后纵有终态
         事件亦不动——前缀性保证读合并恒为"归档+活跃"拼接，无需索引）。
         RETRACT 事件按 task_id 同规则纳入（两遍收集与重建均经透明读，
@@ -233,6 +242,8 @@ class _StoreWriteMixin:
 
         Args:
             dry_run: 只计算搬运计划（prefix/stats），不写任何文件、不删 journal。
+            min_prefix_ratio: 自动压实的前缀门；可新搬事件占活跃事件比例低于
+                该值时返回 ``status=skipped/reason=prefix_ratio`` 且不动盘。
 
         Returns:
             ``{"moved_events", "archived_tasks", "active_before/after": {"lines",
@@ -244,12 +255,18 @@ class _StoreWriteMixin:
         store_dir = resolve_store_dir(self.orchd_dir)
         self.acquire_lock()
         try:
-            return self._compact_archive_locked(store_dir, dry_run=dry_run)
+            return self._compact_archive_locked(
+                store_dir, dry_run=dry_run, min_prefix_ratio=min_prefix_ratio,
+            )
         finally:
             self.release_lock()
 
     def _compact_archive_locked(
-        self, store_dir: Path, *, dry_run: bool
+        self,
+        store_dir: Path,
+        *,
+        dry_run: bool,
+        min_prefix_ratio: float | None = None,
     ) -> dict[str, Any]:
         from orchd.storage import (
             compact_journal_path,
@@ -265,6 +282,15 @@ class _StoreWriteMixin:
             if ts.status in TERMINAL_STATUSES
         }
         events = self._read_ledger_lines(from_line=1)
+        # 撤回集合：已撤回事件不参与状态重放（replay 直接跳过），RETRACT 自身也在
+        # 任务初始化前处理；二者都不产生可观测状态，可随终态任务一并入档。
+        # 这里复用已读出的逻辑流（归档+活跃）自算，避免再付一次 O(L) 扫描。
+        retracted_ids: set[str] = set()
+        for ev in events:
+            if ev.get("type") == EVENT_RETRACT:
+                target = ev.get("target_event_id", "")
+                if target:
+                    retracted_ids.add(target)
         arch, _ = read_archive_events(store_dir)
         arch_ids = {e.get("event_id", "") for e in arch if e.get("event_id")}
         moved: list[dict[str, Any]] = []
@@ -279,6 +305,13 @@ class _StoreWriteMixin:
                 continue
             tid = ev.get("task_id", "")
             if tid and tid not in terminal:
+                # 撤回豁免（task-ledger-compact-retracted-prefix）：全事件被撤回的
+                # 任务在派生态中整条消失，既不 completed 也不 cancelled；若按
+                # task_id 一刀切 break，前缀会永久停在它的首条事件上。
+                if ev.get("type") == EVENT_RETRACT or (eid and eid in retracted_ids):
+                    moved.append(ev)
+                    moved_tasks.add(tid)
+                    continue
                 break
             moved.append(ev)
             if tid:
@@ -306,6 +339,20 @@ class _StoreWriteMixin:
             stats["active_after"] = active_before
             stats["checkpoint_lines"] = len(events)
             return stats
+        if min_prefix_ratio is not None:
+            # 前缀门（自动压实专用）：可新搬事件占活跃事件比例不足时不动盘。
+            active_total = sum(
+                1 for ev in events
+                if not ev.get("event_id") or ev["event_id"] not in arch_ids
+            )
+            ratio = (stats["moved_events"] / active_total) if active_total else 1.0
+            stats["prefix_ratio"] = round(ratio, 4)
+            if active_total and ratio < min_prefix_ratio:
+                stats["status"] = "skipped"
+                stats["reason"] = "prefix_ratio"
+                stats["active_after"] = active_before
+                stats["checkpoint_lines"] = len(events)
+                return stats
         if dry_run:
             return stats
         journal.write_text(json.dumps({
@@ -336,7 +383,7 @@ class _StoreWriteMixin:
     def _active_file_size(store_dir: Path) -> dict[str, Any]:
         """活跃账本文件体积（c2 增长曲线输入；后端无关 best-effort）。"""
         info: dict[str, Any] = {}
-        for name in ("_ledger.jsonl", "_ledger.sqlite3"):
+        for name in ("_ledger.jsonl", SQLITE_DB_FILENAME):
             p = Path(store_dir) / name
             try:
                 info[name] = p.stat().st_size if p.is_file() else 0

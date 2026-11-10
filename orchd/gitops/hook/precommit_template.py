@@ -14,6 +14,12 @@ from __future__ import annotations
 # 刻意**留在本文件内**（不拆独立数据文件）：tests/test_guide.py 通道 D 以
 # hook.py 文本的 echo/print 行做 E017/E020 可达性扫描——外置成 .sh 数据文件会
 # 让该通道静默失明，且引入包数据/安装面改动（越出 §2.1 纯搬移口径）。
+# task-hook-degrade-hint-truth 说明（③④）：
+#   ③ 判据口径有意差异——本模板 shell 段与 doctor/residue 用
+#      `orchd/__init__.py`（文件存在）严格判；py 候选链（templates.py）用
+#      `orchd/` 目录宽松判（烘焙值可能是包父目录或 .orchd 载体）。
+#   ④ 无 python 解释器时不置 _LS_ENGINE_MISSING：无法判定 → 沿旧
+#      fail-closed 保守活跃，不误放行（降级出口只覆盖「引擎不可定位」）。
 _PRE_COMMIT_HOOK_TEMPLATE = """#!/bin/sh
 {HOOK_MARKER} (auto-generated, do not edit)
 # D2（debug-pack D）：GBK 控制台中文输出编码补全（python 段已 reconfigure(utf-8)，
@@ -77,6 +83,41 @@ case "$BRANCH" in
         ;;
 esac
 
+# 0a) CHANGELOG 格式契约（task-changelog-precheck）：仅当暂存区含 CHANGELOG.md。
+#     真源 = scripts/check_changelog_format.py（阈值 150 单一真源，与 test_docs 同函数）；
+#     模板只做一次外部调用，不复制规则文本。找不到脚本/解释器时留痕放行（best-effort）。
+if git diff --cached --name-only --no-renames 2>/dev/null | grep -qx "CHANGELOG.md"; then
+    _CC_PY=""
+    for _CC_CAND in python python3 py; do
+        if command -v "$_CC_CAND" >/dev/null 2>&1; then
+            _CC_PY="$_CC_CAND"
+            break
+        fi
+    done
+    _CC_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    _CC_SCRIPT=""
+    for _CC_DIR in "${{ORCHD_SRC_DIR:-}}" "$_CC_ROOT/.orchd" "$_CC_ROOT" {ENGINE_Q}; do
+        [ -n "$_CC_DIR" ] || continue
+        if [ -f "$_CC_DIR/scripts/check_changelog_format.py" ]; then
+            _CC_SCRIPT="$_CC_DIR/scripts/check_changelog_format.py"
+            break
+        fi
+        if [ -f "$_CC_DIR/../scripts/check_changelog_format.py" ]; then
+            _CC_SCRIPT="$_CC_DIR/../scripts/check_changelog_format.py"
+            break
+        fi
+    done
+    if [ -n "$_CC_PY" ] && [ -n "$_CC_SCRIPT" ]; then
+        if ! "$_CC_PY" "$_CC_SCRIPT" --check CHANGELOG.md; then
+            echo "orchd: CHANGELOG 格式契约未通过（单条 >150 字符），提交已阻断" >&2
+            echo "无绕过通道：git commit --no-verify 被 git 代理拒绝；请修正 CHANGELOG 后重试" >&2
+            exit 1
+        fi
+    else
+        echo "[orchd] CHANGELOG 格式检查跳过：未找到解释器或 check_changelog_format.py（best-effort）" >&2
+    fi
+fi
+
 # 1) 任务未活跃 → 放行：读 ledger 判该任务是否处于活跃状态
 #    （最近事件为 CLAIMED / REVIEW_CLAIMED，且无后续 DONE / RETRACT /
 #      REVIEW_SUBMITTED）——in_review 阶段任务同样活跃（审查中，实现者
@@ -99,6 +140,7 @@ else
     # 路径逐字一致。解释器探针与第 4 步动态解析同模式；查询失败（无解释器 /
     # 引擎不可导入 / Store 异常）→ 沿旧语义保守按活跃处理并留痕。
     _LS_OK=no
+    _LS_ENGINE_MISSING=0
     _PY_TASK=EMPTY
     _PY_REVIEW=EMPTY
     ORCHD_PY_LS=""
@@ -111,14 +153,22 @@ else
     if [ -z "$ORCHD_PY_LS" ]; then
         echo "[orchd E020] ledger 未找到（$LEDGER）且无可用 python → 保守按任务活跃处理（继续范围校验）" >&2
     else
-        _LS_RAW=$("$ORCHD_PY_LS" - "$TASK_ID" {ENGINE_Q} <<'ORCHD_HOOK_LEDGER'
+        # task-precommit-hook-bake-guard：引擎定位候选链（与 ref-tx 同构）——显式
+        # ORCHD_SRC_DIR → 当前仓 .orchd → 仓库根；解析不到时退回安装期烘焙路径。
+        _ORCHD_SRC=""
+        _ORCHD_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        for _ORCHD_C in "${{ORCHD_SRC_DIR:-}}" "$_ORCHD_ROOT/.orchd" "$_ORCHD_ROOT"; do
+            [ -n "$_ORCHD_C" ] || continue
+            if [ -f "$_ORCHD_C/orchd/__init__.py" ]; then _ORCHD_SRC="$_ORCHD_C"; break; fi
+        done
+        _LS_SRC="${{_ORCHD_SRC:-{ENGINE_Q}}}"
+        _LS_RAW=$("$ORCHD_PY_LS" - "$TASK_ID" "$_LS_SRC" <<'ORCHD_HOOK_LEDGER'
 {PY_LEDGER_STATE}ORCHD_HOOK_LEDGER
 )
         if [ $? -ne 0 ]; then
             echo "[orchd E020] ledger-state 回退查询失败 → 保守按任务活跃处理（继续范围校验）" >&2
-            echo "[orchd E020] 若因引擎目录搬移/改名导致安装期烘入路径失效：请重建 hook" >&2
-            echo "[orchd E020]   修复：python .orchd/__main__.py doctor --fix" >&2
-            echo "[orchd E020]   逃生（须自行留痕可审计）：git commit --no-verify；绕过后在任务 notes 记录理由" >&2
+            echo "[orchd E020] 若因引擎目录搬移/改名导致安装期烘入路径失效：重装/升级引擎后重新 claim（claim 安装期按当前仓重烘焙 hook）" >&2
+            echo "[orchd E020]   请在任务 notes 留痕，并重装/升级引擎后重新 claim；git commit --no-verify 被 git 代理拒绝（无绕过通道）" >&2
         else
             _PY_TASK=$(printf '%s\\n' "$_LS_RAW" | sed -n '1p' | tr -d '\\r')
             _PY_REVIEW=$(printf '%s\\n' "$_LS_RAW" | sed -n '2p' | tr -d '\\r')
@@ -126,7 +176,12 @@ else
             if [ -z "$_PY_REVIEW" ]; then _PY_REVIEW=EMPTY; fi
             # NO_LEDGER（账本无载体：无 jsonl/db/归档）≠ EMPTY（载体在但任务无事件）：
             # 前者沿旧语义保守按活跃处理（fail-closed），后者按非活跃放行。
-            if [ "$_PY_TASK" = "NO_LEDGER" ] || [ "$_PY_REVIEW" = "NO_LEDGER" ]; then
+            # task-precommit-hook-bake-guard：区分两类失败——
+            #   NO_ENGINE（引擎不可定位，本次根因）→ 标记 _LS_ENGINE_MISSING，稍后 degraded 放行；
+            #   NO_LEDGER（引擎在、仓库真无账本载体）→ 保留既有 fail-closed 保守活跃语义。
+            if [ "$_PY_TASK" = "NO_ENGINE" ] || [ "$_PY_REVIEW" = "NO_ENGINE" ]; then
+                _LS_ENGINE_MISSING=1
+            elif [ "$_PY_TASK" = "NO_LEDGER" ] || [ "$_PY_REVIEW" = "NO_LEDGER" ]; then
                 echo "[orchd E020] ledger 未找到（$LEDGER）且账本无载体 → 保守按任务活跃处理（继续范围校验）" >&2
             else
                 _LS_OK=yes
@@ -146,6 +201,17 @@ else
     fi
 fi
 
+# task-precommit-hook-bake-guard（根因出口）：**引擎不可定位**（烘焙路径失效且候选链
+# 未命中当前仓）→ 降级放行并留痕。旧语义「查不到就当任务活跃」会拿烘焙期的任务身份
+# （可能是一张已完结卡）去校验 main 提交，实测在升级后首次非豁免提交时误拦 E020。
+# 本出口**只**覆盖「引擎不可定位」；「账本无载体（NO_LEDGER）」仍沿旧 fail-closed 语义。
+if [ "${{_LS_ENGINE_MISSING:-0}}" = "1" ] && [ -z "$_ORCHD_SRC" ]; then
+    echo "[orchd E020] 引擎不可定位（烘焙路径失效且未退回当前仓）→ degraded：跳过范围校验放行" >&2
+    echo "[orchd E020]   修复：重装/升级引擎（python orchd-core/install.py . --update）后重新 claim——claim 安装期按当前仓重烘焙 hook（doctor --fix 对 hook 仅告警、不处置）" >&2
+    echo "[orchd E020]   本轮未做范围校验，越界风险自负；建议在任务 notes 留痕" >&2
+    exit 0
+fi
+
 # 2) R1-b 审查期实现者冻结：任务分支上最后 review 事件 REVIEW_CLAIMED
 #    （审查进行中）→ 拒绝提交，保护审查基线（任何分支，保留既有契约）。
 #    debug-pack B2：**引擎内部提交身份豁免**——staged 全为引擎固定资产
@@ -160,6 +226,11 @@ else
     for _ORCHD_E_FILE in $_ORCHD_E_STAGED; do
         case "$_ORCHD_E_FILE" in
             .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md|ROADMAP.md|.orchd/_full_regression.json) ;;
+            docs/_generated/*|.orchd/docs/_generated/*{MANIFEST_DOCS_PATTERNS})
+                # 生成物目录只在主干（bound）视为引擎提交；任务分支仍走 dynamic +
+                # surface_refresh（未声明的生成物刷新由第 4 步 E020 拦截）。
+                if [ "$SCOPE_MODE" != "bound" ]; then _ORCHD_ENGINE_ONLY=no; fi
+                ;;
             *) _ORCHD_ENGINE_ONLY=no ;;
         esac
     done
@@ -173,7 +244,7 @@ if [ "$_ORCHD_ENGINE_ONLY" != "yes" ]; then
             *REVIEW_CLAIMED*)
                 echo "orchd E017: review in progress, commit blocked on $BRANCH"
                 echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
-                echo "To bypass: git commit --no-verify"
+                echo "无绕过通道：git commit --no-verify 被 git 代理拒绝（红线 #1）；请等 reviewer 结论或 orchd retract 后再提交"
                 exit 1
                 ;;
         esac
@@ -186,7 +257,7 @@ if [ "$_ORCHD_ENGINE_ONLY" != "yes" ]; then
                 *REVIEW_CLAIMED*)
                     echo "orchd E017: review in progress, commit blocked on $BRANCH"
                     echo "任务正在审查中（REVIEW_CLAIMED）。请等待 reviewer 提交结论，或先执行 retract 撤回审查再提交。"
-                    echo "To bypass: git commit --no-verify"
+                    echo "无绕过通道：git commit --no-verify 被 git 代理拒绝（红线 #1）；请等 reviewer 结论或 orchd retract 后再提交"
                     exit 1
                     ;;
             esac
@@ -213,7 +284,10 @@ fi
 # 丢弃；重定向在当前 shell 内消费。临时文件用后即删（trap EXIT，含异常路径）。
 STAGED_TMP="${{TMPDIR:-/tmp}}/orchd-hook-staged-$$"
 ALLOWED_TMP="${{TMPDIR:-/tmp}}/orchd-hook-allowed-$$"
-trap 'rm -f "$STAGED_TMP" "$ALLOWED_TMP"' EXIT
+MERGE_PARENT_TMP="${{TMPDIR:-/tmp}}/orchd-hook-merge-parent-$$"
+MERGE_FLAG_TMP="${{TMPDIR:-/tmp}}/orchd-hook-merge-flag-$$"
+MERGE_LIST_TMP="${{TMPDIR:-/tmp}}/orchd-hook-merge-list-$$"
+trap 'rm -f "$STAGED_TMP" "$ALLOWED_TMP" "$MERGE_PARENT_TMP" "$MERGE_FLAG_TMP" "$MERGE_LIST_TMP"' EXIT
 trap 'exit 130' INT TERM HUP
 if ! git diff --cached --name-only --no-renames -z > "$STAGED_TMP" 2>/dev/null; then
     echo "[orchd E020] staged 列表获取失败（git diff 异常）→ best-effort 放行（未校验范围，禁止静默）" >&2
@@ -321,6 +395,49 @@ if [ "$SCOPE_MODE" = "dynamic" ] && [ "$_SC_SKIP_RESOLVER" != "yes" ]; then
     fi
 fi
 
+# 3c) merge 操作状态与父侧带入集（task-engine-defect-fix-unified-u6）：
+#     判定与 commit 层同源——内联 import 引擎实现
+#     （orchd/gitops/commit.py::merge_in_progress / _merge_parent_side_paths），
+#     不另写一套 MERGE_HEAD 判定。merge 进行中时，被合并父侧带入的任务范围外
+#     文件单独成档（MERGE_CARRIED）分档放行；非 merge 场景判定逐字不变。
+MERGE_IN_PROGRESS=no
+MERGE_CARRIED=""
+if [ -f "$(git rev-parse --git-path MERGE_HEAD 2>/dev/null || echo /nonexistent)" ]; then
+    _ORCHD_MERGE_PY=""
+    for _CAND in python python3 py; do
+        if command -v "$_CAND" >/dev/null 2>&1; then
+            _ORCHD_MERGE_PY="$_CAND"
+            break
+        fi
+    done
+    _ORCHD_MERGE_SRC=""
+    for _ORCHD_C in "${{ORCHD_SRC_DIR:-}}" "$PWD/.orchd" "$PWD" {ENGINE_Q}; do
+        [ -n "$_ORCHD_C" ] || continue
+        if [ -f "$_ORCHD_C/orchd/__init__.py" ]; then
+            _ORCHD_MERGE_SRC="$_ORCHD_C"
+            break
+        fi
+    done
+    if [ -z "$_ORCHD_MERGE_PY" ]; then
+        echo "[orchd E020] merge 操作状态判定跳过：未找到可用 python 解释器（父侧带入分档未生效，越界判定保持原强度）" >&2
+    else
+        if "$_ORCHD_MERGE_PY" - "$_ORCHD_MERGE_SRC" "$MERGE_FLAG_TMP" "$MERGE_LIST_TMP" > "$MERGE_PARENT_TMP" 2>/dev/null <<'ORCHD_HOOK_MERGE'
+{PY_MERGE_STATE}ORCHD_HOOK_MERGE
+        then
+            if [ -s "$MERGE_FLAG_TMP" ]; then
+                MERGE_IN_PROGRESS=$(cat "$MERGE_FLAG_TMP" 2>/dev/null)
+            fi
+            if [ "$MERGE_IN_PROGRESS" = "yes" ]; then
+                echo "[orchd E020] merge 进行中：父侧带入文件按分档判定（判定源与 commit 层同源）" >&2
+            fi
+        else
+            echo "[orchd E020] merge 操作状态判定降级：引擎不可导入（父侧带入分档未生效，越界判定保持原强度）" >&2
+            MERGE_IN_PROGRESS=no
+            : > "$MERGE_PARENT_TMP" 2>/dev/null || true
+        fi
+    fi
+fi
+
 # 4) 校验每个 staged 文件：固定资产豁免 或 任务范围（动态 / 回退静态）。
 #    "$@" 由 STAGED_TMP 装载（NUL 精确消费：R2-9a 空白拆词修、
 #    task-hook-staged-nul-rootfix 换行拆分修；不用 here-doc + read——文件名含
@@ -355,6 +472,11 @@ for FILE in "$@"; do
         .orchd/_master.json|IDEAS.md|.orchd/IDEAS.md|ROADMAP.md|.orchd/_full_regression.json)
             IN_SCOPE=yes
             ;;
+        docs/_generated/*|.orchd/docs/_generated/*{MANIFEST_DOCS_PATTERNS})
+            # 引擎/宿主两套布局的生成物目录：仅主干自动提交（bound）豁免；
+            # 任务分支仍须通过 surface_refresh 声明，保持原有纪律。
+            if [ "$SCOPE_MODE" = "bound" ]; then IN_SCOPE=yes; fi
+            ;;
     esac
     if [ "$IN_SCOPE" != "yes" ]; then
         if [ "$SCOPE_MODE" = "dynamic" ]; then
@@ -379,7 +501,13 @@ for FILE in "$@"; do
         fi
     fi
     if [ "$IN_SCOPE" != "yes" ]; then
-        OUT_OF_SCOPE="$OUT_OF_SCOPE$FILE "
+        # merge 父侧带入分档（u6）：命中父侧带入集 → MERGE_CARRIED（仅本次 merge
+        # 提交放行），否则仍按越界累积 OUT_OF_SCOPE（非 merge 场景判定强度不变）。
+        if [ "$MERGE_IN_PROGRESS" = "yes" ] && [ -s "$MERGE_LIST_TMP" ] && grep -Fxq -- "$FILE" "$MERGE_LIST_TMP" 2>/dev/null; then
+            MERGE_CARRIED="$MERGE_CARRIED$FILE "
+        else
+            OUT_OF_SCOPE="$OUT_OF_SCOPE$FILE "
+        fi
     fi
 done
 
@@ -403,9 +531,22 @@ if [ -n "$OUT_OF_SCOPE" ]; then
     echo ""
     echo ""
 {E020_ESCAPE_BLOCK}
-    echo "To bypass: git commit --no-verify"
+    echo "无绕过通道：git commit --no-verify 被 git 代理拒绝（红线 #1，E020 是唯一守门人）；请按上方合规步骤收口"
     exit 1
+fi
+
+# 5b) merge 父侧带入分档放行（u6）：仅 merge 进行中非空；非 merge 场景恒为空。
+#     不改变非 merge 判定强度——分档只在本段打印说明，未命中父侧带入的文件
+#     仍已在第 5 步被 E020 拒绝。
+if [ -n "$MERGE_CARRIED" ]; then
+    echo "[orchd E020] merge 进行中：以下文件由被合并父侧带入且不在本任务声明范围——分档放行（仅限本次 merge 提交）："
+    for _ORCHD_MF in $MERGE_CARRIED; do
+        echo "  - $_ORCHD_MF"
+    done
+    echo "[orchd E020] 判定源与 commit 层同源：orchd/gitops/commit.py::merge_in_progress / _merge_parent_side_paths"
 fi
 
 exit 0
 """
+
+

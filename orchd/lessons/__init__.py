@@ -16,7 +16,7 @@ monkeypatch 打点面（W8-8 迁移，**易错点**）：修补 ``orchd.lessons.
   ``orchd.lessons.hook.<名>``；
 - 一个符号被多域消费时逐消费域打点；
 - 例外：消费方用**函数级** ``from orchd.lessons import X``（调用时读属性）时，打聚合入口**有效**
-  （已在 tests/test_lessons_pkg.py 的 ``_ALLOWED_AGGREGATE_PATCHES`` 登记）。
+  （已在 tests/test_pkg_contract.py 的 ``_ALLOWED_AGGREGATE_PATCHES`` 登记）。
 
 陷阱：``orchd.lessons.stage`` 等**同名函数/模块**——包属性被函数遮蔽，取子模块须
 ``importlib.import_module("orchd.lessons.stage")``。

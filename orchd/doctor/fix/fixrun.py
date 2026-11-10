@@ -14,6 +14,40 @@ from .dispose import _dispose_file_to_backup, _dispose_residual_dir
 from .prune import _prune_stale_backups
 
 
+def _archive_proposal(path: Path, project_root: Path) -> tuple[bool, dict[str, Any]]:
+    """把单个陈旧提案草稿移入 ``.orchd/proposals/archive/<ts>/``（可回滚归档）。
+
+    task-cont-autoclean-detectors：stale_proposal 的专用处置分支。与通用
+    ``move_to_backup``（.doctor-backup 桶）的差异只在落点——提案内容留在
+    proposals 就近归档区，人工翻阅无需去备份桶翻找；语义同为「整文件搬移、
+    源消失仅一份、逐字节可回滚」（回滚 = 搬回原位）。同名冲突递增 ``-1`` 后缀，
+    绝不覆盖既有归档。失败返回 (False, 带 error)，源文件原地保留。
+    """
+    bucket = (Path(project_root) / ".orchd" / "proposals" / "archive" /
+              time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        bucket.mkdir(parents=True, exist_ok=True)
+        dest = bucket / path.name
+        index = 0
+        while dest.exists():
+            index += 1
+            dest = bucket / f"{path.stem}-{index}{path.suffix}"
+        shutil.move(str(path), str(dest))
+        return True, {
+            "backup": str(dest),
+            "disposition": "archived",
+        }
+    except Exception as exc:
+        # 失败语义与 _dispose_file_to_backup / _dispose_residual_dir 对齐：
+        # move_failed=True + source_preserved 表达「搬移失败、源原地保留」，
+        # 调用方（--fix 循环）据此归入 errors 且绝不降级为删除。
+        return False, {
+            "error": f"{type(exc).__name__}: {exc}",
+            "move_failed": True,
+            "source_preserved": path.exists(),
+        }
+
+
 def doctor_fix(
     project_root: Path,
     *,
@@ -247,6 +281,18 @@ def _doctor_fix_impl(
             # 降级进系统 temp（见 _dispose_file_to_backup docstring）。
             ok, record = _dispose_file_to_backup(path, backup_path,
                                                  Path(project_root))
+            if ok:
+                cleaned.append({**item, **record})
+            else:
+                errors.append({**item, **record})
+            continue
+
+        if action == "archive_proposal":
+            # 陈旧提案草稿（task-cont-autoclean-detectors）：移入
+            # .orchd/proposals/archive/<ts>/（用户内容只归档不删除；整文件搬移、
+            # 源消失仅一份、逐字节可回滚）。必须显式分支——未知 action 会落到
+            # 通用删除分支，提案内容将不可回滚。
+            ok, record = _archive_proposal(path, Path(project_root))
             if ok:
                 cleaned.append({**item, **record})
             else:

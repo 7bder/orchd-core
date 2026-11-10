@@ -38,12 +38,14 @@ def _git_worktree_name(orchd_dir: Path) -> str | None:
     """
     project_root = orchd_dir.parent
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            cwd=str(project_root),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
+        # G1 收敛（task-guard-drift-b2-g1-converge）：归因实测本站点为三探针
+        # 单一最大调用点（--git-dir 2660 次/61.2s），改走 _run_git 的 probe memo
+        # （键 = .git/HEAD 快照 + env，rc=0 才缓存）；超时/异常/降级语义不变。
+        from orchd.gitops._run import _run_git
+
+        proc = _run_git(
+            project_root,
+            ["rev-parse", "--git-dir"],
             timeout=_GIT_TIMEOUT,
         )
         if proc.returncode != 0:

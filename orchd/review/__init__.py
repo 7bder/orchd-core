@@ -32,6 +32,13 @@ from .decl_gate import _review_submit_decl_gate
 from .merge_run import _review_submit_merge_run
 from .merge_finalize import _review_submit_merge_finalize
 from .guidance import _build_completion_guidance, build_reviewer_rerun_command
+from .handoff import (
+    build_review_handoff,
+    files_to_review,
+    render_handoff_prompt,
+    review_phase_of,
+    template_for_phase,
+)
 from .submit import review_submit, _review_submit_impl
 from .precheck import get_head_commit
 from .merge_run import try_git_merge
@@ -59,6 +66,11 @@ __all__ = (
     '_review_submit_merge_finalize',
     '_build_completion_guidance',
     'build_reviewer_rerun_command',
+    'build_review_handoff',
+    'files_to_review',
+    'render_handoff_prompt',
+    'review_phase_of',
+    'template_for_phase',
     'review_submit',
     '_review_submit_impl',
     'get_head_commit',

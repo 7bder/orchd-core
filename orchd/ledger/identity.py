@@ -1,44 +1,30 @@
-"""orchd 身份与会话域（file-split-program W1-L3，2026-10-15）。
+"""orchd 身份派生与事件时间原语（file-split-program W1-L3；2026-11-01 再拆）。
 
-本模块自 ``orchd/ledger/__init__.py`` 整块搬出「身份 + 会话」两组叶子原语（15 函数 + 5 私有
-常量，语句级等价，零逻辑改动）：
+本模块保留与 session runtime 无关的叶子原语：
 
-- 身份派生：``resolve_session_identity`` / ``resolve_agent_id`` / ``is_fingerprint_agent_id``
-  / ``_derive_session_identity_from_token``（``ORCHD_SESSION_ID`` 注入 → 64 位 session_id +
+- 身份派生：``resolve_agent_id`` / ``resolve_session_identity`` /
+  ``is_fingerprint_agent_id``（``ORCHD_SESSION_ID`` 注入 → 64 位 session_id +
   12 位兼容指纹）；
-- session runtime：``session_runtime_dir`` / ``_session_runtime_path`` / ``session_start`` /
-  ``session_current`` / ``session_end`` / ``_touch_session_last_seen``；
-- TTL 与事件时间序：``session_ttl_minutes`` / ``_parse_session_ts`` / ``parse_event_time`` /
-  ``event_sort_key`` / ``is_session_expired``。
+- 事件时间序：``_parse_session_ts`` / ``parse_event_time`` / ``event_sort_key``。
 
-依赖方向：顶层只依赖标准库与 ``orchd.errors``；对 ``resolve_store_dir``（paths 域）与
-``_write_text_atomic``（atomic 域）的引用一律用**函数级惰性导入**
-``from orchd.ledger import ...``：① 避免与聚合入口 ``orchd/ledger/__init__.py`` 形成加载期
-循环；② 保持「调用点解析」语义——``monkeypatch.setattr("orchd.ledger.resolve_store_dir"`` /
-``"_write_text_atomic", ...)`` 的既有补丁面不变（搬移前这些调用走同模块全局查找，补丁同样生效）。
+session runtime / lifecycle / TTL / lineage 已迁至 ``orchd/ledger/session.py``
+（task-residuals-ledger-identity-split），聚合入口 ``orchd.ledger`` 的重导出面
+保持不变。依赖方向：顶层只依赖标准库与 ``orchd.constants``。
 """
 
 from __future__ import annotations
 
-import json
 import os
-import uuid
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from orchd.constants import ORCHD_SESSION_ID_ENV, ORCHD_SESSION_TTL_MIN_ENV
+from orchd.constants import ORCHD_SESSION_ID_ENV
 from orchd.errors import ErrorCode, OrchdError
 
-
 # 宿主注入的每对话唯一会话标识环境变量（session-id-fingerprint）。
-# 由宿主在每次对话启动时注入，据此确定性派生 12 位 hex 指纹：
-# 同一对话内所有命令返回同一指纹，切换对话（新值）即换指纹。
 _ORCHD_SESSION_ID_ENV = ORCHD_SESSION_ID_ENV  # 变量名真源：orchd.constants
-
-# 会话身份完全由宿主注入的 ORCHD_SESSION_ID 派生，引擎不自持身份、不借用
-# 任何历史身份。据此彻底废除 .orchd/.agent_id 文件（读取与写入均删除）：
-# 未注入 ORCHD_SESSION_ID 时身份为空（None），引擎不生成、不落盘、不复用。
 
 
 def resolve_agent_id(orchd_dir: Path | None = None) -> str:
@@ -54,7 +40,9 @@ def resolve_agent_id(orchd_dir: Path | None = None) -> str:
 
     用途（session-id-fingerprint）：
     - 依据宿主注入的每对话唯一码锚定身份，实现者对话与审查者对话身份不同，
-      切换到新对话可正常领取 review（不被 E016 自审阻断）。
+      审查须由**当前实现会话主动 spawn 的独立 subagent** 携带自己的 session token
+      领取（异指纹只是 E016 的下限，不足以证明「是子代理」；三条禁止与无 subagent
+      能力即中断见 rules/review.md「审查者身份约定」）。
     - 各 agent 宿主（TRAE / codex / opencode / workbuddy 等）在启动 orchd 前
       统一把各自会话唯一码注入 ``ORCHD_SESSION_ID``，本函数只认该标准化变量。
 
@@ -62,6 +50,14 @@ def resolve_agent_id(orchd_dir: Path | None = None) -> str:
         单一事实源为 :func:`resolve_session_identity`，本函数取其 ``fingerprint``。
     """
     return resolve_session_identity(orchd_dir)["fingerprint"]
+
+
+def _derive_session_identity_from_token(sid: str) -> dict[str, str]:
+    """由会话 token 确定性派生 session_id/fingerprint（与 resolve 同算法）。"""
+    import hashlib
+
+    full = hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()
+    return {"session_id": full, "fingerprint": full[:12]}
 
 
 def resolve_session_identity(orchd_dir: Path | None = None) -> dict[str, str]:
@@ -80,10 +76,7 @@ def resolve_session_identity(orchd_dir: Path | None = None) -> dict[str, str]:
     sid = os.environ.get(_ORCHD_SESSION_ID_ENV) or None
     if not sid:
         return {"session_id": "", "fingerprint": ""}
-    import hashlib
-
-    full = hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()
-    return {"session_id": full, "fingerprint": full[:12]}
+    return _derive_session_identity_from_token(sid)
 
 
 def is_fingerprint_agent_id(agent_id: str) -> bool:
@@ -112,71 +105,43 @@ def is_fingerprint_agent_id(agent_id: str) -> bool:
         return False
 
 
-# ------------------------------------------------------------------
-# Session runtime（task-session-cli-lifecycle，Session Identity Layer）
-# ------------------------------------------------------------------
-# 每个 session 由引擎显式开启：session start 生成唯一 session_token +
-# 派生 session_id/fingerprint，并写入共享账本根下的 sessions/<id>.json；
-# 后续命令通过 ORCHD_SESSION_ID 指向该 session。它把“会话边界”从宿主
-# 的隐式环境常量升级为引擎持有的运行时实体，避免多个对话共享同一指纹。
+def _lineage_text(value: Any) -> str:
+    """lineage 字段归一：**只有真字符串**才回显，其余脏值一律按「未声明」处理。
 
-_SESSION_RUNTIME_DIRNAME = "sessions"
-_SESSION_RUNTIME_ACTIVE = True
-
-
-def _derive_session_identity_from_token(sid: str) -> dict[str, str]:
-    """由会话 token 确定性派生 session_id/fingerprint（与 resolve_session_identity 同算法）。"""
-    import hashlib
-
-    full = hashlib.sha256(("orchd-session:" + sid).encode("utf-8")).hexdigest()
-    return {"session_id": full, "fingerprint": full[:12]}
-
-
-def session_runtime_dir(orchd_dir: Path) -> Path:
-    """返回 session runtime 目录（共享账本根下，container/flat 兼容）。"""
-    from orchd.ledger import resolve_store_dir
-    return resolve_store_dir(orchd_dir) / _SESSION_RUNTIME_DIRNAME
-
-
-def _session_runtime_path(orchd_dir: Path, session_id: str) -> Path:
-    return session_runtime_dir(orchd_dir) / f"{session_id}.json"
-
-
-# ------------------------------------------------------------------
-# Session TTL 与惰性过期（task-audit-session-ttl-lazy-expiry）
-# ------------------------------------------------------------------
-# 根因：session 依赖显式 end，而宿主会话中断（关对话 / IDE 崩 / agent 超时 /
-# context 满）时 session end 永不被调用，orchd 每次调用都是独立短进程、无法
-# 感知宿主存活 → 僵尸 runtime 文件累积（实测约 9 个/天）。
-#
-# 策略：不追求「删除」（清理是被动的，得有人跑命令才触发），而是读时按
-# ``last_seen + TTL`` 判定过期、**判定即生效**——过期文件即使仍在磁盘：
-#   - 不参与身份解析：session current / end → E033（reason=session_expired），
-#     附重新 start 指引（对齐 E033 现有语义）；
-#   - 不再计入活跃：watchdog stale_sessions → reason=session_expired
-#     （见 report.py，供接管流程发现）。
-
-
-_SESSION_TTL_MIN_ENV = ORCHD_SESSION_TTL_MIN_ENV  # 变量名真源：orchd.constants
-_SESSION_TTL_DEFAULT_MIN = 24 * 60  # 默认 24h
-
-
-def session_ttl_minutes() -> int:
-    """返回 session TTL（分钟）：``ORCHD_SESSION_TTL_MIN`` 覆盖，默认 24h（1440）。
-
-    非法值（非整数 / <= 0 / 空串）静默回退默认——环境差异不得击穿身份路径。
-
-    Returns:
-        当前生效的 TTL 分钟数（正整数）。
+    task-session-runtime-dirty-input：旧实现 ``str(value or "")`` 会把手写
+    runtime 里的 ``{"a":1}`` / ``123`` / ``True`` 变成 ``"{'a': 1}"`` / ``"123"``
+    / ``"True"`` 这类非空垃圾，令 ``review_lineage_unverified`` 的「缺声明」告警
+    被静默压制——观测面因此失去可信度。此处类型判定优先于真值判定：非 ``str``
+    直接返回空串，``strip()`` 后为空（纯空白）同样算未声明。
     """
-    raw = os.environ.get(_SESSION_TTL_MIN_ENV)
-    if raw is None or not raw.strip():
-        return _SESSION_TTL_DEFAULT_MIN
-    try:
-        val = int(raw.strip())
-    except ValueError:
-        return _SESSION_TTL_DEFAULT_MIN
-    return val if val > 0 else _SESSION_TTL_DEFAULT_MIN
+    return value.strip() if isinstance(value, str) else ""
+
+
+# --parent 取值域（12–64 位小写 hex）：12 位 = 兼容指纹形态，64 位 = session_id 全形态。
+_PARENT_SESSION_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+# --adopt 注入 token 的合法形态：session start 生成的 ``uuid4().hex``。
+_SESSION_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _validate_parent_session_id(parent_session_id: str | None) -> str:
+    """校验并归一 ``--parent``：空值合法（未声明），非空须 12–64 位小写 hex。"""
+    value = (parent_session_id or "").strip()
+    if value and not _PARENT_SESSION_ID_RE.fullmatch(value):
+        raise OrchdError(
+            ErrorCode.E007,
+            "invalid_parent_session_id: --parent 仅接受 12–64 位小写 hex"
+            "（12 位指纹或 64 位 session_id）",
+            [{
+                "field": "parent_session_id",
+                "observed_length": len(value),
+                "hint": (
+                    "用 'orchd session current'（在实现会话内执行）获取完整 "
+                    "session_id 后原样传入；不要传指纹以外的自造标识"
+                ),
+            }],
+        )
+    return value
 
 
 def _parse_session_ts(value: Any) -> datetime | None:
@@ -237,220 +202,3 @@ def event_sort_key(ev: dict[str, Any]) -> tuple[datetime, str, str]:
         str(ev.get("session_id") or ev.get("agent_id") or ""),
         str(ev.get("event_id") or "") if fine_precision else "",
     )
-
-
-def is_session_expired(data: dict[str, Any], now: datetime | None = None) -> bool:
-    """TTL 判定：``last_seen + TTL <= now`` → 过期（惰性过期，判定即生效）。
-
-    纯只读计算，不触碰磁盘、不依赖任何清理动作：
-
-    - ``last_seen`` 缺失 / 非法 → 判**未过期**（兼容降级：旧式 runtime 文件
-      与测试夹具可能缺该字段；缺字段不构成过期依据，僵尸判定宁可保守，
-      与既有「无 last_seen 的 active runtime 不算僵死」行为零回归）；
-    - 否则按 :func:`session_ttl_minutes`（``ORCHD_SESSION_TTL_MIN`` 可覆盖）比较。
-
-    Args:
-        data: session runtime JSON 内容（含 ``last_seen``）。
-        now: 判定基准时刻；缺省取当前 UTC 时间。
-
-    Returns:
-        True：会话已过期；False：未过期或无法判定。
-    """
-    last_seen = _parse_session_ts(data.get("last_seen"))
-    if last_seen is None:
-        return False
-    moment = now or datetime.now(timezone.utc)
-    return last_seen + timedelta(minutes=session_ttl_minutes()) <= moment
-
-
-def _touch_session_last_seen(orchd_dir: Path) -> None:
-    """刷新当前会话 runtime 的 ``last_seen``（best-effort，任何异常静默降级）。
-
-    写命令路径事件追加成功后调用（另见 :func:`session_current` 的活跃刷新）：
-    仅当 runtime 文件存在且 active 时写入新时间戳。TTL 判定依赖该信号，
-    但活性刷新自身不得阻塞写路径——失败只影响判活精度，不影响账本正确性。
-    """
-    from orchd.ledger import _write_text_atomic
-    try:
-        identity = resolve_session_identity(orchd_dir)
-        if not identity["session_id"]:
-            return
-        path = _session_runtime_path(Path(orchd_dir), identity["session_id"])
-        if not path.exists():
-            return
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not data.get("active"):
-            return
-        data["last_seen"] = datetime.now(timezone.utc).isoformat()
-        _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    except (OSError, ValueError):
-        return
-
-
-def session_start(
-    orchd_dir: Path,
-    agent_name: str | None = None,
-) -> dict[str, Any]:
-    """开启一个新的会话，返回 engine 生成的 session_id/fingerprint/token。
-
-    每次调用都会生成全新 ``session_token``（UUID），据此确定性派生
-    ``session_id`` 与兼容指纹。写入：
-    ``<runtime>/sessions/<session_id>.json``。
-
-    调用方（宿主接入层）应把返回的 ``session_token`` 注入
-    ``ORCHD_SESSION_ID`` 环境变量，使本会话后续命令解析到同一身份。
-    """
-    from orchd.ledger import _write_text_atomic
-    orchd_dir = Path(orchd_dir)
-    token = uuid.uuid4().hex
-    identity = _derive_session_identity_from_token(token)
-    now = datetime.now(timezone.utc).isoformat()
-    data: dict[str, Any] = {
-        "session_id": identity["session_id"],
-        "fingerprint": identity["fingerprint"],
-        "session_token": token,
-        "agent_name": agent_name or "",
-        "created_at": now,
-        "last_seen": now,
-        "active": _SESSION_RUNTIME_ACTIVE,
-    }
-    path = _session_runtime_path(orchd_dir, identity["session_id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    return {
-        **data,
-        "path": str(path),
-        "started": True,
-        "inject_action": {
-            "description": "将 session_token 注入 ORCHD_SESSION_ID 环境变量，后续命令即识别为同一会话身份",
-            "powershell": f'$env:ORCHD_SESSION_ID="{token}"',
-            "bash": f'export ORCHD_SESSION_ID="{token}"',
-            "env_var": ORCHD_SESSION_ID_ENV,
-            "token": token,
-        },
-    }
-
-
-def session_current(orchd_dir: Path) -> dict[str, Any]:
-    """返回当前会话运行时信息；未开启（无 ORCHD_SESSION_ID/无 runtime 文件）→ E033。
-
-    判定：取 ``resolve_session_identity()`` 的 session_id，再在 runtime 目录中
-    定位同名 JSON。若 runtime 文件缺失或已 inactive，提示重新 session start。
-
-    TTL 惰性过期（task-audit-session-ttl-lazy-expiry）：runtime active 但
-    ``last_seen`` 超过 TTL（默认 24h，``ORCHD_SESSION_TTL_MIN`` 覆盖）→
-    E033（reason=session_expired）附重新 start 指引；判定即生效、不清理文件。
-    活跃会话每次查询刷新 ``last_seen``（活性信号）。
-    """
-    from orchd.ledger import _write_text_atomic
-    orchd_dir = Path(orchd_dir)
-    identity = resolve_session_identity(orchd_dir)
-    if not identity["session_id"]:
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_identity_missing: 未开启 orchd session，无法识别当前会话身份",
-            [{
-                "hint": (
-                    "请先运行 'orchd session start' 并在后续命令中将返回的 "
-                    "session_token 注入 ORCHD_SESSION_ID；"
-                    "若已有活跃 session（session current 可查），可直接复用其 "
-                    "session_token 注入 ORCHD_SESSION_ID，无需重复 start"
-                ),
-            }],
-        )
-    path = _session_runtime_path(orchd_dir, identity["session_id"])
-    if not path.exists():
-        # 兼容：runtime 文件未被 session start 写入（如旧式指纹会话）
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_not_found: 当前指纹没有对应的 session runtime 文件",
-            [{
-                "session_id": identity["session_id"],
-                "hint": "请先运行 'orchd session start' 开启会话，并将 session_token 注入 ORCHD_SESSION_ID；若已有活跃 session 可复用其 session_token，无需重复 start",
-            }],
-        )
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not data.get("active"):
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_inactive: 当前 session 已结束，请重新 session start",
-            [{"session_id": data.get("session_id"), "path": str(path)}],
-        )
-    if is_session_expired(data):
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_expired: 当前 session 已超过 TTL 未活动，请重新 session start",
-            [{
-                "session_id": data.get("session_id"),
-                "reason": "session_expired",
-                "ttl_minutes": session_ttl_minutes(),
-                "last_seen": data.get("last_seen"),
-                "hint": (
-                    "会话已按 TTL 惰性过期（判定即生效，无需清理）：重新运行 "
-                    "'orchd session start' 开启新会话，并将返回的 session_token "
-                    "注入 ORCHD_SESSION_ID"
-                ),
-            }],
-        )
-    now = datetime.now(timezone.utc).isoformat()
-    data["last_seen"] = now
-    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    return {**data, "path": str(path), "current": True}
-
-
-def session_end(
-    orchd_dir: Path,
-    *,
-    force_bypass: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """结束当前会话：标记 runtime 文件 inactive（best-effort，不删除）。
-
-    红线 #5 硬化（task-audit-session-end-clean-gate）：CLI 层在调用前已校验
-    工作区无已跟踪改动，脏且未 --force 时会被拒绝，不会到达本函数。当
-    ``--force`` 放行时，``force_bypass`` 携带放行原因与待提交文件清单，
-    原样写入 runtime 文件，保证审计可查。
-    """
-    from orchd.ledger import _write_text_atomic
-    orchd_dir = Path(orchd_dir)
-    identity = resolve_session_identity(orchd_dir)
-    if not identity["session_id"]:
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_identity_missing: 未开启 orchd session，无法结束会话",
-            [{"hint": "无需结束：当前没有可识别的会话身份"}],
-        )
-    path = _session_runtime_path(orchd_dir, identity["session_id"])
-    if not path.exists():
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_not_found: 当前指纹没有对应的 session runtime 文件",
-            [{"session_id": identity["session_id"], "hint": "先 session start 再 session end"}],
-        )
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("active") and is_session_expired(data):
-        # TTL 惰性过期：会话早已无人活动，无需「结束」一个已过期会话——
-        # 与 session_current 同样报 E033（reason=session_expired），指引重新 start。
-        raise OrchdError(
-            ErrorCode.E033,
-            "session_expired: 当前 session 已超过 TTL 未活动，无需结束，请重新 session start",
-            [{
-                "session_id": data.get("session_id"),
-                "reason": "session_expired",
-                "ttl_minutes": session_ttl_minutes(),
-                "last_seen": data.get("last_seen"),
-                "hint": (
-                    "会话已按 TTL 惰性过期（判定即生效，无需清理）：重新运行 "
-                    "'orchd session start' 开启新会话，并将返回的 session_token "
-                    "注入 ORCHD_SESSION_ID"
-                ),
-            }],
-        )
-    data["active"] = False
-    data["ended_at"] = datetime.now(timezone.utc).isoformat()
-    if force_bypass:
-        data["force_bypass"] = {
-            **force_bypass,
-            "at": data["ended_at"],
-        }
-    _write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    return {**data, "path": str(path), "ended": True}

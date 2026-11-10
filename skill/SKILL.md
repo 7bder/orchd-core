@@ -1,5 +1,6 @@
 # Orchid Agent
 > agent 工作流协议（引擎自判阶段与纪律）；使用手册见 [docs/user-manual.md](../docs/user-manual.md)。
+> 宿主根 `AGENTS.md` 顶部为 6 行常驻契约卡（入口/status/红线/exit_type/E033/审查）；本文件是详细入口协议。
 > 体积口径：字符（本文件 ≤7200 字符，逼近时外置细则至 rules/，仅留协议概览与索引链接）。
 
 ## 入口协议（MUST，每 session 首读）
@@ -24,10 +25,11 @@
 1. **禁手动 git 写操作**：任何会话中，不得执行 `git checkout / branch / reset / stash / gc / prune / clean / rebase / cherry-pick / merge / push`。git 写操作仅由引擎自动执行；豁免 = 任务分支上的 `git commit` + 任务分支上的 `orchd git merge main`（精确形态，受管出口，详见 rules/git.md）。若确需其他手动 git 写，先向人报告获许可。
 2. **禁破坏性 git**：`reset --hard` / `gc --prune=now` / `clean -fdx` / `branch -D` / `push --force` 一律禁止，无豁免。
 3. **禁改范围外文件**：只读 files_to_read、只写 files_to_edit；不触 `.git/`；删文件前确认属验收范围。确需增删声明文件时回主工作树执行 amend 补登，不手改 _master.json。
-4. **禁绕过身份（自审默认阻断）**：
-   - 缺省 `config.enforce_self_review_block=true`（读 config 缺省 true）：claim review 异指纹不满足即 `E016 self_review_blocked` 中断，guidance 指引起独立 subagent / 换新会话。
-   - 任务级 `require_independent_review=true`（与全局开关 OR）同阻断。
-   - 显式 `config.enforce_self_review_block=false`：退回提示档（附 `self_review_notice`），须在 review comments 显式披露。
+4. **禁绕过身份（审查只认本会话 spawn 的独立 subagent）**：领审并撰写审查意见的必须是当前会话主动 spawn 的 subagent 上下文；**三条禁止**——自铸 session token 自用、手设 `ORCHD_SESSION_ID`、复用他人 token（审查会话由引擎在 `done` 成功时 mint，随 `review_handoff` 一并交接 `prompt` / token / lineage；实现会话把 `prompt` 原样交给 subagent，判据是执行上下文独立，不是指纹新旧）。
+   - **自审恒阻断（不可配置）**：实现指纹 == 审查指纹时 claim 与 submit 均直接 `E016 self_review_blocked`——无 config 开关、无任务级开关、无降级档。
+   - **审查会话 lineage 硬门**：审查者会话须 `kind=reviewer` 且 `parent_session_id` = 该任务最后一次 DONE 的会话 id；缺失/不符同样 E016（`details.reason` ∈ lineage_missing / kind_not_reviewer / lineage_mismatch），claim 与 submit 双侧校验。
+   - **无 subagent 能力即中断**：`retract` 释放认领 → 停止并上报，等人工安排独立审查者；不得改用上述任一旁路。
+   - 审查 comments 首句写明 subagent 来源（`本审查由实现会话 <指纹> spawn 的独立 subagent 执行，审查指纹 <指纹>`）。细则见 rules/review.md「审查者身份约定」。
 5. **禁未提交即中断**：改动后必须提交（或报告未提交原因）才结束；session end 硬拦截，`--force` 可放行。
 6. **禁止自动摄入与自动写入**：intake 仅用户指定；灵感只 `idea propose` 记 study；confirm/close 仅用户可执行。
 7. **禁擅自 auto-claim**：`request --auto-claim` 默认拒绝（E032），仅 `config.allow_auto_claim: true` 时可调。
@@ -73,12 +75,14 @@
 ## 身份约定（会话级指纹）
 - 身份 = `ORCHD_SESSION_ID` 派生 12 位 hex 指纹；同对话不变，不同对话不同。
 - 归属 / 忙度 / 自审 / 锁所有权以指纹为主键；同 agent 不同 session 可并行领不同任务。
-- 自审口径（默认阻断 / 显式 opt-out 提示 / comments 披露）见红线 4 与 rules/session.md。
+- 自审口径（恒阻断）与审查会话 lineage 硬门见红线 4 与 rules/review.md「审查者身份约定」。
 
 ## 摄入口令（统一管线）
 - 四句口令：先记下来 / 确认<slug> / 这条不做 / 拉出来先对一下再拆。
 - 对照卡：原文 / 现状 / 拆分 / 推断；confirm/close 仅用户可执行。
 - 三硬界限：假设被改先问；共享文件默认 `depends_on`；单任务一次做完一次审完。
+- 共享面硬界限：CHANGELOG.md 等共享面不再写进 files_to_edit/exempt_files——fragments 面 done 交 `--changelog-*`/`--surface-entry`，generated 面交给生成器，serial 面用 `depends_on`；确需并行才 `--allow-shared-write <path> --reason`（见 rules/surfaces.md）。
+- 共享面 → rules/surfaces.md（fragments 片段、生成物、串行面与发版检查）
 
 ## 规则目录（见 rules/README.md）
 - 会话/claim → rules/session.md · 摄入 → rules/intake.md · verify → rules/verify.md

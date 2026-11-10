@@ -6,8 +6,8 @@
 三个检测器适配器（``_detect_stale_proposals`` / ``_detect_stray_draft_files`` /
 ``_detect_proposals_dir_entries``），以及 master 登记 id 读取（``_load_master_task_ids``）。
 
-承载 14 个顶层定义（11 函数 + 3 随域常量）；函数体与搬迁前基线**逐字一致**（AST 等价性与
-字节级判据见 tests/test_doctor_pkg.py）。
+承载 15 个顶层定义（11 函数 + 4 常量，含 registered/ 白名单）；搬迁定义与基线**逐字一致**
+（AST 等价性与字节级判据见 tests/test_doctor_pkg.py）。
 
 依赖方向：标准库（``json`` / ``pathlib`` / ``typing``）+ ``orchd.doctor.runtime``
 （``_unavailable_residue``：INV-4a「检测不可用」留痕）；对 ``orchd.spec`` /
@@ -215,6 +215,11 @@ def proposals_dir_entries(orchd_dir: Path) -> list[Path]:
         return []
     entries: list[Path] = []
     for path in sorted(proposals_dir.iterdir()):
+        # task-debug-claim-register-ux：注册成功后草稿归档到 registered/（引擎自建、
+        # 语义明确），不是「前序流程遗留」。不排除会让任一宿主首次注册成功即常驻一条
+        # proposals_dir_entry 残留 + 卫生门 FAIL（该档恒 manual，doctor --fix 不处理）。
+        if path.name == _REGISTERED_PROPOSAL_DIRNAME and path.is_dir():
+            continue
         if path.is_dir() or (path.is_symlink() and not path.is_file()):
             entries.append(path)
     return entries
@@ -281,8 +286,10 @@ def _detect_stale_proposals(project_root: Path) -> list[dict[str, Any]]:
     「清理器即将处理」豁免（若归 auto_clean，门禁会豁免掉本域全部存量，注册路径
     失守重新变成不可见——正是本任务要堵的洞）。
 
-    ``action=move_to_backup`` 由 :func:`_dispose_file_to_backup` 处理：整文件搬入既有
-    ``.doctor-backup/<ts>/`` 桶（保持相对路径），源消失、内容逐字节可回滚。
+    ``action=archive_proposal``（task-cont-autoclean-detectors）由 ``doctor --fix``
+    的同名分支处理：整文件移入 ``.orchd/proposals/archive/<ts>/``（用户内容只归档
+    不删除；源消失、仅一份副本、逐字节可回滚）。移 destination 自通用
+    ``.doctor-backup`` 桶改为 proposals 就近归档区，档案仍不入 git（.gitignore 面）。
     """
     orchd_dir = Path(project_root) / ".orchd"
     try:
@@ -295,6 +302,10 @@ def _detect_stale_proposals(project_root: Path) -> list[dict[str, Any]]:
             "type": "stale_proposal",
             "task_id": p.stem,
             "reason": _STALE_PROPOSAL_REASON,
-            "action": "move_to_backup",
+            "action": "archive_proposal",
         } for p in paths
     ]
+
+
+#: 注册成功后的草稿归档目录名（与 control/proposals.py 的 _REGISTERED_DIRNAME 同形态）。
+_REGISTERED_PROPOSAL_DIRNAME = "registered"

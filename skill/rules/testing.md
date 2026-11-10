@@ -51,6 +51,22 @@ guide:
 - **理由（实证）**：2026-09-13 `task-decl-dir-match-conflict` 与 `task-inflight-conflict-visibility` 并行时**同时**向 `tests/test_pool.py` / `tests/test_worktree.py` 尾部追加测试 → 必然 modify/modify 冲突。根因：同一热点文件被多个并发异步任务共享作为追加点，引擎无法干预 append 冲突。约定层根治：降低冲突面，不新增引擎校验。
 - **例外**：修复既有测试文件中的 bug / 调整既有测试用例（非新增类/方法）不受此限；新增测试类必须新建文件。
 
+## 守卫成本登记（2026-10-31，task-guard-drift-b2-fastlane-cost）
+
+> 绝对墙钟跨机不稳，不做门禁；门禁用**双计数**（spawn 次数 / 用例数）。本节管
+> 「新增守卫的成本入账纪律」：任何新增守卫（测试 / done 期检查 / pre-commit 段）
+> 必须在交付说明附**单文件定向实测耗时**（time.perf_counter 或 pytest --durations）
+> 与**快车道 spawn 增量**（scripts/fast_lane_census.py 复跑对账）。
+
+- **登记阈值**：单文件定向 >10 秒，或快车道 spawn 增量 >20 ⇒ 必须合并到既有守卫或
+  下沉 nightly（`test-slow` 车道），不得以「顺手加一个检查」名义进快车道；
+- **锚单一真源**：spawn / 用例锚 = `scripts/update_stable_lanes.py` 常量
+  （`FAST_LANE_SPAWN_CAP` / `FAST_LANE_CASES_CAP`）；台账 `tests/STABLE_LANES.md`
+  `## Fast` 节头与 `tests/test_lanes_policy.py` 一致性断言同值，三处任一漂移即
+  `--check` / 断言红；
+- **墙钟口径**：墙钟只记录（台账表头 + `FAST_LANE_BUDGET_S`），不进 pytest 运行时
+  硬断言；跨机实测记录写 `docs/perf-call-census.md`。
+
 ## 注册用测试骨架 hygiene（与摄入协议附录 B 双向指针）
 
 - 为注册而建的测试**占位文件**一律直接写任务 worktree，或注册后立即删 main 副本——main 残留的同路径 untracked 文件会在 code APPROVED 合并时触发「untracked would be overwritten」致 merge_env_error；合入前必验 main 干净。

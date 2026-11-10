@@ -1,30 +1,102 @@
 """report — merge 审计域（W6-C3 拆分，纯搬移）。
 
-来源：``orchd/report.py``（1489 行，W6-C3 纯搬移）。
-
-``merge_audit`` / 落地缺口扫描 / main 祖先判定。
-
-依赖 ``acks``（``load_merge_acks``，顶层导入）。
+来源：``orchd/report.py``（1489 行）。``merge_audit`` / main 祖先判定；
+落地面在册判据拆入 ``landing`` 并重导出（保持旧路径同一对象）。
 """
 
 from __future__ import annotations
 
-import json
-import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from orchd.contracts.events import TERMINAL_STATUSES
-from orchd.errors import ErrorCode, OrchdError
-from orchd.gitops import list_tracked_changes, session_lock_check, session_lock_release
 from orchd.line import TASK_BRANCH_ROOT
-from orchd.ledger import Store, TaskState, resolve_workspace_root
-from .acks import (
-    load_merge_acks,
+from orchd.ledger import Store
+from .acks import load_merge_acks
+from .landing import (
+    LandingScan, changelog_landing_scan,
+    surface_landing_scan, _changelog_landing_gaps,
 )
 
 
+# merge 审计严重度分级（task-engine-defect-fix-unified-u12）。
+#
+# 根因：审计项原是无类型字符串集合（只有 reason），``merge_finalize`` 在分档前把
+# 自家残留全量并入 ``merge_audit.warnings``，``worktree_not_recycled``（环境性、
+# 可延迟收敛）与 ``changelog_landed_task_missing``（记账缺口）同级——既无
+# severity 可回看，弹回判据也只能按 reason 硬编码。此处把审计项类型化为
+# ``{code, severity, deferred}``，成为 severity 的**单一真源**：
+# ``merge_audit`` 自产项与 ``review/merge_finalize`` 的窄口径自家残留共用本表
+# （后者以函数级 import 消费，避免 report↔review 顶层循环依赖）。
+AUDIT_SEVERITY_BLOCKING = "blocking"
+AUDIT_SEVERITY_ACCOUNTING = "accounting"
+AUDIT_SEVERITY_ENV = "env"
+AUDIT_SEVERITY_INFO = "info"
+AUDIT_SEVERITIES = (
+    AUDIT_SEVERITY_BLOCKING,
+    AUDIT_SEVERITY_ACCOUNTING,
+    AUDIT_SEVERITY_ENV,
+    AUDIT_SEVERITY_INFO,
+)
+# code → severity。判据口径：
+# - blocking：本任务一方的硬残留（实现/分支未落地、绕过 claim 的幽灵分支）——
+#   唯一允许触发 in_review 弹回的一档；
+# - accounting：记账类缺口（CHANGELOG 缺行 / 不可读、cancelled 分支遗留），须补记
+#   或人工处置，但不等于「实现未落地」；
+# - env：环境性残留（Windows 句柄占用导致 worktree 未回收），延迟回收可收敛；
+# - info：卫生提示（已并入 main 但分支未删），不阻断亦不记账。
+# 未登记 code 一律按 blocking（fail-closed：宁可多打回，不静默放行）。
+AUDIT_SEVERITY_BY_CODE: dict[str, str] = {
+    "unregistered_task_branch": AUDIT_SEVERITY_BLOCKING,
+    "branch_not_merged_into_main": AUDIT_SEVERITY_BLOCKING,
+    "branch_not_cleaned": AUDIT_SEVERITY_BLOCKING,
+    "merge_warning_unresolved": AUDIT_SEVERITY_BLOCKING,
+    "changelog_landed_task_missing": AUDIT_SEVERITY_ACCOUNTING,
+    "changelog_unreadable": AUDIT_SEVERITY_ACCOUNTING,
+    "cancelled_branch_not_cleaned": AUDIT_SEVERITY_ACCOUNTING,
+    "worktree_not_recycled": AUDIT_SEVERITY_ENV,
+    "merged_but_not_cleaned": AUDIT_SEVERITY_INFO,
+}
+_DEFAULT_AUDIT_SEVERITY = AUDIT_SEVERITY_BLOCKING
+
+
+def audit_severity(code: str) -> str:
+    """审计 code → severity（未登记 code 按 blocking，fail-closed）。
+
+    Args:
+        code: 审计项的 ``code``（取值口径同 ``reason``）。
+
+    Returns:
+        ``blocking`` / ``accounting`` / ``env`` / ``info`` 之一。
+    """
+    return AUDIT_SEVERITY_BY_CODE.get(str(code), _DEFAULT_AUDIT_SEVERITY)
+
+
+def classify_audit_item(item: dict[str, Any]) -> dict[str, Any]:
+    """把一条审计项类型化为 ``{..., code, severity, deferred}``（幂等，只增不改）。
+
+    ``code`` 缺省取既有 ``reason``（既有消费方按 reason 过滤，保持零回归）；
+    显式给出的 ``code`` / ``severity`` 优先（供上层覆写）。``deferred`` = 非
+    blocking，语义为「只注解、不触发 in_review 弹回」，与
+    ``review/merge_finalize`` 的分档判定同口径。
+
+    Args:
+        item: 原始审计项（至少含 ``reason`` 或 ``code``）。
+
+    Returns:
+        新 dict（不改入参），保留原键并补 ``code`` / ``severity`` / ``deferred``。
+    """
+    out = dict(item)
+    code = str(out.get("code") or out.get("reason") or "")
+    out["code"] = code
+    out["severity"] = str(out.get("severity") or audit_severity(code))
+    out["deferred"] = out["severity"] != AUDIT_SEVERITY_BLOCKING
+    return out
+
+
+def classify_audit_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """逐条类型化审计项（保持原顺序；见 :func:`classify_audit_item`）。"""
+    return [classify_audit_item(item) for item in items]
 
 
 def merge_audit(
@@ -61,8 +133,12 @@ def merge_audit(
 
     Returns:
         {"skipped": False, "warnings": [{"task_id"?, "branch", "reason",
-        "ahead_count"}]} 或 {"skipped": True, "reason": "..."}。
-        幽灵分支告警无 task_id 字段（无注册任务）。
+        "code", "severity", "deferred", "ahead_count"}]} 或
+        {"skipped": True, "reason": "..."}。
+        幽灵分支告警无 task_id 字段（无注册任务）。每项经
+        :func:`classify_audit_item` 类型化：``code`` 与 ``reason`` 同值（既有
+        消费方零回归），``severity`` ∈ {blocking, accounting, env, info}，
+        ``deferred`` 表示「只注解、不触发 in_review 弹回」。
     """
     import subprocess
 
@@ -220,71 +296,10 @@ def merge_audit(
     # 命中只并入 warnings（注解层）——不进窄口径拦截分支：拦截会让「本卡自己的
     # CHANGELOG 行尚未写」变成「合不进来」的死锁口。
     warnings.extend(_changelog_landing_gaps(root))
-    return {"skipped": False, "warnings": warnings}
-
-
-
-def _changelog_landing_gaps(project_root: Path) -> list[dict[str, Any]]:
-    """『落地任务须在 CHANGELOG 在册』的缺行清单（只读，恒不阻断）。
-
-    真源（**禁**自建 git 遍历、**禁**复制 CHANGELOG 判据）：
-    - ``orchd.gitops.query.previous_release_tag``：锚 = 上一发版 tag；
-    - ``orchd.gitops.query.landed_task_ids_since``：落地集 = ``锚..HEAD`` 的
-      first-parent 历史（merge 提交 / 实现提交 / 括号引用三种形态）。
-
-    与 ``tests/test_docs_drift_batch.py::TestChangelogCutoverCompleteness``
-    同源同口径（交叉断言见 ``tests/test_report.py``：替换任一真源后两侧结论必须
-    一致，防判据分叉）。在册判定按漂移用例逐字同口径：``task_id not in
-    CHANGELOG.md 全文``（已发版任务记在版本节即合规，未发版任务须在 Unreleased）。
-
-    存在意义（本卡根因）：该判据此前只在**全量套件**里跑，CI 不可达期间 5 张卡
-    同日合入造成的缺行漂移静默累积 9 天；接入每次合入必跑的 merge 审计后，漂移
-    在合入当时即可见，不必等下一次全量。
-
-    降级（best-effort，绝不抛异常出界）：无 tag / 落地集为空（锚缺失时「缺行」
-    无从定义）/ git 不可读 → 返回空；``CHANGELOG.md`` 不可读 → 单列
-    ``changelog_unreadable`` 留痕（仍不阻断）。
-
-    Args:
-        project_root: 仓库根目录（git 命令 cwd，与 :func:`merge_audit` 一致）。
-
-    Returns:
-        warning 项列表（0 或 1 项），由 :func:`merge_audit` 并入 warnings。
-    """
-    from orchd.gitops import query as _query
-
-    prev = _query.previous_release_tag(project_root)
-    if not prev:
-        return []
-    landed = _query.landed_task_ids_since(project_root, prev)
-    if not landed:
-        return []
-    changelog = Path(project_root) / "CHANGELOG.md"
-    try:
-        text = changelog.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        # UnicodeDecodeError ⊂ **ValueError**，不在 OSError 内：只捕 OSError 会让
-        # 非 UTF-8 的 CHANGELOG 把异常抛到调用方——而 `status --audit-merge`
-        # 对 merge_audit 无 try 保护，会整条命令以 exit 1 失败。降级留痕。
-        return [{
-            "reason": "changelog_unreadable",
-            "path": str(changelog),
-            "message": (f"CHANGELOG.md 不可读（{type(exc).__name__}: {exc}）"
-                        "——『落地任务在册』检查降级，需人工核对"),
-        }]
-    missing = [tid for tid in landed if tid not in text]
-    if not missing:
-        return []
-    return [{
-        "reason": "changelog_landed_task_missing",
-        "path": str(changelog),
-        "task_ids": missing,
-        "message": (f"自 {prev} 以来 {len(missing)} 张落地任务未在 CHANGELOG.md 在册"
-                    f"（不阻断合入，但须补记）：{', '.join(missing)}"),
-        "hint": ("在 CHANGELOG.md 的 [Unreleased] 分区为上述 id 各补一行语义化条目"
-                 "（判据真源：orchd.gitops.query.landed_task_ids_since）"),
-    }]
-
+    # 出口统一类型化（task-engine-defect-fix-unified-u12）：逐项补
+    # code/severity/deferred，使 report/audit（status --audit-merge）与 review
+    # 响应的 merge_audit 回看都带分档信息。只增字段，reason 不变。
+    return {"skipped": False, "warnings": classify_audit_items(warnings)}
 
 
 def _is_ancestor_of_main(project_root: Path, sha: str) -> bool:

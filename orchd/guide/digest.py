@@ -40,6 +40,10 @@ NEXT_ACTION_AWAIT_REVIEW: str = "await_review"  # done 收尾 lessons 待审核
 # 对应 next_action 取值 → request 在「已持有审查认领」时只能产 review_first，把会话引向
 # 他任务的审查（必被 claim 的 E011 review busy 拒绝），手上的认领就此悬空未提交。
 NEXT_ACTION_SUBMIT_REVIEW: str = "submit_review"
+# 本会话已持有实现认领（claimed）且池中存在他人在审：先 done 收尾，不再产 review_first。
+# task-feedback-request-review-priority-align：request 原实现先查全局 in_review，与
+# _classify 的 my_claimed 优先顺序打架，agent 按 review_first 去 claim 会被 E011 拒。
+NEXT_ACTION_DONE: str = "done"
 
 NEXT_ACTION_TO_STEP: dict[str, str] = {
     NEXT_ACTION_EXIT: "stop_wait",
@@ -50,6 +54,7 @@ NEXT_ACTION_TO_STEP: dict[str, str] = {
     NEXT_ACTION_REVIEW_TAKEOVER: "claim_review",
     NEXT_ACTION_AWAIT_REVIEW: "lesson_review",
     NEXT_ACTION_SUBMIT_REVIEW: "submit_review",
+    NEXT_ACTION_DONE: "done",
 }
 
 

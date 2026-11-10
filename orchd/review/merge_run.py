@@ -7,12 +7,154 @@ from pathlib import Path
 import subprocess
 
 from orchd.gitops import main_worktree_root
+from orchd.gitops.guard.restore import restore_worktree_paths
 from orchd.line_ctx import resolve_task_branch_for
 from orchd.line_ctx import resolve_trunk_for
 from orchd.gitops_ops import try_auto_resolve_conflict
 from orchd.gitops_ops import try_git_merge
 from .branch import _wt_dir_name
 from .resolve_markers import _resolve_review_resolve_markers
+
+
+def _generate_in_main_worktree(root: Path, artifact: str) -> str:
+    """在主工作树上下文里生成单份产物内容（避免用任务 worktree 的包根求值）。
+
+    生成器的 ``ROOT`` 由被导入的 ``orchd`` 包位置推导；本进程内直接调用会锚定到
+    任务 worktree（其行数/文件集与 main 不同，导致 merge 后 docs check 仍漂移）。
+    故以 ``cwd=root`` + ``PYTHONPATH`` 指向主工作树的子进程生成到临时目录，
+    再只读取目标产物。
+    """
+    import os
+    import sys
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="orchd-merge-docsgen-") as tmp:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [sys.executable, "-m", "orchd.docsgen", "--write", tmp],
+            cwd=str(root), env=env, capture_output=True, text=True,
+            encoding="utf-8", timeout=120,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"docsgen 生成失败（rc={proc.returncode}）：{(proc.stderr or '')[-300:]}"
+            )
+        return (Path(tmp) / Path(artifact).name).read_text(encoding="utf-8")
+
+
+def _rollback_generated_artifact(root: Path, artifact: str) -> None:
+    """把生成物恢复到 HEAD；HEAD 中不存在则从索引与工作树移除。
+
+    merge 后刷新是独立提交：失败时不能把 staged 生成物留在主工作树，否则
+    当前活跃任务的 hook 会持续拦截后续无关提交。tracked 文件走受管还原
+    （``git checkout HEAD --``）；首次生成的新文件没有 HEAD 版本，改为从
+    索引移除并删除工作树文件。
+    """
+    target = Path(root) / artifact
+    probe = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"HEAD:{artifact}"],
+        capture_output=True, timeout=30,
+    )
+    if probe.returncode == 0:
+        restore_worktree_paths(Path(root), [artifact])
+        return
+    subprocess.run(
+        ["git", "-C", str(root), "rm", "--cached", "--ignore-unmatch", "--", artifact],
+        check=True, capture_output=True, timeout=30,
+    )
+    target.unlink(missing_ok=True)
+
+
+def _refresh_dependency_graph_after_merge(
+    project_root: Path,
+    task_id: str,
+    degraded: list[dict[str, Any]],
+) -> None:
+    """merge 成功后刷新 dependency-graph 并提交（失败回滚生成物，不回滚 merge）。
+
+    仅在引擎仓执行：以主工作树为 cwd 重生成 ``docs/_generated/dependency-graph.md``；
+    内容有变化才写盘并做一次引擎提交（``chore(docs): ...``）。宿主仓 / 非引擎仓
+    直接跳过，避免误触 engine-only 生成器；无 git 单目录同样跳过（无提交通道）。
+    """
+    from orchd.repo_role import is_engine_repo
+
+    try:
+        root = main_worktree_root(project_root)
+    except Exception as exc:  # noqa: BLE001 - 定位主工作树失败只降级
+        degraded.append({
+            "guard": "dependency_graph_refresh",
+            "task_id": task_id,
+            "error": f"{type(exc).__name__}: {exc}",
+            "hint": (
+                "merge 已完成；dependency-graph 未刷新，"
+                "可在主工作树手工执行 docs sync --point merge"
+            ),
+        })
+        return
+    if not is_engine_repo(root):
+        return
+    try:
+        from orchd.nogit import git_available
+
+        if not git_available(Path(root)):
+            return  # 无 git 单目录：add/commit 必失败，跳过刷新避免误导性 degraded
+    except Exception:  # noqa: BLE001 - 探测失败按原路径继续，由 git 步骤自行降级
+        pass
+    artifact = ""
+    wrote = False
+    try:
+        from orchd import docs_manifest
+
+        entry = docs_manifest.by_id("dependency-graph")
+        if entry is None:
+            raise RuntimeError("dependency-graph 产物未登记")
+        artifact = entry.artifact
+        expected = _generate_in_main_worktree(Path(root), entry.artifact)
+        target = Path(root) / entry.artifact
+        current = target.read_text(encoding="utf-8") if target.is_file() else None
+        if current == expected:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        wrote = True
+        target.write_text(expected, encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(root), "add", entry.artifact],
+            check=True, capture_output=True, timeout=30,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-m",
+             f"chore(docs): merge 后刷新 {entry.artifact}（{task_id}）",
+             "--", entry.artifact],
+            check=True, capture_output=True, timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001 - 刷新失败不阻断已完成的 merge
+        rollback_error = None
+        if wrote and artifact:
+            try:
+                _rollback_generated_artifact(Path(root), artifact)
+            except Exception as rexc:  # noqa: BLE001 - 回滚失败要单独留痕
+                rollback_error = f"{type(rexc).__name__}: {rexc}"
+        stderr = ""
+        if isinstance(exc, subprocess.CalledProcessError):
+            raw = exc.stderr or exc.stdout or b""
+            stderr = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        hint = (
+            "merge 已完成；刷新失败且自动回滚失败，请检查主工作树 "
+            "git status，并用 orchd restore --path <artifact> 恢复"
+            if rollback_error else
+            "merge 已完成；本次刷新已回滚；修复 hook 后可重跑 "
+            "docs sync --point merge 并提交"
+        )
+        degraded.append({
+            "guard": "dependency_graph_refresh",
+            "task_id": task_id,
+            "artifact": artifact,
+            "error": f"{type(exc).__name__}: {exc}",
+            "stderr": stderr[-500:],
+            "rollback_error": rollback_error,
+            "hint": hint,
+        })
 
 
 def _review_submit_merge_run(
@@ -134,4 +276,42 @@ def _review_submit_merge_run(
                     f"--reason 'merge冲突回退'"
                 )
 
-    return merge_result, auto_resolved, _nogit_single_dir
+    # 段体保持基线 6 条语句（段体拼接守卫）：merge 成功判定 + 依赖图刷新由尾随
+    # return 表达式承载——见 `_finish_merge_run`，不得写回段体。
+    return _finish_merge_run(
+        merge_result=merge_result,
+        auto_resolved=auto_resolved,
+        nogit_single_dir=_nogit_single_dir,
+        project_root=project_root,
+        task_id=task_id,
+        degraded=degraded,
+    )
+
+
+def _finish_merge_run(
+    *,
+    merge_result: dict[str, Any] | None,
+    auto_resolved: bool,
+    nogit_single_dir: bool,
+    project_root: Path | None,
+    task_id: str,
+    degraded: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, bool, bool]:
+    """merge 成功判定 + 成功后依赖图刷新（原段体尾部两条语句的承载点）。
+
+    刷新失败只记 degraded（见 :func:`_refresh_dependency_graph_after_merge`），
+    不回滚已完成 merge、不改变审查结论。
+    """
+    merged_ok = (
+        nogit_single_dir
+        or auto_resolved
+        or (
+            merge_result is not None
+            and not merge_result.get("conflict")
+            and not merge_result.get("merge_diagnostic")
+        )
+    )
+    if project_root and merged_ok:
+        # merge 已落 main；刷新失败只记 degraded，不回滚 merge。
+        _refresh_dependency_graph_after_merge(Path(project_root), task_id, degraded)
+    return merge_result, auto_resolved, nogit_single_dir

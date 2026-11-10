@@ -5,27 +5,41 @@
 
 from __future__ import annotations
 
-import json
-import sys
+import functools
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
 
 from orchd.gitops._run import _run_git
 from orchd.gitops.cleanup import _safe_delete
 
+from .active_gate import uninstall_gate, with_state_check
 from .content import (
-    _baked_hook_endpoints,
+    HOOK_RUNTIME_UNAVAILABLE,
+    ORCHD_HOOK_SHELL_ENV,
     _line_ref_tx_env,
     _precommit_hook_content,
     _precommit_hook_params,
+    _run_hook_shell,
+    probe_hook_runtime,
     ref_tx_hook_content,
+    resolve_hook_shell,
+)
+from .runtime import (
+    ORCHD_ALLOW_HOOK_DEGRADED_ENV,
+    _baked_hook_endpoints,
+    _is_orchd_hook,
+    _log_hook_skip,
+    _validate_hook_content,
+    _write_runtime_gate,
 )
 from .paths import (
-    _HOOK_FILENAME,
+    _HOOK_FILENAME, _REF_TX_HOOK_FILENAME, _acquire_hook_lock,
     _ensure_hooks_path,
-    _get_hook_path,
-    _get_hooks_dir,
-    _get_ref_tx_hook_path,
+    _get_ref_tx_hook_path,  # conftest 会话级 ref-tx 桩按本域命名空间取路径（F401 豁免）
+    _resolve_hooks_dir_checked, clear_hook_runtime_degraded,
+    hook_lock_path, hook_runtime_degraded_path, read_hook_runtime_degraded,
+    record_hook_runtime_degraded,
 )
 from .templates import (
     _HOOK_MARKER,
@@ -34,77 +48,6 @@ from .templates import (
     _REF_TX_HOOK_MARKER,
 )
 
-
-
-def _is_orchd_hook(hook_path: Path) -> bool:
-    """目标 pre-commit 是否由本引擎生成（首部含 orchd 归属标记，owner-aware）。
-
-    只扫首部 ``_HOOK_MARKER_SCAN_LINES`` 行；读取失败（权限 / 二进制 / 编码）
-    一律返回 False——保守方向是「不动宿主文件」，宁可跳过安装也不覆盖未知文件。
-
-    Args:
-        hook_path: pre-commit 文件路径。
-
-    Returns:
-        True = 本引擎生成物（可安全覆盖 / 删除）。
-    """
-    try:
-        text = hook_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    head = "\n".join(text.splitlines()[:_HOOK_MARKER_SCAN_LINES])
-    return _HOOK_MARKER in head
-
-
-
-def _validate_hook_content(content: str) -> dict[str, Any]:
-    """生成物完整性自检：写盘前拒绝 / 写盘后回读共用的**唯一形态判据**。
-
-    事故背景（task-hook-staged-nul-rootfix）：f-string 内 ``tr '\\0' '\\n'`` 未转义
-    → 生成物被写入**真实** NUL / 换行字符；而写入路径只强制 LF（``newline="\\n"``）、
-    无内容自检，缺陷只能靠测试侧 ``bash -n`` 事后暴露。本函数把「生成物必须满足的
-    形态约束」收敛为写盘前的单一判据：不通过即拒绝写盘，**不落半截生成物、不覆盖
-    已有 hook**（宿主自有 hook 的完整性优先）。
-
-    检查项（任一不满足即判失败）：
-
-    - **NUL 控制字符**（``\\x00``：f-string 转义事故的典型产物）；
-    - **CR**（``\\r``：hook 须纯 LF，CR 会污染 here-doc 终止符与路径比较）；
-    - **shebang 首行**（缺失 → git 无法执行该 hook，等于拦截能力静默失效）；
-    - **归属标记在首部**（owner-aware 判据，缺失会让引擎无法识别自己的生成物，
-      卸载时不敢删、安装时被误判为宿主 hook）。
-
-    Args:
-        content: 待写入（或已写入后回读）的 hook 脚本文本。
-
-    Returns:
-        ``{"ok": True}`` 通过；``{"ok": False, "reason": <str>, "error": <str>}``
-        拒绝，``reason`` 取值：``empty_content`` / ``nul_byte`` / ``cr_present`` /
-        ``missing_shebang`` / ``missing_marker``。
-    """
-    if not content:
-        return {"ok": False, "reason": "empty_content",
-                "error": "生成物为空：拒绝写入 pre-commit hook"}
-    if "\x00" in content:
-        return {"ok": False, "reason": "nul_byte",
-                "error": "生成物含 NUL 控制字符（典型为 f-string 内 \\0 被真实转义）"}
-    if "\r" in content:
-        return {"ok": False, "reason": "cr_present",
-                "error": "生成物含 CR（hook 须纯 LF，CR 会污染 here-doc 终止符与路径比较）"}
-    lines = content.splitlines()
-    if not lines[0].startswith("#!"):
-        return {"ok": False, "reason": "missing_shebang",
-                "error": f"生成物首行缺失 shebang（须为 {_HOOK_SHEBANG}）"}
-    if _HOOK_MARKER not in "\n".join(lines[:_HOOK_MARKER_SCAN_LINES]):
-        return {
-            "ok": False,
-            "reason": "missing_marker",
-            "error": (
-                f"生成物首部 {_HOOK_MARKER_SCAN_LINES} 行内缺失归属标记"
-                f"（{_HOOK_MARKER}）"
-            ),
-        }
-    return {"ok": True}
 
 
 
@@ -121,38 +64,18 @@ def _write_hook_file(path: Path, content: str) -> None:
 
 
 
-def _log_hook_skip(action: str, payload: dict[str, Any]) -> None:
-    """把 hook 跳过 / 拒绝动作写 stderr 留痕（``orchd ▸ [hook]`` 前缀，best-effort）。
-
-    与 ``worktree._log_recycle`` 同型：结构化 JSON 单行、任何异常静默不阻断主流程。
-    差异：**不受 ORCHD_QUIET 抑制**——回收留痕是常规噪声，而「因宿主 hook 存在而
-    跳过安装」是必须可追溯的安全决策（R2-3 的静默覆盖正是漏掉了这层留痕）；唯一
-    调用方 ``onboard/claim.py::claim`` 目前丢弃 hook_install 返回值，故在此落一条
-    stderr 审计行，避免跳过被静默吞掉。
-    """
-    # 跨 mypy 版本免疫：getattr 取回 Any，无需 type-ignore（旧 ignore 码
-    # [attr-defined] 在新版报 union-attr，pass8 F3）；缺失/异常仍静默跳过。
-    _reconfigure = getattr(sys.stderr, "reconfigure", None)
-    if callable(_reconfigure):
-        try:
-            _reconfigure(encoding="utf-8")
-        except (AttributeError, ValueError, OSError):
-            pass
-    try:
-        record = {"action": action, **payload}
-        print(f"orchd ▸ [hook] {json.dumps(record, ensure_ascii=False)}", file=sys.stderr)
-    except Exception:
-        pass
-
-
-
 def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
     """安装强制层 hook（best-effort；owner-aware：宿主自有同名 hook 不覆盖）。
 
     与 pre-commit 共用同一 hooks 目录 / hooksPath 解析与形态自检，但不共用文件：
     pre-commit 管「提交范围（E020）」，reference-transaction 管「引用事务（红线 #1/#2）」。
+    探测失败即 fail-closed（``reason="git_unavailable"``，不猜 ``.git/hooks``）。
     """
-    path = _get_ref_tx_hook_path(project_root)
+    hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "install_ref_tx")
+    if fail is not None:
+        _log_hook_skip("install_ref_tx_skipped_git_unavailable", fail)
+        return fail
+    path = hooks_dir / _REF_TX_HOOK_FILENAME
     if path.exists() and not _is_orchd_hook(path):
         result = {
             "installed": False, "reason": "foreign_hook_present", "path": str(path),
@@ -175,6 +98,9 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
                   "path": str(path), "error": check.get("error", "生成物自检未通过")}
         _log_hook_skip("install_ref_tx_rejected_invalid_content", result)
         return result
+    runtime_fail = _write_runtime_gate(content, path)
+    if runtime_fail is not None:
+        return runtime_fail
     try:
         _write_hook_file(path, content)
     except (OSError, IOError) as exc:
@@ -193,10 +119,15 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
     return installed_result
 
 
-
 def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:
-    """删除强制层 hook（best-effort；owner-aware：只删本引擎生成物）。"""
-    path = _get_ref_tx_hook_path(project_root)
+    """删除强制层 hook（best-effort；owner-aware：只删本引擎生成物）。
+
+    探测失败时 **fail-closed**：一个文件都不删（``reason="git_unavailable"``）。
+    """
+    hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "uninstall_ref_tx")
+    if fail is not None:
+        return fail
+    path = hooks_dir / _REF_TX_HOOK_FILENAME
     if not path.exists():
         return {"uninstalled": True, "reason": "not_exists", "path": str(path)}
     if not _is_orchd_hook(path):
@@ -211,6 +142,39 @@ def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:
 
 
 
+def _precommit_write_guard(
+    fn: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
+    """安装写盘守卫：运行时双检 → 共享 hook 锁 → 落盘 → 成功后清 degraded。
+
+    流程放在装饰器而非编排体内：``_write_precommit_hook`` 的编排语句序须保持
+    基线 9 条（``tests/test_hook_template_external.py`` 的搬移等价判据）。
+
+    T18：装饰器必须留在 install 域——``functools.wraps`` 返回的包装函数其
+    ``__globals__`` 即本模块（``test_install_holds_its_own_bindings`` 判据）；
+    runtime 只提供被调用的探测 / 留痕 / 清 degraded 辅助。
+    """
+    @functools.wraps(fn)
+    def _guarded(hooks_dir, hooks_path, hook_content, project_root):
+        runtime_fail = _write_runtime_gate(hook_content, hooks_dir / _HOOK_FILENAME)
+        if runtime_fail is not None:
+            return runtime_fail
+        lock, lock_error = _acquire_hook_lock(project_root)
+        if lock_error is not None:
+            _log_hook_skip("install_skipped_hook_lock", lock_error)
+            return lock_error
+        try:
+            result = fn(hooks_dir, hooks_path, hook_content, project_root)
+        finally:
+            lock.release()
+        if result.get("installed"):
+            clear_hook_runtime_degraded(project_root)
+        return result
+
+    return _guarded
+
+
+@_precommit_write_guard
 def _write_precommit_hook(
     hooks_dir: Path,
     hooks_path: dict[str, Any],
@@ -286,7 +250,6 @@ def _write_precommit_hook(
     ref_tx = _install_ref_tx_hook(project_root)
     return {"installed": True, "path": str(hook_path), "hooks_path": hooks_path,
             "ref_tx_hook": ref_tx}
-
 
 
 def hook_install(
@@ -366,23 +329,16 @@ def hook_install(
             "error": "task_id 含非 [A-Za-z0-9_-] 字符，拒绝写入 pre-commit hook（防 shell 注入）",
         }
 
-    # 安装期确保仓库自带 hooks 目录已启用（core.hooksPath 不随 clone 传播）：
-    # 先于 hooks_dir 解析执行，使本次安装即落到正确目录；best-effort，不影响主流程。
-    hooks_path = _ensure_hooks_path(project_root)
-
-    hooks_dir = _get_hooks_dir(project_root)
+    # 非仓库先判掉（探测失败 git_unavailable 与「不是仓库」处置不同，先判后者）。
     if not (project_root / ".git").exists():
         return {"installed": False, "reason": "not_a_git_repo"}
-
-    # 强制层（task-ref-tx-hook）：与 pre-commit 同时安装——pre-commit 管「提交范围
-    # （E020）」，reference-transaction 管「引用事务（红线 #1/#2 强制拦截）」。两者
-    # 独立文件、独立 owner-aware 判定。安装时机放在 pre-commit 校验/写盘**之后**：
-    # 提交层生成物不合格时整轮安装即失败，此时不应额外落盘强制层文件（保持
-    # 「拒绝即不写任何文件」的既有语义，见 test_hook_content_guard）。
-
+    # hooksPath 不随 clone 传播：先确保仓库自带 hooks 目录已启用（best-effort）。
+    hooks_path = _ensure_hooks_path(project_root)
+    # u11：git 答不出 hooks 目录即 fail-closed（不写/不删、不回退 .git/hooks）。
+    hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "install")
+    if fail is not None:
+        return fail
     exempt = exempt_files or []
-
-    # 模板渲染与落盘自检拆为两个模块级段函数（F1/F2 同族形态）：
     # 烘焙块 → 模板渲染 → 落盘/自检/强制层；调用顺序与起点逐条一致。
     hook_content = _precommit_hook_content(
         **_precommit_hook_params(project_root, task_id, files_to_edit, exempt))
@@ -390,32 +346,104 @@ def hook_install(
 
 
 
+def _with_state_check(
+    result: dict[str, Any], state_check: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """给卸载结果附活跃判定留痕（转发 :mod:`.active_gate` 单一实现）。"""
+    return with_state_check(result, state_check)
 
-def hook_uninstall(project_root: Path) -> dict[str, Any]:
+
+def hook_uninstall(
+    project_root: Path,
+    *,
+    orchd_dir: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
     """删除 pre-commit hook（best-effort，owner-aware：只删本引擎生成物）。
+
+    **活跃认领门控（task-debug-hook-active-gate）**：hook 目录由 ``core.hooksPath``
+    决定，是全仓绝对路径、多任务共享（见 ``.paths``）。此前每个任务收尾都无条件
+    卸载 ⇒ 并行会话下「A 合并完成删 hook → B 的提交窗口期越界校验 fail-open」
+    （实测：``.githooks/pre-commit`` 瞬时消失约 1 分钟后被下一会话 claim 重烘焙）。
+    现改为：提供 ``orchd_dir`` 且账本里仍有**其他**活跃认领时保留 hook，返回
+    ``reason=retained_active_claims`` + ``active_tasks``；状态不可读时回退旧行为
+    （删除）并在 ``state_check.reason`` 留痕 ``state_unavailable``——能力探测失败
+    不得让 hook 永久残留。
 
     Args:
         project_root: git 仓库根目录。
+        orchd_dir: 可选，``.orchd`` 目录（用于解析账本活跃认领）。缺省 = 旧行为。
+        force: 显式跳过活跃门控（仅测试/极端兜底保留；**生产调用点不使用**——
+            force-status 也走 ``orchd_dir``，否则僵尸清理时他人仍持认领会重开并行期缺口）。
 
     Returns:
         结构化结果，永不抛异常：
             - ``{"uninstalled": True, "reason": "removed"}`` hook 已删除。
             - ``{"uninstalled": True, "reason": "not_exists"}`` hook 本就不存在（幂等）。
+            - ``{"uninstalled": False, "reason": "retained_active_claims",
+              "active_tasks": [...]}`` 仍有活跃认领 → 保留（强制层同样保留）。
             - ``{"uninstalled": False, "reason": "foreign_hook_present", "path": <str>,
               "hint": <str>}`` 目标 pre-commit 不含 orchd 标记头（宿主自有 hook）
               → **不删除**，附不删原因（保护宿主文件）。
             - ``{"uninstalled": False, "reason": "io_error", "error": <str>}``
               删除失败（best-effort 降级）。
+            - ``{"uninstalled": False, "reason": "git_unavailable", ...}`` git 无法
+              回答 hooks 目录 → **fail-closed**：不删任何文件（防误删宿主 hook）。
+            后三种除保留分支外均可能附 ``state_check``（活跃判定可观测性）。
     """
-    # 强制层与提交层同生命周期卸载（各自 owner-aware，互不波及宿主文件）
-    ref_tx = _uninstall_ref_tx_hook(project_root)
-    hook_path = _get_hook_path(project_root)
+    # 活跃认领门控：只要还有别的任务在实现/审查，本任务收尾不得拆掉共享 hook。
+    # 门控只对**本引擎生成物**生效——宿主自有 hook 任何时候都不删（owner-aware
+    # 优先），此时如实返回 foreign_hook_present 比「保留」更符合调用方预期。
+    # 探测失败 → fail-closed：一个文件都不删，也不进活跃认领门控（同一探测结论）。
+    # 安装与卸载共用 .orchd-runtime/hook.lock：消除删/装交错的 TOCTOU 窗口。
+    lock, lock_error = _acquire_hook_lock(project_root)
+    if lock_error is not None:
+        _log_hook_skip("uninstall_skipped_hook_lock", lock_error)
+        return lock_error
+    try:
+        return _hook_uninstall_locked(
+            project_root, orchd_dir=orchd_dir, force=force)
+    finally:
+        lock.release()
+
+
+def _hook_uninstall_locked(
+    project_root: Path,
+    *,
+    orchd_dir: Path | None,
+    force: bool,
+) -> dict[str, Any]:
+    """锁内卸载实现（调用方已持 ``hook.lock``）。"""
+    hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "uninstall")
+    if fail is not None:
+        return fail
+    hook_path = hooks_dir / _HOOK_FILENAME
+    hook_is_ours = hook_path.exists() and _is_orchd_hook(hook_path)
+    gate = uninstall_gate(
+        hook_is_ours=hook_is_ours, orchd_dir=orchd_dir, force=force,
+        log=_log_hook_skip,
+    )
+    if gate["retain"]:
+        return gate["result"]
+    state_check = gate["state_check"]
+    # 强制层与提交层同生命周期卸载（各自 owner-aware，互不波及宿主文件）。
+    # 但「仍有活跃认领」时强制层必须保留，即便 pre-commit 不是本引擎生成物——
+    # 否则红线 #1/#2 的引用事务强制层在并行期照旧被拆（code 审查 BLOCKER 1）。
+    if gate["ref_tx_retained"]:
+        ref_tx: dict[str, Any] = {
+            "uninstalled": False, "reason": "retained_active_claims",
+        }
+    else:
+        ref_tx = _uninstall_ref_tx_hook(project_root)
     if not hook_path.exists():
-        return {"uninstalled": True, "reason": "not_exists", "ref_tx_hook": ref_tx}
+        return _with_state_check(
+            {"uninstalled": True, "reason": "not_exists", "ref_tx_hook": ref_tx},
+            state_check,
+        )
     # R2-3 owner-aware：只删除本引擎生成物（含 orchd 标记头）。宿主自有 hook
     # （husky / lint-staged / 手写）一律不动，返回不删原因。
     if not _is_orchd_hook(hook_path):
-        result = {
+        return _with_state_check({
             "uninstalled": False,
             "reason": "foreign_hook_present",
             "path": str(hook_path),
@@ -423,11 +451,17 @@ def hook_uninstall(project_root: Path) -> dict[str, Any]:
                 f"{hook_path} 不含 orchd 标记头（{_HOOK_MARKER}）——判定为宿主自有 "
                 "hook，未删除（保护宿主文件）"
             ),
-        }
-        return result
+            "ref_tx_hook": ref_tx,
+        }, state_check)
     try:
         _safe_delete(hook_path, project_root)
-        return {"uninstalled": True, "reason": "removed", "ref_tx_hook": ref_tx}
+        return _with_state_check(
+            {"uninstalled": True, "reason": "removed", "ref_tx_hook": ref_tx},
+            state_check,
+        )
     except (OSError, IOError) as exc:
-        return {"uninstalled": False, "reason": "io_error", "error": str(exc),
-                "ref_tx_hook": ref_tx}
+        return _with_state_check(
+            {"uninstalled": False, "reason": "io_error", "error": str(exc),
+             "ref_tx_hook": ref_tx},
+            state_check,
+        )

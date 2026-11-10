@@ -21,7 +21,6 @@ from orchd.contracts.task_schema import (
     MAX_ATTEMPTS_FIELD,
     MODULE_FIELD,
     NAME_FIELD,
-    REQUIRE_INDEPENDENT_REVIEW_FIELD,
     REQUIRES_FIELD,
     REVIEWERS_FIELD,
     SOURCE_FIELD,
@@ -38,23 +37,21 @@ from .constants import CONFLICT_POLICY_DEFAULT, _RETRACT_COOLDOWN_S
 def _find_review_priority_tasks(
     store: Store, state: dict[str, TaskState], tasks: list[dict[str, Any]],
     agent_id: str, derived: TaskDerived | None = None,
-    enforce_self_review_block: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """查找该 agent 可审查的 in_review 任务（用于 implementer request 时的优先调度提示）。
 
     返回 ``(review_tasks, excluded_self_review)`` 二元组：
     - ``review_tasks``：可分配的审查任务（按 spec 阶段优先排序）。
-    - ``excluded_self_review``：自审任务列表。默认（enforce=False）仅标注、照常
-      进入 review_tasks；线上版 enforce=True 时改为排除（仅标注、不分配）。
+    - ``excluded_self_review``：自审任务列表（仅可见性留痕、永不进入
+      review_tasks）——P0-2 起自审无条件排除，不再读 config / 任务级开关。
 
     过滤条件（task-fp-request-filter，指纹身份模型）：
     1. 任务状态 in_review 且审查未被他人认领（review_claimed_by is None）。
     2. reviewers 名单门禁仅作**向后兼容**：该字段存在且非空时，不在名单内
        直接排除（不计入自审）；字段缺失/为空（生产 _master.json 已无
        reviewers）则跳过名单门禁，仅按实现指纹去重。
-    3. self-review：DONE 实现指纹 == 当前 request 指纹时，默认仅标注
-       is_self_review（照常分配）；enforce_self_review_block=True 或任务
-       require_independent_review=true 时归入 excluded_self_review（不分配，AC1）。
+    3. self-review：DONE 实现指纹 == 当前 request 指纹时一律归入
+       excluded_self_review（不分配；无 config / 任务级开关，P0-2 无条件）。
 
     H2（2026-08-13）：``derived`` 为 request 单次扫描的派生缓存，
     循环内查询实现者改为 O(1)（原实现对每个候选任务全扫一次 ledger）。
@@ -75,12 +72,10 @@ def _find_review_priority_tasks(
         if designated and agent_id not in designated \
                 and not _is_fingerprint_agent_id(agent_id):
             continue
-        # self-review：DONE 实现指纹 == 当前 request 指纹。
-        # 默认仅标注 is_self_review 并照常分配；enforce=True 时归入
-        # excluded_self_review（不分配，保 AC1 可见性）。
+        # self-review：DONE 实现指纹 == 当前 request 指纹 → 一律排除，
+        # 只在 excluded_self_review 留痕（P0-2 无条件硬约束，无开关）。
         done_author, _ = _extract_last_done(store, tid, derived)
-        is_self = bool(done_author and done_author == agent_id)
-        if is_self:
+        if done_author and done_author == agent_id:
             excluded_self_review.append({
                 "task_id": tid,
                 "review_phase": ts.review_phase or "spec",
@@ -88,18 +83,12 @@ def _find_review_priority_tasks(
                 "done_author": done_author,
                 "is_self_review": True,
             })
-        # task-review-independence-enforce：任务级独立审查与全局开关 OR。
-        if is_self and (enforce_self_review_block
-                        or task_def.get(REQUIRE_INDEPENDENT_REVIEW_FIELD, False)):
             continue
-        entry = {
+        review_tasks.append({
             "task_id": tid,
             "review_phase": ts.review_phase or "spec",
             NAME_FIELD: task_def.get(NAME_FIELD, ""),
-        }
-        if is_self:
-            entry["is_self_review"] = True
-        review_tasks.append(entry)
+        })
     # spec 阶段优先
     review_tasks.sort(key=lambda c: (0 if c["review_phase"] == "spec" else 1))
     return review_tasks, excluded_self_review

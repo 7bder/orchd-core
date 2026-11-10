@@ -234,6 +234,17 @@ def _merge_passthrough_forms(trunk: str) -> tuple[tuple[str, ...], ...]:
 
 
 
+def _is_merge_continue(rest: list[str]) -> bool:
+    """受管收口精确形态：``merge --continue``（task-engine-defect-fix-unified-u5）。
+
+    git 自身的 ``merge --continue`` 要求冲突文件已 ``git add``——而 ``git add``
+    是红线 #1 拒绝面，故该形态由代理改写成**受管收口**（暂存声明路径 → 校验
+    暂存集 → 不带 pathspec 提交），不再透传 git。``merge --continue`` 之外的
+    continue 形态（带 ref / 旗标）仍判写拒绝。
+    """
+    return tuple(rest) == ("--continue",)
+
+
 def _is_merge_passthrough(rest: list[str], trunk: str = "main") -> bool:
     """是否为受管 merge 出口精确形态（与当前分支无关，分支在执行层判定）。"""
     return tuple(rest) in _merge_passthrough_forms(trunk)
@@ -282,6 +293,17 @@ def classify_git_argv(argv: list[str] | None, trunk: str = "main") -> dict[str, 
             "kind": "commit",
             "family": "commit",
             "reason": "任务分支 git commit 是红线 #1 豁免一（提交范围由 E020 hook 校验）",
+        }
+    if subcommand == "merge" and _is_merge_continue(rest):
+        return {
+            "subcommand": subcommand,
+            "rest": rest,
+            "kind": "merge_continue",
+            "family": "merge",
+            "reason": (
+                "任务分支 merge --continue 是受管收口形态（代理暂存声明路径 + "
+                "不带 pathspec 提交，冲突解决不需要 agent 手执行 git add）"
+            ),
         }
     if subcommand == "merge" and _is_merge_passthrough(rest, trunk):
         return {

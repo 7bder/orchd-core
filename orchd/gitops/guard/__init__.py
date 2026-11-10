@@ -66,6 +66,7 @@ from .restore import (
     _count_git_processes,
     restore_worktree_paths,
     _restore_refusal_reason,
+    _layout_is_not_container,
 )
 from .write import (
     _build_wrong_branch_hint,
@@ -75,7 +76,7 @@ from .write import (
     _resolve_claim_check_root,
     _same_git_repo,
     guard_claim,
-    _layout_is_not_container,
+
     guard_done_branch,
     guard_clean_workspace,
     guard_review_write,

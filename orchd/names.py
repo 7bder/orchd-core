@@ -27,6 +27,9 @@ ROADMAP_FILE = "ROADMAP.md"
 MASTER_FILE = "_master.json"
 LEDGER_FILE = "_ledger.jsonl"
 LEDGER_ARCHIVE_FILE = "_ledger.archive.jsonl"
+# 账本后端库文件（sqlite 适配器经 ``orchd.storage.sqlite_db_path`` 派生，
+# 唯一字面量来源；task-layout-paths-converge）
+LEDGER_SQLITE_FILE = "_ledger.sqlite3"
 CHECKPOINT_FILE = "_checkpoint.json"
 
 # 课程库

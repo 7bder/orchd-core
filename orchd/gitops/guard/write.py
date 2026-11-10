@@ -42,6 +42,8 @@ from .core import (
     record_degraded_guard,
 )
 
+from .restore import _layout_is_not_container
+
 def _build_wrong_branch_hint(
     allowed_branches: set[str],
     command: str,
@@ -104,26 +106,57 @@ def _build_wrong_branch_hint(
         )
     return "；".join(hint_parts)
 
+def _build_task_context_hint(context: dict[str, Any] | None) -> str:
+    """E018 诊断补充：任务当前状态与占用者（u3 AC2）。
+
+    分支/工作区守卫只解释「分支不对」时，agent 会漏看任务其实处于 in_review、
+    已被他人认领审查等状态机原因。上下文由 claim precheck 用同一份 replay 结果
+    传入；无上下文时返回空串（既有调用方零回归）。
+    """
+    if not context:
+        return ""
+    parts: list[str] = [f"任务状态 {context.get('task_status')}"]
+    if context.get("review_phase"):
+        parts.append(f"review_phase={context.get('review_phase')}")
+    if context.get("review_claimed_by"):
+        parts.append(f"审查认领者={context.get('review_claimed_by')}")
+    if context.get("claimed_by"):
+        parts.append(f"实现认领者={context.get('claimed_by')}")
+    return (
+        "；任务上下文：" + "，".join(parts)
+        + "（分支/工作区错误须先按状态机错误码处置后再重试）"
+    )
+
+
 def _enforce_branch_allowed(
     branch: str | None,
     allowed_branches: set[str] | None,
     command: str,
     project_root: Path,
+    context: dict[str, Any] | None = None,
 ) -> None:
-    """判定分支是否在允许列表；不匹配时抛 E018 wrong_branch。"""
+    """判定分支是否在允许列表；不匹配时抛 E018 wrong_branch。
+
+    ``context``：可选任务状态/占用者上下文（claim 路径传入），并入 details 与
+    hint，使「分支不对」不再掩盖「任务状态不对」这一真因（u3 AC2）。
+    """
     if allowed_branches is None or branch in allowed_branches:
         return
     expected = sorted(allowed_branches)
     hint_text = _build_wrong_branch_hint(allowed_branches, command, project_root)
+    hint_text += _build_task_context_hint(context)
+    details: dict[str, Any] = {
+        "command": command,
+        "current_branch": branch,
+        "expected_branches": expected,
+        "hint": hint_text,
+    }
+    if context:
+        details["task_context"] = dict(context)
     raise OrchdError(
         ErrorCode.E018,
         f"wrong_branch: {command} 须在 {expected} 分支执行，当前在 '{branch}'",
-        [{
-            "command": command,
-            "current_branch": branch,
-            "expected_branches": expected,
-            "hint": hint_text,
-        }],
+        [details],
     )
 
 def _enforce_workspace_clean(
@@ -176,6 +209,7 @@ def guard_write_command(
     orchd_dir: Path | None = None,
     agent_id: str | None = None,
     degraded: list[dict[str, Any]] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> None:
     """L1 分支守卫 + L2 session 锁：写命令前校验分支、工作区干净度与 session 锁。
 
@@ -212,7 +246,8 @@ def guard_write_command(
         if state.get("available"):
             git_available = True
             branch = state.get("branch")
-            _enforce_branch_allowed(branch, allowed_branches, command, project_root)
+            _enforce_branch_allowed(
+                branch, allowed_branches, command, project_root, context=context)
             _enforce_workspace_clean(state, require_clean, command, project_root)
         elif _is_nogit_orchd_dir(project_root):
             # 无 git orchd 项目（task-nogit-guard-parity）：不降级——走 L1 等价
@@ -350,6 +385,7 @@ def guard_claim(
     orchd_dir: Path | None = None,
     agent_id: str | None = None,
     degraded: list[dict[str, Any]] | None = None,
+    task_context: dict[str, Any] | None = None,
 ) -> None:
     """claim 前置守卫（L1+L2 意图化封装）：调用点不再拼 allowed_branches / require_clean。
 
@@ -366,6 +402,7 @@ def guard_claim(
             orchd_dir=orchd_dir,
             agent_id=agent_id,
             degraded=degraded,
+            context=task_context,
         )
     else:
         default = resolve_trunk_for(project_root) if project_root else "main"
@@ -377,21 +414,8 @@ def guard_claim(
             orchd_dir=orchd_dir,
             agent_id=agent_id,
             degraded=degraded,
+            context=task_context,
         )
-
-def _layout_is_not_container(project_root: Path) -> bool:
-    """判定项目是否为非 container 布局（best-effort，布局未知 / 探测失败 → True）。
-
-    done 分支守卫的布局分流依据：container 布局（多 worktree）下只允许任务分支，
-    默认分支（主工作树）不在白名单内——从主工作树执行 done 会被拒绝；flat /
-    布局未知一律视为"非 container"，保持既有默认分支放行语义（零回归）。
-    """
-    try:
-        from orchd.worktree import detect_layout
-
-        return detect_layout(project_root).get("layout") != "container"
-    except Exception:
-        return True
 
 def guard_done_branch(
     project_root: Path | None,

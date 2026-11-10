@@ -41,6 +41,7 @@ REQUIRE_INDEPENDENT_REVIEW_FIELD = "require_independent_review"
 REQUIRES_FIELD = "requires"
 REVIEWERS_FIELD = "reviewers"
 SOURCE_FIELD = "source"
+SURFACE_REFRESH_FIELD = "surface_refresh"
 VERIFY_COMMAND_FIELD = "verify_command"
 VERIFY_TIMEOUT_SECONDS_FIELD = "verify_timeout_seconds"
 
@@ -67,6 +68,7 @@ TASK_FIELDS = frozenset({
     REQUIRES_FIELD,
     REVIEWERS_FIELD,
     SOURCE_FIELD,
+    SURFACE_REFRESH_FIELD,
     VERIFY_COMMAND_FIELD,
     VERIFY_TIMEOUT_SECONDS_FIELD,
 })

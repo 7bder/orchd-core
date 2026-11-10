@@ -45,6 +45,7 @@ from .steps import (
 def remove_task_wt(
     project_root: Path, task_id: str, store_root: Path, *, lock_held: bool = False,
     force_recycle: bool = False,
+    discard_uncommitted: bool = False, discard_confirmed: bool = False,
 ) -> dict[str, Any]:
     """终态回收：git worktree remove + 删 task/{id} 分支 + 解绑（best-effort 幂等）。
 
@@ -59,10 +60,20 @@ def remove_task_wt(
     - 仅当调用方显式传 ``force_recycle=True``（CLI 侧对应 ``--force-recycle``）时，
       才对未合并分支升级 ``-D``；计数为 0 时仍走 ``-d``（无需强删）。
 
-    worktree 移除安全闸（review W-6）：非 ``--force`` 移除失败时，仅当 stderr 表明
-    「contains modified or untracked files」才升级 ``--force``（终态回收允许丢弃脏
-    工作区并记 ``discarded_uncommitted``）；句柄占用 / 权限 / 未知原因一律不升级，
-    失败原因写入 ``recycle_log`` 与 ``residual``（可读、不静默）。
+    worktree 移除安全闸（review W-6 → task-cont-dirty-worktree-ladder 五级降级）：
+    脏 worktree 不再「脏即 --force」——L1 干净/仅 ignored 缓存普通 remove；脏
+    （tracked/untracked 或 ignored 用户文件）走 L2 救援提交（未提交改动保全进
+    ``refs/heads/orchd/rescue/<task>-<UTC>``，ignored 用户文件另复制到
+    ``.orchd/.doctor-backup/worktrees/<task>-<UTC>-l2-files/``）；复制失败不得
+    force remove，降级 L3 整目录隔离到
+    ``.orchd/.doctor-backup/worktrees/<task>-<UTC>/``；移动失败 L4
+    bundle+patch+``files/`` 镜像+``manifest.json`` 备份；镜像失败不 rmtree，
+    仍失败 L5 原地保留 + manual notice。仅 ``discard_uncommitted`` 与
+    ``discard_confirmed`` 双旗标齐备（CLI ``--discard-uncommitted --confirm``）
+    才允许显式 force 丢弃（``discarded_uncommitted`` 语义 = 数据未保全即销毁）；
+    ``force_recycle`` 只作用于未合并分支删除（``-D``），不承担丢弃脏工作区。
+    句柄占用 / 权限 / 未知原因一律不进梯，失败原因写入 ``recycle_log`` 与
+    ``residual``（可读、不静默）。
 
     稳定 cwd 闸（review W-7）：``stable_wt`` 必须是与待回收 worktree **不同**且真实
     存在的主工作树根（``main_worktree_root`` 探测失败会回退 ``project_root``，容器
@@ -227,6 +238,11 @@ def remove_task_wt(
         discarded_files = None
         residual_cleaned = False
         _remove_reason = None
+        _remove_post_action: dict[str, Any] | None = None
+        _ladder_level = "L1"
+        _rescue_ref: str | None = None
+        _isolated_to: str | None = None
+        _rescue_backup_dir: str | None = None
         # 子动作收敛：prune 仍跑（防崩溃落在 prune 与记 done 之间——幽灵登记会
         # 占用分支名，致后继删分支失败，属半完成态，必须在重放中收敛）。
         _tx_prune_registry(stable_wt)
@@ -240,12 +256,19 @@ def remove_task_wt(
     else:
         _s1 = _tx_step_remove_worktree(
             stable_wt=stable_wt, wt_path=wt_path, status=status,
-            actor=actor, task_id=task_id, recycle_log=recycle_log)
+            actor=actor, task_id=task_id, recycle_log=recycle_log,
+            discard_uncommitted=discard_uncommitted,
+            discard_confirmed=discard_confirmed)
         removed = _s1["removed"]
         discarded_uncommitted = _s1["discarded_uncommitted"]
         discarded_files = _s1.get("discarded_files")
         residual_cleaned = _s1["residual_cleaned"]
         _remove_reason = _s1["remove_reason"]
+        _remove_post_action = _s1.get("post_action")
+        _ladder_level = _s1.get("ladder") or "L1"
+        _rescue_ref = _s1.get("rescue_ref")
+        _isolated_to = _s1.get("isolated_to")
+        _rescue_backup_dir = _s1.get("rescue_backup_dir")
         if removed:
             _tx_mark_step_done(
                 _jx_path, task_id, "worktree_remove", {"removed": True})
@@ -325,10 +348,22 @@ def remove_task_wt(
         result["discarded_uncommitted"] = True
         if discarded_files:
             result["discarded_files"] = discarded_files
+    if _ladder_level != "L1" or _rescue_ref or _isolated_to or _rescue_backup_dir:
+        # 五级降级触梯透出：最终落点 + 救援产物位置（审计/回捞入口）。
+        result["recycle_ladder"] = _ladder_level
+    if _rescue_ref:
+        result["rescue_ref"] = _rescue_ref
+    if _isolated_to:
+        result["isolated_to"] = _isolated_to
+    if _rescue_backup_dir:
+        result["rescue_backup_dir"] = _rescue_backup_dir
     if residual_cleaned:
         result["residual_cleaned"] = True
     if _jx_resumed:
         result["resumed_from_journal"] = True
+    if _remove_post_action:
+        # task-debug-worktree-merge-hint：失败归因的可执行动作项（cwd_held_by_caller）。
+        result["post_action"] = _remove_post_action
     if not _tx_committed and (
         removed and branch_deleted and unbound.get("unbound", False)
     ):
@@ -365,6 +400,11 @@ def remove_task_wt(
             "removed": removed,
             "residual_cleaned": residual_cleaned,
             "reason": (
+                "脏 worktree 五级降级全部失败（L2 救援提交 / L3 目录隔离 / "
+                "L4 bundle+patch 均未成功），目录已原地保留、未提交改动零丢失，"
+                "等待人工处置（见 post_action）"
+                if _ladder_level == "L5"
+                else
                 "调用方 shell 的 cwd 仍位于待删目录，git worktree remove 被句柄占用拒绝"
                 "（切出目录后重试，或等下次引擎调用自动回收）"
                 if _remove_reason == "cwd_held_by_caller"

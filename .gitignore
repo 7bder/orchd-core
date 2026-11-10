@@ -56,6 +56,10 @@ pytest_tmp_*/
 !.orchd/rules/
 .orchd-v0-archive/
 
+# 账本 sqlite 库与其伴生文件（**/_ledger.sqlite3*）：运行时状态，永不入库
+# （task-layout-paths-converge；历史误跟踪见 file-census 基线）
+**/_ledger.sqlite3*
+
 # agent 工作产物（摄入草稿 / 变更笔记 / 工具配置）
 _tmp_*
 .workbuddy/

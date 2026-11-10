@@ -12,6 +12,7 @@ import argparse
 
 from orchd import __version__
 from orchd.cli.commands import register as _register_commands
+from orchd.cli.manifest import command_names
 from orchd.cli._util import (
     _flatten_nargs,
     _resolve_text_arg,
@@ -52,6 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="orchd",
         description="Cross-agent-platform task distribution CLI",
         epilog=(
+            f"共 {len(command_names())} 个顶层命令（元数据见 orchd.cli.manifest）；"
             "无感引导：任意命令的 JSON 响应含 guidance 字段（step/command/hint，"
             "指导下一步行动）；运行 'orchd status --text' 查看任务池与下一步引导。"
         ),

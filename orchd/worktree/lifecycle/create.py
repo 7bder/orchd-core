@@ -17,61 +17,13 @@ from orchd.worktree.layout import _GIT_TIMEOUT, detect_layout
 
 from .engine import _merge_vendored_engine_entry, _propagate_container_marker
 from .mainhead import _check_main_head_unchanged, _read_main_worktree_head, _restore_main_head
-from .probe import _cleanup_stale_task_wt, _verify_task_wt
+from .probe import (
+    _cleanup_stale_task_wt,
+    _recreate_task_wt_from_base,
+    _task_branch_divergence,
+    _verify_task_wt,
+)
 from .suppress import _master_suppression_entry
-
-def _task_branch_divergence(
-    project_root: Path, branch: str, base: str
-) -> dict[str, int] | None:
-    """任务分支相对主分支的超前/落后计数（best-effort，测不到返回 None）。
-
-    - ``ahead``：分支独有提交数（``base..branch``）；
-    - ``behind``：主分支独有提交数（``branch..base``）。
-    任一 git 调用失败 → None（调用方按"无法判定"处理，不阻断复用）。
-    """
-    try:
-        ahead = subprocess.run(
-            ["git", "rev-list", "--count", f"{base}..{branch}"],
-            cwd=str(project_root), capture_output=True, encoding="utf-8",
-            errors="replace", timeout=_GIT_TIMEOUT,
-        )
-        behind = subprocess.run(
-            ["git", "rev-list", "--count", f"{branch}..{base}"],
-            cwd=str(project_root), capture_output=True, encoding="utf-8",
-            errors="replace", timeout=_GIT_TIMEOUT,
-        )
-        if ahead.returncode != 0 or behind.returncode != 0:
-            return None
-        return {"ahead": int(ahead.stdout.strip()), "behind": int(behind.stdout.strip())}
-    except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
-        return None
-
-
-def _recreate_task_wt_from_base(
-    project_root: Path, wt_path: Path, branch: str, base: str
-) -> bool:
-    """纯陈旧分支的安全重建（仅调用方确认 ahead == 0 后调用）。
-
-    ``git worktree remove --force`` + ``git branch -d``（安全删除：ahead == 0
-    意味着分支 tip 已合入 base，``-d`` 必成功；用 ``-d`` 不用 ``-D``，语义即断言）。
-    任一步失败 → False（调用方回退复用 + degraded 留痕，禁止半截状态）。
-    """
-    try:
-        rm = subprocess.run(
-            ["git", "worktree", "remove", "--force", str(wt_path)],
-            cwd=str(project_root), capture_output=True, encoding="utf-8",
-            errors="replace", timeout=_GIT_TIMEOUT,
-        )
-        if rm.returncode != 0:
-            return False
-        delete = subprocess.run(
-            ["git", "branch", "-d", branch],
-            cwd=str(project_root), capture_output=True, encoding="utf-8",
-            errors="replace", timeout=_GIT_TIMEOUT,
-        )
-        return delete.returncode == 0
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return False
 
 
 def _check_stale_baseline(
@@ -84,10 +36,14 @@ def _check_stale_baseline(
           调用方照常复用；
         - ``{"action": "reuse", "warning": {...}}``：分叉且含独有提交——调用方挂
           ``stale_baseline_warning`` 后复用；
-        - ``{"action": "recreate", "base": str, "behind": int}``：纯陈旧指针——
-          调用方安全重建后落创建流。
+        - ``{"action": "preserve", "reason": "dirty" | "dirty_unknown",
+          "warning": {...}}``：纯陈旧指针但 worktree 内有未提交改动 / 脏度无法判定
+          ——调用方保留 worktree（**不重建**）并挂 ``stale_baseline_warning``；
+        - ``{"action": "recreate", "base": str, "behind": int}``：纯陈旧指针且
+          worktree 干净——调用方安全重建后落创建流。
 
-    ``wt_path`` 仅作签名对称（未来可校验 worktree 实指分支），当前未使用。
+    ``wt_path`` 用于脏度取证（``git status --porcelain=v1 --untracked-files=all``）：
+    ``git worktree remove --force`` 会连未提交改动一起删掉，故重建前必须确认干净。
     """
     try:
         from orchd.gitops import get_default_branch
@@ -115,6 +71,74 @@ def _check_stale_baseline(
                     "`git log --oneline HEAD..main -- <改动文件>` 确认 main 侧进展，"
                     "必要时在任务 worktree 内 merge main 同步基线后再实现。"
                 ),
+            },
+        }
+    # 脏守卫（P0 task-cont-stale-baseline-dirty-guard）：纯陈旧指针的「安全重建」以
+    # ``git worktree remove --force`` 落地，会把该 worktree 里所有未提交改动**静默**
+    # 一起删掉（tracked 修改与未跟踪新文件都不在 git 对象里，事后无法找回）。故重建
+    # 前必须取证 ``git status --porcelain=v1 --untracked-files=all``：
+    # - 有输出（tracked 改动 / untracked 新文件 / 冲突态）→ 保留 worktree，处置权交
+    #   agent（提交或走受管 restore 回滚无用改动后重领）；
+    # - 取证失败（git 不可用 / 非零退出）→ **同样保留**：无法判定脏度时按「可能丢数据」
+    #   处理（fail-closed），不得默认干净；
+    # - 仅确认干净才允许重建。
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=str(wt_path), capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_GIT_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        status = None
+    unknown = status is None or status.returncode != 0
+    entries = [] if unknown else [
+        ln for ln in (status.stdout or "").splitlines() if ln.strip()
+    ]
+    # 引擎自产工件不计入脏度：``.orchd/.layout.json``（container 标记）与
+    # ``.orchd/orchd/``（宿主布局的 vendored 引擎副本）由本函数调用序内的
+    # ``_propagate_container_marker`` / ``_merge_vendored_engine_entry`` 写入，属引擎
+    # 维护面而非 agent 实现。正常布局下它们已被 ``.orchd/.gitignore`` 忽略、不会出现在
+    # porcelain 里；本豁免是**宿主未忽略 ``.orchd/``** 时的兜底（不兜底则该布局下每次
+    # 复用都被判脏、重建永不发生）。排除仅限**未跟踪**（``??``）形态：这些路径若被
+    # 跟踪且被改，仍算真实改动。
+    engine_owned = {".orchd/.layout.json", ".orchd/_master.json"}
+    engine_prefixes = (".orchd/orchd/",)
+    rows = [
+        (e[:2], (e[3:] if len(e) > 3 else e).strip()) for e in entries
+    ]
+    files = [
+        path for code, path in rows
+        if not (code == "??" and (
+            path in engine_owned or path.startswith(engine_prefixes)
+        ))
+    ]
+    if unknown or files:
+        if unknown:
+            hint = (
+                f"任务分支 {branch} 落后 {base} {div['behind']} 提交，但 worktree "
+                "脏度无法判定（git status 失败）：已保留 worktree 不重建——"
+                "先修复 git 可用性后重试 `python .orchd/__main__.py status`"
+            )
+        else:
+            hint = (
+                f"任务分支 {branch} 落后 {base} {div['behind']} 提交，但 worktree "
+                f"有 {len(files)} 处未提交改动：已保留 worktree 不重建（重建会静默"
+                "删除这些改动）。先提交，或对无用改动执行 `python .orchd/__main__.py "
+                "restore --path <文件>` 回滚，再重领本任务"
+            )
+        return {
+            "action": "preserve",
+            "reason": "dirty_unknown" if unknown else "dirty",
+            "warning": {
+                "dirty": bool(files),
+                "dirty_unknown": unknown,
+                "dirty_count": len(files),
+                "dirty_files": files[:20],
+                "behind": div["behind"],
+                "ahead": 0,
+                "branch": branch,
+                "base": base,
+                "hint": hint,
             },
         }
     return {"action": "recreate", "base": base, "behind": div["behind"]}
@@ -185,9 +209,11 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
             # 主分支的新鲜度。retract 只解绑不清分支（见 onboard/control.py），重领
             # 会静默复用落后基线（2026-09-21 实测落后 10 提交还浑然不觉）。
             # - behind == 0 → 新鲜，照常复用；
-            # - behind > 0 且 ahead == 0 → 纯陈旧指针（无独有提交）：安全重建——
-            #   worktree 移除 + 分支安全删除（-d，已合入必成功）后**落到下方创建流**
-            #   从当前 base 重建；重建失败则回退复用 + degraded 留痕；
+            # - behind > 0 且 ahead == 0 → 纯陈旧指针（无独有提交）：先验脏
+            #   （task-cont-stale-baseline-dirty-guard）——worktree 脏 / 脏度无法判定
+            #   → **保留**（remove --force 会静默删掉未提交改动）；
+            #   干净才安全重建：worktree 移除 + 分支安全删除（-d，已合入必成功）后
+            #   **落到下方创建流**从当前 base 重建；重建失败则回退复用 + degraded 留痕；
             # - behind > 0 且 ahead > 0 → 含独有实现：**禁止自动重建**（删分支即丢
             #   数据），挂 stale_baseline_warning 告警后复用，处置权交 agent；
             # - 测不到（base 未知 / git 异常）→ 维持旧行为（无门禁），不静默降级以外的
@@ -204,9 +230,33 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
                         file=sys.stderr,
                     )
                 return result
-            if _recreate_task_wt_from_base(
+            if stale.get("action") == "preserve":
+                # 脏 / 脏度未知：保留 worktree，不执行 remove --force / branch -d
+                # （task-cont-stale-baseline-dirty-guard P0：重建会静默删除未提交改动）。
+                warn = stale["warning"]
+                result["stale_baseline_warning"] = warn
+                result["stale_baseline_dirty_preserved"] = {
+                    "reason": stale.get("reason"),
+                    "dirty_count": warn["dirty_count"],
+                    "dirty_files": warn["dirty_files"],
+                    "behind": warn.get("behind"),
+                    "ahead": warn.get("ahead", 0),
+                    "base": warn.get("base"),
+                    "hint": warn.get("hint"),
+                }
+                print(
+                    "orchd ▸ [worktree] {\"action\": \"stale_baseline_dirty_preserved\", "
+                    f"\"task_branch\": \"{branch}\", "
+                    f"\"reason\": \"{stale.get('reason')}\", "
+                    f"\"dirty_count\": {warn['dirty_count']}, "
+                    f"\"behind\": {warn['behind']}" + "}",
+                    file=sys.stderr,
+                )
+                return result
+            rec = _recreate_task_wt_from_base(
                 project_root, wt_path, branch, stale["base"]
-            ):
+            )
+            if rec["ok"]:
                 print(
                     "orchd ▸ [worktree] {\"action\": \"stale_baseline_recreated\", "
                     f"\"task_branch\": \"{branch}\", "
@@ -216,12 +266,54 @@ def ensure_task_wt(project_root: Path, task_id: str) -> dict[str, Any]:
                 # 落到下方创建流：从当前 base 重建（created: True 即为重建证据，
                 # 与首建同形，辅以本 stderr 留痕区分）。
             else:
-                result["degraded"] = True
                 prev = result.get("degraded_reason")
+                detail = rec.get("reason", "")
+                if rec.get("half_state"):
+                    # 绑定装回失败：该路径已不存在，**不得**再作为 worktree 交付
+                    # （调用方 onboard/claim 会把它当 cwd 绑定给 agent）。改走同函数
+                    # 其它降级分支同形（worktree=主工作树 / separate=False），并把失效
+                    # 路径单列 worktree_invalid 供人工处置。
+                    _reason = (
+                        f"陈旧基线重建失败（{detail}）：原 worktree 路径已失效，"
+                        "已回退主工作树语义，需人工处置后再 claim；"
+                        "见 stale_baseline_warning"
+                    )
+                    print(
+                        "orchd ▸ [worktree] {\"action\": \"stale_baseline_half_state\", "
+                        f"\"task_branch\": \"{branch}\", "
+                        f"\"invalid_path\": \"{wt_path}\", "
+                        f"\"behind\": {stale['behind']}" + "}",
+                        file=sys.stderr,
+                    )
+                    return {
+                        "worktree": project_root,
+                        "separate": False,
+                        "created": False,
+                        "worktree_invalid": str(wt_path),
+                        "degraded": True,
+                        # ``reason`` 是 claim 侧 degraded_warning 的读取键
+                        # （onboard/claim/execute.py），只写 degraded_reason 会得到
+                        # "worktree degraded: None"，人工处置提示到不了 agent。
+                        "reason": _reason,
+                        "degraded_reason": f"{prev}；{_reason}" if prev else _reason,
+                        "stale_baseline_warning": {
+                            "behind": stale["behind"], "ahead": 0,
+                            "branch": branch, "base": stale["base"],
+                            "hint": _reason,
+                        },
+                    }
+                # 绑定已装回：``remove`` + ``add`` 会丢掉 worktree 级运行态，按创建流
+                # 同序重建（容器标记 → 副本抑制 → vendored 引擎），否则装回后的工作树
+                # 读不到布局标记（回退本地空账本）、master 双副本漂移复活。
+                _propagate_container_marker(wt_path, project_root)
+                result.update(_master_suppression_entry(wt_path))
+                _merge_vendored_engine_entry(result, project_root, wt_path)
                 _reason = (
-                    "陈旧基线重建失败（worktree 移除或分支安全删除未成功）："
-                    "已回退复用陈旧分支，见 stale_baseline_warning"
+                    f"陈旧基线重建失败（{detail}）：已回退复用陈旧分支并重建"
+                    "容器标记 / 副本抑制 / vendored 引擎，见 stale_baseline_warning"
                 )
+                result["degraded"] = True
+                result["reason"] = _reason
                 result["degraded_reason"] = f"{prev}；{_reason}" if prev else _reason
                 result["stale_baseline_warning"] = {
                     "behind": stale["behind"], "ahead": 0,

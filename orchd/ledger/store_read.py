@@ -15,6 +15,7 @@ import warnings
 from orchd.names import (
     LEDGER_ARCHIVE_FILE,
     LEDGER_FILE,
+    LEDGER_SQLITE_FILE,
 )
 from orchd.contracts.events import (
     EVENT_DONE,
@@ -249,7 +250,7 @@ class _StoreReadMixin:
         """账本是否存在（三载体先判，无后端副作用）。
 
         task-sqlite-robustness-batch：直接判 ``_ledger.jsonl`` /
-        ``_ledger.sqlite3`` / 共享归档任一存在——不再经后端构造即建库的
+        ``LEDGER_SQLITE_FILE`` / 共享归档任一存在——不再经后端构造即建库的
         sqlite 语义恒真（此前新建 Store 即 True，无账本状态不可检测，
         12 处 ``if not ledger_exists`` 守卫退化为读空列表）。
         """
@@ -261,7 +262,7 @@ class _StoreReadMixin:
             store_dir = Path(self.orchd_dir)
         return (
             (store_dir / LEDGER_FILE).is_file()
-            or (store_dir / "_ledger.sqlite3").is_file()
+            or (store_dir / LEDGER_SQLITE_FILE).is_file()
             or (store_dir / LEDGER_ARCHIVE_FILE).is_file()
         )
 

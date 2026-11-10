@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 from orchd.names import (
     MASTER_FILE,
+    SHARED_DIR,
 )
 from orchd.doctor.checks_runtime import (
     _check_checkpoint_consistency, _check_event_schema, _check_hung_git_processes,
@@ -320,15 +322,14 @@ def check_repo(project_root: Path) -> list[dict[str, str]]:
     # 7f) lessons 运行时观测（task-lessons-runtime-migrate-observe，只读告警）
     checks.extend(_check_lessons_runtime(project_root))
 
+    # 7g) 审查契约文档（task-contract-docs-host-enforce）：旁路词零命中，宿主/引擎共用
+    checks.extend(_check_contract_docs(project_root))
+
+    # 7h) 宿主 guard 配置回显（task-host-guard-config，只读）：无配置/空配置
+    # 全 off 不改变引擎行为；配置非法 fail-closed（不静默当「全 off」）。
+    checks.extend(_check_host_guards(project_root))
+
     return checks
-
-
-
-
-
-
-
-
 
 
 # 生成物目录（P5-②）：与 scripts/gen_contract_docs.py::GENERATORS 逐字三锁
@@ -340,6 +341,7 @@ _GENERATED_DOCS = (
     "fields.md",
     "events.md",
     "statemachine.md",
+    "dependency-graph.md",
 )
 
 _GENERATED_MARKER = "生成物，勿手改"
@@ -377,6 +379,27 @@ def _check_contract_drift(project_root: Path) -> list[dict[str, str]]:
             continue
         if not text.strip() or _GENERATED_MARKER not in text:
             problems.append(f"生成物异常（空或无标记）：docs/_generated/{name}")
+            continue
+        if name != "dependency-graph.md":
+            continue
+        if root != _engine_root():
+            # 跨仓 / 跨工作树运行：摘要由被导入引擎的真源算得，此处比对会误报，跳过。
+            continue
+        deps_json = root / ".orchd" / SHARED_DIR / "deps.json"
+        if not deps_json.is_file():
+            problems.append("生成物真源缺失：.orchd/shared/deps.json")
+            continue
+        try:
+            deps_text = deps_json.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            problems.append(f"生成物真源不可读：{deps_json.name}（{exc}）")
+            continue
+        digest = hashlib.sha256(deps_text.encode()).hexdigest()
+        if f"deps.json sha256：{digest}" not in text:
+            problems.append(
+                "生成物与 deps.json 不同步（digest 不符）："
+                "docs/_generated/dependency-graph.md"
+            )
     try:
         tree = ast.parse(manifest.read_text(encoding="utf-8"))
         referenced = {
@@ -643,3 +666,79 @@ def _check_in_review_worktree_integrity(
             "并补回任务 worktree 的 .orchd/.layout.json（_propagate_container_marker 语义）"
         )
     return [_make_check("in_review_integrity", "fail", "；".join(hints))]
+
+
+def _engine_root() -> Path:
+    """被导入 orchd 引擎的仓库根（裸包名不计依赖边，W7-A 口径）。"""
+    import orchd
+
+    return Path(orchd.__file__).resolve().parent.parent
+
+
+def _check_contract_docs(project_root: Path) -> list[dict[str, str]]:
+    """审查契约文档检查（task-contract-docs-host-enforce，只读、不自动清理）。
+
+    判据单一真源在 :mod:`orchd.contract_docs`：引擎仓扫 10 个契约面（含协议在场
+    标记），宿主仓扫安装器发货的 SKILL/rules/templates 与宿主 ``AGENTS.md``。
+    """
+    from orchd.contract_docs import scan_project
+
+    try:
+        findings = scan_project(project_root)
+    except Exception as exc:  # noqa: BLE001 - 未能判定按 INV-4a 记「检测不可用」（fail）
+        return [_make_check_unavailable("contract_docs", exc, "契约文档扫描")]
+    if not findings:
+        return [_make_check("contract_docs", "ok", "契约文档旁路词零命中")]
+    paths = "、".join(str(item["path"]) for item in findings)
+    return [
+        _make_check(
+            "contract_docs",
+            "fail",
+            f"契约文档含被禁旁路措辞：{paths}（改用占位名，见 rules/review.md 旁路写法约束）",
+        )
+    ]
+
+
+def _check_host_guards(project_root: Path) -> list[dict[str, str]]:
+    """宿主 guard 配置回显（task-host-guard-config，只读、零子进程）。
+
+    缺省（无文件 / 空文件 / 空 guards）时全部 guard 为 off，检查项 ok；
+    配置非法时 fail-closed 记 fail（不得静默当「全 off」）；有启用项时 ok 并
+    列出启用清单。判定真源在 :mod:`orchd.guards.config`（函数级惰性导入，保持
+    doctor 叶子模块口径与补丁面）。
+    """
+    from orchd.guards import doctor_echo
+
+    try:
+        echo = doctor_echo(project_root)
+    except Exception as exc:  # noqa: BLE001 - 未能判定按 INV-4a 记「检测不可用」（fail）
+        return [_make_check_unavailable("host_guards", exc, "宿主 guard 配置回显")]
+    if not echo.get("ok"):
+        kinds = "、".join(str(item.get("kind")) for item in echo.get("errors", []))
+        return [
+            _make_check(
+                "host_guards",
+                "fail",
+                f"宿主 guard 配置非法（{kinds}）：{echo.get('config_path')}；"
+                "修好 .orchd/shared/guards.json 或删除该文件回退全 off",
+            )
+        ]
+    if not echo.get("configured"):
+        return [
+            _make_check(
+                "host_guards",
+                "ok",
+                "宿主 guard 无配置（全 off）；运行 `python .orchd/__main__.py guards init`"
+                " 可生成最小可用配置（docs/deps/census，默认 warn），"
+                "或手写 .orchd/shared/guards.json 逐项启用",
+            )
+        ]
+    enabled = "、".join(str(item.get("name")) for item in echo.get("enabled", []))
+    return [
+        _make_check(
+            "host_guards",
+            "ok",
+            f"宿主 guard 已启用 {len(echo.get('enabled', []))} 项：{enabled or '（全部显式 off）'}",
+        )
+    ]
+

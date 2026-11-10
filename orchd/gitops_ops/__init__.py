@@ -53,6 +53,8 @@ from .branch import (
     try_ff_merge_to_main,
     try_git_branch,
     try_git_merge,
+    _precheck_untracked_collision,
+    _untracked_collision_diagnostic,
 )
 from .events import (
     _TS_LOCK,
@@ -101,6 +103,8 @@ __all__ = [
     "try_ff_merge_to_main",
     "try_git_branch",
     "try_git_merge",
+    "_precheck_untracked_collision",
+    "_untracked_collision_diagnostic",
     "_TS_LOCK",
     "make_event",
     "now_iso",

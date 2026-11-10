@@ -56,6 +56,8 @@ ORCHD_BAKED_PY_ENV = "ORCHD_BAKED_PY"
 ORCHD_BAKED_SRC_ENV = "ORCHD_BAKED_SRC"
 ORCHD_SRC_ENV = "ORCHD_SRC"
 ORCHD_SRC_DIR_ENV = "ORCHD_SRC_DIR"
+# task-guard-drift-done-closure（B1）：done 期「改动集缺镜像」闭环三档（warn 默认 / hard / off）。
+ORCHD_DRIFT_CLOSURE_ENV = "ORCHD_DRIFT_CLOSURE"
 
 # T3 特例：非环境变量，仅锁定 ledger ref 的契约名（见模块 docstring）
 ORCHD_LEDGER_REF_ENV = "ORCHD_LEDGER_REF"

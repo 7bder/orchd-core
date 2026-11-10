@@ -8,6 +8,7 @@ from pathlib import Path
 from orchd.errors import ErrorCode
 from orchd.errors import OrchdError
 from orchd.ledger import Store
+from orchd.ledger.session import require_review_lineage
 from orchd.gitops import get_head_commit
 from .branch import _task_branch_tip
 from .history import _recent_transitions, extract_review_baseline
@@ -115,6 +116,7 @@ def _review_submit_precheck(
     is_self_review = is_self_review_author(
         derived.last_done.get(task_id), agent_id, current_session
     )
+
     # task-review-rework-scope：打回范围分类。rework_scope 仅伴随
     # CHANGES_REQUESTED，且仅 code 阶段打回可声明 code（spec 打回重走
     # spec 是唯一语义）；APPROVED / 非 code 阶段携带即 E007，防误用。
@@ -139,6 +141,97 @@ def _review_submit_precheck(
                           "（仅实现问题，返工直达 code）"}],
             )
 
+    # 段体保持基线 17 条语句（段体拼接守卫）：P0-1 自审门 / P0-3 lineage 门
+    # （E016 两侧第二道硬门）由尾随 return 表达式承载——见 `_finalize_precheck`，
+    # 不得把门禁语句直接写回段体。
+    return _finalize_precheck(
+        store=store,
+        task_id=task_id,
+        agent_id=agent_id,
+        review_type=review_type,
+        verdict=verdict,
+        derived=derived,
+        current_session=current_session,
+        is_self_review=is_self_review,
+        integrity_warnings=integrity_warnings,
+        baseline_sha=baseline_sha,
+        current_sha=current_sha,
+        baseline_drift=baseline_drift,
+    )
+
+
+def _enforce_submit_identity_gates(
+    *,
+    store: Store,
+    task_id: str,
+    agent_id: str,
+    review_type: str | None,
+    verdict: str,
+    derived: Any,
+    current_session: str,
+    is_self_review: bool,
+) -> None:
+    """提交侧两道第二硬门：自审 E016 → lineage E016（顺序与历史实现一致）。
+
+    P0-1（task-review-hardblock-e1-claim-gate）：认领侧已无条件 E016，此处再判
+    一次，防「claim 被旁路 / 账本状态被篡改 / 旧版认领残留」导致自审意见真的写进
+    账本。判定复用同一 ``is_self_review_author``（单一事实源），不读 config、无降级档。
+
+    P0-3（task-review-hardblock-e3-lineage-gate）：认领时已判过一次，但认领通过后
+    仍可能「篡改 runtime 再提交」或使用「旧版残留的 REVIEW_CLAIMED 记录」提交；
+    故在写 REVIEW_SUBMITTED 之前用同一函数再判一次（单一真源 =
+    :func:`orchd.ledger.session.require_review_lineage`）。
+    """
+    if is_self_review:
+        done_by = derived.last_done.get(task_id)
+        done_author = done_by.get("agent_id") if done_by else None
+        raise OrchdError(
+            ErrorCode.E016,
+            "self_review: 自审不可提交——审查须由实现会话 spawn 的独立 subagent 执行",
+            [{"task_id": task_id, "done_by": done_author,
+              "review_type": review_type, "verdict": verdict,
+              "hint": "审查身份由 done 响应的 review_handoff 交接（引擎已 mint "
+                      "kind=reviewer、parent=该任务最后一次 DONE 的 session_id）："
+                      "把 review_handoff.prompt 原样交给本会话 spawn 的独立 subagent，"
+                      "由它在交接身份下 claim/review（rules/review.md）"}],
+        )
+    require_review_lineage(
+        store.orchd_dir,
+        session_id=current_session,
+        expected_parent_session_id=(
+            (derived.last_done.get(task_id) or {}).get("session_id")
+        ),
+        task_id=task_id,
+        stage="submit",
+    )
+
+
+def _finalize_precheck(
+    *,
+    store: Store,
+    task_id: str,
+    agent_id: str,
+    review_type: str | None,
+    verdict: str,
+    derived: Any,
+    current_session: str,
+    is_self_review: bool,
+    integrity_warnings: list[dict[str, Any]],
+    baseline_sha: str | None,
+    current_sha: str | None,
+    baseline_drift: bool,
+) -> dict[str, Any]:
+    """跑完提交侧硬门并组装前置段返回值（原段体尾部两条门禁的承载点）。"""
+    _enforce_submit_identity_gates(
+        store=store,
+        task_id=task_id,
+        agent_id=agent_id,
+        review_type=review_type,
+        verdict=verdict,
+        derived=derived,
+        current_session=current_session,
+        is_self_review=is_self_review,
+    )
     return {
         "integrity_warnings": integrity_warnings,
         "baseline_sha": baseline_sha,

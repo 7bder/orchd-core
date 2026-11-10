@@ -8,6 +8,7 @@ from __future__ import annotations
 from orchd.names import (
     CHECKPOINT_FILE,
     LEDGER_FILE,
+    LEDGER_SQLITE_FILE,
     SESSION_WORKTREES_FILE,
 )
 
@@ -75,7 +76,7 @@ def _is_junk_entry(name: str) -> bool:
 _LEDGER_RUNTIME_FILES = (
     LEDGER_FILE, CHECKPOINT_FILE, ".lock", ".session.lock",
     SESSION_WORKTREES_FILE,
-    "_ledger.sqlite3", "_ledger.sqlite3-wal", "_ledger.sqlite3-shm",
+    LEDGER_SQLITE_FILE, f"{LEDGER_SQLITE_FILE}-wal", f"{LEDGER_SQLITE_FILE}-shm",
 )
 
 

@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import json
+
 from typing import Any
 from pathlib import Path
 
+from orchd.contracts.events import STATUS_CLAIMED, STATUS_IN_REVIEW
+from orchd.errors import ErrorCode, OrchdError
 from orchd.ledger import Store
+from orchd.ledger.session import (
+    _session_runtime_path,
+    is_session_expired,
+    session_runtime_dir,
+)
 from orchd.gitops import guard_review_write
 from orchd.gitops import hook_uninstall
 from orchd.gitops import main_worktree_root
@@ -19,6 +28,146 @@ from .merge_finalize import _review_submit_merge_finalize
 from .merge_run import _review_submit_merge_run
 from .precheck import _review_submit_precheck
 from .record import _review_submit_record
+
+# 自动压实（task-ledger-auto-compact-after-merge）：活跃 payload 阈值、硬上限、
+# 前缀最小比例。
+_AUTO_COMPACT_MIN_BYTES = 5 * 1024 * 1024
+_AUTO_COMPACT_HARD_CAP_BYTES = 10 * 1024 * 1024
+_AUTO_COMPACT_MIN_PREFIX_RATIO = 0.8
+
+
+def _session_live(store: Store, session_id: str) -> bool:
+    """会话 runtime 文件存在、active 且未过期（stale 认领的判据）。"""
+    if not session_id:
+        return False
+    try:
+        data = json.loads(
+            _session_runtime_path(store.orchd_dir, session_id).read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(data, dict)
+        and bool(data.get("active"))
+        and not is_session_expired(data)
+    )
+
+
+def _active_pool(store: Store, state: dict[str, Any]) -> list[str]:
+    """活跃池：claimed / in_review；claimed 会话缺失或过期视为 stale 剔除。"""
+    pool: list[str] = []
+    for task_id, ts in state.items():
+        if ts.status == STATUS_CLAIMED:
+            if ts.claimed_session and _session_live(store, ts.claimed_session):
+                pool.append(task_id)
+        elif ts.status == STATUS_IN_REVIEW:
+            if not ts.review_claimed_session or _session_live(
+                store, ts.review_claimed_session
+            ):
+                pool.append(task_id)
+    return sorted(pool)
+
+
+def _other_live_sessions(store: Store) -> list[str]:
+    """其他活跃会话（排除当前会话），用于自动压实并发门。"""
+    from orchd.ledger.identity import resolve_session_identity
+
+    current = resolve_session_identity(store.orchd_dir).get("session_id", "")
+    runtime_dir = session_runtime_dir(store.orchd_dir)
+    if not runtime_dir.is_dir():
+        return []
+    found: list[str] = []
+    for path in sorted(runtime_dir.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not data.get("active"):
+            continue
+        session_id = data.get("session_id") or path.stem
+        if session_id != current and not is_session_expired(data):
+            found.append(session_id)
+    return found
+
+
+def _compact_if_needed(store: Store) -> dict[str, Any]:
+    """阈值/池/并发门判定；满足时压实并返回 stats，否则 skipped。"""
+    from orchd.storage import read_archive_events
+
+    store_dir = resolve_store_dir(store.orchd_dir)
+    if not store.ledger_exists():
+        return {"status": "skipped", "reason": "no_ledger"}
+    events = store._read_ledger_lines(from_line=1)
+    arch, _ = read_archive_events(store_dir)
+    arch_ids = {e.get("event_id", "") for e in arch if e.get("event_id")}
+    active = [
+        ev for ev in events
+        if not ev.get("event_id") or ev["event_id"] not in arch_ids
+    ]
+    active_bytes = sum(
+        len(json.dumps(ev, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"))
+        for ev in active
+    )
+    base = {"active_bytes": active_bytes, "active_events": len(active)}
+    if active_bytes <= _AUTO_COMPACT_MIN_BYTES:
+        return {
+            "status": "skipped", "reason": "below_threshold",
+            "min_bytes": _AUTO_COMPACT_MIN_BYTES, **base,
+        }
+    state = store.replay()
+    pool = _active_pool(store, state)
+    if pool and active_bytes <= _AUTO_COMPACT_HARD_CAP_BYTES:
+        return {"status": "skipped", "reason": "active_pool",
+                "pool": pool[:10], **base}
+    live = _other_live_sessions(store)
+    if live:
+        return {"status": "skipped", "reason": "active_session",
+                "sessions": live[:10], **base}
+    try:
+        stats = store.compact_archive(
+            min_prefix_ratio=_AUTO_COMPACT_MIN_PREFIX_RATIO,
+        )
+    except OrchdError as exc:
+        if exc.code is not ErrorCode.E012:
+            raise
+        return {"status": "skipped", "reason": "lock_busy",
+                "error": str(exc), **base}
+    stats.update(base)
+    if stats.get("status") == "skipped":
+        return stats
+    if stats.get("moved_events"):
+        stats["status"] = "compacted"
+    else:
+        stats["status"] = "skipped"
+        stats["reason"] = "no_prefix"
+    return stats
+
+
+def _auto_compact_after_merge(
+    store: Store, main_wt: Path | None = None,
+) -> dict[str, Any]:
+    """merge 成功后 best-effort 自动压实；异常降级为 warning，不阻断审查。
+
+    container 布局下 code APPROVED 会先回收任务 worktree（连同其 ``.orchd``），
+    此时 ``store`` 指向已删除路径；改用主工作树上的 store 读取共享账本根。
+    """
+    try:
+        target = store
+        if main_wt is not None:
+            main_orchd = Path(main_wt) / ".orchd"
+            if main_orchd.resolve() != Path(store.orchd_dir).resolve():
+                target = Store(main_orchd)
+        return _compact_if_needed(target)
+    except Exception as exc:  # noqa: BLE001 - best-effort，任何失败都不改变审查结果
+        return {
+            "status": "warning",
+            "reason": "compact_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
 
 
 def _init_review_routing(project_root: Path | None) -> None:
@@ -210,10 +359,24 @@ def _review_submit_impl(
         finally:
             if merge_lock is not None:
                 merge_lock.release_lock()
+        # task-cont-autoclean-triggers / task-ledger-auto-compact-after-merge：
+        # merge 成功后的 best-effort 收尾（本任务局部清理 + 账本自动压实）。
+        # 必须在 merge_lock 释放之后调用——auto_clean / compact 自身要取账本锁，
+        # 持锁期内再取会自锁。target 取主工作树（任务 worktree 可能已被回收）。
+        if result.get("merged") is True:
+            _post_merge_followups(
+                result=result,
+                store=store,
+                main_wt=main_wt,
+                task_id=task_id,
+                project_root=project_root,
+            )
     # L3 pre-commit hook 卸载（best-effort）：code APPROVED 终态后不再需要任务级
     # hook，防止残留（与 done/retract 一致；覆盖 merge 降级/成功全部完成路径）。
+    # task-debug-hook-active-gate：传 orchd_dir 让卸载前判活跃认领——hook 目录是
+    # core.hooksPath 的全仓共享路径，其他任务仍在实现/审查时必须保留。
     if project_root and result.get("task_status") == "completed":
-        hook_uninstall(project_root)
+        hook_uninstall(project_root, orchd_dir=store.orchd_dir)
 
     if project_root:
         orchd_dir = project_root / ".orchd"
@@ -231,9 +394,57 @@ def _review_submit_impl(
             main_worktree=str(main_wt) if main_wt is not None else None,
         )
 
+
     # AC4：守卫降级不静默——会话锁未持有时非空，并入响应（沿用「有降级才补字段」
     # 约定，无降级则维持既有字段集合不变）。
     if degraded:
         result["degraded_guards"] = degraded
 
     return result
+
+
+def _post_merge_followups(
+    *,
+    result: dict[str, Any],
+    store: Store,
+    main_wt: Path | None,
+    task_id: str,
+    project_root: Path | None,
+) -> None:
+    """merge 成功后的 best-effort 收尾：本任务局部清理 + 账本自动压实。
+
+    必须在 merge 主锁释放后调用——``auto_clean`` 与 ``compact_archive`` 都会
+    自行取账本锁，持锁期内重入会自锁（E012 同进程双 fd）。两者失败均不改变
+    审查结论：auto_clean 静默、compact 降级为 ``compact`` warning。
+
+    定义置于 ``_review_submit_impl`` 之后：`tests/test_autoclean_continuity.py`
+    以源码文本位置钉「trigger=\"merge\" 出现在 merge_lock.release_lock() 之后」。
+    """
+    if result.get("merged") is not True:
+        return
+    # task-cont-autoclean-triggers：merge 成功触发本任务局部清理，上限 10 项。
+    # 范围 = 本任务 id（生产可达项：``review/<task-id>/`` 的 merged_review_dir，
+    # 其 path/reason 都带 id）；verify tmp 的命名不含 task id，属 done 的
+    # worktree 局部范围，不在此按 id 匹配——避免「看似覆盖、实则恒不命中」。
+    # target 取主工作树（任务 worktree 可能已被回收）；best-effort。
+    _clean_root = main_wt or project_root
+    if _clean_root is not None:
+        try:
+            from orchd.doctor import auto_clean
+
+            ac_merge = auto_clean(
+                _clean_root,
+                emit_stderr=False,
+                trigger="merge",
+                task_id=task_id,
+            )
+            if (ac_merge.get("auto_cleaned")
+                    or ac_merge.get("auto_moved")
+                    or ac_merge.get("manual_notice")):
+                result["auto_clean"] = ac_merge
+        except Exception:
+            pass
+    # task-ledger-auto-compact-after-merge：merge 后 best-effort 自动压实，
+    # 任何失败只降级为 compact warning，不影响审查结果。
+    if result.get("task_status") == "completed":
+        result["compact"] = _auto_compact_after_merge(store, main_wt)

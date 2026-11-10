@@ -221,6 +221,7 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict | None:
         state=state,
         phase=phase_flag,
         active_phase=active_phase,
+        agent_id=agent_id,
     )
     # W-2 僵尸审查认领：status 读路径浮现超时未提交的审查认领（同 request 判定），
     # 让"任何一次状态查看"都能暴露僵局，不依赖后续再发 request。
@@ -234,6 +235,21 @@ def _cmd_status(args, tasks, orchd_dir, master, store, agent_id) -> dict | None:
                 {TASK_ID_KEY: tid, **v}
                 for tid, v in sorted(_stale.items(), key=lambda kv: kv[1]["age_s"], reverse=True)
             ]
+    # stale 认领统一视图（task-engine-defect-fix-unified-u10）：与 watchdog、
+    # E034 retract 同一判定（claim_age / review_age / session 失联），不再出现
+    # 「status 看不到 claim_age、E034 却按同一阈值放行」的互斥语义。
+    if not args.text:
+        try:
+            from orchd.onboard.control import stale_claim_snapshot
+
+            _snap = stale_claim_snapshot(store, state)
+            _entries = _snap["claims"]
+            result["stale_claims"] = {
+                "total": len(_entries),
+                "top": _entries[:10],
+            }
+        except Exception:
+            result["stale_claims"] = {"total": 0, "top": []}
     # 会话指纹碰撞只读告警（task-contract-session-collision-warning）：不阻断、不落状态
     if not args.text:
         exclude = args.task or _current_task_from_branch(orchd_dir.parent)

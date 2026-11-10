@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +23,17 @@ from orchd.constants import (
 )
 from orchd.gitops._run import _shell_quote
 
-from .paths import _resolve_ledger_path
+from .paths import (
+    _HOOK_RUNTIME_TIMEOUT_S, _engine_source_root, _resolve_ledger_path,
+)
 from .precommit_template import _PRE_COMMIT_HOOK_TEMPLATE
 from .templates import (
     _HOOK_MARKER,
+    _manifest_docs_patterns,
     _HOOK_PY_LEDGER_STATE,
     _HOOK_PY_RESOLVER,
     _HOOK_SHEBANG,
+    _PRE_COMMIT_HOOK_PY_MERGE_STATE,
     _REF_TX_HOOK_MARKER,
 )
 
@@ -36,7 +44,9 @@ def _e020_hook_escape_block() -> str:
 
     单一生成函数：guide.py ERROR_GUIDANCE["E020"] 为权威来源，hook 文本
     从其 recovery/command/exit_type 派生，避免双写漂移。
-    逃生步骤覆盖：查看被拦文件、移出暂存区、amend 补声明、红线命令警告。
+    逃生步骤覆盖：查看被拦文件、受管还原（orchd restore --path）、amend 补声明、
+    受管提交（orchd git commit）、红线命令警告；不再指引被 git 代理拒绝的
+    git restore --staged / git commit --no-verify。
     """
     try:
         from orchd.guide import ERROR_GUIDANCE, amend_patch_cmd
@@ -58,69 +68,20 @@ def _e020_hook_escape_block() -> str:
         f'    echo "E020 exit_type: {exit_type}"',
         f'    echo "E020 diagnostic: {command}"',
         '    echo ""',
-        '    echo "=== 合规逃生步骤 ==="',
+        '    echo "=== 合规逃生步骤（以下命令均可在 git 代理下执行）==="',
         '    echo "1. 查看被拦文件: git diff --cached --name-only"',
-        '    echo "2. 移出暂存区(保留工作区): git restore --staged <file>"',
-        f'    echo "3. 确属本任务: {amend_files}"',
+        f'    echo "2. 确属本任务: {amend_files}（在主工作树执行；claimed 态只增不删）"',
+        '    echo "3. 误改或范围外文件还原到 HEAD: orchd restore --path <file>（受管还原，会丢弃该文件未提交改动，先备份）"',
         f'    echo "4. 豁免类(测试/文档): {amend_exempt}"',
-        '    echo "5. 重新提交: git commit -m \"...\""',
+        '    echo "5. 重新提交: orchd git commit -m <说明>（受管提交，git 代理放行）"',
         '    echo ""',
         '    echo "=== 红线命令(禁止,会丢失未提交工作) ==="',
         '    echo "  X git reset --hard  (丢弃工作区+暂存区)"',
         '    echo "  X git clean -fdx    (删除未跟踪文件,含.orchd运行时)"',
         '    echo "  X git checkout -- . (丢弃所有未提交改动)"',
-        '    echo "  绕过仅限固定资产: git commit --no-verify"',
     ]
     return "\n".join(lines)
 
-
-
-def _baked_hook_endpoints(project_root: Path) -> tuple[str | None, str | None]:
-    """安装期固化 hook 的解释器与引擎源码根（task-ref-tx-hook-cost）。
-
-    运行期钩子每次 checkout 都重走「解释器探测 + 嵌套 ``git rev-parse``」，
-    在 MSYS 祖先链下被放大 35–90 倍。安装期 ``project_root`` 已知，一次性
-    解析并烘焙进脚本，运行期零探测直达执行；固化路径失效时回退既有探针。
-
-    Returns:
-        ``(python_exe, src_dir)``；任一不可用即 ``(None, None)``（= 不烘焙，
-        生成物与旧版逐字一致）。
-    """
-    try:
-        py = sys.executable
-        if not py:
-            return None, None
-        from orchd.gitops._run import _run_git
-
-        top = _run_git(project_root, ["rev-parse", "--show-toplevel"])
-        if top.returncode != 0 or not (top.stdout or "").strip():
-            return None, None
-        root = Path((top.stdout or "").strip())
-        module_rel = "orchd/gitops/ref_tx_hook.py"
-        if (root / ".orchd" / module_rel).is_file():
-            return py, str(root / ".orchd")
-        if (root / module_rel).is_file():
-            return py, str(root)
-    except Exception:
-        pass
-    return None, None
-
-
-
-def _engine_source_root() -> Path:
-    """引擎源码根（仓库根）：**与实现文件深度无关**的推导。
-
-    W6-C8 修正：此处原本是 `_precommit_hook_params` 体内的
-    ``Path(__file__).resolve().parent.parent.parent`` —— 它暗含「本文件在
-    ``orchd/gitops/<file>.py``」这一深度假设。拆包后本文件变成
-    ``orchd/gitops/hook/content.py``，同一表达式少算一层、把引擎根算成 ``<repo>/orchd``，
-    于是 hook 运行期 ``import orchd`` 失败（``No module named 'orchd'``）、ledger 回退查询
-    失效，实测把 DONE 任务误判为活跃并拦提交（E020）。改用 ``orchd`` 包自身的 ``__file__``
-    （``<repo>/orchd/__init__.py`` 上两级 = 仓库根），函数内导入避免顶层循环。
-    """
-    from orchd import __file__ as _orchd_file
-
-    return Path(_orchd_file).resolve().parent.parent
 
 def _line_ref_tx_env(project_root: Path) -> tuple[str | None, str | None]:
     """多线下强制层需要的 trunk；**单线 → (None, None)**。
@@ -243,7 +204,6 @@ def ref_tx_hook_content(
     )
 
 
-
 def _precommit_hook_content(
     *,
     task_id: str,
@@ -263,7 +223,7 @@ def _precommit_hook_content(
     """按 _PRE_COMMIT_HOOK_TEMPLATE 渲染 pre-commit hook 脚本（原 hook_install 体内 f-string 的等价替换）。
 
     只做模板插值：13 个随任务/仓库变化的字段由 :func:`_precommit_hook_params` 烘焙，
-    4 个模块级/函数级值（归属标记 / 两段内联 python / E020 逃生指引）在此就地填充。
+    5 个模块级/函数级值（归属标记 / 三段内联 python / E020 逃生指引）在此就地填充。
     渲染结果需与起点 blob 的 f-string 渲染**逐字节相等**（守卫
     ``tests/test_hook_template_external.py`` 以基线 AST 就地 eval 机判）。
     """
@@ -283,9 +243,11 @@ def _precommit_hook_content(
         STATIC_EXEMPT_ECHO=static_exempt_echo,
         HOOK_MARKER=_HOOK_MARKER,
         PY_RESOLVER=_HOOK_PY_RESOLVER,
+        PY_MERGE_STATE=_PRE_COMMIT_HOOK_PY_MERGE_STATE,
         PY_LEDGER_STATE=_HOOK_PY_LEDGER_STATE,
         E020_ESCAPE_BLOCK=_e020_hook_escape_block(),
         ORCHD_HOME_ENV=ORCHD_HOME_ENV,
+        MANIFEST_DOCS_PATTERNS=_manifest_docs_patterns(),
     )
 
 
@@ -405,3 +367,125 @@ def _precommit_hook_params(
         "static_exempt_header": static_exempt_header,
         "static_exempt_echo": static_exempt_echo,
     }
+
+
+# hook 解释器解析与运行时双检（task-cont-hook-runtime-gate / task-v163）：
+# claim 预检与安装共用同一判定；解析优先级 = ORCHD_HOOK_SHELL → PATH sh → Windows 候选。
+ORCHD_HOOK_SHELL_ENV = "ORCHD_HOOK_SHELL"
+HOOK_RUNTIME_UNAVAILABLE = "hook_runtime_unavailable"
+# 进程内正结果缓存：同一 sh 可用性反复探测是纯开销；只缓存成功，失败不缓存。
+_SHELL_SMOKE_OK: set[str] = set()
+
+
+# Windows 专用回退：PATH 不含 sh 时按顺序检查 Git for Windows 的常见安装位置。
+# 仅当文件存在且可执行时选用；全部不存在返回 None（fail-closed）。
+_WINDOWS_SHELL_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("ProgramFiles", "Git/bin/sh.exe"),
+    ("ProgramFiles", "Git/usr/bin/sh.exe"),
+    ("ProgramW6432", "Git/bin/sh.exe"),
+    ("LOCALAPPDATA", "Programs/Git/bin/sh.exe"),
+)
+
+
+def _windows_shell_candidates() -> list[str]:
+    """按安装顺序枚举 Windows 上 Git for Windows 的 sh 候选路径（缺失环境变量跳过）。"""
+    out: list[str] = []
+    for env_name, rel in _WINDOWS_SHELL_CANDIDATES:
+        base = (os.environ.get(env_name) or "").strip()
+        if not base:
+            continue
+        out.append(str(Path(base) / rel))
+    return out
+
+
+def _resolve_windows_hook_shell() -> str | None:
+    """Windows 回退：返回首个「文件存在且可执行」的 Git for Windows sh。"""
+    for candidate in _windows_shell_candidates():
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def resolve_hook_shell() -> str | None:
+    """解析 hook 解释器：``ORCHD_HOOK_SHELL`` 优先，否则 PATH 中的 ``sh``。
+
+    Windows 且前两级均未命中时，回退到 Git for Windows 的常见安装路径；非 Windows
+    行为与旧实现一致（只认 override 与 PATH），全部不存在返回 ``None``（fail-closed）。
+    """
+    override = (os.environ.get(ORCHD_HOOK_SHELL_ENV) or "").strip()
+    if override:
+        return override
+    found = shutil.which("sh")
+    if found:
+        return found
+    if sys.platform == "win32":
+        return _resolve_windows_hook_shell()
+    return None
+
+
+def _run_hook_shell(shell: str, args: list[str]) -> dict[str, Any]:
+    """执行一次 shell 探测；任何执行故障都结构化返回，不抛异常。"""
+    try:
+        proc = subprocess.run(
+            [shell, *args], capture_output=True, encoding="utf-8",
+            errors="replace", timeout=_HOOK_RUNTIME_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        return {
+            "ok": False,
+            "error": f"{shell} {' '.join(args)} 返回 {proc.returncode}"
+                     + (f"：{detail}" if detail else ""),
+        }
+    return {"ok": True}
+
+
+def probe_hook_runtime(content: str | None = None) -> dict[str, Any]:
+    """探测 hook 运行时可用性（``sh -c 'exit 0'`` + 可选 ``sh -n <hook>``）。
+
+    Args:
+        content: 待安装的 hook 文本；提供时额外做语法检查（写盘前完成双检）。
+
+    Returns:
+        ``{"ok": True, "shell": <path>}``；不可用时 ``{"ok": False,
+        "reason": "hook_runtime_unavailable", "shell": <path|None>, "error": <str>}``。
+    """
+    shell = resolve_hook_shell()
+    if not shell:
+        return {
+            "ok": False,
+            "reason": HOOK_RUNTIME_UNAVAILABLE,
+            "shell": None,
+            "error": "PATH 中找不到 sh，且未设置 ORCHD_HOOK_SHELL",
+        }
+    if shell not in _SHELL_SMOKE_OK:
+        check = _run_hook_shell(shell, ["-c", "exit 0"])
+        if not check["ok"]:
+            return {
+                "ok": False,
+                "reason": HOOK_RUNTIME_UNAVAILABLE,
+                "shell": shell,
+                "error": f"sh -c 'exit 0' 未通过：{check['error']}",
+            }
+        _SHELL_SMOKE_OK.add(shell)
+    if content is not None:
+        fd, tmp_name = tempfile.mkstemp(prefix="orchd-hook-", suffix=".sh")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(content)
+            syntax = _run_hook_shell(shell, ["-n", tmp_name])
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        if not syntax["ok"]:
+            return {
+                "ok": False,
+                "reason": HOOK_RUNTIME_UNAVAILABLE,
+                "shell": shell,
+                "error": f"sh -n 未通过：{syntax['error']}",
+            }
+    return {"ok": True, "shell": shell}

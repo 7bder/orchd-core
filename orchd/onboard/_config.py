@@ -91,3 +91,77 @@ def _is_doc_single_stage(
         if not lower.endswith(_DOC_SINGLE_STAGE_SUFFIXES):
             return False
     return True
+
+# done 响应的审查路径维度（task-engine-defect-fix-unified-u13-review-created-mode）：
+# 历史 ``review_created`` 只有 type，而 type=code 同时承载「双阶段项目下的纯文档单阶段」
+# 与「code 范围返工直达」两种互不相干的原因，消费方无法区分来源。故拆出正交的
+# ``mode`` + ``reason``；``type`` 保留原值，历史消费方零改动。
+#   - mode=unified                    项目 project.review_mode=unified（单阶段审查）
+#   - mode=two_phase_single_stage_doc 双阶段项目下的纯文档单阶段（跳过 spec）
+#   - mode=two_phase                  双阶段项目（默认；含 code 返工直达）
+REVIEW_CREATED_MODE_UNIFIED = "unified"
+REVIEW_CREATED_MODE_TWO_PHASE = "two_phase"
+REVIEW_CREATED_MODE_TWO_PHASE_SINGLE_STAGE_DOC = "two_phase_single_stage_doc"
+REVIEW_CREATED_MODES = (
+    REVIEW_CREATED_MODE_UNIFIED,
+    REVIEW_CREATED_MODE_TWO_PHASE,
+    REVIEW_CREATED_MODE_TWO_PHASE_SINGLE_STAGE_DOC,
+)
+
+
+def resolve_review_created(
+    store: Store,
+    task_def: dict[str, Any],
+    task_id: str,
+) -> dict[str, str]:
+    """done 响应 ``review_created`` 的单一推导真源：``{type, mode, reason}``。
+
+    判定顺序（与历史 done 行为逐字一致，仅补 mode/reason 维度）：
+    1. ``project.review_mode=unified`` → type=unified / mode=unified；
+    2. 双阶段项目下 ``files_to_edit`` 全为文档白名单且不碰约定/状态文件 →
+       type=code / mode=two_phase_single_stage_doc（跳过 spec 直达 code 终审）；
+    3. 上轮 code 范围打回（``rework_scope=code``）→ type=code / mode=two_phase
+       （返工直达 code，跳过 spec）；
+    4. 其余 → type=spec / mode=two_phase（默认双阶段）。
+
+    ``mode`` 回答「哪条审查路径」，``reason`` 回答「为什么走这条路径」，
+    两者与 ``type``（下游兼容字段）正交；REVIEW_READY 事件字段不变。
+
+    Args:
+        store: 账本 Store（读 project.review_mode / config / rework_scope）。
+        task_def: 任务定义（读 files_to_edit）。
+        task_id: 任务 id（读最新 rework_scope）。
+
+    Returns:
+        ``{"type": str, "mode": str, "reason": str}``。
+    """
+    from orchd.contracts.task_schema import FILES_TO_EDIT_FIELD
+    from orchd.ledger import latest_rework_scope, resolve_review_mode
+
+    if resolve_review_mode(store.orchd_dir) == "unified":
+        return {
+            "type": "unified",
+            "mode": REVIEW_CREATED_MODE_UNIFIED,
+            "reason": "项目 project.review_mode=unified：单阶段审查，一次 APPROVED 即 merge",
+        }
+    files_to_edit = task_def.get(FILES_TO_EDIT_FIELD) or []
+    if _is_doc_single_stage(files_to_edit, blocked=_load_config_blocked(store)):
+        return {
+            "type": "code",
+            "mode": REVIEW_CREATED_MODE_TWO_PHASE_SINGLE_STAGE_DOC,
+            "reason": (
+                "files_to_edit 全为文档白名单且未触碰约定/状态文件："
+                "双阶段项目下跳过 spec 直达 code 终审"
+            ),
+        }
+    if latest_rework_scope(store, task_id) == "code":
+        return {
+            "type": "code",
+            "mode": REVIEW_CREATED_MODE_TWO_PHASE,
+            "reason": "上轮 code 范围打回（rework_scope=code）：返工直达 code 审查，跳过 spec",
+        }
+    return {
+        "type": "spec",
+        "mode": REVIEW_CREATED_MODE_TWO_PHASE,
+        "reason": "默认双阶段：先 spec 后 code",
+    }

@@ -124,6 +124,18 @@ def resolve_read_paths(
 # 正交，保留手写（见模块 review 记录）。
 # ---------------------------------------------------------------------------
 
+#: 本卡新增的会话接续 / 降级场景（task-cont-guidance-read-coverage）。
+#: 它们的路由来自各 rules 文件 front-matter；缺路由时退回安全兜底索引。
+_SESSION_CONTINUITY_SITUATIONS = frozenset({
+    "handoff", "takeover", "show_resume", "session_adopt",
+    "auto_clean", "dirty_worktree_rescue", "agents_card_update",
+    "stale_baseline_dirty_preserved", "hook_runtime_unavailable",
+    "archive_commit_rolled_back", "restore_multi_path",
+})
+
+#: 安全兜底：路由缺失时先读规则索引，保证 read 非空且路径真实存在。
+_SAFE_FALLBACK_READ = ("rules/README.md",)
+
 #: 路由场景闭词汇（front-matter ``guide:`` 的合法键；未知键 fail-closed，防笔误）。
 GUIDANCE_SITUATIONS = frozenset({
     "first_time", "empty_project", "stop_wait", "lesson_review", "check_status",
@@ -131,7 +143,7 @@ GUIDANCE_SITUATIONS = frozenset({
     "wait_review", "optional_cancel", "done_all", "audit_merge",
     "claimed_impl", "done_submitted", "approved_completed", "cancelled",
     "changes_requested", "warning_unmapped",
-})
+}) | _SESSION_CONTINUITY_SITUATIONS
 
 #: 路由缓存：init_routing 填充；read_for/template_for 只读。
 _ROUTING_CACHE: dict[str, Any] | None = None
@@ -312,11 +324,19 @@ def read_for(situation: str) -> list[str]:
     """反向生成某场景的 read 列表（task-guide-routing-meta）。
 
     按 front-matter 优先级排序；未知场景 → []；空降级缓存 → []。
+    会话接续场景（``_SESSION_CONTINUITY_SITUATIONS``）在本轮路由缺失时退回
+    ``_SAFE_FALLBACK_READ``，保证新增流程至少有可读入口；T0/T1（first_time /
+    empty_project）等既有空场保持 ``[]`` 不变。
     """
     cache = _require_routing()
     if cache.get("empty"):
         return []
-    return list(cache["situations"].get(situation, []))
+    hits = cache["situations"].get(situation, [])
+    if hits:
+        return list(hits)
+    if situation in _SESSION_CONTINUITY_SITUATIONS:
+        return list(_SAFE_FALLBACK_READ)
+    return []
 
 
 def template_for(role: str, mode: str | None = None) -> list[str]:

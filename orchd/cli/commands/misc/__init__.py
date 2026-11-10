@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from .evidence import (
     _commit_regression_evidence,
+    _write_regression_evidence,
     _EVIDENCE_NONCOMMIT_OK,
     _warn_evidence_not_committed,
     _cmd_full_regression,
@@ -51,6 +52,7 @@ from .registration import register
 
 __all__ = [
     "_commit_regression_evidence",
+    "_write_regression_evidence",
     "_EVIDENCE_NONCOMMIT_OK",
     "_warn_evidence_not_committed",
     "_cmd_full_regression",

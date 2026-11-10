@@ -59,6 +59,12 @@ REMOTE_PREFIX = "refs/remotes/"
 HEADS_PREFIX = "refs/heads/"
 TAG_PREFIX = "refs/tags/"
 STASH_REF = "refs/stash"
+# git 伪引用（不是 refs/ 命名空间下的真实引用）：merge/cherry-pick/rebase 的
+# 状态指针，以及 ORIG_HEAD/FETCH_HEAD。它们由 git 内部写入，不构成红线操作。
+PSEUDO_REFS = frozenset({
+    "AUTO_MERGE", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+    "REBASE_HEAD", "ORIG_HEAD", "FETCH_HEAD",
+})
 
 _ZERO = "0" * 40
 
@@ -67,6 +73,7 @@ _ALLOW_TASK = "task_branch"
 _ALLOW_ENGINE = "engine_ref"
 _ALLOW_REMOTE = "remote_tracking"
 _ALLOW_FF_DEFAULT = "default_branch_fast_forward"
+_ALLOW_PSEUDO = "pseudo_ref"
 _ALLOW_UNCLASSIFIED = "unclassified_allow"
 
 # 拒绝集合
@@ -140,6 +147,11 @@ def classify_update(
         return {**base, "action": "allow", "rule": _ALLOW_ENGINE}
     if ref.startswith(REMOTE_PREFIX):
         return {**base, "action": "allow", "rule": _ALLOW_REMOTE}
+    if ref in PSEUDO_REFS:
+        # task-feedback-ref-tx-auto-merge：伪引用是 git 内部状态（AUTO_MERGE 等），
+        # 显式放行且不打 degraded；未知命名空间仍走兜底 fail-open + 留痕。
+        return {**base, "action": "allow", "rule": _ALLOW_PSEUDO,
+                "reason": "git 伪引用（索引/merge 状态指针，非受管命名空间）"}
     if ref == STASH_REF:
         return {
             **base, "action": "refuse", "rule": _REFUSE_STASH,

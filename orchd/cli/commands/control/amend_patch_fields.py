@@ -131,6 +131,68 @@ def _apply_depends_on_patch(*, master, store, target, patch_task,
             )
 
 
+def _resolve_verify_command_file(*, patch_task, patch_verify, patch_verify_file):
+    """``--verify-command-file`` 解析与状态门（task-feedback-verify-win-shell 起）。
+
+    task-feedback-verify-file-scope：该选项只在 ``--task`` 补丁通道生效；``--register``
+    / 裸 amend 没有 patch_task，旧实现会静默忽略（用户以为已写入），现显式 E007。
+    读失败 / 空文件 / 与 ``--verify-command`` 并用都在内存 master 修改前抛出。
+    """
+    if patch_verify_file is None:
+        return patch_verify
+    if patch_task is None:
+        raise OrchdError(
+            ErrorCode.E007,
+            "verify_command_file_requires_task: --verify-command-file 仅 --task 生效",
+            [{
+                "reason": "verify_command_file_requires_task",
+                "path": str(patch_verify_file),
+                "hint": ("仅 --task 补丁通道读取文件；--register 请把 verify_command "
+                         "写入提案 JSON，裸 amend 请先加 --task <id>"),
+            }],
+        )
+    if patch_verify is not None:
+        raise OrchdError(
+            ErrorCode.E007,
+            "amend_verify_conflict: --verify-command 与 --verify-command-file "
+            "不能同时给出",
+            [{
+                "reason": "verify_command_conflict",
+                "task_id": patch_task,
+                "hint": ("二选一：短命令用 --verify-command，"
+                         "含引号/多段命令用 --verify-command-file"),
+            }],
+        )
+    try:
+        # utf-8-sig：Windows PowerShell 5.1 的 UTF-8 输出常带 BOM；
+        # UnicodeError（非 UTF-8/UTF-16）也归入不可读，避免 E999 裸崩。
+        patch_verify = Path(patch_verify_file).read_text(
+            encoding="utf-8-sig").rstrip("\r\n")
+    except (OSError, UnicodeError) as exc:
+        raise OrchdError(
+            ErrorCode.E007,
+            f"verify_command_file_unreadable: {exc}",
+            [{
+                "reason": "verify_command_file_unreadable",
+                "task_id": patch_task,
+                "path": str(patch_verify_file),
+                "hint": "确认文件存在且为 UTF-8；本次未写入任何内容",
+            }],
+        ) from None
+    if not patch_verify.strip():
+        raise OrchdError(
+            ErrorCode.E007,
+            "verify_command_file_empty: verify_command 文件为空",
+            [{
+                "reason": "verify_command_file_empty",
+                "task_id": patch_task,
+                "path": str(patch_verify_file),
+                "hint": "写入至少一条可执行命令；本次未写入任何内容",
+            }],
+        )
+    return patch_verify
+
+
 def _amend_patch_fields(*, args, master, store, project_root: Path,
                         revise_terminal: str | None) -> str | None:
     """amend 补丁段：CLI 补丁旗标解析 + 状态矩阵门 + 字段应用（原 L542-822）。
@@ -155,6 +217,7 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
     patch_remove_exempt = list(
         getattr(args, "remove_exempt_files", None) or [])
     patch_verify = getattr(args, "verify_command", None)
+    patch_verify_file = getattr(args, "verify_command_file", None)
     patch_depends_present = getattr(args, "depends_on", None) is not None
     patch_depends = list(getattr(args, "depends_on", None) or [])
     patch_sources = list(getattr(args, "additional_sources", None) or [])
@@ -172,16 +235,28 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
     # 状态矩阵见下方 gating 块——pending 直接改，终态经 --revise-terminal）。
     patch_brief = getattr(args, "brief", None)
     patch_name = getattr(args, "name", None)
+    # task-surface-refresh-channel：刷新/撤回旗标由 amend_impl 的
+    # _amend_surface_refresh 在补丁段之前应用；此处只把它们计入「至少一个补丁
+    # 字段」判定，避免仅带刷新旗标时被 amend_multi_field 误拦。
+    patch_refresh = list(getattr(args, "refresh_surface", None) or [])
+    patch_remove_refresh = list(
+        getattr(args, "remove_refresh_surface", None) or [])
+    patch_verify = _resolve_verify_command_file(
+        patch_task=patch_task, patch_verify=patch_verify,
+        patch_verify_file=patch_verify_file)
     if patch_task is not None:
         if not (patch_files or patch_exempt or patch_remove_files
                 or patch_remove_exempt or patch_verify is not None
+                or patch_verify_file is not None
                 or patch_depends_present
                 or patch_sources or patch_timeout is not None
                 or patch_reviewers is not None
                 or patch_files_to_read is not None
                 or patch_ac is not None
                 or patch_brief is not None
-                or patch_name is not None):
+                or patch_name is not None
+                or patch_refresh
+                or patch_remove_refresh):
             raise OrchdError(
                 ErrorCode.E007,
                 "amend --task 需至少携带一个补丁字段",
@@ -203,6 +278,8 @@ def _amend_patch_fields(*, args, master, store, project_root: Path,
                     "brief/name 同为 pending 态直接放行，终态配 --revise-terminal）",
                 }],
             )
+        # task-feedback-verify-win-shell：文件传参避免 PowerShell 吃引号；
+        # 解析/冲突/空值/不可读门已由 _resolve_verify_command_file 统一处理。
         target = next(
             (t for t in master.tasks if t.get("id") == patch_task),
             None,

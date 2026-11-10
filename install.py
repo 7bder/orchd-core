@@ -16,15 +16,19 @@
   shared/、_master.json、IDEAS/ROADMAP、ledger/checkpoint、session 锁）；
   --force 覆盖安装（重建 .orchd/，覆盖全部）；
 - --agent：仅输出最终 JSON（installed/mode/host/orchd_dir/next），无交互提示。
+- --client-pointers：默认关闭；开启时才写宿主根四个 agent 客户端一行指针文件
+  （C-CLIENT-POINTERS@1），关闭时宿主根不新增任何文件。
 - --cleanup：安装成功后删除克隆源目录（orchd-core/），实现无痕安装（仅当脚本位于
   克隆根且目录名为 orchd-core 时删除，主项目布局安全跳过）。
 
 用法：
-    python release/install.py <host> [--update] [--force] [--agent] [--cleanup]
+    python release/install.py <host> [--update] [--force] [--agent]
+        [--client-pointers] [--cleanup]
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -32,6 +36,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # 最低支持 Python（与 pyproject requires-python 同步）：安装器与引擎均要求 >= 3.11。
@@ -68,7 +73,21 @@ RESOURCE_ROOT = _SELF_DIR if (_SELF_DIR / "orchd").is_dir() else _SELF_DIR.paren
 # （与 scripts/sync_orchd_core.sh / scripts/verify_release_self_contained.py 对齐）
 ENGINE_DIR = RESOURCE_ROOT / "orchd"
 RESOURCE_DIRS = [("schema", "schema"), ("templates", "templates"), ("skill/rules", "rules")]
-RESOURCE_FILES = [("docs", "decomposition-guide.md")]
+RESOURCE_FILES = [
+    ("docs", "decomposition-guide.md"),
+    ("docs", "user-manual.md"),
+    ("docs", "runtime-spec.md"),
+]
+# 预生成契约文档快照（task-docsgen-gate）：安装器把六份产物放进
+# <host>/.orchd/docs/_generated/，宿主 docs check 只读校验，不依赖运行时生成。
+GENERATED_DOC_FILES = (
+    "error-codes.md",
+    "commands.md",
+    "fields.md",
+    "events.md",
+    "statemachine.md",
+    "dependency-graph.md",
+)
 PACKAGING_FILES = ["pyproject.toml", "MANIFEST.in", "LICENSE", ".gitignore"]
 # SKILL / 零根入口归置 .orchd/（task-12-workspace-docs）；兼容 orchd-core skill/ 与旧根布局
 SKILL_CANDIDATES = [
@@ -84,6 +103,16 @@ _USER_PATHS = {
     "shared", "proposals", "_master.json", "IDEAS.md",
     "IDEAS-archive.md", "_ledger.jsonl", "_checkpoint.json", ".session.lock",
 }
+
+# 安装清单（task-installer-shipped-ownership）：记录安装器写入的 shipped 文件
+# sha256，供 --update 判断宿主是否改过。位于 .orchd/ 直接条目，被生成的
+# .orchd/.gitignore 的 `/*` 覆盖——不入宿主 git。
+INSTALL_MANIFEST = ".install-manifest.json"
+
+# shipped 文件所有权（task-installer-shipped-ownership）：
+# - engine/rules/templates/SKILL/__main__/schema/docs 由安装器管理，--update 会覆盖；
+#   宿主定制放 shared/（不覆盖）。
+# - hooks（.githooks/）不随包：安装器只配置 core.hooksPath，不写 hook 内容。
 
 # .orchd/.gitignore 契约（task-installer-layout-placement）：安装器按宿主布局生成。
 # 源码根 .gitignore 的规则按「本文件位于 git 根」编写（.orchd/* + 豁免集），被
@@ -153,27 +182,44 @@ _MODE_LABEL = {"install": "安装", "update": "升级", "force": "覆盖安装"}
 
 # AGENTS.md 入口指针（安装器维护）：供"不扫隐藏目录、无 orchd skill"的
 # 新 agent 在宿主根直接发现引擎入口 .orchd/SKILL.md。
-_AGENTS_MARKER = "<!-- orchd: agent 入口指针"
-_AGENTS_POINTER = (
-    """<!-- orchd: agent 入口指针（由 orchd 安装器维护；如需自定义请保留该标记以免重复追加） -->
-# AI agents
+# task-v163-host-installer-pointers（T14）：指针由单段散文升级为 7 行**契约卡**，
+# 并改为 marker 区段就地升级——旧版单行指针条目不得重复追加，区段外内容零改写。
+_AGENTS_START_MARKER = "<!-- orchd:"
+_AGENTS_END_MARKER = "<!-- /orchd -->"
+_AGENTS_POINTER = "\n".join((
+    "<!-- orchd: agent 入口指针（由 orchd 安装器维护；保留该标记以免重复追加） -->",
+    "1. 进场先跑 `python .orchd/__main__.py status`，按返回的 `guidance` / "
+    "`next_action` 执行，不自己判断阶段。",
+    "2. 任务流：`request` → `claim --confirm` → 实现/提交 → `done` → `review`；"
+    "不绕过 claim，不手写 git 写操作。",
+    "3. 只读 `guidance.read` 点名的规则文件（入口协议 `.orchd/SKILL.md`）；"
+    "stdout 是 JSON，stderr 是给人看的。",
+    "4. 六条红线：不破坏 git、不越界改文件、不伪造身份/自审、不提交前中断、"
+    "不手改运行时状态、不绕过门禁。",
+    "5. `E033` → `session start --adopt`；`exit_type` 不是 `exec-command` 时"
+    "按提示停/等/报，不猜。",
+    "6. 审查须由本会话 spawn 的独立 subagent 执行：`done` 的 `review_handoff` "
+    "已含审查会话与 `prompt`，原样转交，缺交接即停报。",
+    "7. 身份三条禁止：自铸 session token 自用、手设 `ORCHD_SESSION_ID`、"
+    "复用他人 token；**无 subagent 能力即中断**（`retract` 后停止上报）。",
+    "<!-- /orchd -->",
+)) + "\n"
 
-本项目使用 [orchd](https://github.com/7bder/orchd-core) 编排 AI agent 任务协作。
-
-- 每个 AI agent 进场请先读 `.orchd/SKILL.md`（协议入口，含纪律红线与 guidance 导航）
-- 引擎命令统一用 `python .orchd/__main__.py <子命令>`
-- 具体规则按需读 `.orchd/rules/`（索引 `rules/README.md`）
-
-若本目录尚无 `.orchd/`（新环境或尚未安装），可自行执行安装接入：
-
-```bash
-git clone https://github.com/7bder/orchd-core.git"""
-    """ && python orchd-core/install.py . --agent --cleanup
-```
-
-装好后读 `.orchd/SKILL.md` 进入工作流。
-<!-- /orchd -->
-"""
+# 客户端指针契约 C-CLIENT-POINTERS@1（task-v163-host-installer-pointers，T14）。
+# 四个常见 agent 客户端入口文件，内容 = 仓库根同名样例的**LF 规范形态**（逐字节）。
+# 默认关闭：仅 --client-pointers 开启时落盘；关闭时宿主根不新增任何文件。
+# 换行固定为 LF（write_bytes 写契约字节），避免 Windows 文本模式把 `\n` 翻成 CRLF
+# 破坏"逐字节一致"；git autocrlf 的工作树 CRLF 形态由 git 决定，安装器不参与。
+_CLIENT_POINTER_LINE = "先读 `.orchd/SKILL.md`（协议入口），按其中的 `guidance` 执行。\n"
+_CLIENT_POINTER_SPECS: tuple[tuple[str, str], ...] = (
+    ("CLAUDE.md", "@AGENTS.md\n\n" + _CLIENT_POINTER_LINE),
+    ("GEMINI.md", _CLIENT_POINTER_LINE),
+    (".github/copilot-instructions.md", _CLIENT_POINTER_LINE),
+    (
+        ".cursor/rules/orchd.mdc",
+        "---\ndescription: orchd 协议入口（always apply）\nalwaysApply: true\n---\n\n"
+        + _CLIENT_POINTER_LINE,
+    ),
 )
 
 
@@ -260,12 +306,15 @@ def _check_engine_inventory(host: Path, orchd: Path) -> dict:
     判定（布局感知——flat 宿主不跟踪引擎完全合法，不得误伤）：
     - 非 git 宿主 → ``{"checked": False, "reason": "not_a_git_repo"}``；
     - 磁盘 ``.orchd/orchd/**/*.py`` 全被跟踪 → ``{"checked": True, "missing": []}``；
-    - 差集非空 + container 布局（worktree 必用 git 检出，缺文件必断）→ **抛错阻断**；
+    - 差集非空 + container 布局（worktree 必用 git 检出，缺文件必断）→ 警告留痕
+      （``missing`` + ``hint`` + ``warning``），**不阻断**；
     - 差集非空 + flat/未知布局 → 警告留痕（``missing`` + ``hint``），不阻断。
 
-    Raises:
-        RuntimeError: container 布局下存在未入库引擎文件（附文件清单与
-        ``git add -f`` 指引；``-f`` 因忽略契约覆盖所必需）。
+    task-installer-inventory-atomicity（诚实语义路线）：container 差集非空**不再抛错**。
+    断言在 ``_assemble_assets`` 之后执行——此刻盘已改且无回滚，抛错只会被 CLI 兜底成
+    ``{"installed": false}`` 而与磁盘矛盾（盘已完整升级、响应却报未安装）。改为返回
+    结构化 ``missing``/``warning``/``hint``，使 ``--agent`` JSON 与磁盘真实状态一致。
+    检出能力不削弱：``missing`` 仍完整列出未入库文件（负控见测试）。
     """
     engine = orchd / "orchd"
     disk = set()
@@ -298,15 +347,20 @@ def _check_engine_inventory(host: Path, orchd: Path) -> dict:
     if layout == "container":
         hint = (
             "升级新增的引擎文件未入库（.orchd/.gitignore 覆盖了 orchd/）："
-            "任务 worktree 是 git 纯净检出，缺文件即 done E999。请执行 "
-            "git add -f .orchd/orchd/ 后提交（整目录加 -f，一次收敛全部新增；"
-            "-f 必需：忽略规则覆盖所致，非宿主失误）。"
+            "任务 worktree 是 git 纯净检出，缺文件即 done E999。请入库后提交："
+            "git add -f .orchd/orchd/ ':(exclude)*__pycache__*'"
+            "（POSIX sh/bash 用单引号；Windows cmd/PowerShell 改用双引号或"
+            " --pathspec-from-file=<清单>）"
+            "（-f 必需：忽略规则覆盖所致，非宿主失误）；切勿用无排除的整目录 add"
+            "——会把 __pycache__/*.pyc 一并入库。未入库：%s"
+            % _shorten_list(missing)
         )
-        raise RuntimeError(
-            "入库完整性断言失败：container 布局下 %d 个引擎文件在盘不在库%s：%s"
-            % (len(missing), "（worktree 纯净检出必缺文件）", _shorten_list(missing))
-            + "。" + hint
-        )
+        try:
+            print(f"orchd ▸ [inventory] 提示：{hint}", file=sys.stderr)
+        except OSError:
+            pass
+        return {"checked": True, "missing": missing,
+                "warning": "container_layout_untracked_engine", "hint": hint}
     hint = (
         "flat/未知布局下 %d 个引擎文件在盘不在库，属合法状态，无需处理"
         "（flat 宿主不跟踪 .orchd/orchd/，引擎随安装器更新；切勿强行入库"
@@ -321,6 +375,18 @@ def _check_engine_inventory(host: Path, orchd: Path) -> dict:
             "hint": hint}
 
 
+def _copy_generated_docs(orchd: Path) -> list[str]:
+    """把六份预生成快照放进 ``<host>/.orchd/docs/_generated/``。"""
+    src = RESOURCE_ROOT / "docs" / "_generated"
+    dst = orchd / "docs" / "_generated"
+    dst.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for name in GENERATED_DOC_FILES:
+        shutil.copy2(src / name, dst / name)
+        copied.append(name)
+    return copied
+
+
 def _assemble_assets(orchd: Path) -> None:
     """组装分发资产（首次安装 / --update / --force 共用）。"""
     (orchd / "docs").mkdir(parents=True, exist_ok=True)
@@ -333,6 +399,8 @@ def _assemble_assets(orchd: Path) -> None:
     # docs/ 单文档
     for sub, name in RESOURCE_FILES:
         shutil.copy2(RESOURCE_ROOT / sub / name, orchd / "docs" / name)
+    # 契约文档预生成快照（宿主 docs check 只读校验）
+    _copy_generated_docs(orchd)
     # 打包配置（.gitignore 为源码根形态，随后由 _write_orchd_gitignore 规范为
     # .orchd/ 相对规则——拷贝保持包一致性，覆写修正布局错位）
     for name in PACKAGING_FILES:
@@ -344,6 +412,121 @@ def _assemble_assets(orchd: Path) -> None:
     _clean_pycache(orchd)
 
 
+def _planned_relpaths() -> list[str]:
+    """安装器将写入 ``.orchd/`` 的相对路径全集（与 :func:`_assemble_assets` 同源）。
+
+    用于两件事：``--update`` 覆盖前判断哪些 shipped 文件被宿主改过；安装完成后
+    写清单记录 sha256。``__pycache__`` 不计入（组装后会被清理）。
+    """
+    rels: list[str] = []
+
+    def collect(src: Path, prefix: str) -> None:
+        if not src.is_dir():
+            return
+        for path in src.rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                rels.append(f"{prefix}/{path.relative_to(src).as_posix()}")
+
+    collect(ENGINE_DIR, "orchd")
+    for src_name, dst_name in RESOURCE_DIRS:
+        collect(_resolve(src_name), dst_name)
+    rels.extend(f"docs/{name}" for _sub, name in RESOURCE_FILES)
+    rels.extend(f"docs/_generated/{name}" for name in GENERATED_DOC_FILES)
+    rels.extend(PACKAGING_FILES)
+    rels.extend(["SKILL.md", "__main__.py", "VERSION"])
+    return sorted(set(rels))
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_manifest_payload(orchd: Path) -> dict:
+    """读上一次安装的清单全文；缺失/损坏/非对象视为空清单。"""
+    path = orchd / INSTALL_MANIFEST
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_manifest(orchd: Path) -> dict[str, str]:
+    """读上一次安装记录的 ``{相对路径: sha256}``；缺失/损坏视为无基线。"""
+    files = _read_manifest_payload(orchd).get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def _read_host_files(orchd: Path) -> dict[str, str]:
+    """读清单里 **宿主根** 安装器自有文件的指纹（``host_files``）。
+
+    task-v163-host-installer-pointers（T14）：仅记录安装器写过且内容等于契约的
+    客户端指针文件（created/exists/updated），``kept_host_modified`` 不登记——
+    否则下一轮会把宿主内容误判成"上轮安装写的"而覆盖。旧清单（无该键）→ ``{}``
+    （无基线 = 保守不覆盖），与 ``_read_manifest`` 的旧宿主语义一致。
+    """
+    host_files = _read_manifest_payload(orchd).get("host_files")
+    return host_files if isinstance(host_files, dict) else {}
+
+
+def _write_manifest(
+    orchd: Path, relpaths: list[str], host_files: dict[str, str] | None = None,
+) -> None:
+    """写安装清单：``files``（.orchd/ 内 shipped）+ ``host_files``（宿主根自有）。
+
+    ``host_files`` 为**本轮结束时的最终指纹**（只含安装器自有文件），供下一轮
+    ``--update`` 判定宿主是否改动过客户端指针。
+    """
+    files = {
+        rel: _sha256_file(orchd / rel)
+        for rel in relpaths
+        if (orchd / rel).is_file()
+    }
+    payload = {
+        "schema_version": 2,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "files": files,
+        "host_files": dict(sorted((host_files or {}).items())),
+    }
+    (orchd / INSTALL_MANIFEST).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _backup_modified_shipped(
+    orchd: Path, relpaths: list[str], previous: dict[str, str],
+) -> tuple[list[str], str | None]:
+    """覆盖前把宿主改过的 shipped 文件备份到 ``.orchd/.doctor-backup/install-<UTC>/``。
+
+    只认清单里登记过、且当前 sha256 与登记值不同的文件；无清单（首次安装或从
+    旧版本升级的第一跑）不误判为「宿主改过」，只建立基线。
+    """
+    modified = [
+        rel for rel in relpaths
+        if (orchd / rel).is_file()
+        and previous.get(rel) is not None
+        and _sha256_file(orchd / rel) != previous[rel]
+    ]
+    if not modified:
+        return [], None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = orchd / ".doctor-backup" / f"install-{stamp}"
+    for rel in modified:
+        target = backup_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(orchd / rel, target)
+    return sorted(modified), str(backup_dir)
+
+
 def _next_step_text(orchd: Path, mode: str) -> str:
     """安装下一步指引（task-intake-hint-phase）：按 ``_master.json`` 是否存在分流，
     与 ``orchd/guide.py::first_time_guide(has_master)`` 同语义——新项目走
@@ -353,15 +536,37 @@ def _next_step_text(orchd: Path, mode: str) -> str:
     ``tests/test_intake_hint_phase.py`` 双边断言锁死一致（改一端即红）。
     """
     if (orchd / "_master.json").exists():
-        return ("python .orchd/__main__.py status 查看项目状态（或 validate 校验），"
+        base = ("python .orchd/__main__.py status 查看项目状态（或 validate 校验），"
                 "随后 request/claim 领取任务")
-    return ("python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
-            "（与 guidance first_time 卡片 steps 顺序一致）")
+    else:
+        base = ("python .orchd/__main__.py bootstrap → init 初始化快照后开始使用"
+                "（与 guidance first_time 卡片 steps 顺序一致）")
+    # task-deps-host-gate：安装器不预置 deps.json，只提示宿主按需生成；
+    # deps guard 在 guards.json 中默认 off，显式 warn/hard 才参与 done 门禁。
+    # task-guards-init：安装器不预置 guards.json（避免替宿主做安全决策），
+    # 只把最小可用配置的生成入口写进 hint。
+    return base + (
+        "；依赖真源可选：python .orchd/__main__.py deps init --root <宿主包目录>"
+        "（安装器不写 deps.json；需要依赖门禁时在 .orchd/shared/guards.json"
+        " 显式开启 deps 的 warn/hard，默认 off）"
+        "；宿主 guard 可选：python .orchd/__main__.py guards init"
+        "（生成 docs/deps/census 最小配置，默认 warn；不生成则全部 off）"
+    )
 
 
-def _install(host: Path, update: bool, force: bool) -> dict:
-    """按目标状态执行安装，返回结果字典。"""
+def _install(
+    host: Path, update: bool, force: bool, client_pointers: bool = False,
+) -> dict:
+    """按目标状态执行安装，返回结果字典。
+
+    ``client_pointers`` 默认关闭（``--client-pointers`` 显式开启）：关闭时宿主根
+    不新增任何客户端指针文件，也不创建其父目录。
+    """
     orchd = host / ".orchd"
+    modified: list[str] = []
+    backup_dir: str | None = None
+    # 上轮客户端指针基线：--force 为显式重建语义，不沿用旧基线（不覆盖宿主改动）。
+    previous_host_files = {} if force else _read_host_files(orchd)
 
     if orchd.exists():
         if not update and not force:
@@ -369,12 +574,14 @@ def _install(host: Path, update: bool, force: bool) -> dict:
                 "已安装，可用 --update 升级（保留宿主数据）或 --force 覆盖安装"
             )
         if force:
-            # 覆盖安装：重建 .orchd/（覆盖全部，含用户数据）
+            # 覆盖安装：重建 .orchd/（覆盖全部，含用户数据；--force 为显式销毁语义）
             shutil.rmtree(orchd)
             _assemble_assets(orchd)
             mode = "force"
         else:
-            # 就地升级：覆盖分发资产，保留宿主用户数据
+            # 就地升级：先按上次清单备份宿主改过的 shipped 文件，再覆盖分发资产。
+            modified, backup_dir = _backup_modified_shipped(
+                orchd, _planned_relpaths(), _read_manifest(orchd))
             _assemble_assets(orchd)
             mode = "update"
     else:
@@ -387,8 +594,18 @@ def _install(host: Path, update: bool, force: bool) -> dict:
     skeleton, roadmap = _mk_skeleton(orchd, host)
     gitignore = _write_orchd_gitignore(orchd)
     version = _write_engine_version(orchd)
-
+    # AGENTS.md 契约卡与客户端指针先落盘，清单最后写（host_files 记最终指纹）。
     agents_entry = _ensure_agents_entry(host)
+    if client_pointers:
+        client_pointer_result = _ensure_client_pointers(host, previous_host_files)
+        host_files = _client_pointer_fingerprints(
+            host, client_pointer_result["files"])
+    else:
+        client_pointer_result = {"enabled": False, "files": {}}
+        # 关闭不丢基线：下次开启 --client-pointers 仍能判定契约升级/宿主改动。
+        host_files = dict(previous_host_files)
+    # 清单必须最后写：.gitignore / VERSION 在此前刚被覆写，哈希以最终形态为准。
+    _write_manifest(orchd, _planned_relpaths(), host_files)
     hooks_path = _ensure_repo_hooks(host)
     # 入库完整性断言（task-vendored-engine-integrity）：三种模式统一执行——
     # 新装即有差集同样是未来的 worktree 断点，不限于 --update。
@@ -400,12 +617,15 @@ def _install(host: Path, update: bool, force: bool) -> dict:
         "host": str(host),
         "orchd_dir": str(orchd),
         "agents_entry": agents_entry,
+        "client_pointers": client_pointer_result,
         "hooks_path": hooks_path,
         "skeleton": skeleton,
         "roadmap": roadmap,
         "gitignore": gitignore,
         "version": version,
         "inventory": inventory,
+        "modified_shipped_files": modified,
+        "backup_dir": backup_dir,
         "next": _next_step_text(orchd, mode),
     }
 
@@ -616,24 +836,107 @@ def _write_orchd_gitignore(orchd: Path) -> str:
 
 
 def _ensure_agents_entry(host: Path) -> str:
-    """确保宿主根 AGENTS.md 含 orchd 入口指针（幂等）。
+    """确保宿主根 AGENTS.md 含 orchd 入口**契约卡**（marker 区段就地升级）。
 
-    供"不扫隐藏目录、无 orchd skill"的新 agent 进场后能直接发现引擎入口
-    ``.orchd/SKILL.md``。安装/升级/覆盖每次运行都会确保其存在：
-    - 无 AGENTS.md → 新建（created）
-    - 有但无 orchd 标记 → 末尾追加（appended，保留宿主已有内容）
-    - 已有 orchd 标记 → 不动（exists，幂等）
+    task-v163-host-installer-pointers（T14）：旧版是"整段散文 + 存在即跳过"，
+    导致指针升级永远到不了宿主。现按 marker 区段处理，全程**字节级**读写
+    （``read_bytes`` / ``write_bytes``，不经文本模式换行翻译），保证区段外内容
+    byte-identical。
+
+    Returns:
+        - ``created``：无 AGENTS.md，直接写入契约卡；
+        - ``appended``：有文件无开始标记，末尾追加一次（保留宿主已有内容）；
+        - ``updated``：旧 marker 区段被替换为 7 行契约卡；
+        - ``exists``：区段已是当前契约卡，不写文件；
+        - ``malformed_marker``：有开始标记但缺结束标记（或次序颠倒）→ **不改写**
+          文件，交由人工修复。
     """
     agents = host / "AGENTS.md"
-    if agents.exists():
-        text = agents.read_text(encoding="utf-8")
-        if _AGENTS_MARKER in text:
-            return "exists"
-        with agents.open("a", encoding="utf-8") as f:
-            f.write("\n\n" + _AGENTS_POINTER)
+    card = _AGENTS_POINTER.encode("utf-8")
+    start_marker = _AGENTS_START_MARKER.encode("utf-8")
+    end_marker = _AGENTS_END_MARKER.encode("utf-8")
+    if not agents.exists():
+        agents.write_bytes(card)
+        return "created"
+    data = agents.read_bytes()
+    start = data.find(start_marker)
+    if start < 0:
+        # 追加点保持完整行边界：宿主末行不留半截（区段外字节只增加、不改写）。
+        if data and not data.endswith(b"\n"):
+            separator = b"\n\n"
+        elif data.endswith(b"\n\n"):
+            separator = b""
+        elif data:
+            separator = b"\n"
+        else:
+            separator = b""
+        agents.write_bytes(data + separator + card)
         return "appended"
-    agents.write_text(_AGENTS_POINTER, encoding="utf-8")
-    return "created"
+    end = data.find(end_marker, start)
+    if end < 0:
+        return "malformed_marker"
+    section_end = end + len(end_marker)
+    # 区段含结束标记所在行的行尾（CRLF/LF）：就地升级不累积空行，也不吞宿主后文。
+    if data[section_end:section_end + 2] == b"\r\n":
+        section_end += 2
+    elif data[section_end:section_end + 1] == b"\n":
+        section_end += 1
+    # 换行归一后比较内容：宿主文件由 git autocrlf 检出的 CRLF 区段同样视为"已是新版"
+    # （不改写文件、不制造混合换行）。
+    if data[start:section_end].replace(b"\r\n", b"\n") == card:
+        return "exists"
+    agents.write_bytes(data[:start] + card + data[section_end:])
+    return "updated"
+
+
+def _ensure_client_pointers(host: Path, previous: dict[str, str]) -> dict:
+    """写四个客户端一行指针文件（C-CLIENT-POINTERS@1），默认不调用（见 --client-pointers）。
+
+    所有权判定（``previous`` = 上轮清单 ``host_files``，即安装器自有文件指纹）：
+
+    - 文件不存在 → 写入契约字节，``created``；
+    - 内容即契约 → ``exists``（不写文件）；
+    - 内容不同 + 上轮指纹与当前一致 → 上轮安装所写、宿主未改（契约升级）→ 重写，
+      ``updated``；
+    - 内容不同 + 无基线 / 指纹不符 → 宿主自行维护 → **保持原样**，
+      ``kept_host_modified``（绝不覆盖宿主内容）。
+
+    父目录按需创建（``.github/`` / ``.cursor/rules/``），仅在真正写文件时创建。
+    """
+    files: dict[str, str] = {}
+    for rel, content in _CLIENT_POINTER_SPECS:
+        path = host / rel
+        payload = content.encode("utf-8")
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            files[rel] = "created"
+            continue
+        actual = path.read_bytes()
+        if actual == payload:
+            files[rel] = "exists"
+            continue
+        recorded = previous.get(rel)
+        if recorded is not None and _sha256_bytes(actual) == recorded:
+            path.write_bytes(payload)
+            files[rel] = "updated"
+        else:
+            files[rel] = "kept_host_modified"
+    return {"enabled": True, "files": files}
+
+
+def _client_pointer_fingerprints(host: Path, statuses: dict[str, str]) -> dict[str, str]:
+    """本轮可进入 ``host_files`` 基线的指纹：仅安装器自有（内容必等于契约）的文件。
+
+    ``kept_host_modified`` 不登记——登记会把宿主内容变成下一轮的"我方基线"，
+    从而在 ``--update`` 时误覆盖宿主改动。
+    """
+    owned = {"created", "exists", "updated"}
+    out: dict[str, str] = {}
+    for rel, status in statuses.items():
+        if status in owned and (host / rel).is_file():
+            out[rel] = _sha256_file(host / rel)
+    return out
 
 
 # ------------------------------------------------------------------
@@ -790,13 +1093,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true",
                         help="已存在时覆盖安装（重建 .orchd/，覆盖全部）")
     parser.add_argument("--agent", action="store_true",
-                        help="非交互：仅输出最终 JSON（installed/mode/host/orchd_dir/next）")
+                        help="非交互：仅输出最终 JSON（installed/mode/host/orchd_dir/"
+                             "agents_entry/client_pointers/next）")
+    parser.add_argument("--client-pointers", action="store_true",
+                        help="写宿主根四个 agent 客户端指针文件（C-CLIENT-POINTERS@1；"
+                             "默认关闭，关闭时宿主根不新增任何文件）")
     parser.add_argument("--cleanup", action="store_true",
                         help="安装成功后删除克隆源目录（orchd-core/），实现无痕安装")
     args = parser.parse_args(argv)
 
     try:
-        result = _install(Path(args.host), args.update, args.force)
+        result = _install(
+            Path(args.host), args.update, args.force, args.client_pointers)
         if args.cleanup:
             result["cleanup"] = _cleanup_source()
     except Exception as exc:  # noqa: BLE001 - 统一收敛为错误输出
@@ -819,6 +1127,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    已启用仓库自带 hooks：core.hooksPath={hooks.get('hooks_path')}")
         elif hooks.get("reason") == "custom_hooks_path":
             print(f"    提示：{hooks.get('hint')}")
+        if result.get("agents_entry") == "malformed_marker":
+            print("    提示：AGENTS.md 的 orchd 标记区段不完整（缺 <!-- /orchd -->），"
+                  "未改写文件；请人工修复后重跑")
+        pointers = result.get("client_pointers") or {}
+        if pointers.get("enabled"):
+            kept = [rel for rel, status in pointers.get("files", {}).items()
+                    if status == "kept_host_modified"]
+            if kept:
+                print(f"    提示：客户端指针保持宿主原样（未覆盖）：{_shorten_list(kept)}")
         print(f"    下一步：{result['next']}")
     return 0
 

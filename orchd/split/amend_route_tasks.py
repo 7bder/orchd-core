@@ -39,13 +39,23 @@ def _amend_route_tasks(
     attachable_sync: list[dict[str, Any]],
     terminal_decl_sync: list[dict[str, Any]],
     terminal_text_revisions: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
+    scope_task: str | None = None,
+    snapshot_drift_warnings: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """amend 分派段：逐任务变更比对与状态矩阵准入 + 源引用校验（原 L611-961）。
 
-    累加器按引用就地增量写入（调用方可见）；返回 (conflict_warnings, removed_tasks)。
+    ``scope_task``（--task 补丁路径）：仅对该任务跑状态矩阵。scope 外任务的
+    master/snapshot 漂移不再判 E007（否则一个历史终态卡的路径写法差异会全局
+    阻断无关补登），只记 ``snapshot_drift_warnings``；快照仍由 persist 段按
+    master 重写，属派生数据收敛。``scope_task=None`` 保持全量校验。
+
+    累加器按引用就地增量写入（调用方可见）；返回
+    ``(conflict_warnings, removed_tasks, snapshot_drift_warnings)``。
     """
     new_task_ids = set()
     conflict_warnings: list[dict[str, Any]] = []
+    if snapshot_drift_warnings is None:
+        snapshot_drift_warnings = []
     for task in tasks:
         tid = task.get(ID_FIELD, "")
         new_task_ids.add(tid)
@@ -112,6 +122,35 @@ def _amend_route_tasks(
             continue
 
         old_task = existing_tasks[tid]
+        # task-feedback-amend-scope：--task 补丁只校验目标任务。scope 外任务
+        # 的 snapshot/master 漂移是派生数据落后，不是本次意图变更；若仍跑状态
+        # 矩阵，一个历史终态卡的 files_to_read 写法差异（main/design vs design）
+        # 会全局阻断无关补登，并把 hint 指向 force-status 终态卡（错误处置）。
+        # 这里只留可见告警；快照仍由 persist 段按 master 重写收敛。
+        if scope_task is not None and tid != scope_task:
+            if old_task != task:
+                drift_fields = sorted(
+                    key for key in set(task) | set(old_task)
+                    if task.get(key) != old_task.get(key)
+                )
+                snapshot_drift_warnings.append({
+                    "task_id": tid,
+                    "status": status,
+                    "fields": drift_fields,
+                    "message": (
+                        "scope 外任务 snapshot 漂移：已按 master 重同步派生快照，"
+                        "本次未做状态矩阵校验"
+                    ),
+                    "hint": (
+                        "本次 amend 作用域为 --task 目标；如需修改该任务，"
+                        "请显式 --task <id>（pending/claimed 白名单）或 "
+                        "--revise-terminal（终态文本字段），不要回退终态绕过作用域"
+                    ),
+                })
+            else:
+                unchanged_tasks.append(tid)
+            continue
+
         if old_task == task:
             unchanged_tasks.append(tid)
             continue
@@ -178,4 +217,4 @@ def _amend_route_tasks(
             f"invalid_state: {len(errors)} task(s) cannot be amended",
             [{**errors[0], "reason": "cannot_amend"}, *errors[1:]],
         )
-    return conflict_warnings, removed_tasks
+    return conflict_warnings, removed_tasks, snapshot_drift_warnings

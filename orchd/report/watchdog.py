@@ -141,128 +141,59 @@ def watchdog(
         exit code 由 CLI 层决定。
     """
     state = store.replay()
-    now = datetime.now(timezone.utc)
     stuck: list[dict[str, Any]] = []
 
-    # 读取 ledger 获取事件时间戳
-    events = store._read_ledger_lines(from_line=1)
-    # 构建 task_id → 最近 CLAIMED / REVIEW_CLAIMED 事件信息
-    claim_times: dict[str, datetime] = {}
-    review_claims: dict[str, dict[str, Any]] = {}
-    for ev in events:
-        tid = ev.get("task_id", "")
-        ts_str = ev.get("timestamp", "")
-        if not ts_str:
-            continue
-        try:
-            ev_time = datetime.fromisoformat(ts_str)
-        except ValueError:
-            continue
-        if ev.get("type") == EVENT_CLAIMED:
-            claim_times[tid] = ev_time
-        elif ev.get("type") == EVENT_REVIEW_CLAIMED:
-            review_claims[tid] = {
-                "time": ev_time,
-                "event_id": ev.get("event_id", ""),
-                "agent": ev.get("agent_id", ""),
-            }
+    # stale 判定统一时钟源（task-engine-defect-fix-unified-u10）：CLAIMED /
+    # REVIEW_CLAIMED 事件年龄、session 失联（missing_runtime / inactive /
+    # session_expired）与 stuck 一律经 onboard.control.stale_claim_snapshot 产出，
+    # 本处只做输出形状适配（不再自行维护阈值或年龄判定）。
+    from orchd.onboard.control import stale_claim_snapshot
 
-    for tid, ts in sorted(state.items()):
-        if ts.status == "claimed" and tid in claim_times:
-            elapsed = (now - claim_times[tid]).total_seconds() / 60
-            if elapsed > timeout_min:
-                stuck.append({
-                    "task_id": tid,
-                    "stuck_kind": "implementer",
-                    "claimed_by": ts.claimed_by,
-                    "stuck_minutes": round(elapsed, 1),
-                    "action": f"建议运行: orchd force-status --task {tid} --status pending",
-                })
-        elif ts.status == "in_review" and ts.review_claimed_by and tid in review_claims:
-            elapsed = (now - review_claims[tid]["time"]).total_seconds() / 60
-            if elapsed > timeout_min:
-                claim_event_id = review_claims[tid].get("event_id", "")
-                if claim_event_id:
-                    action = (
-                        f"如审查已中断：orchd retract "
-                        f"--event {claim_event_id} --reason 'abandoned review'（释放审查认领，"
-                        f"任务保持 in_review 可被重新认领）；如审查无法继续也可 "
-                        f"orchd force-status --task {tid} --status pending（打回实现，较重）"
-                    )
-                else:
-                    action = (
-                        f"审查认领事件缺 event_id，无法直接 retract：可 "
-                        f"orchd force-status --task {tid} --status pending（打回实现，较重）"
-                    )
-                stuck.append({
-                    "task_id": tid,
-                    "stuck_kind": "reviewer",
-                    "review_claimed_by": ts.review_claimed_by,
-                    "review_claim_event_id": claim_event_id,
-                    "stuck_minutes": round(elapsed, 1),
-                    "action": action,
-                })
+    snapshot = stale_claim_snapshot(store, state, timeout_min=timeout_min)
+    for entry in snapshot["stuck"]:
+        tid = entry["task_id"]
+        if entry["role"] == "implementer":
+            stuck.append({
+                "task_id": tid,
+                "stuck_kind": "implementer",
+                "claimed_by": state[tid].claimed_by,
+                "stuck_minutes": round(float(entry["age_s"]) / 60.0, 1),
+                "clock": entry["clock"],
+                "threshold_s": entry["threshold_s"],
+                "action": f"建议运行: orchd force-status --task {tid} --status pending",
+            })
+        else:
+            claim_event_id = entry.get("event_id", "")
+            if claim_event_id:
+                action = (
+                    f"如审查已中断：orchd retract "
+                    f"--event {claim_event_id} --reason 'abandoned review'（释放审查认领，"
+                    f"任务保持 in_review 可被重新认领）；如审查无法继续也可 "
+                    f"orchd force-status --task {tid} --status pending（打回实现，较重）"
+                )
+            else:
+                action = (
+                    f"审查认领事件缺 event_id，无法直接 retract：可 "
+                    f"orchd force-status --task {tid} --status pending（打回实现，较重）"
+                )
+            stuck.append({
+                "task_id": tid,
+                "stuck_kind": "reviewer",
+                "review_claimed_by": state[tid].review_claimed_by,
+                "review_claim_event_id": claim_event_id,
+                "stuck_minutes": round(float(entry["age_s"]) / 60.0, 1),
+                "clock": entry["clock"],
+                "threshold_s": entry["threshold_s"],
+                "action": action,
+            })
 
-    # Session Identity Layer：僵死 session 检测（task-session-watchdog-stale）。
-    # 对 claimed/done/in_review 任务，若实现者或审查者的 session runtime 已缺失、
-    # inactive 或过期（TTL 惰性过期：last_seen 超过 TTL 即判过期，判定即生效、
-    # 不依赖清理动作），则计入 stale_claims。不自动释放有活跃 session 的任务锁。
-    stale_sessions: list[dict[str, Any]] = []
+    # Session Identity Layer：僵死 session / 超龄认领（同一 snapshot，取舍即全舍）。
+    stale_sessions: list[dict[str, Any]] = list(snapshot["sessions"])
     stale_claims: list[dict[str, Any]] = []
-    try:
-        from orchd.ledger import is_session_expired, session_runtime_dir
-
-        session_dir = session_runtime_dir(store.orchd_dir)
-        sessions_by_id: dict[str, dict[str, Any]] = {}
-        if session_dir.exists():
-            for f in sorted(session_dir.glob("*.json")):
-                try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                sid = data.get("session_id")
-                if sid:
-                    sessions_by_id[sid] = data
-
-        for tid, ts in sorted(state.items()):
-            if ts.status not in ("claimed", "done", "in_review"):
-                continue
-            for role, sid, owner in (
-                ("implementer", ts.claimed_session, ts.claimed_by),
-                ("reviewer", ts.review_claimed_session, ts.review_claimed_by),
-            ):
-                if not sid:
-                    continue
-                runtime = sessions_by_id.get(sid)
-                reason = ""
-                if runtime is None:
-                    reason = "missing_runtime"
-                elif not runtime.get("active", True):
-                    reason = "inactive"
-                elif is_session_expired(runtime):
-                    # TTL 惰性过期：runtime 仍在且标称 active，但 last_seen 已超
-                    # TTL → 宿主会话早已中断（session end 未被调用）。判定即生效，
-                    # 过期文件即使仍在磁盘也不计入活跃，交接管流程处置。
-                    reason = "session_expired"
-                if reason:
-                    stale_sessions.append({
-                        "session_id": sid,
-                        "task_id": tid,
-                        "role": role,
-                        "owner": owner,
-                        "reason": reason,
-                    })
-                    stale_claims.append({
-                        "task_id": tid,
-                        "role": role,
-                        "owner": owner,
-                        "session_id": sid,
-                        "reason": reason,
-                        "action": _stale_claim_dual_action(tid),
-                    })
-    except Exception:
-        # best-effort：session runtime 不可用时静默降级，不影响既有 watchdog 行为
-        pass
+    for claim_info in snapshot["claims"]:
+        item = dict(claim_info)
+        item["action"] = _stale_claim_dual_action(item["task_id"])
+        stale_claims.append(item)
 
     takeover_results: list[dict[str, Any]] = []
     if takeover and stale_claims:
@@ -377,6 +308,7 @@ def watchdog(
             ac = auto_clean(
                 project_root,
                 emit_stderr=_auto_clean_emit_stderr(project_root),
+                trigger="watchdog",
             )
             if ac.get("auto_cleaned") or ac.get("auto_moved") or ac.get("manual_notice"):
                 watchdog_auto_clean = ac

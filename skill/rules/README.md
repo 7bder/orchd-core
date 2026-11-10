@@ -15,12 +15,24 @@ guide: {}
 | `intake.md` | 摄入 IDEAS → 注册任务 | 摄入/注册 |
 | `verify.md` | verify_command（120s / 模块定向 / --basetemp） | done 前 |
 | `git.md` | 分支 / 提交 / merge / amend / exempt_files | 提交/merge 前 |
-| `review.md` | 审查者 / 禁自审 / 证据分层 / 模板 | 审查 |
+| `review.md` | 审查者身份 / lineage 硬门 / 证据分层 / 模板 | 审查 |
 | `testing.md` | 测试纪律（复用 conftest / 参数化） | 写测试 |
 | `recovery.md` | 仓库对象/refs 丢失恢复 SOP | 事故 |
 | `windows.md` | Windows / 管道编码 | Windows 环境 |
 | `safety.md` | 引擎改动触碰 §9.1 停服边界 | 改引擎 |
 | `install.md` | 无感安装协议 + BOOTSTRAP | 新项目首次进入 |
+
+## 默认值登记（单一真源，改默认须同批改本表与代码）
+
+| 主题 | 当前默认 |
+|------|----------|
+| 自审（实现指纹 == 审查指纹） | **恒阻断**（claim + submit 双侧 `E016`），无开关 |
+| 自审降级开关（config / 任务级） | **已废弃**（引擎不再读取） |
+| 审查会话 lineage | **硬门**：`kind=reviewer` + `parent_session_id` = 最后一次 DONE 会话 id |
+| 接管超时阈值 | claim 600s / review 300s |
+| retract 后认领冷却 | 300s（`--force` 可绕） |
+| 冲突策略 | `conflict_policy` 缺省 `warn` |
+| verify 预算 | 120s（`amend --verify-timeout-seconds` 可提） |
 
 ## 外置协议文件（自 SKILL.md 外置，SKILL 内留入口链接）
 

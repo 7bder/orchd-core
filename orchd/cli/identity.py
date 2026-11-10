@@ -73,6 +73,13 @@ def _require_agent_id(orchd_dir: Path | None = None) -> str:
                 ),
             }],
         )
+    # task-feedback-session-runtime-gate：写命令与 session current 共用同一
+    # runtime 判据（存在 / active / 未过 TTL）。缺 runtime 的非空 token 不再
+    # 被信任——否则宿主项目级共享 token 可绕过「每对话唯一 session」契约。
+    if orchd_dir is not None:
+        from orchd.ledger import require_session_runtime
+
+        require_session_runtime(orchd_dir)
     return agent_id
 
 
@@ -248,8 +255,8 @@ def _session_collision_warning(
     """只读检测当前会话指纹的「并行会话碰撞」，返回 ``session_collision_warning`` 或 None。
 
     两种成因按 reason 区分归因（task-e035-hint-split）：自审（reviewer session ==
-    实现者 session）首要成因是同一会话既实现又审查，按自审处置（comments 披露
-    或换会话）；并行活跃任务首要成因才是 host 项目级会话码注入（全项目同一
+    实现者 session）首要成因是同一会话既实现又审查，按自审处置（comments 披露，
+    或由实现会话 spawn 独立 subagent 领审）；并行活跃任务首要成因才是 host 项目级会话码注入（全项目同一
     ``ORCHD_SESSION_ID`` 使并行对话派生同一指纹）。本函数仅只读 replay
     ledger，**不修改身份机制（resolve_agent_id 不变）、不落状态（不写 ledger/checkpoint）、
     不阻断命令**，只在命中时附加只读告警，提示 host 注入粒度违约。
@@ -298,9 +305,10 @@ def _session_collision_warning(
                 hint=(
                     "当前会话与任务实现者 session 相同，疑似审查自己实现：请先按自审"
                     "处置——在 review comments 首句披露自审（写明实现者 = 审查者），"
-                    "或换一个独立会话（新对话 / 重新 session start 注入唯一会话码）"
-                    "担任 reviewer；仅当各对话确已使用独立会话码但仍派生同指纹时，"
-                    "再按 host 会话码项目级注入排查。"
+                    "或由本会话 spawn 的独立 subagent 携自己的 session token "
+                    "领审（不得自铸 token / 手设 ORCHD_SESSION_ID / 复用他人 token，"
+                    "见 rules/review.md「审查者身份约定」）；仅当各对话确已使用独立"
+                    "会话码但仍派生同指纹时，再按 host 会话码项目级注入排查。"
                 ),
             )
 

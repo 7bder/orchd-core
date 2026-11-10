@@ -379,10 +379,11 @@ def _check_checkpoint_consistency(project_root: Path) -> list[dict[str, str]]:
     orchd_dir = Path(project_root) / ".orchd"
     try:
         from orchd.ledger import _STORAGE_BACKEND_ENV, resolve_backend_kind, resolve_store_dir
+        from orchd.storage import sqlite_db_path
 
         store_dir = resolve_store_dir(orchd_dir)
         backend_kind = resolve_backend_kind()
-        if backend_kind == "sqlite" and (store_dir / "_ledger.sqlite3").is_file():
+        if backend_kind == "sqlite" and sqlite_db_path(store_dir).is_file():
             return _check_checkpoint_consistency_sqlite(orchd_dir, store_dir)
         if backend_kind != "file" and backend_kind != "sqlite":
             raise ValueError(
@@ -414,18 +415,30 @@ def _check_migration_consistency(project_root: Path) -> list[dict[str, str]]:
     里已有数或处歧义残留）→ **fail**（mismatch：疑似两步改名中断 / 回滚残留，
     附手工收敛 hint）。待迁移态（fresh / resume，下次写命令自动收敛）与
     file 后端（活名文件属正常载体）、无库部署一律 ok。
+
+    缺库（task-layout-no-shell-ledger）：懒建库下「库文件未物化」属正常态，
+    返回 ok 并复用 ``DB_ABSENT_NOTE`` 统一措辞（与 storage CLI 缺库守卫同句），
+    不构造后端、不建库。
     只读：经 ``Store(..., readonly=True)`` 判定，不建库 / 不迁移 / 不改名。
     """
     orchd_dir = Path(project_root) / ".orchd"
     try:
         from orchd.ledger import Store, resolve_backend_kind, resolve_store_dir
+        from orchd.storage import sqlite_db_path
+        from orchd.storage.sqlite import DB_ABSENT_NOTE
 
         if resolve_backend_kind() != "sqlite":
             return [_make_check("migration_consistency", "ok",
                                 "file 后端：活名文件属正常载体")]
         store_dir = resolve_store_dir(orchd_dir)
-        if not (store_dir / "_ledger.sqlite3").is_file():
-            return [_make_check("migration_consistency", "ok", "无库文件：尚未迁移")]
+        if not sqlite_db_path(store_dir).is_file():
+            return [
+                _make_check(
+                    "migration_consistency",
+                    "ok",
+                    f"{DB_ABSENT_NOTE}：尚未迁移（下次写命令自动物化）",
+                )
+            ]
         store = Store(orchd_dir, readonly=True)
         live = [n for n in (LEDGER_FILE, CHECKPOINT_FILE)
                 if (store_dir / n).is_file()]
@@ -474,7 +487,8 @@ def _check_checkpoint_consistency_files(store_dir: Path) -> list[dict[str, str]]
             _make_check(
                 "checkpoint_consistency",
                 "ok",
-                "无 checkpoint 或账本（checkpoint 由写命令惰性建立）",
+                "无 checkpoint 或账本（checkpoint 由写命令惰性建立；"
+                "懒建库未物化时属正常）",
             )
         ]
     try:
@@ -563,14 +577,16 @@ def _check_checkpoint_consistency_sqlite(
     meta checkpoint 缺失沿用"任一缺失 → ok"语义（惰性建立，属正常）。
     """
     from orchd.ledger import _CHECKPOINT_SCHEMA_VERSION, Store
+    from orchd.storage import sqlite_db_path
 
-    db_path = store_dir / "_ledger.sqlite3"
+    db_path = sqlite_db_path(store_dir)
     if not db_path.is_file():
         return [
             _make_check(
                 "checkpoint_consistency",
                 "ok",
-                "无 checkpoint 或账本（checkpoint 由写命令惰性建立）",
+                "无 checkpoint 或账本（checkpoint 由写命令惰性建立；"
+                "懒建库未物化时属正常）",
             )
         ]
     store = Store(orchd_dir, readonly=True)
@@ -580,7 +596,8 @@ def _check_checkpoint_consistency_sqlite(
             _make_check(
                 "checkpoint_consistency",
                 "ok",
-                "无 checkpoint 或账本（checkpoint 由写命令惰性建立）",
+                "无 checkpoint 或账本（checkpoint 由写命令惰性建立；"
+                "懒建库未物化时属正常）",
             )
         ]
     if not isinstance(raw, dict):
@@ -709,10 +726,11 @@ def _check_event_schema(project_root: Path) -> list[dict[str, str]]:
     orchd_dir = Path(project_root) / ".orchd"
     try:
         from orchd.ledger import _STORAGE_BACKEND_ENV, resolve_backend_kind, resolve_store_dir
+        from orchd.storage import sqlite_db_path
 
         store_dir = resolve_store_dir(orchd_dir)
         backend_kind = resolve_backend_kind()
-        if backend_kind == "sqlite" and (store_dir / "_ledger.sqlite3").is_file():
+        if backend_kind == "sqlite" and sqlite_db_path(store_dir).is_file():
             return _check_event_schema_sqlite(orchd_dir, store_dir)
         if backend_kind != "file" and backend_kind != "sqlite":
             raise ValueError(
@@ -745,7 +763,11 @@ def _check_event_schema_files(store_dir: Path) -> list[dict[str, str]]:
 
     ledger_path = store_dir / LEDGER_FILE
     if not ledger_path.is_file():
-        return [_make_check("event_schema", "ok", "无账本文件，跳过")]
+        return [
+            _make_check(
+                "event_schema", "ok", "无账本文件（懒建库未物化时属正常），跳过"
+            )
+        ]
     bad: list[str] = []
     total = 0
     for lineno, line in enumerate(
@@ -792,8 +814,9 @@ def _check_event_schema_sqlite(
     构造一律 ``Store(..., readonly=True)``（不建库、不迁移、不改名）。
     """
     from orchd.ledger import Store
+    from orchd.storage import sqlite_db_path
 
-    db_path = store_dir / "_ledger.sqlite3"
+    db_path = sqlite_db_path(store_dir)
     if not db_path.is_file():
         return [_make_check("event_schema", "ok", "无账本，跳过")]
     store = Store(orchd_dir, readonly=True)

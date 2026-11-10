@@ -48,12 +48,10 @@ def _summarize(
         STATUS_IN_REVIEW: 0, STATUS_COMPLETED: 0, STATUS_CANCELLED: 0,
     }
     my_claimed: list[str] = []
-    rework = 0
-    first_rework_tid: str | None = None
     first_unclaimed_review: str | None = None
     first_unclaimed_review_phase: str | None = None
     # task-review-independence-enforce：焦点审查任务是否要求独立审查（claim_review
-    # hint 显式指引换会话；step 词表不新增，hint 文案与 rules/review.md 同语义）。
+    # hint 显式指引 spawn 独立 subagent；step 词表不新增，hint 文案与 rules/review.md 同语义）。
     first_unclaimed_review_requires_independence = False
     # 本 agent 已领未提交的审查（task-guide-step-vocab-and-routing-fix）：原实现只
     # 计数 my_in_review 却不产出出口，导致 in_review 全被领走时引导指回 request。
@@ -65,10 +63,6 @@ def _summarize(
         ts = state.get(tid)
         s = ts.status if ts else STATUS_PENDING
         counts[s] = counts.get(s, 0) + 1
-        if s == STATUS_PENDING and ts and ts.attempt_count > 0:
-            rework += 1
-            if first_rework_tid is None:
-                first_rework_tid = tid
         if s == STATUS_CLAIMED and agent_id and ts and ts.claimed_by == agent_id:
             my_claimed.append(tid)
         if s == STATUS_IN_REVIEW:
@@ -82,6 +76,12 @@ def _summarize(
                 first_unclaimed_review_phase = ts.review_phase or "unified"
                 if _task_map.get(tid, {}).get("require_independent_review"):
                     first_unclaimed_review_requires_independence = True
+    # rework 单一真源（u14）：与 request 候选池共用 rank_candidates，不再按
+    # attempt_count>0 各算一套（hint 计数与排序后候选池恒一致）。
+    from orchd.pool import build_pool, rank_candidates
+    rework_cards = [c for c in rank_candidates(build_pool(tasks, state)) if c.rework]
+    rework = len(rework_cards)
+    first_rework_tid = rework_cards[0].task.get("id", "") if rework_cards else None
     counts["total"] = len(tasks)
     counts["my_claimed"] = my_claimed
     counts["rework"] = rework
@@ -114,15 +114,20 @@ def _classify(
             "step": "empty_project" if has_master else "first_time",
             "focus_tid": None,
         }
+    # 优先级（task-guidance-review-priority-fix）：**先收尾本 agent 已领未提交的审查，
+    # 再谈领新审查**。原先 first_unclaimed_review 判定在前，导致只要池中存在任何未认领
+    # 审查，submit_review 出口就永不可达——会话被引去领他任务的审查，而该 claim 会被
+    # orchd/onboard/claim.py 的 E011 review busy 拒绝，手上已领的审查就此悬空未提交
+    # （2026-09-13 实测 evt-cd8fa533，任务冻结在 in_review/code）。
+    if c.get("my_review_tid"):
+        # 本 agent 已领审查未提交 → 先给出可推进出口
+        return {"step": "submit_review", "focus_tid": c["my_review_tid"]}
+    # task-feedback-claim-guidance-order：本 agent 已持有的实现任务优先于「他人在审」。
+    # 原顺序把全局 STATUS_IN_REVIEW>0 放在 my_claimed 之前，导致刚 claim 成功就被无关
+    # 审查抢占成 wait_review，my_claimed 分支永不可达；实现任务必须先收尾。
+    if c.get("my_claimed"):
+        return {"step": "done", "focus_tid": c["my_claimed"][0]}
     if c.get(STATUS_IN_REVIEW, 0) > 0:
-        # 优先级（task-guidance-review-priority-fix）：**先收尾本 agent 已领未提交的审查，
-        # 再谈领新审查**。原先 first_unclaimed_review 判定在前，导致只要池中存在任何未认领
-        # 审查，submit_review 出口就永不可达——会话被引去领他任务的审查，而该 claim 会被
-        # orchd/onboard/claim.py 的 E011 review busy 拒绝，手上已领的审查就此悬空未提交
-        # （2026-09-13 实测 evt-cd8fa533，任务冻结在 in_review/code）。
-        if c.get("my_review_tid"):
-            # 本 agent 已领审查未提交 → 先给出可推进出口
-            return {"step": "submit_review", "focus_tid": c["my_review_tid"]}
         if c.get("first_unclaimed_review"):
             return {"step": "claim_review", "focus_tid": c["first_unclaimed_review"]}
         # 审查已被他人领取：本 agent 无可做之事 → 等待（不再产出 request_review 死路）
@@ -133,8 +138,6 @@ def _classify(
         # 忙度只看**本 agent** 的 claimed（原实现用全局 claimed，导致其他会话一旦有
         # 任务在实现，本 agent 永远拿不到 request_impl，与 request 的候选结论打架）
         return {"step": "request_impl", "focus_tid": None}
-    if c.get("my_claimed"):
-        return {"step": "done", "focus_tid": c["my_claimed"][0]}
     if c[STATUS_CLAIMED] > 0 or c[STATUS_DONE] > 0:
         return {"step": "wait_review", "focus_tid": None}
     if c[STATUS_CANCELLED] > 0:
@@ -301,8 +304,9 @@ def _review_step_guidance(
                 f"该 worktree，回收前请先切出任务目录（Windows 句柄占用会导致回收失败）；"
                 f"代码审查通过任务才算完成。"
             ) + (
-                " 注意：该任务 require_independent_review=true，要求异指纹审查——"
-                "实现会话不得认领，请换独立会话（不同 ORCHD_SESSION_ID）执行 claim"
+                " 注意：该任务 require_independent_review=true，要求独立 subagent 审查——"
+                "实现会话不得认领，须由本会话 spawn 的独立 subagent 携自己的 session token "
+                "执行 claim；自铸 token / 手设 ORCHD_SESSION_ID / 复用他人 token 均禁止"
                 "（同指纹提交的审查结论视为无效）。"
                 if c.get("first_unclaimed_review_requires_independence") else ""
             ),

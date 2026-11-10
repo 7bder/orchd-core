@@ -19,6 +19,7 @@ def amend(
     reason: str | None = None,
     expected_head: str | None = None,
     release_lock: bool = True,
+    scope_task: str | None = None,
 ) -> dict[str, Any]:
     """增量更新 snapshot：按状态约束矩阵过滤变更。
 
@@ -37,6 +38,11 @@ def amend(
     reviewers 发生了变更，允许通过；否则拒绝（提示"仅允许修改 reviewers"）。
 
     新增任务始终允许。删除任务不阻止，但在摘要中报告 removed_tasks。
+
+    ``scope_task``（``--task`` 补丁路径）把状态矩阵校验收敛到该任务：scope 外
+    任务的 master/snapshot 漂移只记 ``snapshot_drift_warnings``，不再因历史
+    终态卡的路径写法差异全局 E007；快照仍按 master 重写（派生数据收敛）。
+    ``scope_task=None``（裸 amend / --register）保持全量校验语义。
 
     红线 7（task-redline7-amend-refuse，roadmap:constraint-hardening）：
     amend 只在 default（main）分支执行。在非 main 分支上调用 amend 直接
@@ -142,7 +148,8 @@ def amend(
             revise_terminal=revise_terminal, reason=reason,
             expected_head=expected_head,
         )
-        conflict_warnings, removed_tasks = _amend_route_tasks(
+        (conflict_warnings, removed_tasks,
+         snapshot_drift_warnings) = _amend_route_tasks(
             tasks=tasks, state=state, existing_tasks=existing_tasks,
             master=master, project_root=project_root, orchd_dir=orchd_dir,
             revise_terminal=revise_terminal, revision_reason=revision_reason,
@@ -153,6 +160,7 @@ def amend(
             attachable_sync=attachable_sync,
             terminal_decl_sync=terminal_decl_sync,
             terminal_text_revisions=terminal_text_revisions,
+            scope_task=scope_task,
         )
         quality_warnings, _exempted_terminal_warnings = _amend_persist(
             orchd_dir=orchd_dir, tasks=tasks, modules=modules, master=master,
@@ -199,6 +207,7 @@ def amend(
         "quality_warnings": _annotate_if_needed(quality_warnings, orchd_dir),
         "exempted_terminal_warnings": _exempted_terminal_warnings,
         "conflict_warnings": conflict_warnings,
+        "snapshot_drift_warnings": snapshot_drift_warnings,
         "sources_missing": sources_missing,
         "sources_invalid": sources_invalid,
     }

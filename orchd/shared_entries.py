@@ -114,6 +114,22 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_cli_query.py",
         "tests/test_nogit_init_layout.py",
     ),
+    # 2026-11-03 task-host-guard-config：新增只读宿主 guard CLI 入口（guards list），
+    # 行为面由 tests/test_host_guard_config.py 独占断言；改它须跑该测试。
+    "orchd/cli/commands/guards.py": (
+        "tests/test_host_guard_config.py",
+    ),
+    # task-deps-graph-truth-source / task-docsgen-manifest：两个命令组的 argparse 出口与
+    # 退出码契约被专属测试直接断言（deps 的 init/check/sync 与 docs 的 list/check/write）；
+    # 改它们只跑通用门不够，须带登记测试。
+    "orchd/cli/commands/deps.py": (
+        "tests/test_deps.py",
+        "tests/contract/test_dependency_direction.py",
+    ),
+    "orchd/cli/commands/docs.py": (
+        "tests/test_docs_manifest.py",
+        "tests/test_docs.py",
+    ),
     # 2026-09-27 task-pass9-shared-entry-registry（pass9 实测）：hook 生成物形态
     # （case 模式 / scope-check 行）被 test_decl_dir_match_guards.py 的断言钉住，
     # 改生成层而不跑它 = 断言漂移只能靠全量回归兜底（实测漏 3 条红）。生成行为
@@ -149,6 +165,18 @@ SHARED_ENTRY_TESTS: dict[str, tuple[str, ...]] = {
     "orchd/gitops/hook/precommit_template.py": (
         "tests/test_hook_template_external.py",
         "tests/test_gitops.py",
+    ),
+    # task-debug-hook-active-gate：活跃认领门控叶域的行为测试 + 包结构/AST 面。
+    "orchd/gitops/hook/active_gate.py": (
+        "tests/test_hook_active_gate.py", "tests/test_pkg_contract.py",
+    ),
+    # T18 拆包新增叶域（task-v163-pkg-registry-convergence）：运行时探测 / 写盘双检 /
+    # 解释器烘焙三处判据随 install.py 搬入；行为面由 hook 三件套覆盖，结构与绑定
+    # 关系由 test_pkg_contract 守卫（install 需保留自身 __globals__ 绑定）。
+    "orchd/gitops/hook/runtime.py": (
+        "tests/test_gitops.py",
+        "tests/test_gitops_hook_shell_resolve.py",
+        "tests/test_pkg_contract.py",
     ),
     "orchd/cli/_util/__init__.py": (
         "tests/test_cli_workflow.py",
@@ -286,6 +314,11 @@ CLI_COMMAND_MODULE_EXEMPT: dict[str, str] = {
     "orchd/cli/commands/session.py": "会话命令组，行为面由 tests/test_session*.py 覆盖",
     "orchd/cli/commands/sync.py": "账本同步命令，行为面由 tests/test_sync*.py 覆盖",
     "orchd/cli/commands/workflow.py": "任务流程命令组，行为面由 tests/test_cli_workflow.py 覆盖",
+    # task-shared-surface-engine：落地面命令组（list/validate/check/assemble）只做注册表
+    # 与片段协议的薄封装，判据真源在 orchd/surfaces.py / orchd/surface_assembly.py，
+    # 行为面由 tests/test_surfaces*.py 与 test_shared_surfaces_e2e.py 覆盖；对外面由通用门覆盖。
+    "orchd/cli/commands/surfaces.py": "落地面命令组（薄封装），对外面由通用门覆盖，"
+                                      "判据面见 tests/test_surfaces*.py",
 }
 
 
@@ -393,6 +426,7 @@ def cli_command_modules_unaccounted(commands_dir: Path) -> list[str]:
             continue
         unaccounted.append(rel)
     return unaccounted
+
 
 # 全局共享文件（形态 A）：影响面无法枚举的共享入口——改它影响**全量**用例，因此不存在
 # 「断言它的有限测试文件集合」可登记。对这些文件，门禁退一步要求 verify_command 的 pytest
@@ -567,6 +601,57 @@ def verify_command_covers_all_tests(verify_command: str) -> bool:
     return False
 
 
+def shared_entry_key_matches(entry: str, path: str) -> bool:
+    """登记键是否命中某个仓库相对路径（尾斜杠键 = 包级通配）。
+
+    task-decl-subpackage-test-anchor：**单一真源**——``missing_shared_entry_tests``
+    与 :func:`orchd.subpackage_guard.subpackage_entries_unaccounted` 的锚点判定共用本
+    函数（code 审查 Q2a：同一语义若两处各自实现，改口径必然漂移）。尾斜杠键
+    （``orchd/gitops/hook/``）命中该包下任意文件，防拆包后「原单文件键失明」
+    （W6-C8 实测；E039 会对整棵子树静默失明）；其余键精确匹配——现有 32 个精确键
+    行为零变化。
+    """
+    if entry.endswith("/"):
+        return path.startswith(entry)
+    return entry == path
+
+
+def shared_entry_coverage_gaps(
+    entries: Mapping[str, Sequence[str]],
+    changed_files: Iterable[str],
+    verify_command: str,
+) -> list[dict[str, str]]:
+    """给定登记表，返回「入口改动但 verify_command 未覆盖登记测试」的缺口清单。
+
+    判定本体（目标解析、全量逃逸口、尾斜杠通配键匹配）在此单点实现：引擎 E039
+    （:func:`missing_shared_entry_tests`，registry 缺省 = :data:`SHARED_ENTRY_TESTS`）与宿主
+    ``drift`` guard（registry = 宿主 ``.orchd/shared/guards.json`` 的 ``shared_entries``）
+    共用本函数，避免两套覆盖判据各写一遍而漂移。
+
+    Args:
+        entries: 登记表（入口键 → 登记测试文件序列；尾 ``/`` 键按包级前缀匹配）。
+        changed_files: 本次改动集（仓库相对路径，``/`` 或 ``\\`` 皆可）。
+        verify_command: 验证命令（done 期传任务 ``verify_command``）。
+
+    Returns:
+        ``[{"shared_entry": ..., "required_test": ...}, ...]``；空列表 = 通过。
+    """
+    changed = {str(path).replace("\\", "/") for path in changed_files}
+    if verify_command_covers_all_tests(verify_command):
+        # 超集逃逸口：跑全量 ⇒ 每个登记测试都被执行（无论是否逐个列出）。
+        return []
+    targets = set(verify_command_test_targets(verify_command))
+    gaps: list[dict[str, str]] = []
+    for entry in sorted(entries):
+        # 键匹配语义（精确 / 尾斜杠通配）收敛在 shared_entry_key_matches 单一真源。
+        if not any(shared_entry_key_matches(entry, path) for path in changed):
+            continue
+        for test in entries[entry]:
+            if test not in targets:
+                gaps.append({"shared_entry": entry, "required_test": test})
+    return gaps
+
+
 def missing_shared_entry_tests(
     changed_files: Iterable[str],
     verify_command: str,
@@ -583,19 +668,7 @@ def missing_shared_entry_tests(
         缺口列表 ``[{"shared_entry": ..., "required_test": ...}, ...]``；空列表 = 通过。
     """
     entries = SHARED_ENTRY_TESTS if registry is None else registry
-    changed = {str(path).replace("\\", "/") for path in changed_files}
-    if verify_command_covers_all_tests(verify_command):
-        # 超集逃逸口：跑全量 ⇒ 每个登记测试都被执行（无论是否逐个列出）。
-        return []
-    targets = set(verify_command_test_targets(verify_command))
-    gaps: list[dict[str, str]] = []
-    for entry in sorted(entries):
-        if entry not in changed:
-            continue
-        for test in entries[entry]:
-            if test not in targets:
-                gaps.append({"shared_entry": entry, "required_test": test})
-    return gaps
+    return shared_entry_coverage_gaps(entries, changed_files, verify_command)
 
 
 def missing_baseline_test_coverage(

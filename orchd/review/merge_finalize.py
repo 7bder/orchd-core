@@ -216,23 +216,36 @@ def _review_submit_merge_finalize(
                     )
                 except Exception:
                     _own = []
+                # task-engine-defect-fix-unified-u12：先分档再组装——自家残留先
+                # 类型化（code/severity/deferred）再并入 merge_audit.warnings；
+                # 弹回判据由「reason != worktree_not_recycled」硬编码改为
+                # 「severity == blocking」，未知 code 默认 blocking（fail-closed）。
+                # report.audit 是 severity 单一真源，此处函数级 import 是为回避
+                # report↔review 顶层循环依赖
+                # （tests/test_audit_hint_show.py::test_no_top_level_report_import）。
+                from orchd.report.audit import (
+                    AUDIT_SEVERITY_BLOCKING,
+                    classify_audit_items,
+                )
+
+                _own = classify_audit_items(_own)
                 if _own:
                     if not _audit.get("skipped", False):
                         _audit.setdefault("warnings", []).extend(_own)
                     else:
                         _audit["own_residual"] = _own
-                    # task-recycle-noblock：残留分两档处置——
-                    # ① 分支类（未合入 / 未清理）：代码未落地，不得标记完成，
-                    #    仍打回 in_review（下不变）；
-                    # ② 目录残留（worktree_not_recycled，Windows 下调用方
-                    #    shell 句柄占用常见）：改警告注解 + completed 维持，
-                    #    不再空转第二轮审查；回收 journal 保留（仅全成功才删），
-                    #    引擎下次回收该任务时按 journal 重放收敛（延迟回收）。
-                    # 未知 reason 按分支档处理（fail-closed 方向）。
+                    # 分档处置（task-recycle-noblock + u12 严重度分级）——
+                    # ① blocking（分支类：未合入 / 未清理等「代码未落地」）：
+                    #    不得标记完成，打回 in_review；
+                    # ② 非 blocking（env 目录残留 / accounting 记账缺口 /
+                    #    info 卫生提示）：仅注解 + completed 维持，不再空转
+                    #    第二轮审查；目录残留的回收 journal 保留（仅全成功才
+                    #    删），引擎下次回收该任务时按 journal 重放收敛。
+                    # 未登记 code 由 classify 归 blocking（fail-closed 方向）。
                     _bounce = [w for w in _own
-                               if w.get("reason") != "worktree_not_recycled"]
+                               if w.get("severity") == AUDIT_SEVERITY_BLOCKING]
                     _deferred = [w for w in _own
-                                 if w.get("reason") == "worktree_not_recycled"]
+                                 if w.get("severity") != AUDIT_SEVERITY_BLOCKING]
                     if _bounce:
                         # 退回 in_review：FORCE_STATUS 通道（replay 层 ungated，
                         # target=in_review 保留审查认领字段，同一 reviewer 可重试；
@@ -257,24 +270,44 @@ def _review_submit_merge_finalize(
                         result["action"] = _own_residual_action(
                             task_id, _bounce, _audit_root)
                     elif _deferred:
-                        # 目录残留：completed 维持，仅注解（merge_audit
-                        # warnings 已含该项；延迟回收指引见完成态 guidance）。
+                        # 非阻断残留（env 目录残留 / accounting 记账缺口 / info
+                        # 卫生提示）：completed 维持，仅注解（merge_audit
+                        # warnings 已含该项，均带 severity/deferred；延迟收敛
+                        # 指引见完成态 guidance）。
                         result["worktree_residual_deferred"] = {
                             "task_id": task_id,
                             "residual": _deferred,
                             "hint": (
-                                "任务已 completed；目录残留改警告注解，不再打回 "
-                                "in_review。回收 journal 已保留，引擎下次回收该任务"
-                                "时按 journal 重放收敛；目录残留可运行 doctor --fix "
-                                "清理（doctor_check=worktree_residual）"
+                                "任务已 completed；非阻断残留（env 目录残留 / "
+                                "accounting 记账缺口等）改警告注解，不再打回 "
+                                "in_review。目录残留的回收 journal 已保留，引擎下次"
+                                "回收该任务时按 journal 重放收敛；目录残留可运行 "
+                                "doctor --fix 清理（doctor_check=worktree_residual）"
                             ),
                         }
 
-    # A1/A4（debug-pack A 组）：merge 未落地的失败路径统一兜底——审查结论
-    # （verdict/comments）仍须落账，使 review --show 可回看，且响应 submitted
-    # 与账本 REVIEW_SUBMITTED 落账状态一致（不再出现「报成功、账已回滚」的背离）。
-    # 事件带 merge_pending 标记，状态机据此保持 in_review（不推进终态），审查
-    # 认领与阶段字段不变，同一 reviewer 可重试 code APPROVED。
+    # merge 未落地失败路径的兜底落账由尾随 return 表达式承载——见
+    # `_record_pending_submission`（A1/A4）。段体保持单一 If（段体拼接守卫）。
+    return _record_pending_submission(
+        result=result,
+        store=store,
+        pending_code_event=pending_code_event,
+    )
+
+
+def _record_pending_submission(
+    *,
+    result: dict[str, Any],
+    store: Store,
+    pending_code_event: dict[str, Any] | None,
+) -> None:
+    """A1/A4（debug-pack A 组）：merge 未落地的失败路径统一兜底。
+
+    审查结论（verdict/comments）仍须落账，使 ``review --show`` 可回看，且响应
+    ``submitted`` 与账本 REVIEW_SUBMITTED 落账状态一致（不再出现「报成功、账已
+    回滚」的背离）。事件带 ``merge_pending`` 标记，状态机据此保持 in_review
+    （不推进终态），审查认领与阶段字段不变，同一 reviewer 可重试 code APPROVED。
+    """
     if (
         pending_code_event is not None
         and result.get("task_status") == "in_review"

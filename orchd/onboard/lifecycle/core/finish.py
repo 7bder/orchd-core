@@ -17,7 +17,7 @@ from orchd.contracts.events import (
 from orchd.errors import ErrorCode, OrchdError
 from orchd.gitops_ops import make_event as _make_event
 from orchd.guide import NEXT_ACTION_AWAIT_REVIEW
-from orchd.ledger import Store, resolve_review_mode
+from orchd.ledger import Store
 from orchd.contracts.task_schema import (
     FILES_TO_EDIT_FIELD,
 )
@@ -34,8 +34,13 @@ def _write_done_event(
 ) -> dict[str, Any]:
     """S-A2 阶段 6：锁内 TOCTOU 二次校验 + 写 DONE/REVIEW_READY + checkpoint。
 
-    记账一律以任务认领者 claimed_by 为准，忽略 caller 当前指纹（宿主会话身份
-    漂移时仍正常放行并按认领者记账）。返回组装所需字段，不在本函数拼完整响应。
+    DONE 事件归属口径（task-cont-done-lineage-docs）：``agent_id`` 记任务认领者
+    ``claimed_by``（归属主体，宿主会话身份漂移时仍按认领者记账），``session_id``
+    记当前执行 done 的调用方会话（``make_event`` 从环境身份注入）。审查 lineage
+    硬门（``orchd/ledger/session.py::require_review_lineage``）即以「该任务最后
+    一次 DONE 事件的 ``session_id``」作为 expected parent——等价于：审查会话必须
+    由执行 done 的那个实现会话 spawn。
+    返回组装所需字段，不在本函数拼完整响应。
     """
     store.acquire_lock()
     try:
@@ -53,6 +58,9 @@ def _write_done_event(
         assert claimed_by is not None
         author_mismatch = claimed_by != agent_id
         attempt_count = ts.attempt_count + 1
+        # DONE 归属（task-cont-done-lineage-docs）：agent_id=claimed_by（认领者），
+        # session_id 由 make_event 注入当前调用方会话——审查 lineage 硬门取的
+        # expected parent 就是这里的 session_id。
         done_event = _make_event(
             task_id, claimed_by, EVENT_DONE,
             changes_description=changes_description,
@@ -65,24 +73,17 @@ def _write_done_event(
         store.append_event(done_event)
 
         # 自动 REVIEW_READY（review-unify-r2）
-        if resolve_review_mode(store.orchd_dir) == "unified":
+        # task-engine-defect-fix-unified-u13：review 路径由单一真源
+        # ``resolve_review_created`` 推导（type/mode/reason），本函数只消费其
+        # type 决定事件字段；延迟导入避免循环依赖（与历史一致）。
+        from orchd.onboard import resolve_review_created
+
+        review_created = resolve_review_created(store, task_def, task_id)
+        if review_created["mode"] == "unified":
             review_type: str | None = None
             review_event = _make_event(task_id, claimed_by, EVENT_REVIEW_READY)
         else:
-            # 延迟导入避免循环依赖
-            from orchd.onboard import _load_config_blocked, _is_doc_single_stage
-            blocked_config = _load_config_blocked(store)
-            review_type = "code" if _is_doc_single_stage(
-                task_def.get(FILES_TO_EDIT_FIELD, []), blocked=blocked_config
-            ) else "spec"
-            # task-review-rework-scope：code 范围打回的返工直达 code 审查，
-            # 跳过 spec（缺省/历史事件无标记即 spec，与旧行为一致；标记随
-            # 本次 done 消费隐式失效，见 ledger.latest_rework_scope）。
-            if review_type == "spec":
-                from orchd.ledger import latest_rework_scope
-
-                if latest_rework_scope(store, task_id) == "code":
-                    review_type = "code"
+            review_type = review_created["type"]
             review_event = _make_event(
                 task_id, claimed_by, EVENT_REVIEW_READY, review_type=review_type
             )
@@ -99,6 +100,7 @@ def _write_done_event(
         "attempt_count": attempt_count,
         "done_event": done_event,
         "review_type": review_type,
+        "review_created": review_created,
         "integrity_warnings": integrity_warnings,
     }
 
@@ -146,6 +148,7 @@ def _assemble_done_result(
     attempt_count: int,
     review_type: str | None,
     done_event_id: str,
+    review_created: dict[str, str] | None = None,
     integrity_warnings: list[Any],
     degraded_guards: list[dict[str, Any]],
     author_mismatch: bool,
@@ -163,7 +166,7 @@ def _assemble_done_result(
         "task_id": task_id,
         "status": "done",
         "attempt_count": attempt_count,
-        "review_created": {"type": review_type or "unified"},
+        "review_created": review_created or {"type": review_type or "unified"},
         "event_id": done_event_id,
     }
     if integrity_warnings:

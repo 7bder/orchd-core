@@ -122,6 +122,76 @@ def _clean_stale_index_lock(workdir: Path) -> bool:
     return False
 
 
+def _untracked_collision_diagnostic(files: list[str]) -> dict[str, Any]:
+    """untracked 同路径碰撞诊断（预检与 merge 失败共用同一形状与文案）。
+
+    task-debug-worktree-merge-hint：预检命中与 merge 真失败必须给**同一种**结构化
+    结论，否则同一件事在两条路径上有两种说法，agent 无法照做。
+    """
+    listing = "、".join(files) if files else "（未能解析）"
+    return {
+        "kind": "untracked_collision",
+        "files": files,
+        "hint": (
+            f"主工作树有未跟踪文件阻挡合并：{listing}。"
+            "用文件系统移走或删除它们（Remove-Item / 移出工作树，非 git 写操作，"
+            "不违反红线；切勿 git add）后，由同一 reviewer 重试 code APPROVED。"
+        ),
+    }
+
+
+def _precheck_untracked_collision(
+    workdir: Path, trunk: str, branch: str,
+) -> dict[str, Any] | None:
+    """merge 前**纯读**预检：任务分支改动路径 ∩ 主工作树 untracked 路径。
+
+    为什么不靠 stderr：``would be overwritten by merge`` 是本地化字串，中文 git
+    下整条分类会落到 ``unknown``。这里只用 git 的路径集合求交，与语言无关。
+    副作用面：仅两条读命令（``diff --name-only`` / ``ls-files --others``），
+    HEAD、工作区、分支均不变（AC3）。
+
+    Returns:
+        命中 → ``_untracked_collision_diagnostic`` 同形 dict；未命中 / 读不到分支
+        （分支已删、git 不可用）→ ``None``（调用方按既有路径继续，零回归）。
+    """
+    try:
+        # 本环境 git 的 ``--diff-filter`` 与三点 ``...`` 语法组合行为异常（实测：``d``
+        # 未按预期过滤、``amr`` 反而把 A 过滤掉、``!d`` 直接报错），故不依赖它；改用
+        # ``--name-status`` 取状态后在 Python 侧排除「删除型」(D)：分支删除某文件而主
+        # 工作树有同名 untracked 时，git merge 本会成功（删的是 tracked、留的是
+        # untracked），属假碰撞；A/M/R/T 才是真碰撞源。
+        changed = subprocess.run(
+            ["git", "-C", str(workdir), "diff", "--name-status",
+             f"{trunk}...{branch}"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+        if changed.returncode != 0:
+            return None
+        untracked = subprocess.run(
+            ["git", "-C", str(workdir), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+        if untracked.returncode != 0:
+            return None
+        changed_set: set[str] = set()
+        for _ln in (changed.stdout or "").splitlines():
+            _parts = _ln.split("\t")
+            if len(_parts) < 2:
+                continue
+            if "D" in _parts[0]:
+                continue  # 删除型：git merge 本会成功，非碰撞
+            changed_set.add(_parts[-1].strip())
+        untracked_set = {
+            ln.strip() for ln in (untracked.stdout or "").splitlines() if ln.strip()
+        }
+        hit = sorted(changed_set & untracked_set)
+        if not hit:
+            return None
+        return _untracked_collision_diagnostic(hit)
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
 def _classify_merge_failure(stderr: str) -> dict[str, Any]:
     """merge 非冲突失败分类（task-merge-failure-diagnostic）。
 
@@ -146,16 +216,7 @@ def _classify_merge_failure(stderr: str) -> dict[str, Any]:
             if ln.strip()
         ]
         files = [f for f in files if f]
-        listing = "、".join(files) if files else "（未能解析）"
-        return {
-            "kind": "untracked_collision",
-            "files": files,
-            "hint": (
-                f"主工作树有未跟踪文件阻挡合并：{listing}。"
-                "用文件系统移走或删除它们（Remove-Item / 移出工作树，非 git 写操作，"
-                "不违反红线；切勿 git add）后，由同一 reviewer 重试 code APPROVED。"
-            ),
-        }
+        return _untracked_collision_diagnostic(files)
     if "would be overwritten by merge" in text:
         return {
             "kind": "local_changes",
@@ -197,6 +258,25 @@ def try_git_merge(project_root: Path, task_id: str) -> dict[str, Any] | None:
     try:
         workdir = main_worktree_root(project_root)
         _clean_stale_index_lock(workdir)
+        # task-debug-worktree-merge-hint：先纯读预检 untracked 交集——命中就**不**
+        # checkout/merge，直接返回与失败同形的诊断（AC3：git 无副作用）。
+        # 仅在「当前视图就是 trunk」时预检：flat 布局下 HEAD 可能是 task/x，
+        # 此时 ls-files 列的是任务分支视图，与 merge 后的 trunk 视图不等价，
+        # 宁可跳过（退回 stderr 分类）也不误报。
+        _hb = subprocess.run(
+            ["git", "-C", str(workdir), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+        _head_is_trunk = (
+            _hb.returncode == 0 and (_hb.stdout or "").strip() == trunk
+        )
+        if _head_is_trunk:
+            _pre = _precheck_untracked_collision(workdir, trunk, branch)
+            if _pre is not None:
+                return {
+                    "conflict": False,
+                    "merge_diagnostic": {"stage": "precheck", **_pre},
+                }
         checkout = subprocess.run(
             ["git", "-C", str(workdir), "checkout", trunk],
             capture_output=True,
