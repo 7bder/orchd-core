@@ -39,7 +39,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from orchd.guards import GuardEvalContext, GuardFinding, GuardsConfigError, load_guards_config
 
@@ -212,7 +212,7 @@ def _as_count(value: object, field_name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{field_name} 不能是布尔值")
     try:
-        return math.ceil(float(value))
+        return math.ceil(float(cast(Any, value)))
     except (TypeError, ValueError) as exc:
         raise TypeError(f"{field_name} 不是计数：{value!r}") from exc
 
@@ -229,7 +229,7 @@ def _total_probes(sites: Mapping[str, Mapping[str, Any]]) -> int:
 def _top_sites(sites: Mapping[str, Mapping[str, Any]], top: int) -> list[dict[str, Any]]:
     """按计数降序取 TopN 站点（含 ``site`` / ``count``，与 spawn 侧行对齐）。"""
     rows = [{"site": key, "count": _site_count(key, rec)} for key, rec in sites.items()]
-    rows.sort(key=lambda row: -int(row["count"]))
+    rows.sort(key=lambda row: -int(cast(int, row["count"])))
     return rows[:top]
 
 

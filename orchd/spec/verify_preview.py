@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 
 # 注册期真实预演的超时预算（秒；与历史 amend_register_gate 的 30s 一致）。
 PREVIEW_TIMEOUT_SECONDS = 30
@@ -203,7 +203,7 @@ def preview_verify_command(
 
     budget = PREVIEW_TIMEOUT_SECONDS if timeout is None else int(timeout)
     try:
-        proc = run_shell(verify_cmd, str(project_root) if project_root else None,
+        proc = run_shell(verify_cmd, cast(str, str(project_root) if project_root else None),
                          budget)
     except subprocess.TimeoutExpired:
         # AC3：TimeoutExpired 记 reason=timeout，调用方必须把它留在结果列表里。

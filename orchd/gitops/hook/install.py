@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 
 from orchd.gitops._run import _run_git
@@ -75,7 +75,7 @@ def _install_ref_tx_hook(project_root: Path) -> dict[str, Any]:
     if fail is not None:
         _log_hook_skip("install_ref_tx_skipped_git_unavailable", fail)
         return fail
-    path = hooks_dir / _REF_TX_HOOK_FILENAME
+    path = cast(Path, hooks_dir) / _REF_TX_HOOK_FILENAME
     if path.exists() and not _is_orchd_hook(path):
         result = {
             "installed": False, "reason": "foreign_hook_present", "path": str(path),
@@ -127,7 +127,7 @@ def _uninstall_ref_tx_hook(project_root: Path) -> dict[str, Any]:
     hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "uninstall_ref_tx")
     if fail is not None:
         return fail
-    path = hooks_dir / _REF_TX_HOOK_FILENAME
+    path = cast(Path, hooks_dir) / _REF_TX_HOOK_FILENAME
     if not path.exists():
         return {"uninstalled": True, "reason": "not_exists", "path": str(path)}
     if not _is_orchd_hook(path):
@@ -417,7 +417,7 @@ def _hook_uninstall_locked(
     hooks_dir, fail = _resolve_hooks_dir_checked(project_root, "uninstall")
     if fail is not None:
         return fail
-    hook_path = hooks_dir / _HOOK_FILENAME
+    hook_path = cast(Path, hooks_dir) / _HOOK_FILENAME
     hook_is_ours = hook_path.exists() and _is_orchd_hook(hook_path)
     gate = uninstall_gate(
         hook_is_ours=hook_is_ours, orchd_dir=orchd_dir, force=force,

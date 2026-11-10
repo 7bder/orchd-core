@@ -91,7 +91,7 @@ def _check_stale_baseline(
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         status = None
     unknown = status is None or status.returncode != 0
-    entries = [] if unknown else [
+    entries = [] if status is None or unknown else [
         ln for ln in (status.stdout or "").splitlines() if ln.strip()
     ]
     # 引擎自产工件不计入脏度：``.orchd/.layout.json``（container 标记）与

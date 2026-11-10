@@ -257,7 +257,7 @@ def _changelog_landing_gaps(
             )
     if not missing and not incoming_missing:
         return []
-    if incoming_missing and incoming_task_id not in missing:
+    if incoming_task_id and incoming_missing and incoming_task_id not in missing:
         missing.append(incoming_task_id)
     hint = ("在 CHANGELOG.md 的 [Unreleased] 分区为上述 id 各补一行语义化条目"
             "（判据真源：orchd.gitops.query.landed_task_ids_since）")

@@ -219,7 +219,7 @@ def _cmd_storage_recutover(args) -> dict:
         db_ids = {e.get("event_id") for e in db_events if e.get("event_id")}
         missing = [e for e in live_events
                    if e.get("event_id") and e["event_id"] not in db_ids]
-        live_ids = {e.get("event_id") for e in live_events if e.get("event_id")}
+        live_ids = [e.get("event_id") for e in live_events if e.get("event_id")]
         arch, _ = read_archive_events(store_dir)
         active = list(backend.read_events(from_line=len(arch) + 1))
         result: dict[str, Any] = {
@@ -246,7 +246,7 @@ def _cmd_storage_recutover(args) -> dict:
             backend.replace_active_events(active + missing)
         after = list(backend.read_events())
         verified_ids = {e.get("event_id") for e in after if e.get("event_id")}
-        expected_ids = db_ids | live_ids
+        expected_ids = db_ids | set(live_ids)
         # 第二子句按「有 event_id 的事件数」口径：len(after) 计全部事件，若库内
         # 存在无 event_id 事件（import_jsonl 逐行原样入库、不校验契约）或重复 id，
         # 拿 len(after) 比 len(expected_ids) 会让 match 恒假、命令永不收敛。

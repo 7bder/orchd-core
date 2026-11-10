@@ -378,7 +378,7 @@ def stale_claim_snapshot(
         if ts.status == STATUS_CLAIMED:
             role = "implementer"
             event = info.get("claim") or {}
-            claim_ts: str | None = event.get("timestamp")
+            claim_ts = event.get("timestamp")
         elif ts.status == STATUS_IN_REVIEW and ts.review_claimed_by:
             role = "reviewer"
             event = info.get("review") or {}
@@ -545,7 +545,7 @@ def retract(
             _runtime_state = _session_runtime_state(
                 store, target_event.get(SESSION_ID_KEY)
             )
-            if _stale_role is not None:
+            if _stale_role is not None and _stale_status is not None:
                 if _runtime_state == STALE_SESSION_ACTIVE:
                     stale_release = False
                 elif _runtime_state in (

@@ -69,7 +69,7 @@ def state_invalid_recovery(detail: dict[str, Any]) -> str | None:
     )
 
 
-def e007_guidance_override(detail: Any) -> dict[str, str] | None:
+def e007_guidance_override(detail: Any) -> dict[str, Any] | None:
     """单个 detail → guidance 覆盖（recovery/hint/command/exit_type）；不适用返回 None。"""
     if not isinstance(detail, dict):
         return None
@@ -84,7 +84,7 @@ def e007_guidance_override(detail: Any) -> dict[str, str] | None:
             "read": entry["read"],
         }
     if reason == "stale_base":
-        text = stale_base_recovery(detail)
+        text: str | None = stale_base_recovery(detail)
         return {
             "recovery": text,
             "hint": text,

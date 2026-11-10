@@ -160,7 +160,7 @@ def _done_impl(
         # 4) verify_command 锁外执行（含超时/失败假消除；假失败消除命中时提前返回）
         verify_record, early_done = _run_verify(store, task_def, task_id, project_root)
         if early_done is not None:
-            if surface_created:
+            if surface_created and project_root:
                 surfaces.discard_new_fragments(project_root, surface_created)
             return early_done
 
@@ -171,7 +171,7 @@ def _done_impl(
         )
 
     except BaseException as exc:
-        if surface_created:
+        if surface_created and project_root:
             surfaces.discard_new_fragments(
                 project_root,
                 surface_created,

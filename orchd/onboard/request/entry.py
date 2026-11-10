@@ -106,7 +106,7 @@ def request(
     # review_first，agent 去 claim 审查被 E011 拒，手上的实现任务悬空。
     held_impl = next(
         (t.get("id") for t in tasks
-         if (ts := state.get(t.get("id"))) is not None
+         if (ts := state.get(t.get("id") or "")) is not None
          and ts.status == "claimed" and ts.claimed_by == agent_id),
         None,
     )

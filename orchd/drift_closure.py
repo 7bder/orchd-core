@@ -428,9 +428,9 @@ def co_change_gaps(
                 GENERATED_DIR
             ):
                 continue
-            missing = tuple(p for p in mirrors if p not in changed_set and p not in reported)
+            missing = [p for p in mirrors if p not in changed_set and p not in reported]
             if missing:
-                gaps.append(MirrorGap("mirror", row.domain, trigger, missing))
+                gaps.append(MirrorGap("mirror", row.domain, trigger, tuple(missing)))
     return gaps
 
 

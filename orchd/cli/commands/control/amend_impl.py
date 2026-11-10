@@ -390,7 +390,7 @@ def _amend_impl(args, tasks, orchd_dir, master, store, agent_id) -> dict:
         orchd_dir=orchd_dir, master=master, store=store,
         project_root=project_root, revise_terminal=revise_terminal,
         scope_task=patch_task,
-        allow_shared_write=getattr(args, "allow_shared_write", None) or (),
+        allow_shared_write=getattr(args, "allow_shared_write", None),
         surface_reason=getattr(args, "reason", None))
 
     # 校验通过后执行 amend（写入 snapshot + checkpoint；透传终态文本修订通道）。

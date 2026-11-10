@@ -1006,7 +1006,7 @@ def _scan_fragments_dir(base: Path, spec: SurfaceSpec) -> FragmentScan:
         )
     return FragmentScan(
         surface=spec.name,
-        dir_rel=spec.dir,
+        dir_rel=spec.dir or "",
         fragments=fragments,
         invalid=tuple(invalid),
     )

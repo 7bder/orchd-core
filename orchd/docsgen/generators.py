@@ -14,6 +14,7 @@ import hashlib
 import json
 import pathlib
 import sys
+from typing import cast
 
 import orchd
 
@@ -225,7 +226,7 @@ def gen_dependency_graph_md() -> str:
         f"- 层数：{len(layers)}（无依赖=0，沿 hard 边取 1 + max(依赖层)）",
         "- 各层节点数：" + " / ".join(f"{k}:{v}" for k, v in sorted(layers.items())),
         f"- 最大 SCC：{max_scc} 节点（"
-        + " / ".join(max(all_cycles, key=len, default=()))
+        + " / ".join(() + max(all_cycles, key=len, default=()))
         + f"；hard 顶层环 {len(hard_cycles)} 个）",
         f"- 边覆盖：hard {sum(len(v) for v in graph.hard.values())} / "
         f"delayed {sum(len(v) for v in graph.delayed.values())} / "
@@ -246,7 +247,7 @@ def gen_dependency_graph_md() -> str:
         try:
             named = derive_related_test_files(rel, ROOT / "tests")
         except (OSError, ValueError):
-            named = ()
+            named = []
         named_text = named[0] if named else "-"
         e039 = [k for k in SHARED_ENTRY_TESTS if shared_entry_key_matches(k, rel)]
         e039_text = ", ".join(e039) if e039 else "-"
@@ -388,16 +389,15 @@ def gen_deps_summary_md() -> str:
 def gen_drift_matrix_md() -> str:
     """契约漂移矩阵（整文件生成物）：真源 ``docs_manifest.DRIFT_MATRIX``。"""
     from orchd.docs_manifest import DRIFT_MATRIX
-
-    lines = list(DRIFT_MATRIX["head_lines"])
+    lines = list(cast("list[str]", DRIFT_MATRIX["head_lines"]))
     lines.append("| 漂移域 | 真源 | 断言 | 门禁 |")
-    lines.append(DRIFT_MATRIX["sep"])
-    for row in DRIFT_MATRIX["rows"]:
+    lines.append(cast(str, DRIFT_MATRIX["sep"]))
+    for row in cast("tuple[dict[str, str], ...]", DRIFT_MATRIX["rows"]):
         lines.append(
             f"| {row['domain']} | {row['source']} | {row['assertions']} "
             f"| {row['gates']} |"
         )
-    lines.extend(DRIFT_MATRIX["tail_lines"])
+    lines.extend(cast("list[str]", DRIFT_MATRIX["tail_lines"]))
     return "\n".join(lines) + "\n"
 
 

@@ -143,7 +143,7 @@ def _parse_uncommitted_status(stdout: str, limit: int = 50) -> dict[str, Any]:
             sample.append(path)
     return {"tracked": tracked, "untracked": untracked, "sample": sample}
 
-def _fallback_next_action(status_value: str, task_id: str) -> str:
+def _fallback_next_action(status_value: str, task_id: str) -> str | None:
     """分类器不可用时的原文案兜底（仅 degraded 路径，正常路径不硬编码中文）。"""
     return {
         STATUS_PENDING: f"request → claim --task {task_id} --confirm",

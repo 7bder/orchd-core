@@ -384,9 +384,9 @@ def _raise_plan(
     previous_totals: dict[str, int] = previous.get("totals") or {}
     fresh_totals: dict[str, int] = fresh.get("totals") or {}
     for root, current in sorted(fresh_totals.items()):
-        cap = previous_totals.get(root)
-        if cap is not None and current > cap:
-            raised.append(f"raise totals:{root} {cap} -> {current}")
+        prev_total = previous_totals.get(root)
+        if prev_total is not None and current > prev_total:
+            raised.append(f"raise totals:{root} {prev_total} -> {current}")
     return raised, new_over
 
 

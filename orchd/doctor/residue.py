@@ -37,7 +37,7 @@ from orchd.constants import (
     ORCHD_BAKED_PY_ENV, ORCHD_BAKED_SRC_ENV, ORCHD_HOME_ENV,
     ORCHD_LINE_TASK_PREFIX_ENV,
 )
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from orchd.contracts.events import (
     EVENT_FORCE_STATUS,
@@ -1075,7 +1075,7 @@ def _detect_hook_guard_gaps(project_root: Path) -> list[dict[str, Any]]:
         return [_unavailable_residue("hook_guard_gaps",
                                      RuntimeError(fail.get("error") or "git 探测失败"),
                                      canonical)]
-    pre_commit = Path(hooks_dir) / hook_mod._HOOK_FILENAME
+    pre_commit = Path(cast(Path, hooks_dir)) / hook_mod._HOOK_FILENAME
     listed = "、".join(active_ids)
     # 运行时不可用与「缺失」分道（AC3）：hook 由 sh 执行，运行时不可用时即便文件在位
     # git 也会静默跳过（fail-open）——此时报 hook_runtime_unavailable 而非 missing。

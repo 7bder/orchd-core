@@ -161,7 +161,7 @@ def _cmd_deps_init(args: argparse.Namespace) -> tuple[dict, int]:
 
 def _drift(
     deps_path: Path, root_dir: Path, package: str
-) -> tuple[dict | None, dict | None]:
+) -> tuple[deps_query.DepsGraph | None, dict | None]:
     """对拍真源与 AST；返回 ``(graph, drift)``，配置错时返回 ``(None, error)``。"""
     if not deps_path.is_file():
         return None, _error(
